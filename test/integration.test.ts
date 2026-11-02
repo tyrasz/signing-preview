@@ -1,0 +1,74 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import type { AddressInfo } from 'node:net';
+import { createPreviewServer } from '../src/server.ts';
+import { remotePreview, withSigningPreview, UserRejectedError, type Eip1193Provider } from '../src/interceptor.ts';
+import { ALICE, buildSamples } from '../mocks/data.ts';
+import { mockDeps } from './helpers.ts';
+
+async function withServer(fn: (url: string) => Promise<void>) {
+  const server = createPreviewServer({ deps: mockDeps(), samples: () => buildSamples() });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try { await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}`); } finally { server.close(); }
+}
+
+test('HTTP API previews requests, allows any origin and rejects bad input', async () => {
+  await withServer(async url => {
+    const s = buildSamples().find(x => x.id === 'hl-withdraw')!;
+    const res = await fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json', origin: 'chrome-extension://abc' }, body: JSON.stringify({ request: s.request, context: { account: ALICE } }) });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.equal((await res.json()).title, 'Withdraw 50 USDC to Arbitrum');
+
+    const bad = await fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ request: { method: 'eth_sendTransaction', params: [{}] } }) });
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error.code, 'INVALID_REQUEST');
+
+    const big = await fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'x'.repeat(300 * 1024) }).catch(() => null);
+    assert.ok(big === null || big.status === 413);
+
+    const preflight = await fetch(`${url}/v1/preview`, { method: 'OPTIONS' });
+    assert.equal(preflight.status, 204);
+  });
+});
+
+test('Interceptor previews signing requests, forwards approvals, rejects with 4001, passes others through', async () => {
+  await withServer(async url => {
+    const calls: string[] = [];
+    const wallet: Eip1193Provider = {
+      isMockWallet: true,
+      async request({ method }) {
+        calls.push(method);
+        if (method === 'eth_chainId') return '0xa4b1';
+        if (method === 'eth_accounts') return [ALICE];
+        if (method === 'eth_blockNumber') return '0x10';
+        return '0xsigned';
+      },
+    };
+    const seen: string[] = [];
+    let answer = true;
+    const provider = withSigningPreview(wallet, { preview: remotePreview(`${url}/v1/preview`), confirm: async p => { seen.push(p.title); return answer; }, origin: 'https://dapp.example' });
+    const deposit = buildSamples().find(x => x.id === 'bridge2-deposit')!.request;
+
+    assert.equal(await provider.request(deposit as never), '0xsigned');
+    assert.deepEqual(seen, ['Deposit 100 USDC to Hyperliquid']);
+    assert.ok(calls.includes('eth_sendTransaction'));
+
+    answer = false;
+    calls.length = 0;
+    await assert.rejects(provider.request(deposit as never), (e: unknown) => e instanceof UserRejectedError && e.code === 4001);
+    assert.ok(!calls.includes('eth_sendTransaction'));
+
+    assert.equal(await provider.request({ method: 'eth_blockNumber' }), '0x10');
+    assert.equal(seen.length, 2);
+    assert.equal(provider.isMockWallet, true);
+  });
+});
+
+test('Interceptor shows an explicit fallback when the preview service fails', async () => {
+  const wallet: Eip1193Provider = { async request() { return '0x1'; } };
+  let shown;
+  const provider = withSigningPreview(wallet, { preview: async () => { throw new Error('offline'); }, confirm: async p => { shown = p; return false; } });
+  await assert.rejects(provider.request({ method: 'personal_sign', params: ['0x68656c6c6f', ALICE] }));
+  assert.equal((shown as unknown as { warnings: { code: string }[] }).warnings[0].code, 'preview_unavailable');
+});

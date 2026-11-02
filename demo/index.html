@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signing Preview</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #5d6470; --border: #e2e5ea; --accent: #2f5bea;
+    --info-bg: #eaf1ff; --info: #2350c7; --caution-bg: #fff4e0; --caution: #9a5b00; --danger-bg: #fdecec; --danger: #b42318;
+    --ok-bg: #e8f6ee; --ok: #1d7a46; --code: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1115; --panel: #171a20; --text: #e8eaee; --muted: #9aa2ae; --border: #2a2f38; --accent: #7c9cff;
+      --info-bg: #17243f; --info: #9db7ff; --caution-bg: #33260f; --caution: #f2c36b; --danger-bg: #3a1716; --danger: #ff9a92;
+      --ok-bg: #12301f; --ok: #7fd6a2; --code: #1f232b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 20px 16px 8px; max-width: 1180px; margin: 0 auto; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0; color: var(--muted); max-width: 760px; }
+  main { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 16px; padding: 16px; max-width: 1180px; margin: 0 auto; }
+  @media (max-width: 820px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; min-width: 0; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 10px; }
+  .group { margin-bottom: 12px; }
+  .group h3 { font-size: 12px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
+  .sample { display: block; width: 100%; text-align: left; border: 1px solid var(--border); background: transparent; color: var(--text); border-radius: 7px; padding: 7px 9px; margin-bottom: 5px; cursor: pointer; font: inherit; }
+  .sample:hover, .sample:focus-visible { border-color: var(--accent); outline: none; }
+  .sample.active { border-color: var(--accent); background: var(--info-bg); }
+  textarea { width: 100%; min-height: 120px; font: 12px/1.4 ui-monospace, Menlo, monospace; background: var(--code); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  select, button.primary, button.secondary { font: inherit; border-radius: 7px; padding: 7px 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .wallet { display: flex; flex-direction: column; gap: 12px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .network { font-size: 12px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .chip { border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; font-size: 12px; }
+  .title { font-size: 19px; font-weight: 650; margin: 2px 0 0; overflow-wrap: anywhere; }
+  .summary { margin: 0; color: var(--text); }
+  .badge { font-weight: 600; border-radius: 999px; padding: 1px 9px; font-size: 12px; }
+  .badge.none { background: var(--ok-bg); color: var(--ok); } .badge.info { background: var(--info-bg); color: var(--info); }
+  .badge.caution { background: var(--caution-bg); color: var(--caution); } .badge.danger { background: var(--danger-bg); color: var(--danger); }
+  .warning { border-radius: 8px; padding: 8px 10px; }
+  .warning.info { background: var(--info-bg); color: var(--info); } .warning.caution { background: var(--caution-bg); color: var(--caution); } .warning.danger { background: var(--danger-bg); color: var(--danger); }
+  .warning strong { text-transform: capitalize; }
+  .changes { display: flex; flex-direction: column; gap: 4px; }
+  .change { display: flex; justify-content: space-between; gap: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+  .change .amt { font-weight: 650; font-variant-numeric: tabular-nums; }
+  .change.out .amt { color: var(--danger); } .change.in .amt { color: var(--ok); }
+  .change small { color: var(--muted); }
+  dl { display: grid; grid-template-columns: minmax(110px, max-content) minmax(0, 1fr); gap: 4px 14px; margin: 0; }
+  dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+  dd code { font-size: 12px; }
+  .call { border-left: 3px solid var(--border); padding-left: 10px; }
+  .actions { display: flex; gap: 8px; }
+  .actions button { flex: 1; padding: 9px; font-weight: 600; }
+  details summary { cursor: pointer; color: var(--muted); }
+  pre { background: var(--code); border-radius: 7px; padding: 8px; overflow: auto; font-size: 12px; max-height: 360px; }
+  .log { font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted); }
+  .log div { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Signing Preview</h1>
+  <p>A mock dApp sends EIP-1193 requests to a mock wallet wrapped with <code>withSigningPreview()</code>. Each request is previewed by <code>POST /v1/preview</code> before the wallet signs. All balances, prices and accounts are mock data.</p>
+</header>
+<main>
+  <section class="panel" aria-label="Mock dApp">
+    <h2>dApp requests</h2>
+    <div id="samples">Loading…</div>
+    <div class="group">
+      <h3>Custom request (EIP-1193 JSON)</h3>
+      <textarea id="custom" spellcheck="false" aria-label="Custom request JSON"></textarea>
+      <div class="row">
+        <select id="chain" aria-label="Wallet chain"><option value="1">Ethereum</option><option value="42161" selected>Arbitrum One</option><option value="999">HyperEVM</option></select>
+        <button class="primary" id="send">Send to wallet</button>
+      </div>
+    </div>
+  </section>
+  <section class="panel wallet" aria-label="Wallet" aria-live="polite">
+    <h2>Wallet confirmation</h2>
+    <div id="preview" class="empty">Pick a request on the left.</div>
+    <div class="log" id="log"></div>
+  </section>
+</main>
+<script type="module" src="/demo/app.js"></script>
+</body>
+</html>

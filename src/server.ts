@@ -1,0 +1,136 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { extname, join, normalize, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { previewRequest } from './preview.ts';
+import { RequestError } from './evm/transaction.ts';
+import { StaticTokenRegistry } from './chains.ts';
+import { HttpHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
+import { RpcSimulator } from './simulation.ts';
+import type { Dependencies, PreviewContext } from './types.ts';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const MAX_BODY = 256 * 1024;
+const TYPES: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.map': 'application/json' };
+
+export interface ServerOptions {
+  deps: Dependencies;
+  /** Value of Access-Control-Allow-Origin. "*" lets any wallet, extension or web app call the API. */
+  corsOrigin?: string;
+  /** Sample requests served at /v1/samples (demo only). */
+  samples?: () => unknown;
+  /** Serve the demo page and browser bundles. */
+  serveDemo?: boolean;
+}
+
+export function createPreviewServer(options: ServerOptions) {
+  const cors = options.corsOrigin ?? '*';
+  return createServer(async (req, res) => {
+    res.setHeader('access-control-allow-origin', cors);
+    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+    res.setHeader('access-control-allow-headers', 'content-type');
+    res.setHeader('access-control-max-age', '600');
+    try {
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      if (req.method === 'OPTIONS') return void res.writeHead(204).end();
+      if (req.method === 'GET' && url.pathname === '/v1/health') return json(res, 200, { status: 'ok' });
+      if (req.method === 'POST' && url.pathname === '/v1/preview') return await handlePreview(req, res, options.deps);
+      if (req.method === 'GET' && url.pathname === '/v1/samples' && options.samples) return json(res, 200, options.samples());
+      if (req.method === 'GET' && options.serveDemo) return await serveStatic(url.pathname, res);
+      return json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found' } });
+    } catch (error) {
+      if (!res.headersSent) json(res, 500, { error: { code: 'INTERNAL', message: error instanceof Error ? error.message : 'Internal error' } });
+    }
+  });
+}
+
+async function handlePreview(req: IncomingMessage, res: ServerResponse, deps: Dependencies) {
+  if (!(req.headers['content-type'] ?? '').includes('application/json')) return json(res, 415, { error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Send application/json' } });
+  let body: { request?: unknown; context?: PreviewContext };
+  try { body = JSON.parse(await readBody(req)); } catch (error) {
+    return json(res, error instanceof BodyTooLarge ? 413 : 400, { error: { code: 'INVALID_JSON', message: error instanceof Error ? error.message : 'Invalid JSON' } });
+  }
+  if (!body || typeof body !== 'object' || !body.request) return json(res, 400, { error: { code: 'INVALID_REQUEST', message: 'Body must be { request: { method, params }, context? }' } });
+  const context = sanitizeContext(body.context);
+  try {
+    const preview = await previewRequest(body.request as never, context, deps);
+    return json(res, 200, preview);
+  } catch (error) {
+    if (error instanceof RequestError || (error as { code?: string })?.code === 'INVALID_REQUEST') return json(res, 400, { error: { code: 'INVALID_REQUEST', message: (error as Error).message } });
+    throw error;
+  }
+}
+
+function sanitizeContext(raw: unknown): PreviewContext {
+  if (!raw || typeof raw !== 'object') return {};
+  const c = raw as Record<string, unknown>;
+  const out: PreviewContext = {};
+  if (typeof c.chainId === 'number' && Number.isSafeInteger(c.chainId)) out.chainId = c.chainId;
+  if (typeof c.origin === 'string') out.origin = c.origin.slice(0, 256);
+  if (typeof c.account === 'string' && /^0x[0-9a-fA-F]{40}$/.test(c.account)) out.account = c.account;
+  const hl = c.hyperliquid as Record<string, unknown> | undefined;
+  if (hl && typeof hl === 'object' && hl.action && typeof hl.action === 'object' && typeof hl.nonce === 'number') {
+    out.hyperliquid = {
+      action: hl.action as Record<string, unknown>, nonce: hl.nonce,
+      vaultAddress: typeof hl.vaultAddress === 'string' && /^0x[0-9a-fA-F]{40}$/.test(hl.vaultAddress) ? hl.vaultAddress : null,
+      expiresAfter: typeof hl.expiresAfter === 'number' ? hl.expiresAfter : null,
+    };
+  }
+  return out;
+}
+
+class BodyTooLarge extends Error {}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY) { reject(new BodyTooLarge(`Body exceeds ${MAX_BODY} bytes`)); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+async function serveStatic(pathname: string, res: ServerResponse) {
+  const path = pathname === '/' ? '/demo/index.html' : pathname;
+  if (!/^\/(demo|dist)\//.test(path)) return json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found' } });
+  const file = normalize(join(ROOT, path));
+  if (!file.startsWith(ROOT.endsWith(sep) ? ROOT : ROOT + sep)) return json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found' } });
+  try {
+    const content = await readFile(file);
+    res.writeHead(200, { 'content-type': TYPES[extname(file)] ?? 'application/octet-stream', 'cache-control': 'no-store' }).end(content);
+  } catch {
+    json(res, 404, { error: { code: 'NOT_FOUND', message: path.startsWith('/dist/') ? 'Not built yet: run npm run build' : 'Not found' } });
+  }
+}
+
+function json(res: ServerResponse, status: number, body: unknown) {
+  res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+}
+
+/** Dependencies for live mode: Hyperliquid's public /info API and eth_simulateV1 against configured RPCs. */
+export function liveDependencies(env = process.env): Dependencies {
+  const rpcs: Record<number, string> = {};
+  if (env.ETHEREUM_RPC_URL) rpcs[1] = env.ETHEREUM_RPC_URL;
+  if (env.ARBITRUM_RPC_URL) rpcs[42161] = env.ARBITRUM_RPC_URL;
+  if (env.HYPEREVM_RPC_URL) rpcs[999] = env.HYPEREVM_RPC_URL;
+  return {
+    tokens: new StaticTokenRegistry(),
+    hyperliquid: { mainnet: new HttpHyperliquidInfo(INFO_URLS.mainnet), testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
+    ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs) }),
+  };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const mode = process.env.SIGNING_PREVIEW_MODE === 'live' ? 'live' : 'mock';
+  const { buildSamples, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
+  const deps: Dependencies = mode === 'live' ? liveDependencies() : { tokens: new StaticTokenRegistry(), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() } };
+  const port = Number(process.env.PORT ?? 8787);
+  const host = process.env.HOST ?? '127.0.0.1';
+  createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true })
+    .listen(port, host, () => console.log(`signing-preview (${mode} data) on http://${host}:${port}  ·  POST /v1/preview`));
+}
