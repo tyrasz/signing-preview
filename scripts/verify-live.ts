@@ -6,12 +6,19 @@
 //  4. Resolves every live HyperCore asset ID (perps, spot, HIP-3, outcomes) to a named, priced market.
 //  5. Checks HyperCore -> other-chain withdrawal fees and runs CoreDepositWallet's HyperEVM withdrawal step
 //     (eth_call from the USDC system address), comparing each outcome with the preview's prediction.
-// Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io and
-// rpc.hyperliquid.xyz and api.hyperliquid.xyz (behind a proxy, run with NODE_USE_ENV_PROXY=1 on Node >= 22.21).
+//  6. Checks the curated token list's decimals against each token contract, on-chain metadata reads and proxy
+//     detection on deployed contracts, and the Sourcify / OpenChain / 4byte (and, with ETHERSCAN_API_KEY,
+//     Etherscan) response shapes. A service that can't be reached is skipped, unless VERIFY_LIVE_STRICT=1 (CI).
+// Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
+// rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus sourcify.dev, api.openchain.xyz and www.4byte.directory
+// for step 6 (behind a proxy, run with NODE_USE_ENV_PROXY=1 on Node >= 22.21).
 import { createPublicClient, http, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
-import { HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
+import { builtinTokens, CHAINS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
+import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
+import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
+import type { RpcClient } from '../src/rpc.ts';
 import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
@@ -233,6 +240,86 @@ console.log('\n# HyperCore -> other chains via Circle CCTP (CoreDepositWallet.co
     const reverted = !!res.error;
     check(predictedFail === reverted, label.padEnd(34), reverted ? `reverts: ${String(res.error.message).replace('execution reverted: ', '')}` : 'succeeds');
   }
+}
+
+console.log('\n6. Token metadata, proxy detection, ABI and signature services');
+{
+  const urls: Record<number, string> = { 42161: RPC, 999: 'https://rpc.hyperliquid.xyz/evm' };
+  // Same RpcClient contract as JsonRpcClient (node errors carry rpcError), with the rate-limit retries above.
+  const live: RpcClient = { has: c => !!urls[c], async call(c, method, params) {
+    const r = await jsonRpc(urls[c], { jsonrpc: '2.0', id: 1, method, params });
+    if (r.error) throw Object.assign(new Error(`${method}: ${r.error.message}`), { rpcError: r.error });
+    return r.result;
+  } };
+  const onchain = new OnchainTokenRegistry(live);
+  // A wrong curated decimals value would misstate every amount of that token, so compare with the contract.
+  for (const chain of [42161, 999]) {
+    for (const t of builtinTokens(chain)) {
+      const got = await onchain.get(chain, t.address);
+      check(got?.decimals === t.decimals, `${t.symbol} on ${CHAINS[chain].name}: ${t.decimals} decimals`.padEnd(34), got ? `contract says ${got.symbol}, ${got.decimals}` : 'no metadata');
+    }
+  }
+  check(await onchain.get(42161, TMV2) === undefined, 'a non-token contract has no token metadata');
+
+  const AAVE_POOL: Address = '0x794a61358D6845594F94dc1DB02A252b5b4814aD';
+  for (const [chain, address, label, method] of [
+    [42161, USDC, 'Arbitrum USDC', 'zeppelinos'], [42161, TMV2, 'TokenMessengerV2', 'eip1967'], [42161, EXT, 'CctpExtension', null],
+    [42161, AAVE_POOL, 'Aave V3 Pool', 'eip1967'], [999, H.cdw, 'CoreDepositWallet', 'eip1967'], [999, FWD, 'CctpForwarder', 'eip1967'],
+  ] as const) {
+    const found = await detectProxy(live, chain, address);
+    check((found?.method ?? null) === method, `proxy: ${label}`.padEnd(34), found ? `${found.method} -> ${found.implementation}` : 'not a proxy');
+  }
+
+  const strict = process.env.VERIFY_LIVE_STRICT === '1';
+  const service = async (name: string, probe: string, run: () => Promise<void>) => {
+    let reachable = false;
+    try { const r = await fetch(probe, { signal: AbortSignal.timeout(15_000) }); reachable = r.status !== 403 && r.status !== 407; } catch { reachable = false; }
+    if (!reachable) {
+      if (strict) check(false, `${name} reachable`, probe);
+      else console.log(`skip ${name}: ${new URL(probe).host} not reachable from here`);
+      return;
+    }
+    try { await run(); } catch (e) { check(false, name, (e as Error).message); }
+  };
+  const nobody = privateKeyToAccount(generatePrivateKey()).address;
+
+  await service('Sourcify', 'https://sourcify.dev/server/chains', async () => {
+    const sourcify = new SourcifyAbiSource();
+    // The Ethereum deposit contract is Sourcify's own documentation example: verified, exact match.
+    const deposit = await sourcify.lookup(1, '0x00000000219ab540356cBB839Cbe05303d7705Fa');
+    const ok = deposit?.name === 'DepositContract' && (deposit.abi as { name?: string }[]).some(i => i.name === 'deposit');
+    let why = deposit ? `${deposit.name}, ${deposit.source}, ${deposit.abi.length} ABI entries` : 'no ABI';
+    if (!ok) {
+      const raw = await fetch('https://sourcify.dev/server/v2/contract/1/0x00000000219ab540356cBB839Cbe05303d7705Fa?fields=abi,compilation');
+      why += ` | HTTP ${raw.status}, keys: ${Object.keys(await raw.json().catch(() => ({}))).join(',')}`;
+    }
+    check(ok, 'Sourcify: verified ABI parsed', why);
+    check(await sourcify.lookup(1, nobody) === null, 'Sourcify: unverified address is a clean miss');
+    // End to end: an Aave supply through the Pool proxy. Decodes from Sourcify when the Pool is verified there,
+    // otherwise from the built-in signature list; either way the amount must come out in USDC.
+    const deps = { tokens: new ChainedTokenRegistry([new StaticTokenRegistry(), onchain]), abis: new ContractAbiResolver({ sources: [sourcify], rpc: live }), signatures: new ChainedSignatures([]) };
+    const data = encodeFunctionData({ abi: parseAbi(['function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode)']), functionName: 'supply', args: [USDC, 100_000_000n, nobody, 0] });
+    const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: nobody, to: AAVE_POOL, data, chainId: '0xa4b1' }] }, {}, deps);
+    const d = (label: string) => p.details.find(x => x.label === label)?.value;
+    check(d('amount') === '100 USDC' && d('onBehalfOf')?.endsWith('(you)') === true, 'Aave supply preview'.padEnd(34), `${p.decoding.decoder}: "${p.title}", ABI from ${d('ABI source')}`);
+  });
+  await service('OpenChain', 'https://api.openchain.xyz/signature-database/v1/lookup?function=0xa9059cbb', async () => {
+    const sigs = await new OpenChainSignatures().lookup('0xa9059cbb');
+    check(sigs.includes('transfer(address,uint256)'), 'OpenChain: 0xa9059cbb is transfer', `${sigs.length} result(s)`);
+  });
+  await service('4byte', 'https://www.4byte.directory/api/v1/signatures/?hex_signature=0xa9059cbb', async () => {
+    const sigs = await new FourByteSignatures().lookup('0xa9059cbb');
+    check(sigs.includes('transfer(address,uint256)'), '4byte: 0xa9059cbb is transfer', `${sigs.length} result(s)`);
+  });
+  if (process.env.ETHERSCAN_API_KEY) {
+    await service('Etherscan', 'https://api.etherscan.io/v2/chainlist', async () => {
+      const es = new EtherscanAbiSource(process.env.ETHERSCAN_API_KEY!);
+      const tm = await es.lookup(42161, TMV2);
+      check(!!tm && tm.abi.length > 0, 'Etherscan: TokenMessengerV2 ABI', tm ? `${tm.name}, ${tm.abi.length} ABI entries` : 'no ABI');
+      await sleep(500);
+      check(await es.lookup(42161, nobody) === null, 'Etherscan: unverified address is a clean miss');
+    });
+  } else console.log('skip Etherscan: ETHERSCAN_API_KEY not set');
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

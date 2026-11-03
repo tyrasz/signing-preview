@@ -1,5 +1,6 @@
 import { formatUnits, PreviewBuilder } from '../format.ts';
 import type { AssetChange, Dependencies, PreviewContext, TokenInfo } from '../types.ts';
+import { impersonatedToken } from '../tokens.ts';
 import { CHAINS } from '../chains.ts';
 
 export interface Tx {
@@ -51,4 +52,19 @@ export function nativeAmount(chainId: number, raw: bigint): string {
 
 export function selectorOf(data: string): string | null {
   return data.length >= 10 ? data.slice(0, 10).toLowerCase() : null;
+}
+
+/**
+ * Warnings about where a token's name came from. On-chain metadata is self-reported; a token copying a curated
+ * symbol from a different address is almost always a fake; non-ASCII symbols can be homoglyph look-alikes.
+ */
+export function tokenSourceWarnings(b: PreviewBuilder, chainId: number, info: TokenInfo | undefined) {
+  if (!info) return;
+  const fake = impersonatedToken(chainId, info);
+  if (fake) {
+    b.warn('danger', 'token_impersonation', `This token calls itself ${info.symbol}, but it is not the real ${fake.symbol} on ${CHAINS[chainId]?.name ?? `chain ${chainId}`} (${fake.address}). It is very likely a fake.`);
+  } else if (info.source === 'onchain') {
+    b.warn('info', 'token_metadata_unverified', `The name "${info.symbol}" and decimals were read from the token contract itself; anyone can deploy a token with any name.`);
+  }
+  if (/[^\x20-\x7e]/.test(info.symbol)) b.warn('caution', 'token_symbol_lookalike', `The symbol "${info.symbol}" contains non-ASCII characters, which can be used to imitate well-known tokens.`);
 }

@@ -102,6 +102,11 @@ export interface TokenInfo {
   symbol: string;
   decimals: number;
   name?: string;
+  /**
+   * Where the metadata came from. 'builtin' (curated, address-checked) and token lists are trusted for display;
+   * 'onchain' means the token contract reported it about itself, which anyone can fake.
+   */
+  source?: 'builtin' | 'tokenlist' | 'onchain' | 'user';
 }
 
 export interface TokenRegistry {
@@ -169,8 +174,32 @@ export interface HyperliquidInfo {
   userAbstraction?(user: string): Promise<'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>;
 }
 
+/** A contract ABI found for an address. */
+export interface ContractAbi {
+  abi: readonly unknown[];
+  /** Contract name from verified source, when known. */
+  name?: string;
+  /** e.g. 'sourcify', 'etherscan', 'user'. */
+  source: string;
+  /** True when the ABI comes from verified source code rather than a signature guess. */
+  verified: boolean;
+  /** Set when `address` is a proxy and the ABI is (or includes) its implementation's. */
+  implementation?: string;
+}
+
+export interface AbiResolver {
+  resolve(chainId: number, address: string): Promise<ContractAbi | null>;
+}
+
+/** Function signature database (selector -> text signatures such as "transfer(address,uint256)"). */
+export interface SignatureResolver {
+  lookup(selector: string): Promise<string[]>;
+}
+
 export interface Dependencies {
   tokens?: TokenRegistry;
+  abis?: AbiResolver;
+  signatures?: SignatureResolver;
   simulator?: Simulator;
   hyperliquid?: { mainnet?: HyperliquidInfo; testnet?: HyperliquidInfo };
 }

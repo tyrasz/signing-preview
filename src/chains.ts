@@ -171,11 +171,20 @@ export class StaticTokenRegistry implements TokenRegistry {
   constructor(extra: Record<number, TokenInfo[]> = {}) {
     for (const source of [BUILTIN_TOKENS, extra]) {
       for (const [chainId, tokens] of Object.entries(source)) {
-        for (const t of tokens) this.map.set(`${chainId}:${t.address.toLowerCase()}`, { ...t, address: t.address.toLowerCase() });
+        for (const t of tokens) this.map.set(`${chainId}:${t.address.toLowerCase()}`, { source: source === BUILTIN_TOKENS ? 'builtin' : 'user', ...t, address: t.address.toLowerCase() });
       }
     }
   }
   get(chainId: number, address: string): TokenInfo | undefined {
     return this.map.get(`${chainId}:${address.toLowerCase()}`);
   }
+  /** Curated tokens on a chain, used to spot look-alike tokens. */
+  list(chainId: number): TokenInfo[] {
+    return [...this.map.entries()].filter(([k]) => k.startsWith(`${chainId}:`)).map(([, v]) => v);
+  }
+}
+
+/** Curated (address-checked) token symbols per chain, for impersonation checks. */
+export function builtinTokens(chainId: number): TokenInfo[] {
+  return (BUILTIN_TOKENS[chainId] ?? []).map(t => ({ ...t, address: t.address.toLowerCase(), source: 'builtin' as const }));
 }

@@ -1,5 +1,6 @@
 import { formatDuration, formatTimestamp, formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName, PERMIT2 } from '../chains.ts';
+import { tokenSourceWarnings } from '../evm/common.ts';
 import type { TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv, type TypedData } from './common.ts';
 
@@ -36,6 +37,7 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
   if (data.primaryType === 'Permit' && (m.spender !== undefined)) {
     const tokenAddress = str(data.domain.verifyingContract);
     const info = await token(env, chainId, tokenAddress);
+    if (chainId !== null) tokenSourceWarnings(b, chainId, info);
     const spender = str(m.spender);
     const daiStyle = m.allowed !== undefined;
     const value = daiStyle ? (m.allowed === true || m.allowed === 'true' ? (1n << 256n) - 1n : 0n) : big(m.value);
@@ -57,6 +59,7 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
   const lines: string[] = [];
   const addToken = async (address: string, raw: bigint | null, label: string) => {
     const info = await token(env, chainId, address);
+    if (chainId !== null) tokenSourceWarnings(b, chainId, info);
     const text = amountText(raw, info, address);
     lines.push(text);
     b.detail(label, text, raw?.toString());

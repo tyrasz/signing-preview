@@ -1,5 +1,6 @@
 import { formatDuration, formatTimestamp, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CCTP_NETWORKS, chainName } from '../chains.ts';
+import { tokenSourceWarnings } from '../evm/common.ts';
 import type { TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter } from './common.ts';
 
@@ -22,6 +23,7 @@ export const eip3009Adapter: TypedAdapter = async (data, env) => {
   try { token = chainId !== null ? (await env.deps.tokens?.get(chainId, tokenAddress)) ?? undefined : undefined; } catch { token = undefined; }
   const m = data.message;
   const b = new PreviewBuilder();
+  if (chainId !== null) tokenSourceWarnings(b, chainId, token);
   b.detail('Token', token ? `${token.symbol} on ${network?.name ?? 'unknown chain'} (${tokenAddress})` : `${str(data.domain.name)} (${tokenAddress})`, tokenAddress);
   if (!token) b.warn('caution', 'unknown_token', 'The token contract is not in the known-token list; its name comes from the signing domain and is unverified.');
 

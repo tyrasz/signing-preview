@@ -5,3 +5,6 @@ export { HttpHyperliquidInfo, StaticHyperliquidInfo, INFO_URLS } from './hyperli
 export { l1ActionHash } from './hyperliquid/action-hash.ts';
 export { RpcSimulator, MockSimulator } from './simulation.ts';
 export type * from './types.ts';
+export { JsonRpcClient, isRpcError, type RpcClient } from './rpc.ts';
+export { OnchainTokenRegistry, TokenListRegistry, ChainedTokenRegistry, impersonatedToken, decodeStringOrBytes32 } from './tokens.ts';
+export { ContractAbiResolver, SourcifyAbiSource, EtherscanAbiSource, StaticAbiSource, OpenChainSignatures, FourByteSignatures, ChainedSignatures, COMMON_SIGNATURES, canonicalSignature, detectProxy, PROXY_SLOTS, type AbiSource, type ProxyInfo } from './abi.ts';

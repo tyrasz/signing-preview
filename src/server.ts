@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { previewRequest } from './preview.ts';
@@ -7,7 +8,10 @@ import { RequestError } from './evm/transaction.ts';
 import { StaticTokenRegistry } from './chains.ts';
 import { HttpHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
 import { RpcSimulator } from './simulation.ts';
-import type { Dependencies, PreviewContext } from './types.ts';
+import type { Dependencies, PreviewContext, TokenRegistry } from './types.ts';
+import { JsonRpcClient } from './rpc.ts';
+import { ChainedTokenRegistry, OnchainTokenRegistry, TokenListRegistry } from './tokens.ts';
+import { ChainedSignatures, ContractAbiResolver, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource, type AbiSource } from './abi.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const MAX_BODY = 256 * 1024;
@@ -113,13 +117,26 @@ function json(res: ServerResponse, status: number, body: unknown) {
 }
 
 /** Dependencies for live mode: Hyperliquid's public /info API and eth_simulateV1 against configured RPCs. */
+/**
+ * Dependencies for live mode. RPC URLs enable simulation, on-chain token metadata and proxy detection; ABIs come
+ * from Sourcify (plus Etherscan when ETHERSCAN_API_KEY is set); TOKEN_LIST_FILE adds a tokenlists.org-format list.
+ * Set SIGNING_PREVIEW_OFFLINE_LOOKUPS=1 to skip the public ABI and signature services.
+ */
 export function liveDependencies(env = process.env): Dependencies {
   const rpcs: Record<number, string> = {};
   if (env.ETHEREUM_RPC_URL) rpcs[1] = env.ETHEREUM_RPC_URL;
   if (env.ARBITRUM_RPC_URL) rpcs[42161] = env.ARBITRUM_RPC_URL;
   if (env.HYPEREVM_RPC_URL) rpcs[999] = env.HYPEREVM_RPC_URL;
+  const rpc = new JsonRpcClient(rpcs);
+  const tokenSources: TokenRegistry[] = [new StaticTokenRegistry()];
+  if (env.TOKEN_LIST_FILE) tokenSources.push(new TokenListRegistry(JSON.parse(readFileSync(env.TOKEN_LIST_FILE, 'utf8'))));
+  tokenSources.push(new OnchainTokenRegistry(rpc));
+  const online = env.SIGNING_PREVIEW_OFFLINE_LOOKUPS !== '1';
+  const abiSources: AbiSource[] = online ? [new SourcifyAbiSource(), ...(env.ETHERSCAN_API_KEY ? [new EtherscanAbiSource(env.ETHERSCAN_API_KEY)] : [])] : [];
   return {
-    tokens: new StaticTokenRegistry(),
+    tokens: new ChainedTokenRegistry(tokenSources),
+    abis: new ContractAbiResolver({ sources: abiSources, rpc }),
+    signatures: new ChainedSignatures(online ? [new OpenChainSignatures(), new FourByteSignatures()] : []),
     hyperliquid: { mainnet: new HttpHyperliquidInfo(INFO_URLS.mainnet), testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
     ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs) }),
   };
@@ -128,7 +145,7 @@ export function liveDependencies(env = process.env): Dependencies {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const mode = process.env.SIGNING_PREVIEW_MODE === 'live' ? 'live' : 'mock';
   const { buildSamples, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
-  const deps: Dependencies = mode === 'live' ? liveDependencies() : { tokens: new StaticTokenRegistry(), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() } };
+  const deps: Dependencies = mode === 'live' ? liveDependencies() : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() } };
   const port = Number(process.env.PORT ?? 8787);
   const host = process.env.HOST ?? '127.0.0.1';
   createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true })

@@ -1,8 +1,9 @@
-import { attentionOf, formatUnits, sameAddress } from '../format.ts';
+import { attentionOf, formatUnits, PreviewBuilder, sameAddress } from '../format.ts';
 import { CHAINS, chainName } from '../chains.ts';
-import type { AssetChange, Dependencies, Preview, PreviewContext, SimulationSummary } from '../types.ts';
-import { tokenInfo, type Adapter, type Decoded, type Tx } from './common.ts';
+import type { AssetChange, Dependencies, Preview, PreviewContext, SimulationSummary, TokenInfo } from '../types.ts';
+import { tokenInfo, tokenSourceWarnings, type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
+import { abiAdapter } from './abi-adapter.ts';
 import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
 import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
 
@@ -16,6 +17,7 @@ export const ADAPTERS: Adapter[] = [
   cctpExtensionAdapter,
   coreWriterAdapter,
   erc20Adapter,
+  abiAdapter,
   unknownCallAdapter,
 ];
 
@@ -77,7 +79,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         if (sim.status === 'reverted') {
           b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
         } else {
-          const simulated = await netChanges(sim.transfers, tx, deps);
+          const simulated = await netChanges(sim.transfers, tx, deps, b);
           if (simulated.length || !assetChanges.length) assetChanges = simulated;
           b.note('Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
         }
@@ -97,7 +99,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 }
 
 /** Nets simulated transfers into per-asset changes for the sender. */
-async function netChanges(transfers: { asset: string; from: string; to: string; raw: bigint }[], tx: Tx, deps: Dependencies): Promise<AssetChange[]> {
+async function netChanges(transfers: { asset: string; from: string; to: string; raw: bigint }[], tx: Tx, deps: Dependencies, b: PreviewBuilder): Promise<AssetChange[]> {
   const net = new Map<string, bigint>();
   for (const t of transfers) {
     const asset = t.asset.toLowerCase();
@@ -110,6 +112,7 @@ async function netChanges(transfers: { asset: string; from: string; to: string; 
     if (delta === 0n) continue;
     const chain = CHAINS[tx.chainId];
     const info = asset === 'native' ? { symbol: chain?.nativeSymbol ?? 'native', decimals: chain?.nativeDecimals ?? 18 } : await tokenInfo(env, tx.chainId, asset);
+    if (asset !== 'native') tokenSourceWarnings(b, tx.chainId, info as TokenInfo | undefined);
     const abs = delta < 0n ? -delta : delta;
     out.push({ direction: delta < 0n ? 'out' : 'in', account: tx.from, amount: info ? formatUnits(abs, info.decimals) : abs.toString(), symbol: info?.symbol ?? asset, raw: abs.toString(), asset, basis: 'simulated_events' });
   }

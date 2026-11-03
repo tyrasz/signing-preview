@@ -109,6 +109,8 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | Off-chain approvals | ERC-2612 / DAI `Permit`, Permit2 `PermitSingle/Batch/TransferFrom` | Spender, amount and expiry; flags unlimited or long-lived permissions and owner mismatches. |
 | Messages | `personal_sign`, SIWE, `eth_sign` | Readable text; SIWE domain vs. requesting origin (phishing); `eth_sign` is always danger. |
 | Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. |
+| Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
+| | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata. When several functions fit, the preview says so and names none. |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
 
 ### Hyperliquid L1 actions: the one real limit
@@ -149,7 +151,53 @@ Neither is a measured final balance. Fee-on-transfer or rebasing tokens, and sta
 SIGNING_PREVIEW_MODE=live ETHEREUM_RPC_URL=… ARBITRUM_RPC_URL=… HYPEREVM_RPC_URL=… npm start
 ```
 
-Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulateV1` on any chain that has an RPC URL configured. Chains without one are previewed from the decoded request only. **Live mode has not been exercised against real endpoints yet.** Its RPC and `/info` clients are covered by tests with stubbed responses only.
+Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulateV1` on any chain that has an RPC URL configured. Chains without one are previewed from the decoded request only. The RPC URLs also enable on-chain token metadata and proxy detection.
+
+| Variable | Effect |
+|---|---|
+| `ETHEREUM_RPC_URL`, `ARBITRUM_RPC_URL`, `HYPEREVM_RPC_URL` | Simulation, `symbol()`/`decimals()` lookups and proxy detection on that chain. |
+| `TOKEN_LIST_FILE` | A [tokenlists.org](https://tokenlists.org)-format JSON file, consulted after the built-in tokens. |
+| `ETHERSCAN_API_KEY` | Adds Etherscan (API v2: Ethereum, Arbitrum and HyperEVM with one key) after Sourcify. |
+| `SIGNING_PREVIEW_OFFLINE_LOOKUPS=1` | Don't call Sourcify, Etherscan, OpenChain or 4byte. The built-in signature list still works. |
+
+`liveDependencies()` was run against Arbitrum One and HyperEVM on 2026-11-03: token metadata, proxy detection, simulation and signature decoding all worked. The `/info` client is checked live by `npm run verify:live`. The public ABI and signature services were not reachable from that environment (see below).
+
+## Contract and token lookups
+
+**Tokens** are looked up in order, first hit wins:
+1. The built-in list (`src/chains.ts`).
+2. A token list you supply.
+3. The token contract's own `symbol()`, `decimals()` and `name()`. Both `string` and legacy `bytes32` return values are accepted.
+
+On-chain metadata is whatever the contract says about itself, so the preview marks it "self-reported", with an info warning. Two checks run against the built-in list:
+- **Danger** `token_impersonation`: a self-reported token claims the symbol of a built-in token on the same chain but has a different address, e.g. a fake "USDC" in an airdrop or address-poisoning scam. Symbols are compared after stripping case and punctuation.
+- **Caution** `token_symbol_lookalike`: the symbol uses non-ASCII characters, for example a Cyrillic "С" in "USDС".
+
+**Contract ABIs** come from Sourcify (no key needed), then Etherscan if configured, then any you add with `StaticAbiSource`. When the address is a proxy, the implementation's ABI is used as well. Proxy detection covers:
+- EIP-7702 delegated accounts
+- EIP-1167 minimal proxies
+- EIP-1967 implementation and beacon slots
+- the older ZeppelinOS and EIP-1822 slots
+- Safe
+- an `implementation()` getter
+
+A decoded call must re-encode to exactly the calldata being signed, or it's discarded.
+
+**Function signatures** for contracts without a verified ABI come from three sources:
+- a built-in list of about 35 common functions, with real parameter names (batching, Uniswap V2/V3, Aave V3, ERC-4626, NFT transfers, admin calls)
+- OpenChain
+- 4byte
+
+Anyone can register a name in those databases, so these previews are `partial` and carry a caution.
+
+**Amounts** are shown in token units when a parameter's name says which token it is in:
+- the single token or asset parameter (Aave)
+- `tokenIn`/`tokenOut` (Uniswap V3)
+- the first and last entries of `path` (Uniswap V2)
+
+The raw integer is always kept in `raw`.
+
+Results are cached: tokens and ABIs for 10 minutes, signatures for an hour. A network failure, timeout or rate limit is retried after 30 seconds instead of being cached as "not a token", "not verified" or "not a proxy".
 
 ## What was verified, and what wasn't
 
@@ -164,7 +212,12 @@ Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulat
   - The 1 USDC `Withdraw` fee.
   - The `CDeposit`/`CWithdraw` field layouts, which also match the SDK.
 - **Assumption:** the CoreWriter outcome-operation amount is shown in 8-decimal HyperCore units (USDC's wei decimals). Hyperliquid's table calls it "wei" without stating its decimals; the raw value is always shown.
-- The known-token list is short (`src/chains.ts`). Unknown tokens are shown in base units with a warning. Add a token list or on-chain `symbol()`/`decimals()` lookups through the `TokenRegistry` interface.
+- The built-in token list is short (`src/chains.ts`). In live mode other tokens are read on-chain and marked self-reported. Without an RPC or token list, unknown tokens are shown in base units with a warning.
+- **Lookups, verified live (2026-11-03):**
+  - The built-in tokens' decimals match each token contract on Arbitrum One and HyperEVM.
+  - On-chain metadata reads work, including Arbitrum USDT, which calls itself "USD₮0".
+  - Proxy detection resolves Arbitrum USDC (ZeppelinOS slot), TokenMessengerV2, the Aave V3 Pool, `CoreDepositWallet` and `CctpForwarder` (all EIP-1967). It correctly reports `CctpExtension` as not a proxy.
+- **Lookups, not verified live yet:** the Sourcify, Etherscan, OpenChain and 4byte response formats. Those hosts weren't reachable from the development environment. The parsers are tested against the documented response shapes, and the scheduled live-verification workflow checks them on GitHub's runners, failing if any is unreachable or parses differently.
 - There is no threat-intelligence feed. Warnings are rule-based observations, and `attention: 'none'` doesn't mean "safe".
 
 ## HyperCore coverage
@@ -225,6 +278,8 @@ What the contracts imply, and what the preview reports:
 - **Deployed configuration.** `CctpExtension` points at USDC and `TokenMessengerV2`. The forwarder routes USDC to `CoreDepositWallet`. The USDC system address is `0x2000…0000`. Perps forwarding is enabled. The forwarding fee is 0.20 USDC and the new-account fee is 0.
 - **HyperEVM.** `CoreDepositWallet.depositFor` was called (with a USDC balance override) for new-account perps and spot deposits, which succeed, and for the system address, the wallet itself and zero, which revert with the reasons the preview cites.
 
+- **Token metadata and proxies.** See [What was verified](#what-was-verified-and-what-wasnt). The ABI and signature services are checked by the same script wherever they're reachable.
+
 - **HyperCore → other chains.** `CoreDepositWallet.coreReceiveWithData` is the HyperEVM step of Circle's withdrawal. It was called on HyperEVM from the USDC system address, and each outcome checked against the preview. **8/8 matched:**
   - success
   - fee-boundary reverts ("Amount must exceed maxFee": 0.20 reverts, 0.21 succeeds to Arbitrum)
@@ -257,6 +312,7 @@ Still not verified live:
   - The log is kept as a run artifact for 30 days.
   - A failed scheduled run opens an issue titled "Live verification failed", or comments on the existing open one.
   - Calls retry only on rate limiting, so a throttled public RPC is not reported as a contract change. If a public RPC is down, the run fails and the log says which call.
+  - It also checks the Sourcify, OpenChain and 4byte response formats. It runs with `VERIFY_LIVE_STRICT=1`, so an unreachable service fails the run instead of being skipped. Set an `ETHERSCAN_API_KEY` repository secret to include Etherscan.
 
 Actions are pinned to commit SHAs (with the version in a comment), and workflows get read-only permissions except the issue-reporting job.
 
@@ -264,7 +320,10 @@ Actions are pinned to commit SHAs (with the version in a comment), and workflows
 
 ```
 src/preview.ts            entry point: routes EIP-1193 methods
-src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20)
+src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, any verified ABI)
+src/tokens.ts             token registries: token lists, on-chain metadata, impersonation check
+src/abi.ts                ABI sources (Sourcify, Etherscan, static), proxy detection, signature databases
+src/rpc.ts                JSON-RPC client and the lookup cache
 src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2, generic
 src/hyperliquid/          /info client, asset resolution, L1 action hash
 src/simulation.ts         eth_simulateV1 simulator + mock

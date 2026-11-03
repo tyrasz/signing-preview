@@ -31,6 +31,11 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: Verify against live contracts and APIs
         shell: bash
+        env:
+          # Sourcify, OpenChain and 4byte must be reachable here: an unreachable service fails the run.
+          VERIFY_LIVE_STRICT: '1'
+          # Optional repository secret; the Etherscan checks are skipped without it.
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
         run: |
           set -o pipefail
           npm run verify:live 2>&1 | tee verify-live.log
