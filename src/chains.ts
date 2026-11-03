@@ -46,7 +46,7 @@ export function parseSpotSystemAddress(address: string): number | null {
 }
 
 // Circle CCTP V2 + HyperCore deployments. Sources (snapshot 2026-10-29, saved in
-// research/arbitrum-deposit-v1/sources/docs): contract-addresses.md, usdc-addresses.md,
+// tyrasz/transaction-lab: research/arbitrum-deposit-v1/sources/docs): contract-addresses.md, usdc-addresses.md,
 // hypercore-addresses.md. Contract behaviour: circlefin/hyperevm-circle-contracts @ ffcc978
 // (still master on 2026-11-03) and circlefin/evm-cctp-contracts @ a92a2b4.
 export interface HyperEvmDeployment {

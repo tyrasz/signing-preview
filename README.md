@@ -10,7 +10,7 @@ Withdraws 50 USDC from Hyperliquid to your address on Arbitrum One (a 1 USDC fee
   You receive on Arbitrum (approx.)   49 USDC
 ```
 
-This project is self-contained. It shares no code with the research code elsewhere in this repository.
+This project started in [tyrasz/transaction-lab](https://github.com/tyrasz/transaction-lab) but shares no code with it.
 
 ## Quickstart
 
@@ -162,7 +162,7 @@ The CCTP decoder mirrors Circle's own contracts rather than only the docs:
 - `circlefin/hyperevm-circle-contracts` @ `ffcc978` (`CctpExtension`, `CctpForwarder`, `CctpForwarderHookData`, `CoreDepositWallet`). This was still the latest commit on 2026-11-03.
 - `circlefin/evm-cctp-contracts` @ `a92a2b4` (`TokenMessengerV2`).
 
-Addresses and fees come from Circle's docs (snapshot of 2026-10-29, saved under `research/arbitrum-deposit-v1/sources/docs`).
+Addresses and fees come from Circle's docs (snapshot of 2026-10-29, saved in [transaction-lab](https://github.com/tyrasz/transaction-lab/tree/0a2777196280b9ea3d445101899cf52069b70106/research/arbitrum-deposit-v1/sources/docs)).
 
 `test/circle-docs.test.ts` rebuilds the transactions in Circle's Arbitrum → HyperCore guide. It copies the guide's hook encoder and ABI verbatim and signs with a throwaway key, on Arbitrum Sepolia as written and on mainnet. It also covers the Ethereum guide's fee example.
 
