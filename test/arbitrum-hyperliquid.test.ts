@@ -55,7 +55,8 @@ test('CCTP with a fee cap at or above the amount reverts on the source chain', a
   const abi = parseAbi(['function depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold)']);
   const data = encodeFunctionData({ abi, functionName: 'depositForBurn', args: [1_000_000n, 6, pad(ALICE as Hex), CCTP.usdcByChain[42161] as Hex, pad('0x00'), 1_000_000n, 2000] });
   const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: CCTP.tokenMessengerV2, data, chainId: '0xa4b1' }] }, { now: NOW }, mockDeps());
-  assert.equal(p.title, 'Bridge 1 USDC to Base');
+  assert.equal(p.title, 'Bridge 1 USDC via CCTP: will fail on Arbitrum One');
+  assert.deepEqual(p.assetChanges, []);
   assert.ok(codes(p).includes('cctp_will_revert'));
   assert.equal(p.attention, 'caution');
 });

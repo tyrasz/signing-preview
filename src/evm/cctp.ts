@@ -84,6 +84,8 @@ interface Burn {
   finality: number;
   /** null: no hook (plain depositForBurn). */
   hook: Hex | null;
+  /** Revert conditions already detected by the caller (e.g. CctpExtension batch/authorization checks). */
+  reverts?: { code: string; message: string }[];
 }
 
 const usdc = (raw: bigint) => `${formatUnits(raw, 6)} USDC`;
@@ -117,9 +119,16 @@ function describeBurn(p: Burn, b: PreviewBuilder): Omit<Decoded, 'b' | 'decoder'
   // Source-side checks: these revert on the source chain (gas is spent, USDC stays in your wallet).
   if (!net) b.warn('caution', 'cctp_unknown_network', `Chain ${p.chainId} is not a configured CCTP source; addresses were not checked.`);
   else if (!isUsdc) b.warn('caution', 'cctp_not_usdc', `The burn token is not ${net.name} USDC (${net.usdc}). CCTP only burns tokens Circle has enabled, so this will most likely revert.`);
-  if (p.amount === 0n) b.warn('caution', 'cctp_will_revert', 'The amount is zero, so the transaction will revert on the source chain.');
-  else if (p.maxFee >= p.amount) b.warn('caution', 'cctp_will_revert', `The maximum fee (${usdc(p.maxFee)}) is not less than the amount, so the transaction will revert on ${chainName(p.chainId)}. Your USDC stays in your wallet; only gas is lost.`);
-  if (p.via === 'TokenMessengerV2' && p.hook !== null && p.hook === '0x') b.warn('caution', 'cctp_will_revert', 'depositForBurnWithHook requires non-empty hook data, so this will revert on the source chain.');
+  // Verified against eth_simulateV1 on Arbitrum One (block 520,783,126): each of these reverts before any burn.
+  const reverts = [...(p.reverts ?? [])];
+  if (p.amount === 0n) reverts.push({ code: 'cctp_will_revert', message: 'The amount is zero ("Amount must be nonzero").' });
+  else if (p.maxFee >= p.amount) reverts.push({ code: 'cctp_will_revert', message: `The maximum fee (${usdc(p.maxFee)}) is not less than the amount ("Max fee must be less than amount").` });
+  if (p.via === 'TokenMessengerV2' && p.hook !== null && p.hook === '0x') reverts.push({ code: 'cctp_will_revert', message: 'depositForBurnWithHook requires hook data ("Hook data is empty").' });
+  if (reverts.length) {
+    for (const r of reverts) b.warn('caution', r.code, `${r.message} The transaction will revert on ${chainName(p.chainId)}: your USDC stays in your wallet; only gas is spent.`);
+    return { hyperCore: p.domain === CCTP.hyperEvmDomain, title: `Bridge ${amountText} via CCTP: will fail on ${chainName(p.chainId)}`,
+      summary: `This CCTP transfer will revert on ${chainName(p.chainId)} before anything is burned, so no USDC leaves your wallet.`, status: isUsdc ? 'full' : 'partial', assetChanges: [] };
+  }
 
   const mintIsForwarder = !!mintRecipient && sameAddress(mintRecipient, hyperEvm.forwarder);
   const callerIsForwarder = !!caller && sameAddress(caller, hyperEvm.forwarder);
@@ -173,10 +182,9 @@ function describeBurn(p: Burn, b: PreviewBuilder): Omit<Decoded, 'b' | 'decoder'
     if (p.maxFee < documented) b.warn('caution', 'cctp_max_fee_below_quote', `The maximum fee (${usdc(p.maxFee)}) is below the ${usdc(documented)} Circle documents for this route. Circle's relayer may not deliver it automatically; it would then have to be completed manually (CctpForwarder.mintAndForward accepts the attestation from anyone).`);
     if (n > 1n) b.warn('info', 'cctp_batched_fees', `This sends ${n} separate CCTP transfers, and each pays its own fee (≈ ${usdc(documented * n)} in total).`);
     if (hook.dex === 0 && p.amount - (p.maxFee < documented ? p.maxFee : documented) <= 1_000_000n) {
-      b.warn('caution', 'cctp_perps_new_account_fee', 'Perps deposits to an account that does not exist on HyperCore yet pay a new-account fee (1 USDC per Circle docs). If the deposit does not exceed it, the forwarding reverts and the funds get stuck. Use spot, or send more.');
+      b.warn('info', 'cctp_perps_new_account_fee', "Small perps deposit: CoreDepositWallet can charge a configurable new-account fee on perps deposits to accounts new to HyperCore, and reverts (funds stuck) if the deposit doesn't exceed it. The fee was 0 when checked on 2026-11-03; spot deposits are never charged it.");
     }
   }
-  if (hook.dex === 0) b.note('Perps deposits to a brand-new HyperCore account can have a new-account fee deducted on arrival; spot deposits are credited in full.');
   b.note('CoreDepositWallet also rejects blacklisted recipients; that state is not checked here.');
 
   const who = recipientIsSender ? 'your' : `${shortAddress(hook.recipient)}'s`;
@@ -221,19 +229,20 @@ export const cctpExtensionAdapter: Adapter = async (tx, env) => {
   const b = new PreviewBuilder();
   const now = env.context.now ?? Date.now();
   const total = auth.amount, batch = dep.amount;
+  const reverts: { code: string; message: string }[] = [];
   let messages = 1n, amount = total;
   if (total === 0n || batch === 0n || total % batch !== 0n) {
-    b.warn('caution', 'cctp_will_revert', `The authorized total (${usdc(total)}) must be a positive multiple of the batch size (${usdc(batch)}); this transaction will revert.`);
+    reverts.push({ code: 'cctp_will_revert', message: `The authorized total (${usdc(total)}) must be a positive multiple of the batch size (${usdc(batch)}) ("Total amount must be divisible by batch size").` });
   } else {
     messages = total / batch;
     amount = batch;
   }
-  const r = describeBurn({ chainId: tx.chainId, from: tx.from, via: 'CctpExtension', net, amount, messages, domain: dep.destinationDomain, mintRecipientWord: dep.mintRecipient, burnToken: net.usdc, callerWord: dep.destinationCaller, maxFee: dep.maxFee, finality: dep.minFinalityThreshold, hook: dep.hookData === '0x' ? null : dep.hookData }, b);
   const after = Number(auth.authValidAfter) * 1000, before = Number(auth.authValidBefore) * 1000;
+  if (before <= now) reverts.push({ code: 'cctp_auth_expired', message: 'The USDC authorization has expired ("FiatTokenV2: authorization is expired").' });
+  if (after >= now) reverts.push({ code: 'cctp_auth_not_yet_valid', message: 'The USDC authorization is not valid yet ("FiatTokenV2: authorization is not yet valid").' });
+  const r = describeBurn({ chainId: tx.chainId, from: tx.from, via: 'CctpExtension', net, amount, messages, domain: dep.destinationDomain, mintRecipientWord: dep.mintRecipient, burnToken: net.usdc, callerWord: dep.destinationCaller, maxFee: dep.maxFee, finality: dep.minFinalityThreshold, hook: dep.hookData === '0x' ? null : dep.hookData, reverts }, b);
   b.detail('Authorization valid', `${formatTimestamp(after)} → ${formatTimestamp(before)}`, `${auth.authValidAfter}..${auth.authValidBefore}`);
-  if (before <= now) b.warn('caution', 'cctp_auth_expired', 'The USDC authorization has expired, so this transaction will revert.');
-  if (after > now) b.warn('caution', 'cctp_auth_not_yet_valid', 'The USDC authorization is not valid yet, so this transaction will revert if sent now.');
-  b.note('This transaction uses a ReceiveWithAuthorization signature you gave earlier; it can only pull USDC from the account that sends this transaction.');
+  b.note('This transaction uses a ReceiveWithAuthorization signature you gave earlier; it can only pull USDC from the account that sends this transaction. If that account has contract code (e.g. an EIP-7702 delegation), USDC checks the signature via ERC-1271 and the transaction reverts unless the delegate supports it.');
   const { hyperCore: _route, ...rest } = r;
   return decoded({ ...rest, b, decoder: 'cctp_extension' });
 };

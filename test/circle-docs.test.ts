@@ -248,6 +248,21 @@ test('Source-side reverts and fee/route cautions', async () => {
   assert.ok(codes(revert).includes('cctp_will_revert'));
   assert.deepEqual(dangers(revert), [], 'a source-chain revert loses only gas');
 
+  // These mirror eth_simulateV1 results on Arbitrum One (block 520,783,126): the burn reverts, so nothing
+  // leaves the wallet and nothing can get stuck.
+  for (const o of [{ chainId: 42161, amount: '1', maxFee: '1' }, { chainId: 42161, amount: '10', batchSize: '3' }, { chainId: 42161, validBefore: NOW_S - 10 }]) {
+    const p = await run(o);
+    assert.match(p.title, /will fail on Arbitrum One$/);
+    assert.deepEqual(p.assetChanges, []);
+    assert.equal(detail(p, 'Expected on HyperCore'), undefined);
+    assert.deepEqual(dangers(p), []);
+  }
+  const tmv2EmptyHook = await preview({ method: 'eth_sendTransaction', params: [{ from: account.address, to: CCTP_NETWORKS[42161].tokenMessengerV2, chainId: '0xa4b1',
+    data: encodeFunctionData({ abi: parseAbi(['function depositForBurnWithHook(uint256,uint32,bytes32,address,bytes32,uint256,uint32,bytes)']), functionName: 'depositForBurnWithHook',
+      args: [10_000_000n, 19, `0x${HYPEREVM_MAINNET.forwarder.slice(2).padStart(64, '0')}`, CCTP_NETWORKS[42161].usdc as Address, `0x${HYPEREVM_MAINNET.forwarder.slice(2).padStart(64, '0')}`, 200_000n, 1000, '0x'] }) }] }, 42161);
+  assert.deepEqual(dangers(tmv2EmptyHook), [], 'an empty hook on TokenMessengerV2 reverts on Arbitrum ("Hook data is empty"); it cannot get stuck');
+  assert.ok(codes(tmv2EmptyHook).includes('cctp_will_revert'));
+
   const lowFee = await run({ chainId: 42161, amount: '10', maxFee: '0.1' });
   assert.ok(codes(lowFee).includes('cctp_max_fee_below_quote'));
   assert.equal(detail(lowFee, 'Guaranteed minimum credited'), '9.9 USDC');

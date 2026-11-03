@@ -187,9 +187,28 @@ What the contracts imply, and what the preview reports:
   - A hook of 52–55 bytes routes to perps.
   - DEX IDs other than perps and spot fall back to the recipient's spot balance unless Circle has enabled them.
   - Magic bytes and the length field are ignored on-chain (noted, not flagged).
-- **Docs vs contract.** Circle's concept page says "there is no minimum deposit amount" and that the 1 USDC activation fee is charged later. But `CoreDepositWallet._sendAsset` (perps route only) deducts a configurable `newCoreAccountFee` for recipients without a HyperCore account, and reverts if the deposit doesn't exceed it. That would leave the funds stuck. The preview cautions on small perps deposits; spot deposits are unaffected.
+- **Docs vs contract.** Circle's concept page says "there is no minimum deposit amount". `CoreDepositWallet._sendAsset` (perps route only) can deduct a configurable `newCoreAccountFee` for recipients new to HyperCore, and reverts (funds stuck) if the deposit doesn't exceed it. The live fee was **0** on 2026-11-03, so the docs hold today. The preview shows an informational note on small perps deposits.
+- **Smart-contract senders.** If the depositor's address has code (including an EIP-7702 delegation), USDC verifies the `ReceiveWithAuthorization` signature with ERC-1271. `CctpExtension` deposits from such wallets revert with `FiatTokenV2: invalid signature` unless the delegate supports it. The funds are safe; only gas is spent. Found during live simulation; the preview notes it.
 
-Not checked, because they need live chain state: the recipient blacklist, the live `newCoreAccountFee` value, which extra DEXes are enabled, whether the recipient already exists on HyperCore, and whether the deployed bytecode matches this source.
+### Live verification (2026-11-03)
+
+`npm run verify:live` checks the previewer against the deployed contracts. It is read-only: it uses a fresh throwaway key and never broadcasts. It needs network access to `arb1.arbitrum.io` and `rpc.hyperliquid.xyz`, and exits non-zero on any disagreement.
+
+- **Circle docs.** All seven pages used here were re-fetched and are identical to the 2026-10-29 snapshot.
+- **Arbitrum One.** `eth_simulateV1` runs the guide's transactions and 9 variants: perps, spot, standard finality, batch split, header-only hook, empty hook, `maxFee ≥ amount`, indivisible batch, expired authorization, low `maxFee`, and the `TokenMessengerV2` route with and without a hook. **12/12 match the preview.**
+  - Success or revert, with the exact revert reason.
+  - Burned amount equal to the previewed outflow.
+  - "Will get stuck" exactly when the burn succeeds with an invalid hook.
+  - The emitted `DepositForBurn` events carry the previewed amount, fee cap, finality, forwarder addresses and hook.
+- **Deployed configuration.** `CctpExtension` points at USDC and `TokenMessengerV2`. The forwarder routes USDC to `CoreDepositWallet`. The USDC system address is `0x2000…0000`. Perps forwarding is enabled. The forwarding fee is 0.20 USDC and the new-account fee is 0.
+- **HyperEVM.** `CoreDepositWallet.depositFor` was called (with a USDC balance override) for new-account perps and spot deposits, which succeed, and for the system address, the wallet itself and zero, which revert with the reasons the preview cites.
+
+Still not verified live:
+- The CCTP attestation and `CctpForwarder.mintAndForward` itself, because minting needs Circle's attestation signature.
+- Fallback to spot for DEX IDs that aren't enabled; HyperEVM's RPC has no trace API to observe it.
+- Recipient blacklist state.
+- `CctpExtensionV2`. Its source isn't published, so a sponsored deposit's recipient can't be decoded from the signature.
+- Circle's fee API (`iris-api.circle.com`), which this environment couldn't reach.
 
 ## Layout
 

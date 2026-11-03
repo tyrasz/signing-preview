@@ -16,7 +16,8 @@
     "build": "node scripts/build.ts",
     "start": "npm run build && node src/server.ts",
     "test": "node --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:live": "NODE_USE_ENV_PROXY=1 node scripts/verify-live.ts"
   },
   "dependencies": {
     "@msgpack/msgpack": "3.1.3",
