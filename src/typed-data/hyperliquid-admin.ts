@@ -8,7 +8,7 @@ import { big, str, type TypedDecoded } from './common.ts';
 
 type Wire = Record<string, unknown>;
 type Result = Pick<TypedDecoded, 'title' | 'summary' | 'status'>;
-interface Env { signer: string | null }
+interface Env { signer: string | null; vaultAddress?: string | null }
 
 const usd = (value: unknown) => { const n = big(value); return n === null ? str(value) : `${formatUnits(n, 6)} USDC`; };
 /** HyperCore HYPE uses 8 wei decimals (1 HYPE = 10^8 wei). */
@@ -65,8 +65,11 @@ export async function describeMoreL1(type: string, action: Wire, b: PreviewBuild
         .detail('From DEX', str(action.sourceDex) || 'main perps').detail('To DEX', str(action.destinationDex) || 'main perps');
       if (str(action.fromSubAccount)) b.detail('From sub-account', str(action.fromSubAccount));
       b.warn('info', 'agent_action', 'This action is normally signed by an API wallet (agent) on behalf of its owner.');
-      if (env.signer && !sameAddress(dest, env.signer)) b.warn('caution', 'recipient_not_sender', `The tokens go to ${shortAddress(dest)}.`);
-      return { title: `Send ${amount} to ${shortAddress(dest)} (agent)`, summary: 'Transfers an asset on behalf of the agent\'s owner account.', status: 'full' };
+      // Hyperliquid docs (exchange endpoint, "Agent Send Asset"): "Destination must match the source address."
+      b.warn('info', 'agent_send_own_account', 'Hyperliquid only accepts agent transfers whose destination is the owner account itself, so this moves funds between the owner\'s own balances.');
+      if (env.vaultAddress && !sameAddress(dest, env.vaultAddress)) b.warn('caution', 'agent_destination_mismatch', `The destination is not the account this acts for (${shortAddress(env.vaultAddress)}), so Hyperliquid will reject it.`);
+      const src = str(action.sourceDex) === '' ? 'perps' : str(action.sourceDex), dst = str(action.destinationDex) === '' ? 'perps' : str(action.destinationDex);
+      return { title: `Move ${amount} from ${src} to ${dst} (agent)`, summary: 'Moves an asset between the owner account\'s own balances.', status: 'full' };
     }
     case 'agentSetAbstraction': {
       const modes: Record<string, string> = { i: 'standard (separate balances)', u: 'unified account', p: 'portfolio margin' };
@@ -80,6 +83,28 @@ export async function describeMoreL1(type: string, action: Wire, b: PreviewBuild
       b.warn('info', 'agent_action', 'This action is normally signed by an API wallet (agent) on behalf of its owner.');
       b.warn('caution', 'shared_collateral', 'Builder-deployed (HIP-3) perp DEXes will be able to use collateral from the main account, so losses there can affect the main balances.');
       return { title: 'Enable HIP-3 DEX abstraction (agent)', summary: 'Turns on HIP-3 DEX abstraction for the owner account.', status: 'full' };
+
+    case 'cDeposit2':
+      // Hyperliquid docs: "Deposit into staking (agent)" — like cDeposit, but signed by an agent.
+      b.detail('Amount', hype(action.wei), str(action.wei));
+      b.warn('info', 'agent_action', 'This action is normally signed by an API wallet (agent) on behalf of its owner.');
+      return { title: `Stake ${hype(action.wei)} (agent)`, summary: 'Moves HYPE from the owner\'s spot balance into staking.', status: 'full' };
+
+    // ---------------- Trailing stop (Hyperliquid docs; newer than SDK 0.33.3) ----------------
+    case 'trailingStop': {
+      const asset = await resolveAsset(info, Number(action.asset));
+      const r = (action.retracement ?? {}) as Wire;
+      const trail = r.pct !== undefined ? str(r.pct) : r.px !== undefined ? formatDecimalString(str(r.px)) : '?';
+      const side = action.isBuy ? (asset.kind === 'perp' ? 'Long' : 'Buy') : (asset.kind === 'perp' ? 'Short' : 'Sell');
+      const activation = action.activationPx === null || action.activationPx === undefined ? null : formatDecimalString(str(action.activationPx));
+      b.detail('Market', asset.name, str(action.asset)).detail('Side', action.reduceOnly ? `${side} (reduce-only)` : side).detail('Size', formatDecimalString(str(action.sz)))
+        .detail('Trails by', r.pct !== undefined ? `${trail} from the best price` : `${trail} (price distance) from the best price`).detail('Activation price', activation ?? 'active immediately');
+      if (asset.kind === 'unknown') b.warn('caution', 'unknown_asset', `Asset index ${str(action.asset)} could not be matched to a market.`);
+      if (r.pct === undefined && r.px === undefined) b.warn('caution', 'unknown_retracement', 'The trailing distance is missing or not recognised.');
+      if (!action.reduceOnly) b.warn('info', 'not_reduce_only', 'This trailing stop is not reduce-only, so when it triggers it can open or add to a position.');
+      return { title: `Trailing stop: ${action.reduceOnly ? `${side} (reduce-only)` : side} ${formatDecimalString(str(action.sz))} ${asset.name}, trailing ${trail}${activation ? `, from ${activation}` : ''}`,
+        summary: 'Places a stop order that follows the price and triggers after a retracement of the given size.', status: asset.kind === 'unknown' ? 'partial' : 'full' };
+    }
 
     // ---------------- Outcome shares (HIP-4) ----------------
     case 'userOutcome': {

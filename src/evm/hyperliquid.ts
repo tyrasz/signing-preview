@@ -1,6 +1,6 @@
 import { decodeAbiParameters, decodeFunctionData, parseAbi, parseAbiParameters, type Hex } from 'viem';
 import { decimalString, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import { CCTP, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
+import { CCTP, HYPEREVM_MAINNET, HYPEREVM_TESTNET, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
 import { describeOrder, findSpotToken, resolveAsset } from '../hyperliquid/assets.ts';
 import { decoded, nativeAmount, tokenInfo, type Adapter, type AdapterEnv, type Decoded } from './common.ts';
 
@@ -209,7 +209,7 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
     case 9: {
       const [wallet, name] = f as [string, string];
       b.detail('API wallet', wallet).detail('Name', name || '(unnamed)');
-      b.warn('danger', 'add_api_wallet', `${shortAddress(wallet)} will be able to sign trading and other account actions for this account. Only add wallets you control.`);
+      b.warn('danger', 'add_api_wallet', `${shortAddress(wallet)} will be able to sign trading and account actions for this account (Hyperliquid limits agent transfers to the account itself). Only add wallets you control.`);
       return { title: `Authorise API wallet ${shortAddress(wallet)}`, summary: 'Grants trading authority on HyperCore to another key.' };
     }
     case 10:
@@ -251,3 +251,53 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
   }
   return { title: 'HyperCore action', summary: '', status: 'opaque' };
 }
+
+const CDW_ABI = parseAbi([
+  'function deposit(uint256 amount, uint32 destinationDex)',
+  'function depositFor(address recipient, uint256 amount, uint32 destinationDex)',
+  'function depositWithAuth(uint256 amount, uint256 authValidAfter, uint256 authValidBefore, bytes32 authNonce, uint8 v, bytes32 r, bytes32 s, uint32 destinationDex)',
+]);
+
+/**
+ * HyperEVM -> HyperCore USDC deposits through Circle's CoreDepositWallet (Circle: "Transfer USDC from HyperEVM to HyperCore").
+ * Circle's interface page: sending USDC or any token directly to the CoreDepositWallet does not deposit; funds are stuck.
+ */
+export const coreDepositWalletAdapter: Adapter = async (tx) => {
+  const hyperEvm = tx.chainId === 999 ? HYPEREVM_MAINNET : tx.chainId === 998 ? HYPEREVM_TESTNET : null;
+  if (!hyperEvm || !tx.to) return null;
+  const b = new PreviewBuilder();
+  const transfer = tokenCall(tx.data);
+  if (transfer?.functionName === 'transfer' && sameAddress(transfer.args[0] as string, hyperEvm.coreDepositWallet)) {
+    b.detail('Token contract', tx.to).detail('Recipient', `Circle CoreDepositWallet (${hyperEvm.coreDepositWallet})`);
+    b.warn('danger', 'transfer_to_deposit_wallet', 'Sending tokens directly to the CoreDepositWallet does not deposit them on HyperCore; Circle says the funds are permanently stuck. Use its deposit function instead.');
+    return decoded({ title: 'Send tokens directly to the CoreDepositWallet (funds get stuck)', summary: 'A plain token transfer to Circle\'s deposit contract, which is not credited anywhere.', decoder: 'core_deposit_wallet', status: 'full', b });
+  }
+  if (!sameAddress(tx.to, hyperEvm.coreDepositWallet)) return null;
+  let call;
+  try { call = decodeFunctionData({ abi: CDW_ABI, data: tx.data }); } catch {
+    b.warn('caution', 'unknown_function', 'Unrecognised CoreDepositWallet function.');
+    return decoded({ title: 'Call Circle CoreDepositWallet', summary: 'A call to the HyperCore deposit contract that was not decoded.', decoder: 'core_deposit_wallet', status: 'opaque', b });
+  }
+  const args = call.args as readonly unknown[];
+  const amount = (call.functionName === 'depositFor' ? args[1] : args[0]) as bigint;
+  const dex = args[args.length - 1] as number;
+  const recipient = call.functionName === 'depositFor' ? (args[0] as string).toLowerCase() : tx.from;
+  const dexLabel = dex === 0 ? 'perps' : dex === 4294967295 ? 'spot' : `DEX ${dex}`;
+  const amountText = `${formatUnits(amount, 6)} USDC`;
+  b.detail('Amount', amountText, amount.toString()).detail('HyperCore recipient', recipient).detail('HyperCore balance', dexLabel, String(dex));
+  if (amount === 0n) b.warn('caution', 'will_revert', 'The amount is zero ("Amount must be greater than zero"), so this reverts.');
+  if (call.functionName === 'depositFor') {
+    const bad = /^0x0{40}$/.test(recipient) ? 'the zero address' : sameAddress(recipient, CCTP.usdcSystemAddress) ? 'the USDC system address' : sameAddress(recipient, hyperEvm.coreDepositWallet) ? 'the CoreDepositWallet' : null;
+    if (bad) b.warn('caution', 'will_revert', `The recipient is ${bad}, which CoreDepositWallet rejects, so this reverts.`);
+    else if (!sameAddress(recipient, tx.from)) b.warn('caution', 'recipient_not_sender', `The USDC will be credited to ${shortAddress(recipient)} on HyperCore, not to you.`);
+  }
+  if (call.functionName === 'depositWithAuth') b.note('This uses a ReceiveWithAuthorization signature you gave earlier for the CoreDepositWallet.');
+  else b.note('The CoreDepositWallet must already be approved to spend this USDC.');
+  if (dex !== 0 && dex !== 4294967295) b.warn('caution', 'cctp_unknown_dex', `DEX ${dex} is neither perps (0) nor spot (4294967295). Unless Circle has enabled it, the USDC is credited to spot instead.`);
+  return decoded({
+    title: `Deposit ${amountText} to HyperCore ${dexLabel}`,
+    summary: `Moves ${amountText} from HyperEVM into ${sameAddress(recipient, tx.from) ? 'your' : shortAddress(recipient) + "'s"} HyperCore ${dexLabel} balance via Circle's CoreDepositWallet.`,
+    decoder: 'core_deposit_wallet', status: 'full', b,
+    assetChanges: [{ direction: 'out', account: tx.from, amount: formatUnits(amount, 6), symbol: 'USDC', raw: amount.toString(), asset: hyperEvm.usdc, basis: 'requested' }],
+  });
+};

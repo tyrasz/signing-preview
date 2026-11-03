@@ -151,7 +151,7 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
       b.detail('Agent (API wallet)', agent).detail('Agent name', name || '(unnamed)');
       checkNonce(b, env, m.nonce, 'Nonce');
       const requester = env.context.origin ? ` requested by ${env.context.origin}` : '';
-      b.warn('caution', 'approve_agent', `${shortAddress(agent)} will be able to place and cancel orders for your account${requester}. An agent can sign trading and other account actions for you (Hyperliquid's SDKs include agent-signed asset transfers), so treat this as giving the site access to your account. The Hyperliquid app uses this for "Enable trading"; only approve it on sites you trust.`);
+      b.warn('caution', 'approve_agent', `${shortAddress(agent)} will be able to sign trading and account actions for your account and its sub-accounts${requester}, without asking your wallet again. Hyperliquid's docs limit its asset transfers to your own account, but it can still lose you money, for example by trading. The Hyperliquid app uses this for "Enable trading"; only approve it on sites you trust.`);
       if (!name) b.note('An unnamed agent replaces your previous unnamed agent.');
       return out(`Authorise ${shortAddress(agent)} to act for your account`, `Approves an API wallet ("agent") that can sign trading and other account actions on your Hyperliquid account without asking your wallet again.`);
     }
@@ -228,7 +228,7 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
       const forward = dataBytes === 0 || (!!dataHex && dataHex.startsWith('0x' + '636374702d666f7277617264'.padEnd(48, '0')));
       const fee = W.cctpMaxFeeRaw + (forward ? W.forwardFeeByDomain[domainId] ?? W.defaultForwardFeeRaw : 0n);
       const raw = parseUnits(amount, 6);
-      const revert = (code: string, why: string) => b.warn('danger', code, `${why} Circle documents that the HyperEVM step then reverts; it does not document what happens to the HyperCore balance that was debited.`);
+      const revert = (code: string, why: string) => b.warn('danger', code, `${why} Circle documents that the HyperEVM step then reverts. Neither Circle nor Hyperliquid documents a refund of the debited HyperCore balance (Hyperliquid's docs make correct use of this action the caller's responsibility), so treat the funds as at risk.`);
       b.detail('Route', `Circle CCTP: burned on HyperEVM by CoreDepositWallet, minted on ${where}`)
         .detail('Delivery', forward ? "Automatic (Circle's Forwarding Service)" : `Manual: someone must submit the mint on ${where}`)
         .detail('Fee', forward ? `${usdc(fee)} forwarding fee` : `${usdc(fee)} (no forwarding)`, fee.toString());
@@ -505,7 +505,7 @@ async function describeL1Action(action: Wire, b: PreviewBuilder, info: Hyperliqu
     case 'noop':
       return { title: 'Hyperliquid no-op', summary: 'Consumes a nonce without doing anything (used to invalidate pending actions).', status: 'full' };
   }
-  const more = await describeMoreL1(type, action, b, info, env);
+  const more = await describeMoreL1(type, action, b, info, { signer: env.signer, vaultAddress: env.context.hyperliquid?.vaultAddress ?? null });
   if (more) return more;
   for (const [key, value] of Object.entries(action)) if (key !== 'type') b.detail(key, str(value));
   b.warn('caution', 'l1_unknown_action', `Action type "${type}" is not recognised. Its fields are listed as signed.`);

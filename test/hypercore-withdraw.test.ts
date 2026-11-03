@@ -124,3 +124,18 @@ test('HyperEVM -> Arbitrum: a CCTP burn on HyperEVM is recognised', async () => 
     data: encodeFunctionData({ abi, functionName: 'depositForBurn', args: [100_000_000n, 3, pad(BOB as Address), '0xb88339CB7199b77E23DB6E890353E22632Ba630f', pad(ZERO), 10_000n, 2000] }) }] }, { now: NOW, account: ALICE }, mockDeps());
   assert.ok(codes(toOther).includes('recipient_not_sender'));
 });
+
+test("HyperEVM -> HyperCore via Circle's CoreDepositWallet, and direct transfers to it are dangerous", async () => {
+  const CDW = '0x6b9e773128f453f5c2c60935ee2de2cbc5390a24', USDC_EVM = '0xb88339CB7199b77E23DB6E890353E22632Ba630f';
+  const cdw = parseAbi(['function deposit(uint256 amount, uint32 destinationDex)', 'function depositFor(address recipient, uint256 amount, uint32 destinationDex)']);
+  const tx = (to: string, data: string) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to, chainId: '0x3e7', data }] }, { now: NOW, account: ALICE }, mockDeps());
+  const dep = await tx(CDW, encodeFunctionData({ abi: cdw, functionName: 'deposit', args: [100_000_000n, 4294967295] }));
+  assert.equal(dep.title, 'Deposit 100 USDC to HyperCore spot');
+  assert.deepEqual(dangers(dep), []);
+  const forOther = await tx(CDW, encodeFunctionData({ abi: cdw, functionName: 'depositFor', args: [BOB as Address, 5_000_000n, 0] }));
+  assert.ok(codes(forOther).includes('recipient_not_sender'));
+  const toSystem = await tx(CDW, encodeFunctionData({ abi: cdw, functionName: 'depositFor', args: ['0x2000000000000000000000000000000000000000', 5_000_000n, 0] }));
+  assert.ok(codes(toSystem).includes('will_revert'));
+  const direct = await tx(USDC_EVM, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: [CDW as Address, 100_000_000n] }));
+  assert.ok(dangers(direct).includes('transfer_to_deposit_wallet'));
+});

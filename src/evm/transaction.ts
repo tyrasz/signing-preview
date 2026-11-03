@@ -4,10 +4,11 @@ import type { AssetChange, Dependencies, Preview, PreviewContext, SimulationSumm
 import { tokenInfo, type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
-import { bridge2Adapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
+import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
 
 /** Order matters: specific routes before generic ERC-20 shapes. */
 export const ADAPTERS: Adapter[] = [
+  coreDepositWalletAdapter,
   hyperCoreSystemTransferAdapter,
   nativeAdapter,
   bridge2Adapter,

@@ -7,7 +7,7 @@ import { l1ActionHash } from '../src/hyperliquid/action-hash.ts';
 import { previewRequest } from '../src/preview.ts';
 import { ALICE, BOB } from '../mocks/data.ts';
 import type { Preview } from '../src/types.ts';
-import { codes, mockDeps, NOW } from './helpers.ts';
+import { codes, detail, mockDeps, NOW } from './helpers.ts';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 const VAULT = '0xdfc24b077bc1425ad1dea75bcb6f8158e10df303';
@@ -64,7 +64,7 @@ const ALL: [Record<string, unknown>, string][] = [
   [{ type: 'evmUserModify', usingBigBlocks: false }, 'Use small HyperEVM blocks'],
   [{ type: 'noop' }, 'Hyperliquid no-op'],
   // Agent-wallet actions
-  [{ type: 'agentSendAsset', destination: BOB, sourceDex: '', destinationDex: 'spot', token: 'USDC:0x6d1e7cde53ba9467b783cb7c530ce054', amount: '25', fromSubAccount: '', nonce: NOW - 1000 }, 'Send 25 USDC to 0xb0b0…0002 (agent)'],
+  [{ type: 'agentSendAsset', destination: BOB, sourceDex: '', destinationDex: 'spot', token: 'USDC:0x6d1e7cde53ba9467b783cb7c530ce054', amount: '25', fromSubAccount: '', nonce: NOW - 1000 }, 'Move 25 USDC from perps to spot (agent)'],
   [{ type: 'agentSetAbstraction', abstraction: 'u' }, 'Set account mode to unified account (agent)'],
   [{ type: 'agentEnableDexAbstraction' }, 'Enable HIP-3 DEX abstraction (agent)'],
   // Outcome shares (HIP-4)
@@ -139,6 +139,18 @@ test('Every L1 action type and variant decodes to a recognised, fully decoded pr
   }
 });
 
+test('Actions documented by Hyperliquid but newer than SDK 0.33.3 are decoded (cDeposit2, trailingStop)', async () => {
+  const stake = await l1({ type: 'cDeposit2', wei: 250_000_000 });
+  assert.equal(stake.title, 'Stake 2.5 HYPE (agent)');
+  const trail = await l1({ type: 'trailingStop', asset: 0, isBuy: false, sz: '0.01', reduceOnly: true, retracement: { pct: '1.5%' }, activationPx: '99000' });
+  assert.equal(trail.title, 'Trailing stop: Short (reduce-only) 0.01 BTC-PERP, trailing 1.5%, from 99,000');
+  assert.equal(trail.decoding.status, 'full');
+  const byPx = await l1({ type: 'trailingStop', asset: 1, isBuy: true, sz: '1', reduceOnly: false, retracement: { px: '50' }, activationPx: null });
+  assert.equal(detail(byPx, 'Activation price'), 'active immediately');
+  assert.ok(codes(byPx).includes('not_reduce_only'));
+  for (const p of [stake, trail, byPx]) assert.ok(!codes(p).includes('l1_unknown_action'));
+});
+
 test('Impactful admin actions carry warnings', async () => {
   const expect: [Record<string, unknown>, string][] = [
     [{ type: 'perpDeploy', setOracle: { dex: 'xyz', oraclePxs: [['xyz:TSLA', '300']], markPxs: [], externalPerpPxs: [] } }, 'oracle_update'],
@@ -150,7 +162,7 @@ test('Impactful admin actions carry warnings', async () => {
     [{ type: 'CValidatorAction', changeProfile: { node_ip: null, name: null, description: null, unjailed: true, disable_delegations: null, commission_bps: null, signer: BOB } }, 'validator_signer_change'],
     [{ type: 'hip3LiquidatorTransfer', dex: 'xyz', ntl: 1_000_000_000, isDeposit: true }, 'backstop_liquidator'],
     [{ type: 'gossipPriorityBid', slotId: 0, ip: '1.2.3.4', maxGas: 50_000_000 }, 'spends_hype'],
-    [{ type: 'agentSendAsset', destination: BOB, sourceDex: '', destinationDex: '', token: 'USDC', amount: '1', fromSubAccount: '', nonce: NOW - 1000 }, 'recipient_not_sender'],
+    [{ type: 'agentSendAsset', destination: BOB, sourceDex: '', destinationDex: '', token: 'USDC', amount: '1', fromSubAccount: '', nonce: NOW - 1000 }, 'agent_send_own_account'],
   ];
   for (const [action, code] of expect) assert.ok(codes(await l1(action)).includes(code), `${String(action.type)}: ${code}`);
 });
@@ -164,5 +176,5 @@ test('Approving an agent no longer claims agents cannot move funds', async () =>
   const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(typed)] }, { now: NOW }, mockDeps());
   const msg = p.warnings.find(w => w.code === 'approve_agent')!.message;
   assert.doesNotMatch(msg, /cannot withdraw/);
-  assert.match(msg, /access to your account/);
+  assert.match(msg, /limit its asset transfers to your own account/);
 });

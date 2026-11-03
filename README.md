@@ -95,6 +95,7 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | HyperCore → Arbitrum (and other chains), **Circle CCTP** | `SendToEvmWithData` with USDC (Circle's "Withdraw USDC from HyperCore to EVM chains") | Destination as a **CCTP domain** (3 = Arbitrum, not an EVM chain ID), automatic vs manual delivery, the live per-destination fee (Arbitrum/Base 0.20, Ethereum 1.20, Solana 0.50 USDC; 0 without forwarding), amount received and withdrawable balance. **Danger** when the HyperEVM step would revert: amount not above the fee, invalid domain, or data over 1,024 bytes. |
 | HyperCore → Arbitrum, **Hyperliquid Withdraw** | `Withdraw` (withdraw3) | Arbitrum recipient, the 1 USDC fee, amount received and withdrawable perps balance. |
 | HyperCore → HyperEVM | `SendAsset` / `SpotSend` to a system address (Circle's "Withdraw USDC from HyperCore to HyperEVM") | "Move X to HyperEVM", credited to the same address. **Danger** on a system address that doesn't match the token. |
+| HyperEVM → HyperCore, **Circle CoreDepositWallet** | `deposit` / `depositFor` / `depositWithAuth` on HyperEVM | Amount, HyperCore recipient and perps/spot. **Danger** for a plain token transfer to the CoreDepositWallet, which Circle says leaves the funds permanently stuck. |
 | HyperEVM → other chains, **CCTP** | `TokenMessengerV2.depositForBurn(WithHook)` on HyperEVM | Amount, destination, recipient and whether delivery is automatic or manual. |
 | Sponsored HyperCore deposits | `ReceiveWithAuthorization` to `CctpExtensionV2` | Recognised, with a caution that the recipient is bound into the nonce and can't be shown. |
 | USDC gasless transfers | EIP-3009 `TransferWithAuthorization` / `ReceiveWithAuthorization` / `CancelAuthorization` | Amount, spender/recipient, validity window; warns that a transfer authorization works like sending the payment. |
@@ -227,9 +228,15 @@ What the contracts imply, and what the preview reports:
 
   Withdrawal fees match `calculateCrossChainWithdrawalFee` for Ethereum, Arbitrum, Solana and Base. Live `spotMeta` confirms that USDC's HyperEVM link is the `CoreDepositWallet` and that native HYPE has none.
 
+- **Hyperliquid's docs** (hyperliquid.gitbook.io, 2026-11-03) confirm:
+  - The `Withdraw` (withdraw3) fee: "There is a $1 fee for withdrawing at the time of this writing", about 5 minutes to finalize.
+  - That `agentSendAsset`'s "Destination must match the source address", so agents can only move funds between the owner's own balances.
+  - That API wallets "sign on behalf of the master account or any of the sub-accounts". The `ApproveAgent` warning says exactly this.
+  - Two actions newer than SDK 0.33.3, `cDeposit2` (agent staking) and `trailingStop`, which are now decoded.
+- **Failed HyperCore → other-chain withdrawals.** On mainnet the route is unused right now. A scan of 160,000 HyperEVM blocks (about two days) found no `CrossChainWithdraw` events and no CCTP burns by the `CoreDepositWallet`, even though it emitted thousands of deposit events. So there were no real failures to inspect, and the testnet endpoints were not reachable from this environment. Circle documents that a withdrawal below the fee makes the HyperEVM step revert. Hyperliquid's docs make correct use of `sendToEvmWithData` the caller's responsibility. Neither documents a refund, so the preview flags these cases as danger and says the funds are at risk.
+
 Still not verified live:
-- What happens to the debited HyperCore balance when the HyperEVM withdrawal step reverts; Circle doesn't document it, and the preview says so.
-- Hyperliquid's native `Withdraw` fee (1 USDC), which comes from Hyperliquid's docs.
+- What actually happens to the debited HyperCore balance when the HyperEVM withdrawal step reverts (see above).
 - The CCTP attestation and `CctpForwarder.mintAndForward` itself, because minting needs Circle's attestation signature.
 - Fallback to spot for DEX IDs that aren't enabled; HyperEVM's RPC has no trace API to observe it.
 - Recipient blacklist state.
