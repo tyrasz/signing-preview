@@ -115,14 +115,15 @@ function outcomeLabel(name: string, o: Record<string, string>, question: { name:
   return part(humanize(name), o) || 'Outcome market';
 }
 
-export async function findSpotToken(info: HyperliquidInfo | undefined, match: { index?: number; tokenId?: string; evmContract?: string }): Promise<SpotToken | undefined> {
+export async function findSpotToken(info: HyperliquidInfo | undefined, match: { index?: number; tokenId?: string; evmContract?: string; name?: string }): Promise<SpotToken | undefined> {
   if (!info) return undefined;
   try {
     const { tokens } = await info.spotMeta();
     return tokens.find(t =>
       (match.index !== undefined && t.index === match.index) ||
       (match.tokenId !== undefined && t.tokenId.toLowerCase() === match.tokenId.toLowerCase()) ||
-      (match.evmContract !== undefined && t.evmContract?.address.toLowerCase() === match.evmContract.toLowerCase()));
+      (match.evmContract !== undefined && t.evmContract?.address.toLowerCase() === match.evmContract.toLowerCase()) ||
+      (match.name !== undefined && t.name === match.name));
   } catch {
     return undefined;
   }

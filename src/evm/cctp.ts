@@ -139,6 +139,9 @@ function describeBurn(p: Burn, b: PreviewBuilder): Omit<Decoded, 'b' | 'decoder'
     b.detail('Recipient on destination', mintRecipient ?? p.mintRecipientWord, p.mintRecipientWord);
     if (caller && !/^0x0{40}$/.test(caller)) b.detail('Only this address may complete the mint', caller);
     if (p.hook) b.detail('Hook data', `${(p.hook.length - 2) / 2} bytes`, p.hook);
+    const forwarding = !!p.hook && p.hook.toLowerCase().startsWith('0x' + HOOK_MAGIC) && (!caller || /^0x0{40}$/.test(caller));
+    b.detail('Delivery', forwarding ? "Automatic (Circle's Forwarding Service); its fee comes out of the maximum fee"
+      : caller && !/^0x0{40}$/.test(caller) ? `Manual: only ${shortAddress(caller)} can complete the mint on ${destination}` : `Manual: someone must submit the mint on ${destination} with Circle's attestation`);
     if (!mintRecipient) b.warn('caution', 'cctp_non_evm_recipient', 'The recipient is not an EVM address; check it matches the destination chain format.');
     else if (!sameAddress(mintRecipient, p.from)) b.warn('caution', 'recipient_not_sender', `The USDC will be minted to ${shortAddress(mintRecipient)}, not to your address.`);
     b.note('The amount received is the burned amount minus the CCTP fee actually charged, which can never exceed the maximum fee.');

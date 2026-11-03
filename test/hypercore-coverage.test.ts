@@ -94,10 +94,11 @@ test('Unified-account users are not given per-market margin warnings', async () 
 });
 
 test('New user-signed actions are decoded with the right warnings', async () => {
-  const evm = await userSigned('SendToEvmWithData', { token: 'USDC', amount: '100', sourceDex: 'spot', destinationRecipient: BOB, addressEncoding: 'hex', destinationChainId: 999, gasLimit: 200000, data: '0xdeadbeef', nonce: NOW });
-  assert.equal(evm.title, 'Send 100 USDC from HyperCore to HyperEVM');
-  assert.deepEqual(codes(evm).sort(), ['recipient_not_sender', 'send_to_evm_with_data']);
-  assert.equal(detail(evm, 'Data passed to recipient'), '4 bytes');
+  // destinationChainId is a CCTP domain (3 = Arbitrum); data without the forwarding magic disables auto-delivery.
+  const evm = await userSigned('SendToEvmWithData', { token: 'USDC', amount: '100', sourceDex: 'spot', destinationRecipient: BOB, addressEncoding: 'hex', destinationChainId: 3, gasLimit: 200000, data: '0xdeadbeef', nonce: NOW });
+  assert.equal(evm.title, 'Withdraw 100 USDC from HyperCore to Arbitrum via Circle CCTP');
+  assert.deepEqual(codes(evm).sort(), ['manual_delivery', 'recipient_not_sender']);
+  assert.equal(detail(evm, 'Hook data for the destination'), '4 bytes');
 
   const mode = await userSigned('UserSetAbstraction', { user: ALICE, abstraction: 'portfolioMargin', nonce: NOW });
   assert.equal(mode.title, 'Set account mode to portfolio margin');

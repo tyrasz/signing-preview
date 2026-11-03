@@ -1,8 +1,8 @@
 import { formatDecimalString, formatDuration, formatTimestamp, formatUnits, formatUsd, parseUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import { chainName, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
+import { CCTP, HYPERCORE_CCTP_WITHDRAWAL, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
 import { l1ActionHash } from '../hyperliquid/action-hash.ts';
 import { describeOrder, findSpotToken, resolveAsset, TIF_LABELS, type ResolvedAsset } from '../hyperliquid/assets.ts';
-import type { HyperliquidInfo, Network } from '../types.ts';
+import type { HyperliquidInfo, Network, SpotToken } from '../types.ts';
 import { describeMoreL1 } from './hyperliquid-admin.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv } from './common.ts';
 
@@ -36,6 +36,43 @@ function describeDestination(b: PreviewBuilder, env: TypedEnv, destination: stri
   else if (/^0x0{40}$/.test(destination)) b.warn('danger', 'zero_destination', 'The destination is the zero address.');
   else if (env.signer && sameAddress(destination, env.signer)) b.warn('info', 'destination_is_self', 'The destination is your own address.');
 }
+
+/**
+ * HyperCore -> HyperEVM moves go to a system address: 0x2222… for native HYPE, 0x20…<index> for spot tokens.
+ * Native HYPE has no linked EVM contract (live spotMeta); other tokens must have one.
+ */
+function checkSystemAddressTransfer(b: PreviewBuilder, destination: string, name: string, known: SpotToken | undefined) {
+  if (sameAddress(destination, HYPERLIQUID.hypeSystemAddress)) {
+    if ((known?.name ?? name) !== 'HYPE') b.warn('danger', 'system_address_mismatch', `${HYPERLIQUID.hypeSystemAddress} is the HYPE system address; sending ${known?.name ?? name} there will not move it to HyperEVM as intended.`);
+    return;
+  }
+  const systemIndex = parseSpotSystemAddress(destination);
+  if (known && systemIndex !== null && known.index !== systemIndex) b.warn('danger', 'system_address_mismatch', `This system address belongs to token #${systemIndex}, not ${known.name} (#${known.index}). The transfer to HyperEVM will not work as intended.`);
+  else if (known && !known.evmContract) b.warn('danger', 'no_evm_contract', `${known.name} is not linked to a HyperEVM contract, so it cannot be moved to HyperEVM.`);
+}
+
+/** Checks the USDC being withdrawn against the account (skipped for shared-collateral accounts). */
+async function checkUsdcAvailable(b: PreviewBuilder, info: HyperliquidInfo | undefined, account: string | null, source: 'perps' | 'spot', amount: number) {
+  if (!info || !account || !Number.isFinite(amount)) return;
+  let mode: string | undefined;
+  try { mode = await info.userAbstraction?.(account); } catch { mode = undefined; }
+  if (mode === 'unifiedAccount' || mode === 'portfolioMargin') { b.note('The balance was not checked because this account shares collateral across spot and perps.'); return; }
+  let have: number;
+  try {
+    if (source === 'spot') {
+      if (!info.spotClearinghouseState) return;
+      const bal = (await info.spotClearinghouseState(account)).balances.find(x => x.token === 0);
+      have = bal ? Number(bal.total) - Number(bal.hold) : 0;
+    } else {
+      have = Number((await info.clearinghouseState(account)).withdrawable);
+    }
+  } catch { return; }
+  b.detail(`Withdrawable USDC (${source})`, formatDecimalString(String(have)));
+  if (amount > have) b.warn('caution', 'insufficient_balance', `This needs ${formatDecimalString(String(amount))} USDC but only ${formatDecimalString(String(have))} is withdrawable from your ${source} balance, so Hyperliquid will reject it.`);
+}
+
+const usdc = (raw: bigint) => `${formatUnits(raw, 6)} USDC`;
+const dexLabel = (dex: unknown) => str(dex) === '' ? 'perps (main DEX)' : str(dex) === 'spot' ? 'spot' : str(dex);
 
 /** User-signed HyperCore actions (domain HyperliquidSignTransaction). These are fully readable. */
 export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
@@ -74,7 +111,9 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
       const raw = parseUnits(amount, 6), fee = parseUnits(HYPERLIQUID.withdrawFeeUsd, 6)!;
       b.detail('Amount', `${formatDecimalString(amount)} USDC`, amount).detail('Withdrawal fee', `${HYPERLIQUID.withdrawFeeUsd} USDC`);
       if (raw !== null) b.detail('You receive on Arbitrum (approx.)', raw > fee ? `${formatUnits(raw - fee, 6)} USDC` : '0 USDC');
+      b.detail('Route', "Hyperliquid's own bridge (Bridge2 on Arbitrum One), from your perps balance");
       describeDestination(b, env, destination, 'Arbitrum recipient');
+      await checkUsdcAvailable(b, info, env.signer, 'perps', Number(amount));
       if (env.signer && !sameAddress(destination, env.signer)) b.warn('caution', 'withdraw_to_other', `The USDC will arrive at ${shortAddress(destination)} on Arbitrum, which is not your address.`);
       if (raw !== null && raw <= fee) b.warn('danger', 'withdraw_below_fee', `The amount does not cover the ${HYPERLIQUID.withdrawFeeUsd} USDC withdrawal fee.`);
       checkNonce(b, env, m.time, 'Time');
@@ -93,8 +132,7 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
       checkNonce(b, env, m.time, 'Time');
       const change = env.signer ? [{ direction: 'out' as const, account: env.signer, amount: formatDecimalString(amount), symbol: name, basis: 'requested' as const }] : [];
       if (toEvm) {
-        if (known && systemIndex !== null && known.index !== systemIndex) b.warn('danger', 'system_address_mismatch', `This system address belongs to token #${systemIndex}, not ${known.name} (#${known.index}). The transfer to HyperEVM will not work as intended.`);
-        if (known && !known.evmContract) b.warn('danger', 'no_evm_contract', `${known.name} is not linked to a HyperEVM contract.`);
+        checkSystemAddressTransfer(b, destination, name, known);
         b.detail('Credited to (HyperEVM)', env.signer ?? 'your address');
         return out(`Move ${formatDecimalString(amount)} ${name} to HyperEVM`, `Moves ${formatDecimalString(amount)} ${name} from your HyperCore spot balance to the same address on HyperEVM.`, 'full', change);
       }
@@ -144,26 +182,73 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
     }
     case 'SendAsset': {
       const destination = str(m.destination), amount = str(m.amount), token = str(m.token);
-      const name = token.split(':')[0];
+      const [name, tokenId] = token.split(':');
+      const known = await findSpotToken(info, tokenId ? { tokenId } : { name });
+      const from = str(m.fromSubAccount);
       b.detail('Token', name, token).detail('Amount', `${formatDecimalString(amount)} ${name}`, amount)
-        .detail('Source DEX', str(m.sourceDex) || 'default').detail('Destination DEX', str(m.destinationDex) || 'default');
-      if (str(m.fromSubAccount)) b.detail('From sub-account', str(m.fromSubAccount));
-      describeDestination(b, env, destination);
+        .detail('From DEX', dexLabel(m.sourceDex), str(m.sourceDex)).detail('To DEX', dexLabel(m.destinationDex), str(m.destinationDex));
+      if (from) b.detail('From sub-account', from);
+      if (tokenId && known && known.name !== name) b.warn('danger', 'spot_token_name_mismatch', `The token is labelled "${name}" but its ID belongs to ${known.name}.`);
       checkNonce(b, env, m.nonce, 'Nonce');
-      return out(`Send ${formatDecimalString(amount)} ${name} to ${shortAddress(destination)}`, 'Transfers an asset between Hyperliquid accounts or DEXes.');
+      const change = env.signer ? [{ direction: 'out' as const, account: env.signer, amount: formatDecimalString(amount), symbol: name, basis: 'requested' as const }] : [];
+      const toEvm = parseSpotSystemAddress(destination) !== null || sameAddress(destination, HYPERLIQUID.hypeSystemAddress);
+      if (toEvm) {
+        // Circle's "Withdraw USDC from HyperCore to HyperEVM" uses SendAsset to the USDC system address.
+        b.detail('System address', destination).detail('Credited to (HyperEVM)', from || env.signer || 'your address');
+        checkSystemAddressTransfer(b, destination, name, known);
+        return out(`Move ${formatDecimalString(amount)} ${name} from HyperCore to HyperEVM`, `Moves ${formatDecimalString(amount)} ${name} from your HyperCore ${dexLabel(m.sourceDex)} balance to the same address on HyperEVM.`, known ? 'full' : 'partial', change);
+      }
+      describeDestination(b, env, destination);
+      if (env.signer && sameAddress(destination, env.signer) && !from) {
+        return out(`Move ${formatDecimalString(amount)} ${name} from ${dexLabel(m.sourceDex)} to ${dexLabel(m.destinationDex)}`, 'Moves an asset between your own Hyperliquid DEX balances.', 'full');
+      }
+      return out(`Send ${formatDecimalString(amount)} ${name} to ${shortAddress(destination)}`, `Transfers ${formatDecimalString(amount)} ${name} to another Hyperliquid account.`, 'full', change);
     }
     case 'SendToEvmWithData': {
-      const amount = str(m.amount), token = str(m.token), recipient = str(m.destinationRecipient), data = str(m.data);
-      const chainId = Number(m.destinationChainId);
-      const dataBytes = /^0x[0-9a-fA-F]*$/.test(data) ? (data.length - 2) / 2 : NaN;
-      b.detail('Token', token).detail('Amount', `${formatDecimalString(amount)} ${token}`, amount).detail('From DEX', str(m.sourceDex) || 'default')
-        .detail('Destination chain', `${chainName(chainId)} (chain ID ${chainId})`, String(m.destinationChainId)).detail('Recipient', `${recipient} (${str(m.addressEncoding)})`)
-        .detail('Gas limit', str(m.gasLimit)).detail('Data passed to recipient', Number.isNaN(dataBytes) ? data : `${dataBytes} bytes`, data);
+      // destinationChainId is a CCTP domain ID (Circle: 3 = Arbitrum, 0 = Ethereum, 6 = Base), not an EVM chain ID.
+      const amount = str(m.amount), token = str(m.token), name = token.split(':')[0];
+      const recipient = str(m.destinationRecipient), encoding = str(m.addressEncoding), data = str(m.data);
+      const domainId = Number(m.destinationChainId), dest = CCTP.domains[domainId];
+      const where = dest ?? `CCTP domain ${domainId}`;
+      const dataHex = /^0x([0-9a-fA-F]{2})*$/.test(data) ? data.toLowerCase() : null;
+      const dataBytes = dataHex ? (dataHex.length - 2) / 2 : NaN;
+      const source = str(m.sourceDex) === 'spot' ? 'spot' : 'perps';
+      b.detail('Token', name, token).detail('Amount', `${formatDecimalString(amount)} ${name}`, amount).detail('From balance', dexLabel(m.sourceDex), str(m.sourceDex))
+        .detail('Destination', `${where}${dest ? ` (CCTP domain ${domainId})` : ''}`, String(m.destinationChainId))
+        .detail('Recipient', encoding === 'hex' ? recipient : `${recipient} (${encoding})`).detail('Gas limit', str(m.gasLimit));
       checkNonce(b, env, m.nonce, 'Nonce');
-      if (env.signer && str(m.addressEncoding) === 'hex' && !sameAddress(recipient, env.signer)) b.warn('caution', 'recipient_not_sender', `The tokens go to ${shortAddress(recipient)}, not to your address.`);
-      if (dataBytes > 0) b.warn('caution', 'send_to_evm_with_data', `The recipient contract receives the tokens together with ${dataBytes} bytes of data it will act on. That data cannot be interpreted here; only approve if you trust the app that built it.`);
-      return out(`Send ${formatDecimalString(amount)} ${token} from HyperCore to ${chainName(chainId)}`, `Moves ${formatDecimalString(amount)} ${token} from your HyperCore balance to ${shortAddress(recipient)} on ${chainName(chainId)}${dataBytes > 0 ? ', calling the recipient contract with extra data' : ''}.`, dataBytes > 0 ? 'partial' : 'full',
-        env.signer ? [{ direction: 'out', account: env.signer, amount: formatDecimalString(amount), symbol: token, basis: 'requested' }] : []);
+      const change = env.signer ? [{ direction: 'out' as const, account: env.signer, amount: formatDecimalString(amount), symbol: name, basis: 'requested' as const }] : [];
+      if (name !== 'USDC') {
+        if (dataBytes > 0) b.warn('caution', 'send_to_evm_with_data', `The receiving contract gets ${dataBytes} bytes of data it will act on, which cannot be interpreted here.`);
+        b.warn('caution', 'unverified_route', `Only USDC withdrawals (handled by Circle's CoreDepositWallet) are verified. Check how ${name}'s HyperEVM contract handles this.`);
+        return out(`Send ${formatDecimalString(amount)} ${name} from HyperCore via HyperEVM to ${where}`, `Moves ${formatDecimalString(amount)} ${name} out of HyperCore through its HyperEVM contract.`, 'partial', change);
+      }
+      // Circle CCTP: HyperCore debits the balance; CoreDepositWallet.coreReceiveWithData burns on HyperEVM; minted on the destination.
+      const W = HYPERCORE_CCTP_WITHDRAWAL;
+      const forward = dataBytes === 0 || (!!dataHex && dataHex.startsWith('0x' + '636374702d666f7277617264'.padEnd(48, '0')));
+      const fee = W.cctpMaxFeeRaw + (forward ? W.forwardFeeByDomain[domainId] ?? W.defaultForwardFeeRaw : 0n);
+      const raw = parseUnits(amount, 6);
+      const revert = (code: string, why: string) => b.warn('danger', code, `${why} Circle documents that the HyperEVM step then reverts; it does not document what happens to the HyperCore balance that was debited.`);
+      b.detail('Route', `Circle CCTP: burned on HyperEVM by CoreDepositWallet, minted on ${where}`)
+        .detail('Delivery', forward ? "Automatic (Circle's Forwarding Service)" : `Manual: someone must submit the mint on ${where}`)
+        .detail('Fee', forward ? `${usdc(fee)} forwarding fee` : `${usdc(fee)} (no forwarding)`, fee.toString());
+      if (dataBytes > 0) b.detail('Hook data for the destination', `${dataBytes} bytes`, data);
+      if (raw !== null && raw > fee) {
+        b.detail(`You receive on ${where} (expected)`, usdc(raw - fee));
+      }
+      if (!dest || domainId === CCTP.hyperEvmDomain) revert('unknown_cctp_domain', domainId === CCTP.hyperEvmDomain ? 'HyperEVM is CCTP domain 19, so this would burn and mint on the same chain. Circle withdraws to HyperEVM with a SendAsset to the USDC system address instead.' : `${domainId} is not a CCTP domain in Circle's list (Arbitrum is 3, Ethereum 0, Base 6), so the CCTP burn will fail.`);
+      if (raw !== null && raw <= fee) revert('withdrawal_below_fee', `The amount does not exceed the ${usdc(fee)} withdrawal fee.`);
+      if (!dataHex) revert('bad_hook_data', 'The data field is not valid hex.');
+      else if (dataBytes > W.maxDataBytes) revert('hook_data_too_large', `The data is ${dataBytes} bytes; CoreDepositWallet accepts at most ${W.maxDataBytes}.`);
+      if (encoding === 'hex' && !/^0x[0-9a-fA-F]{40}$/.test(recipient)) b.warn('danger', 'bad_destination', 'The recipient is not a valid EVM address.');
+      if ((encoding === 'base58') !== (dest === 'Solana') && dest) b.warn('caution', 'address_encoding_mismatch', `${encoding} addresses are for ${encoding === 'base58' ? 'Solana' : 'EVM chains'}, but the destination is ${where}.`);
+      if (!forward) b.warn('caution', 'manual_delivery', `With custom data there is no automatic delivery: the mint must be submitted on ${where} with Circle's attestation. Anyone can submit it, and the USDC still goes to the recipient.`);
+      if (dataBytes > 0 && forward) b.warn('info', 'custom_hook_data', `${dataBytes} bytes of data are passed to the destination with the transfer and cannot be interpreted here.`);
+      if (encoding === 'hex' && env.signer && !sameAddress(recipient, env.signer)) b.warn('caution', 'recipient_not_sender', `The USDC goes to ${shortAddress(recipient)} on ${where}, not to your address.`);
+      await checkUsdcAvailable(b, info, env.signer, source, Number(amount));
+      return out(`Withdraw ${formatDecimalString(amount)} USDC from HyperCore to ${where} via Circle CCTP`,
+        `Debits your HyperCore ${source} balance; the USDC is burned on HyperEVM via Circle CCTP and minted to ${encoding === 'hex' && env.signer && sameAddress(recipient, env.signer) ? 'your address' : shortAddress(recipient)} on ${where}${forward ? ', delivered automatically' : ''}.`,
+        dest && forward && dataBytes === 0 ? 'full' : 'partial', change);
     }
     case 'UserSetAbstraction': {
       const mode = str(m.abstraction), user = str(m.user);

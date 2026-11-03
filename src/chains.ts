@@ -94,11 +94,31 @@ export const CCTP_NETWORKS: Record<number, CctpSourceNetwork> = {
   11155111: { name: 'Ethereum Sepolia', domain: 0, testnet: true, usdc: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238',
     tokenMessengerV2: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa', hyperEvm: HYPEREVM_TESTNET,
     fees: { fastFeeBps: 1, forwardFeeRaw: 200_000n, forwardFeeDynamic: true } },
+  // HyperEVM as a CCTP source (HyperEVM -> other chains). The HyperCore-deposit fee fields do not apply.
+  999: { name: 'HyperEVM', domain: 19, testnet: false, usdc: HYPEREVM_MAINNET.usdc,
+    tokenMessengerV2: '0x28b5a0e9c621a5badaa536219b3a228c8168cf5d', hyperEvm: HYPEREVM_MAINNET,
+    fees: { fastFeeBps: 0, forwardFeeRaw: 0n, forwardFeeDynamic: false } },
+  998: { name: 'HyperEVM Testnet', domain: 19, testnet: true, usdc: HYPEREVM_TESTNET.usdc,
+    tokenMessengerV2: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa', hyperEvm: HYPEREVM_TESTNET,
+    fees: { fastFeeBps: 0, forwardFeeRaw: 0n, forwardFeeDynamic: false } },
   421614: { name: 'Arbitrum Sepolia', domain: 3, testnet: true, usdc: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d',
     tokenMessengerV2: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
     cctpExtension: '0x8e4e3d0e95c1bec4f3ec7f69aa48473e0ab6eb8d', cctpExtensionV2: '0xc1fec4e5daf8796a490653359536f9c2a9c158ae',
     hyperEvm: HYPEREVM_TESTNET, fees: { fastFeeBps: 0, forwardFeeRaw: 200_000n, forwardFeeDynamic: false } },
 };
+
+/**
+ * HyperCore -> other chains via Circle CCTP (sendToEvmWithData with USDC, handled by CoreDepositWallet.coreReceiveWithData).
+ * Fees read live on 2026-11-03 with CoreDepositWallet.calculateCrossChainWithdrawalFee; they match Circle's Forwarding
+ * Service table (HyperCore withdrawals: Ethereum 1.20, Solana 0.50, other chains 0.20 USDC). cctpMaxFee was 0.
+ */
+export const HYPERCORE_CCTP_WITHDRAWAL = {
+  cctpMaxFeeRaw: 0n,
+  defaultForwardFeeRaw: 200_000n,
+  forwardFeeByDomain: { 0: 1_200_000n, 5: 500_000n } as Record<number, bigint>,
+  /** CoreDepositWallet MAX_HOOK_DATA_SIZE. */
+  maxDataBytes: 1024,
+} as const;
 
 export const CCTP = {
   /** TokenMessengerV2 is deployed at the same address on Ethereum and Arbitrum (mainnets). */
@@ -108,7 +128,10 @@ export const CCTP = {
     1: CCTP_NETWORKS[1].usdc, 42161: CCTP_NETWORKS[42161].usdc, 999: HYPEREVM_MAINNET.usdc,
     11155111: CCTP_NETWORKS[11155111].usdc, 421614: CCTP_NETWORKS[421614].usdc, 998: HYPEREVM_TESTNET.usdc,
   } as Record<number, string>,
-  domains: { 0: 'Ethereum', 1: 'Avalanche', 2: 'OP Mainnet', 3: 'Arbitrum', 5: 'Solana', 6: 'Base', 7: 'Polygon PoS', 19: 'HyperEVM' } as Record<number, string>,
+  /** Circle's CCTP domain table (supported-chains-and-domains, unchanged 2026-10-29 -> 2026-11-03). */
+  domains: { 0: 'Ethereum', 1: 'Avalanche', 2: 'OP Mainnet', 3: 'Arbitrum', 5: 'Solana', 6: 'Base', 7: 'Polygon PoS', 8: 'Sui', 9: 'Aptos', 10: 'Unichain',
+    11: 'Linea', 12: 'Codex', 13: 'Sonic', 14: 'World Chain', 15: 'Monad', 16: 'Sei', 17: 'BNB Smart Chain', 18: 'XDC', 19: 'HyperEVM', 21: 'Ink', 22: 'Plume',
+    25: 'Starknet', 26: 'Arc', 27: 'Stellar', 28: 'EDGE', 29: 'Injective', 30: 'Morph', 31: 'Pharos', 32: 'Cronos', 33: 'Plasma', 37: 'X Layer' } as Record<number, string>,
   hyperEvmDomain: 19,
   /** CoreDepositWallet: 0 = perps (enabled by default), uint32.max = spot; other DEX IDs fall back to spot unless enabled. */
   dexes: { 0: 'perps', 4294967295: 'spot' } as Record<number, string>,

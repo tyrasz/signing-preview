@@ -32,9 +32,10 @@ export function mockHyperliquidInfo(): StaticHyperliquidInfo {
     ] },
     spotMeta: {
       tokens: [
-        { name: 'USDC', index: 0, tokenId: '0x6d1e7cde53ba9467b783cb7c530ce054', szDecimals: 8, weiDecimals: 8, evmContract: null },
+        // USDC and HYPE EVM links as in live spotMeta (2026-11-03): USDC -> Circle's CoreDepositWallet, native HYPE -> none.
+        { name: 'USDC', index: 0, tokenId: '0x6d1e7cde53ba9467b783cb7c530ce054', szDecimals: 8, weiDecimals: 8, evmContract: { address: '0x6b9e773128f453f5c2c60935ee2de2cbc5390a24', evm_extra_wei_decimals: -2 } },
         { name: 'PURR', index: 1, tokenId: '0xc1fb593aeffbeb02f85e0308e9956a90', szDecimals: 0, weiDecimals: 5, evmContract: { address: MOCK_PURR_EVM, evm_extra_wei_decimals: 13 } },
-        { name: 'HYPE', index: 150, tokenId: '0x0d01dc56dcaaca66ad901c959b4011ec', szDecimals: 2, weiDecimals: 8, evmContract: { address: HYPERLIQUID.hypeSystemAddress, evm_extra_wei_decimals: 10 } },
+        { name: 'HYPE', index: 150, tokenId: '0x0d01dc56dcaaca66ad901c959b4011ec', szDecimals: 2, weiDecimals: 8, evmContract: null },
       ],
       universe: [
         { name: 'PURR/USDC', index: 0, tokens: [1, 0] },
@@ -181,6 +182,12 @@ export function buildSamples(now = Date.now()): Sample[] {
       request: typed(userSigned('Withdraw', [['hyperliquidChain', 'string'], ['destination', 'string'], ['amount', 'string'], ['time', 'uint64']], { destination: ALICE, amount: '50', time: now })) },
     { id: 'hl-withdraw-other', group: 'HyperCore', label: 'Withdraw 2,500 USDC to another address', chainId: 42161,
       request: typed(userSigned('Withdraw', [['hyperliquidChain', 'string'], ['destination', 'string'], ['amount', 'string'], ['time', 'uint64']], { destination: BOB, amount: '2500', time: now })) },
+    { id: 'hl-cctp-withdraw', group: 'HyperCore', label: 'Circle CCTP: withdraw 100 USDC to Arbitrum', chainId: 42161,
+      request: typed(userSigned('SendToEvmWithData', [['hyperliquidChain', 'string'], ['token', 'string'], ['amount', 'string'], ['sourceDex', 'string'], ['destinationRecipient', 'string'], ['addressEncoding', 'string'], ['destinationChainId', 'uint32'], ['gasLimit', 'uint64'], ['data', 'bytes'], ['nonce', 'uint64']],
+        { token: 'USDC', amount: '100', sourceDex: '', destinationRecipient: ALICE, addressEncoding: 'hex', destinationChainId: 3, gasLimit: 200000, data: '0x', nonce: now })) },
+    { id: 'hl-to-hyperevm', group: 'HyperCore', label: 'Move 100 USDC to HyperEVM (SendAsset)', chainId: 42161,
+      request: typed(userSigned('SendAsset', [['hyperliquidChain', 'string'], ['destination', 'string'], ['sourceDex', 'string'], ['destinationDex', 'string'], ['token', 'string'], ['amount', 'string'], ['fromSubAccount', 'string'], ['nonce', 'uint64']],
+        { destination: '0x2000000000000000000000000000000000000000', sourceDex: 'spot', destinationDex: 'spot', token: 'USDC', amount: '100', fromSubAccount: '', nonce: now })) },
     { id: 'hl-usd-send', group: 'HyperCore', label: 'Send 25 USDC on Hyperliquid', chainId: 42161,
       request: typed(userSigned('UsdSend', [['hyperliquidChain', 'string'], ['destination', 'string'], ['amount', 'string'], ['time', 'uint64']], { destination: BOB, amount: '25', time: now })) },
     { id: 'hl-spot-send', group: 'HyperCore', label: 'Send 10,000 PURR', chainId: 42161,

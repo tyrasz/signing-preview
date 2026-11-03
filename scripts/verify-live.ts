@@ -4,12 +4,14 @@
 //     Arbitrum One, funding a fresh throwaway address from a large USDC holder inside the simulation only.
 //  3. Checks CoreDepositWallet's recipient rules on HyperEVM with eth_call + a USDC balance/allowance override.
 //  4. Resolves every live HyperCore asset ID (perps, spot, HIP-3, outcomes) to a named, priced market.
+//  5. Checks HyperCore -> other-chain withdrawal fees and runs CoreDepositWallet's HyperEVM withdrawal step
+//     (eth_call from the USDC system address), comparing each outcome with the preview's prediction.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io and
 // rpc.hyperliquid.xyz and api.hyperliquid.xyz (behind a proxy, run with NODE_USE_ENV_PROXY=1 on Node >= 22.21).
 import { createPublicClient, http, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
-import { StaticTokenRegistry } from '../src/chains.ts';
+import { HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
 import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
@@ -189,6 +191,40 @@ console.log('\n# HyperCore markets: every live asset ID resolves to a named mark
   for (const [kind, st] of stats) check(st.bad.length === 0, `${kind.padEnd(16)} ${st.n - st.bad.length}/${st.n}`, st.bad.length ? `unresolved: ${st.bad.slice(0, 5).join(', ')}` : '');
   const mode = await info.userAbstraction('0x0000000000000000000000000000000000000001');
   check(['unifiedAccount', 'portfolioMargin', 'disabled', 'default'].includes(mode), 'userAbstraction returns a known account mode', `live: ${mode}`);
+}
+
+console.log('\n# HyperCore -> other chains via Circle CCTP (CoreDepositWallet.coreReceiveWithData on HyperEVM)');
+{
+  const hlRpc = 'https://rpc.hyperliquid.xyz/evm', SYS = '0x2000000000000000000000000000000000000000' as const;
+  const cdwAbi = parseAbi(['function calculateCrossChainWithdrawalFee(bool,uint32) view returns (uint256)', 'function coreReceiveWithData(address from, bytes32 destinationRecipient, uint32 destinationChainId, uint256 amount, uint64 coreNonce, bytes data)']);
+  for (const d of [0, 3, 5, 6]) {
+    const live = await hl.readContract({ address: H.cdw, abi: cdwAbi, functionName: 'calculateCrossChainWithdrawalFee', args: [true, d] });
+    const expected = HYPERCORE_CCTP_WITHDRAWAL.cctpMaxFeeRaw + (HYPERCORE_CCTP_WITHDRAWAL.forwardFeeByDomain[d] ?? HYPERCORE_CCTP_WITHDRAWAL.defaultForwardFeeRaw);
+    check(live === expected, `withdrawal fee to CCTP domain ${d} matches the previewer`, `live ${live}, previewer ${expected}`);
+  }
+  const spot = await new HttpHyperliquidInfo().spotMeta();
+  check(spot.tokens.find(t => t.index === 0)?.evmContract?.address.toLowerCase() === H.cdw.toLowerCase(), "USDC's HyperEVM link is Circle's CoreDepositWallet");
+  check(spot.tokens.find(t => t.name === 'HYPE')?.evmContract === null, 'native HYPE has no EVM contract link (uses 0x2222…)');
+  const magic = '0x' + '636374702d666f7277617264'.padEnd(48, '0');
+  const fail = new Set(['withdrawal_below_fee', 'unknown_cctp_domain', 'hook_data_too_large']);
+  const me = privateKeyToAccount(generatePrivateKey()).address;
+  for (const [label, domain, amount, data] of [
+    ['10 USDC to Arbitrum', 3, '10', '0x'], ['0.2 USDC to Arbitrum (= fee)', 3, '0.2', '0x'], ['0.21 USDC to Arbitrum', 3, '0.21', '0x'],
+    ['1 USDC to Ethereum (< 1.2 fee)', 0, '1', '0x'], ['10 USDC to domain 42161', 42161, '10', '0x'], ['0.1 USDC, custom data (no fee)', 3, '0.1', '0xaabb'],
+    ['10 USDC, forwarding magic + data', 3, '10', magic + 'aabb'], ['10 USDC, 1025 bytes of data', 3, '10', '0x' + '00'.repeat(1025)],
+  ] as const) {
+    const typed = { domain: { name: 'HyperliquidSignTransaction', version: '1', chainId: 42161, verifyingContract: '0x0000000000000000000000000000000000000000' },
+      types: { 'HyperliquidTransaction:SendToEvmWithData': [['hyperliquidChain', 'string'], ['token', 'string'], ['amount', 'string'], ['sourceDex', 'string'], ['destinationRecipient', 'string'], ['addressEncoding', 'string'], ['destinationChainId', 'uint32'], ['gasLimit', 'uint64'], ['data', 'bytes'], ['nonce', 'uint64']].map(([name, type]) => ({ name, type })) },
+      primaryType: 'HyperliquidTransaction:SendToEvmWithData',
+      message: { hyperliquidChain: 'Mainnet', token: 'USDC', amount, sourceDex: 'spot', destinationRecipient: me, addressEncoding: 'hex', destinationChainId: domain, gasLimit: 200000, data, nonce: Date.now() } };
+    const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [me, JSON.stringify(typed)] }, {}, {});
+    const predictedFail = p.warnings.some(w => fail.has(w.code));
+    await sleep(1000);
+    const res = await fetch(hlRpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call',
+      params: [{ from: SYS, to: H.cdw, data: encodeFunctionData({ abi: cdwAbi, functionName: 'coreReceiveWithData', args: [me, padHex(me), domain, parseUnits(amount, 6), 1n, data as Hex] }) }, 'latest'] }) }).then(x => x.json());
+    const reverted = !!res.error;
+    check(predictedFail === reverted, label.padEnd(34), reverted ? `reverts: ${String(res.error.message).replace('execution reverted: ', '')}` : 'succeeds');
+  }
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
