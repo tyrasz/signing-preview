@@ -111,3 +111,43 @@ test('Exact decimal formatting', () => {
   assert.equal(parseUnits('1.5', 6), 1_500_000n);
   assert.equal(parseUnits('1.1234567', 6), null);
 });
+
+test('CoreWriter details from Hyperliquid\'s action table: outcome operation (17), max amounts, DEX and variant labels', async () => {
+  const abi = parseAbi(['function sendRawAction(bytes data)']);
+  const { encodeAbiParameters, parseAbiParameters } = await import('viem');
+  const raw = (id: number, params: string, values: unknown[]) => encodeFunctionData({ abi, functionName: 'sendRawAction', args: [('0x01' + id.toString(16).padStart(6, '0') + encodeAbiParameters(parseAbiParameters(params), values as never).slice(2)) as `0x${string}`] });
+  const send = (data: string) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x3333333333333333333333333333333333333333', data, chainId: '0x3e7' }] }, { now: NOW }, mockDeps());
+  const OUT = 'uint8, uint32, uint32, uint64';
+  // Outcome 23205 is the mock "SOL above 94.882" market; question 563 is the mock Atletico/Bayern question.
+  const split = await send(raw(17, OUT, [0, 0, 23205, 1_000_000_000n]));
+  assert.equal(split.title, 'HyperCore outcome: Split 10 into Yes and No shares of SOL above 94.882 at 2026-11-03 06:00');
+  assert.equal(split.decoding.status, 'full');
+  const mergeMax = await send(raw(17, OUT, [1, 0, 23205, 0n]));
+  assert.equal(mergeMax.title, 'HyperCore outcome: Merge the maximum available Yes + No shares of SOL above 94.882 at 2026-11-03 06:00');
+  const mergeQ = await send(raw(17, OUT, [2, 563, 0, 500_000_000n]));
+  assert.equal(mergeQ.title, 'HyperCore outcome: Merge 5 Yes shares across question #563');
+  const negate = await send(raw(17, OUT, [3, 563, 22153, 200_000_000n]));
+  assert.match(negate.title, /^HyperCore outcome: Convert 2 No shares of Sports Contest Result .* · Atletico Madrid into Yes shares of the other outcomes$/);
+  const dropped = await send(raw(17, OUT, [0, 563, 23205, 1_000_000_000n]));
+  assert.ok(codes(dropped).includes('dropped_payload'), 'split must leave question = 0');
+  const droppedQ = await send(raw(17, OUT, [2, 563, 7, 1n]));
+  assert.ok(codes(droppedQ).includes('dropped_payload'), 'mergeQuestion must leave outcome = 0');
+
+  const withdrawAll = await send(raw(15, 'uint8, uint64, uint64', [1, 0n, 0n]));
+  assert.equal(withdrawAll.title, 'Withdraw all USDC from HyperCore lending');
+
+  const own = await send(raw(13, 'address, address, uint32, uint32, uint64, uint64', [ALICE, '0x0000000000000000000000000000000000000000', 0, 4294967295, 0n, 500_000_000n]));
+  assert.equal(own.title, 'Move 5 USDC from main perps DEX to spot');
+  const toHip3 = await send(raw(13, 'address, address, uint32, uint32, uint64, uint64', [BOB, '0x0000000000000000000000000000000000000000', 4294967295, 1, 0n, 100_000_000n]));
+  assert.equal(detail(toHip3, 'To'), 'XYZ perps (DEX 1)');
+
+  const fin = await send(raw(8, 'uint64, uint8, uint64', [1n, 2, 0n]));
+  assert.equal(detail(fin, 'Verification'), 'First storage slot');
+  assert.equal(detail(fin, 'Create nonce'), undefined);
+
+  const fee = await send(raw(12, 'uint64, address', [10n, BOB]));
+  assert.equal(detail(fee, 'Maximum fee rate'), '0.01% (10 decibps)', "Hyperliquid: maxFeeRate 10 = 0.01%");
+
+  const wallet = await send(raw(9, 'address, string', [BOB, '']));
+  assert.match(detail(wallet, 'Name')!, /becomes your main API wallet/);
+});

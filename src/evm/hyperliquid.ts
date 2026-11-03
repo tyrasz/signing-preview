@@ -59,6 +59,7 @@ export const bridge2Adapter: Adapter = async (tx, env) => {
   if (amount < HYPERLIQUID.minDepositRaw) {
     b.warn('danger', 'deposit_below_minimum', `Deposits under ${formatUnits(HYPERLIQUID.minDepositRaw, 6)} USDC are not credited and the funds are lost. This deposit is ${amountText}.`);
   }
+  b.warn('info', 'legacy_bridge', "Hyperliquid's docs call Bridge2 the legacy bridge and say it is deprecated; Circle CCTP is now the preferred way to deposit.");
   b.warn('info', 'deposit_credited_to_sender', 'The deposit is credited to the Hyperliquid account with the same address as the sender. If the sender is a smart-contract wallet, make sure it can operate a Hyperliquid account.');
   return decoded({
     title: `Deposit ${amountText} to Hyperliquid`,
@@ -123,7 +124,12 @@ const CORE_ACTIONS: Record<number, { name: string; params: string }> = {
   13: { name: 'sendAsset', params: 'address destination, address subAccount, uint32 sourceDex, uint32 destinationDex, uint64 token, uint64 amount' },
   15: { name: 'borrowLend', params: 'uint8 operation, uint64 token, uint64 amount' },
   16: { name: 'setAbstraction', params: 'address user, uint8 abstraction' },
+  // From Hyperliquid's "Interacting with HyperCore" action table (2026-11-03); not yet in hyper-evm-lib.
+  17: { name: 'outcomeOperation', params: 'uint8 operation, uint32 question, uint32 outcome, uint64 amount' },
 };
+const FINALIZE_VARIANTS: Record<number, string> = { 1: 'Create (uses the EOA deploy nonce)', 2: 'First storage slot', 3: 'Custom storage slot (keccak256("HyperCore deployer"))' };
+const OUTCOME_OPS: Record<number, string> = { 0: 'SplitOutcome', 1: 'MergeOutcome', 2: 'MergeQuestion', 3: 'NegateOutcome' };
+const SPOT_DEX = 4294967295;
 const ABSTRACTIONS: Record<number, string> = { 1: 'disabled', 2: 'unified account', 3: 'portfolio margin' };
 const TIF: Record<number, string> = { 1: 'Limit, add liquidity only (post-only)', 2: 'Limit, good til cancelled', 3: 'Limit, immediate or cancel' };
 
@@ -202,13 +208,15 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
     }
     case 8: {
       const [token, variant, nonce] = f as [bigint, number, bigint];
-      b.detail('Token index', token.toString()).detail('Variant', String(variant)).detail('Create nonce', nonce.toString());
+      b.detail('Token index', token.toString()).detail('Verification', FINALIZE_VARIANTS[variant] ?? `unknown variant ${variant}`, String(variant));
+      if (variant === 1) b.detail('Create nonce', nonce.toString());
+      if (!FINALIZE_VARIANTS[variant]) b.warn('caution', 'unknown_variant', `Finalize variant ${variant} is not one of Create (1), FirstStorageSlot (2) or CustomStorageSlot (3).`);
       b.warn('caution', 'finalize_evm_contract', 'Links a HyperCore token to a HyperEVM contract. This is a token-deployer operation.');
       return { title: `Finalize EVM contract link for token #${token}`, summary: 'Token deployer action.' };
     }
     case 9: {
       const [wallet, name] = f as [string, string];
-      b.detail('API wallet', wallet).detail('Name', name || '(unnamed)');
+      b.detail('API wallet', wallet).detail('Name', name || '(unnamed): becomes your main API wallet, replacing the current one');
       b.warn('danger', 'add_api_wallet', `${shortAddress(wallet)} will be able to sign trading and account actions for this account (Hyperliquid limits agent transfers to the account itself). Only add wallets you control.`);
       return { title: `Authorise API wallet ${shortAddress(wallet)}`, summary: 'Grants trading authority on HyperCore to another key.' };
     }
@@ -221,7 +229,8 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
     }
     case 12: {
       const [rate, builder] = f as [bigint, string];
-      b.detail('Builder', builder).detail('Maximum fee rate', `${Number(rate) / 1000}% (assuming tenths of a basis point)`, rate.toString());
+      // Hyperliquid: "maxFeeRate is in decibps. To approve a builder fee of 0.01% maxFeeRate should be 10."
+      b.detail('Builder', builder).detail('Maximum fee rate', `${decimalString(rate, 3)}% (${rate} decibps)`, rate.toString());
       b.warn('caution', 'approve_builder_fee', `${shortAddress(builder)} will be allowed to charge a fee on orders it submits for you, up to this rate.`);
       return { title: `Approve builder fee for ${shortAddress(builder)}`, summary: 'Allows a frontend/builder to add a fee to your orders.' };
     }
@@ -229,13 +238,21 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
       const [destination, subAccount, sourceDex, destinationDex, tokenIndex, amount] = f as [string, string, number, number, bigint, bigint];
       const token = await findSpotToken(info, { index: Number(tokenIndex) });
       const amountText = token ? `${formatUnits(amount, token.weiDecimals)} ${token.name}` : `${amount} base units of token #${tokenIndex}`;
-      b.detail('Recipient', destination).detail('Sub-account', /^0x0{40}$/.test(subAccount) ? 'none' : subAccount).detail('Source DEX', String(sourceDex)).detail('Destination DEX', String(destinationDex)).detail('Amount', amountText, amount.toString());
+      // Hyperliquid: uint32::MAX selects spot; other values are perp DEX indices (0 = main DEX).
+      let dexes: ({ name: string; fullName?: string } | null)[] = [];
+      try { dexes = (await info?.perpDexs?.()) ?? []; } catch { dexes = []; }
+      const dexName = (d: number) => d === SPOT_DEX ? 'spot' : d === 0 ? 'main perps DEX' : dexes[d] ? `${dexes[d]!.fullName ?? dexes[d]!.name} perps (DEX ${d})` : `perp DEX #${d}`;
+      const fromSub = !/^0x0{40}$/.test(subAccount);
+      b.detail('Recipient', destination).detail('From sub-account', fromSub ? subAccount : 'none (main account)')
+        .detail('From', dexName(sourceDex), String(sourceDex)).detail('To', dexName(destinationDex), String(destinationDex)).detail('Amount', amountText, amount.toString());
+      if (sameAddress(destination, from) && !fromSub) return { title: `Move ${amountText} from ${dexName(sourceDex)} to ${dexName(destinationDex)}`, summary: 'Moves an asset between your own HyperCore balances.', status: token ? 'full' : 'partial' };
       return { title: `Send ${amountText} to ${shortAddress(destination)}`, summary: 'Transfers an asset between HyperCore accounts or DEXes.', status: token ? 'full' : 'partial' };
     }
     case 15: {
       const [op, tokenIndex, amount] = f as [number, bigint, bigint];
       const token = await findSpotToken(info, { index: Number(tokenIndex) });
-      const amountText = token ? `${formatUnits(amount, token.weiDecimals)} ${token.name}` : `${amount} base units of token #${tokenIndex}`;
+      // Hyperliquid: "If wei is 0 then maximally apply the operation, e.g. withdraw full balance from reserve."
+      const amountText = amount === 0n ? `all ${token?.name ?? `token #${tokenIndex}`}` : token ? `${formatUnits(amount, token.weiDecimals)} ${token.name}` : `${amount} base units of token #${tokenIndex}`;
       const verb = op === 0 ? 'Supply' : op === 1 ? 'Withdraw' : `Borrow/lend operation ${op}`;
       b.detail('Operation', verb, String(op)).detail('Amount', amountText, amount.toString());
       if (op !== 0 && op !== 1) b.warn('caution', 'unknown_borrow_lend_op', `Borrow/lend operation ${op} is not recognised.`);
@@ -247,6 +264,27 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
       b.detail('Account', user).detail('Account mode', label, String(mode));
       b.warn('caution', 'set_abstraction', `Changes how balances and margin are shared across this account's markets (to: ${label}). This affects liquidation risk.`);
       return { title: `Set HyperCore account mode to ${label}`, summary: 'Changes the account abstraction (margin sharing) mode.', status: ABSTRACTIONS[mode] ? 'full' : 'partial' };
+    }
+    case 17: {
+      // Hyperliquid: 0 SplitOutcome, 1 MergeOutcome, 2 MergeQuestion, 3 NegateOutcome. Split/Merge ignore question,
+      // MergeQuestion ignores outcome; "Payloads with non-zero unused fields are dropped." Merge amount 0 = maximum.
+      const [op, question, outcome, amount] = f as [number, number, number, bigint];
+      const opName = OUTCOME_OPS[op];
+      const outcomeLabel = async () => { const a = await resolveAsset(info, 100_000_000 + 10 * outcome); return a.kind === 'outcome' ? a.name.replace(/: [^:]*$/, '') : `outcome #${outcome}`; };
+      const amt = amount === 0n && (op === 1 || op === 2) ? 'the maximum available' : decimalString(amount, 8);
+      b.detail('Operation', opName ?? `unknown (${op})`, String(op)).detail('Amount', amount === 0n && (op === 1 || op === 2) ? amt : `${amt} (8-decimal HyperCore units)`, amount.toString());
+      if (op === 0 || op === 1 || op === 3) b.detail('Outcome', await outcomeLabel(), String(outcome));
+      if (op === 2 || op === 3) b.detail('Question', `#${question}`, String(question));
+      const unusedSet = (op === 0 || op === 1) ? question !== 0 : op === 2 ? outcome !== 0 : false;
+      if (!opName) b.warn('caution', 'unknown_outcome_op', `Outcome operation ${op} is not recognised.`);
+      if (unusedSet) b.warn('caution', 'dropped_payload', `${opName} must leave the ${op === 2 ? 'outcome' : 'question'} field at 0; Hyperliquid drops payloads with non-zero unused fields, so this does nothing (gas is still spent).`);
+      b.note("Hyperliquid requires the amount to be a multiple of the market's size step.");
+      const name = op === 2 ? `question #${question}` : await outcomeLabel();
+      const titles: Record<number, string> = {
+        0: `Split ${amt} into Yes and No shares of ${name}`, 1: `Merge ${amt} Yes + No shares of ${name}`,
+        2: `Merge ${amt} Yes shares across ${name}`, 3: `Convert ${amt} No shares of ${name} into Yes shares of the other outcomes`,
+      };
+      return { title: `HyperCore outcome: ${titles[op] ?? `operation ${op}`}`, summary: 'Splits, merges or converts outcome (prediction-market) shares on HyperCore.', status: opName && !unusedSet ? 'full' : 'partial' };
     }
   }
   return { title: 'HyperCore action', summary: '', status: 'opaque' };

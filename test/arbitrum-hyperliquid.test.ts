@@ -68,3 +68,8 @@ test('EIP-5792 batches preview each call and flag the unlimited approval', async
   assert.equal(p.calls?.[1].title, 'Deposit 20 USDC to Hyperliquid');
   assert.ok(p.warnings.some(w => w.code === 'unlimited_approval' && w.message.startsWith('Call 1:')));
 });
+
+test("Bridge2 deposits note that Hyperliquid's docs call the bridge legacy and deprecated", async () => {
+  const p = await sample('bridge2-deposit');
+  assert.ok(codes(p).includes('legacy_bridge'));
+});
