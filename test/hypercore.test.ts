@@ -103,5 +103,5 @@ test('Marketable limit far through the mid is flagged; margin is checked against
   assert.ok(codes(p).includes('price_far_through_market'));
   // 20 ETH × 3900 at the existing 10× position leverage needs ~$7,800 against $3,200 available.
   assert.ok(codes(p).includes('insufficient_margin'));
-  assert.equal(detail(p, 'Margin required (approx.)'), '$7,800.00');
+  assert.equal(detail(p, 'Margin required (approx.)'), '$7,800.00 at 10×');
 });

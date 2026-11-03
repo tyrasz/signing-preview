@@ -3,12 +3,15 @@
 //  2. Simulates Circle's Arbitrum -> HyperCore guide transactions (and known mistakes) with eth_simulateV1 on
 //     Arbitrum One, funding a fresh throwaway address from a large USDC holder inside the simulation only.
 //  3. Checks CoreDepositWallet's recipient rules on HyperEVM with eth_call + a USDC balance/allowance override.
+//  4. Resolves every live HyperCore asset ID (perps, spot, HIP-3, outcomes) to a named, priced market.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io and
-// rpc.hyperliquid.xyz (behind a proxy, run with NODE_USE_ENV_PROXY=1 on Node >= 22.21).
+// rpc.hyperliquid.xyz and api.hyperliquid.xyz (behind a proxy, run with NODE_USE_ENV_PROXY=1 on Node >= 22.21).
 import { createPublicClient, http, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
+import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
+import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
 const RPC = 'https://arb1.arbitrum.io/rpc';
 const client = createPublicClient({ transport: http(RPC) });
@@ -159,6 +162,33 @@ for (const [label, recipient, dex, expectRevert] of [
     params: [{ from: me, to: H.cdw, data: encodeFunctionData({ abi: depositFor, functionName: 'depositFor', args: [recipient as Address, amt, dex] }) }, 'latest', override] }) }).then(x => x.json());
   const got = res.error ? String(res.error.message).replace('execution reverted: ', '') : null;
   check(got === expectRevert, label.padEnd(34), got ? `reverts: ${got}` : 'succeeds');
+}
+
+console.log('\n# HyperCore markets: every live asset ID resolves to a named market with a mid price');
+{
+  const info = new HttpHyperliquidInfo();
+  const [meta, spot, dexs, om] = await Promise.all([info.meta(), info.spotMeta(), info.perpDexs(), info.outcomeMeta()]);
+  const ids: [string, number][] = [];
+  meta.universe.forEach((_, i) => ids.push(['main-DEX perps', i]));
+  spot.universe.forEach(p => ids.push(['spot pairs', 10_000 + p.index]));
+  const mids = new Map<string, Record<string, string>>([['', await info.allMids()]]);
+  for (const [d, dex] of dexs.entries()) {
+    if (d === 0 || !dex) continue;
+    (await info.meta(dex.name)).universe.forEach((_, i) => ids.push(['HIP-3 perps', 100_000 + d * 10_000 + i]));
+    mids.set(dex.name, await info.allMids(dex.name));
+  }
+  om.outcomes.forEach(o => o.sideSpecs.forEach((_, side) => ids.push(['outcome sides', 100_000_000 + 10 * o.outcome + side])));
+  const stats = new Map<string, { n: number; bad: number[] }>();
+  for (const [kind, id] of ids) {
+    const st = stats.get(kind) ?? { n: 0, bad: [] };
+    stats.set(kind, st);
+    const a = await resolveAsset(info, id);
+    st.n++;
+    if (a.kind === 'unknown' || !a.midKey || !(Number(mids.get(a.dex ?? '')?.[a.midKey]) > 0)) st.bad.push(id);
+  }
+  for (const [kind, st] of stats) check(st.bad.length === 0, `${kind.padEnd(16)} ${st.n - st.bad.length}/${st.n}`, st.bad.length ? `unresolved: ${st.bad.slice(0, 5).join(', ')}` : '');
+  const mode = await info.userAbstraction('0x0000000000000000000000000000000000000001');
+  check(['unifiedAccount', 'portfolioMargin', 'disabled', 'default'].includes(mode), 'userAbstraction returns a known account mode', `live: ${mode}`);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

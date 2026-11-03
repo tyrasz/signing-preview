@@ -1,7 +1,7 @@
 import { formatDecimalString, formatDuration, formatTimestamp, formatUnits, formatUsd, parseUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import { HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
+import { chainName, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
 import { l1ActionHash } from '../hyperliquid/action-hash.ts';
-import { describeOrder, findSpotToken, resolveAsset, TIF_LABELS } from '../hyperliquid/assets.ts';
+import { describeOrder, findSpotToken, resolveAsset, TIF_LABELS, type ResolvedAsset } from '../hyperliquid/assets.ts';
 import type { HyperliquidInfo, Network } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv } from './common.ts';
 
@@ -151,6 +151,56 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
       checkNonce(b, env, m.nonce, 'Nonce');
       return out(`Send ${formatDecimalString(amount)} ${name} to ${shortAddress(destination)}`, 'Transfers an asset between Hyperliquid accounts or DEXes.');
     }
+    case 'SendToEvmWithData': {
+      const amount = str(m.amount), token = str(m.token), recipient = str(m.destinationRecipient), data = str(m.data);
+      const chainId = Number(m.destinationChainId);
+      const dataBytes = /^0x[0-9a-fA-F]*$/.test(data) ? (data.length - 2) / 2 : NaN;
+      b.detail('Token', token).detail('Amount', `${formatDecimalString(amount)} ${token}`, amount).detail('From DEX', str(m.sourceDex) || 'default')
+        .detail('Destination chain', `${chainName(chainId)} (chain ID ${chainId})`, String(m.destinationChainId)).detail('Recipient', `${recipient} (${str(m.addressEncoding)})`)
+        .detail('Gas limit', str(m.gasLimit)).detail('Data passed to recipient', Number.isNaN(dataBytes) ? data : `${dataBytes} bytes`, data);
+      checkNonce(b, env, m.nonce, 'Nonce');
+      if (env.signer && str(m.addressEncoding) === 'hex' && !sameAddress(recipient, env.signer)) b.warn('caution', 'recipient_not_sender', `The tokens go to ${shortAddress(recipient)}, not to your address.`);
+      if (dataBytes > 0) b.warn('caution', 'send_to_evm_with_data', `The recipient contract receives the tokens together with ${dataBytes} bytes of data it will act on. That data cannot be interpreted here; only approve if you trust the app that built it.`);
+      return out(`Send ${formatDecimalString(amount)} ${token} from HyperCore to ${chainName(chainId)}`, `Moves ${formatDecimalString(amount)} ${token} from your HyperCore balance to ${shortAddress(recipient)} on ${chainName(chainId)}${dataBytes > 0 ? ', calling the recipient contract with extra data' : ''}.`, dataBytes > 0 ? 'partial' : 'full',
+        env.signer ? [{ direction: 'out', account: env.signer, amount: formatDecimalString(amount), symbol: token, basis: 'requested' }] : []);
+    }
+    case 'UserSetAbstraction': {
+      const mode = str(m.abstraction), user = str(m.user);
+      const labels: Record<string, string> = { disabled: 'standard (separate spot and perps balances)', unifiedAccount: 'unified account', portfolioMargin: 'portfolio margin' };
+      b.detail('Account', user).detail('New account mode', labels[mode] ?? mode, mode);
+      checkNonce(b, env, m.nonce, 'Nonce');
+      if (env.signer && !sameAddress(user, env.signer)) b.warn('caution', 'other_account', `This changes the mode of ${shortAddress(user)}, not your own account.`);
+      if (!labels[mode]) b.warn('caution', 'unknown_mode', `Account mode "${mode}" is not recognised.`);
+      else if (mode !== 'disabled') b.warn('caution', 'shared_collateral', 'Your balances will be shared as collateral across markets. A loss in one position can draw on, and liquidate against, your other balances.');
+      return out(`Set account mode to ${labels[mode] ?? mode}`, 'Changes how your Hyperliquid balances back your positions.', labels[mode] ? 'full' : 'partial');
+    }
+    case 'UserDexAbstraction':
+    case 'UserPortfolioMargin': {
+      const enabled = m.enabled === true || m.enabled === 'true', user = str(m.user);
+      const what = type === 'UserPortfolioMargin' ? 'portfolio margin' : 'HIP-3 DEX abstraction';
+      b.detail('Account', user).detail(type === 'UserPortfolioMargin' ? 'Portfolio margin' : 'HIP-3 DEX abstraction', enabled ? 'Enable' : 'Disable');
+      checkNonce(b, env, m.nonce, 'Nonce');
+      if (env.signer && !sameAddress(user, env.signer)) b.warn('caution', 'other_account', `This changes ${shortAddress(user)}, not your own account.`);
+      if (enabled) b.warn('caution', 'shared_collateral', type === 'UserPortfolioMargin'
+        ? 'With portfolio margin, positions are margined together: a loss in one can reduce the margin of, and liquidate, the others.'
+        : 'Builder-deployed (HIP-3) perp DEXes will be able to use collateral from your main account, so losses there can affect your main balances.');
+      return out(`${enabled ? 'Enable' : 'Disable'} ${what}`, `${enabled ? 'Turns on' : 'Turns off'} ${what} for your Hyperliquid account.`);
+    }
+    case 'LinkStakingUser': {
+      const user = str(m.user), finalize = m.isFinalize === true || m.isFinalize === 'true';
+      b.detail(finalize ? 'Trading account to link' : 'Staking account', user).detail('Step', finalize ? 'Finalize (permanent)' : 'Request link');
+      checkNonce(b, env, m.nonce, 'Nonce');
+      if (finalize) b.warn('caution', 'staking_link_finalize', `This permanently links trading account ${shortAddress(user)} to your staking account for fee discounts.`);
+      else b.warn('danger', 'staking_link_request', `Once ${shortAddress(user)} finalizes, that staking account can permanently disable this trading account, locking its funds and receiving them after a year. Only link to a staking account you control.`);
+      return out(finalize ? `Finalize staking link with ${shortAddress(user)}` : `Request staking link to ${shortAddress(user)}`, 'Links a staking account and a trading account so staked HYPE gives the trading account fee discounts.');
+    }
+    case 'StakingLinkDisableTradingUser': {
+      const user = str(m.tradingUser);
+      b.detail('Trading account', user);
+      checkNonce(b, env, m.nonce, 'Nonce');
+      b.warn('danger', 'staking_link_disable', `Irreversible: permanently disables linked trading account ${shortAddress(user)} and locks its funds. After one year they are transferred to this staking account.`);
+      return out(`Permanently disable trading account ${shortAddress(user)}`, 'Locks a linked trading account for good; its funds move to the staking account after a year.');
+    }
     case 'SendMultiSig': {
       b.detail('Multi-sig action hash', str(m.multiSigActionHash));
       checkNonce(b, env, m.nonce, 'Nonce');
@@ -228,7 +278,7 @@ async function describeL1Action(action: Wire, b: PreviewBuilder, info: Hyperliqu
         const spec = orderSpec(o);
         lines.push(await describeOrder(b, info, asset, spec, orders.length > 1 ? `#${i + 1} ` : ''));
         if (orderSpec(o).orderType === 'Unknown') b.warn('caution', 'unknown_order_type', 'An order has an unrecognised type.');
-        await marginCheck(b, info, account, asset.midKey, Number(spec.price) * Number(spec.size), spec.reduceOnly);
+        await fundsCheck(b, info, account, asset, spec);
       }
       const grouping = str(action.grouping);
       if (grouping && grouping !== 'na') b.detail('Grouping', grouping === 'normalTpsl' ? 'Order with TP/SL' : grouping === 'positionTpsl' ? 'Position TP/SL' : grouping);
@@ -309,6 +359,63 @@ async function describeL1Action(action: Wire, b: PreviewBuilder, info: Hyperliqu
     case 'setReferrer':
       b.detail('Referral code', str(action.code));
       return { title: `Use referral code ${str(action.code)}`, summary: 'Sets the referrer for your account (one-time).', status: 'full' };
+    case 'borrowLend': {
+      const op = str(action.operation), token = await findSpotToken(info, { index: Number(action.token) });
+      const name = token?.name ?? `token #${str(action.token)}`;
+      const amount = action.amount === null || action.amount === undefined ? `all ${name}` : `${formatDecimalString(str(action.amount))} ${name}`;
+      const verbs: Record<string, string> = { supply: 'Supply', withdraw: 'Withdraw', repay: 'Repay', borrow: 'Borrow' };
+      b.detail('Operation', verbs[op] ?? op).detail('Token', name, str(action.token)).detail('Amount', amount, str(action.amount));
+      if (!token) b.warn('caution', 'core_token_unknown', `HyperCore token #${str(action.token)} could not be looked up.`);
+      if (op === 'borrow') b.warn('caution', 'borrow', `Borrowing ${amount} creates debt against your collateral; it accrues interest and can be liquidated if your collateral falls.`);
+      if (!verbs[op]) b.warn('caution', 'unknown_operation', `Lending operation "${op}" is not recognised.`);
+      const prep: Record<string, string> = { supply: 'to', repay: 'to', withdraw: 'from', borrow: 'from' };
+      return { title: `${verbs[op] ?? op} ${amount} ${prep[op] ?? 'via'} HyperCore lending`, summary: 'Changes your HyperCore borrow/lend position.', status: token && verbs[op] ? 'full' : 'partial' };
+    }
+    case 'topUpIsolatedOnlyMargin': {
+      const asset = await resolveAsset(info, Number(action.asset));
+      b.detail('Market', asset.name, str(action.asset)).detail('Target leverage', `${formatDecimalString(str(action.leverage))}×`);
+      return { title: `Top up ${asset.name} isolated margin to ${formatDecimalString(str(action.leverage))}× leverage`, summary: 'Adds USDC margin to an isolated position until it reaches the target leverage.', status: asset.kind === 'unknown' ? 'partial' : 'full' };
+    }
+    case 'subAccountSpotTransfer': {
+      const token = str(action.token), name = token.split(':')[0], amount = `${formatDecimalString(str(action.amount))} ${name}`;
+      b.detail('Sub-account', str(action.subAccountUser)).detail('Token', name, token).detail('Amount', amount, str(action.amount));
+      return { title: `${action.isDeposit ? 'Move' : 'Withdraw'} ${amount} ${action.isDeposit ? 'to' : 'from'} sub-account ${shortAddress(str(action.subAccountUser))}`, summary: 'Moves a spot token between your main account and a sub-account.', status: 'full' };
+    }
+    case 'claimRewards':
+      return { title: 'Claim referral rewards', summary: 'Claims your accumulated referral rewards into your account.', status: 'full' };
+    case 'createVault': {
+      b.detail('Vault name', str(action.name)).detail('Description', str(action.description)).detail('Initial deposit', usd(action.initialUsd), str(action.initialUsd));
+      b.warn('info', 'create_vault', `Creates a vault that you lead, funded with ${usd(action.initialUsd)} from your account. Followers' funds will trade with your strategy.`);
+      return { title: `Create vault "${str(action.name)}" with ${usd(action.initialUsd)}`, summary: 'Creates a new Hyperliquid vault led by your account.', status: 'full' };
+    }
+    case 'vaultModify': {
+      const flag = (v: unknown) => v === null || v === undefined ? 'unchanged' : v ? 'Yes' : 'No';
+      b.detail('Vault', str(action.vaultAddress)).detail('Allow deposits', flag(action.allowDeposits)).detail('Always close positions on withdrawal', flag(action.alwaysCloseOnWithdraw));
+      return { title: `Change settings of vault ${shortAddress(str(action.vaultAddress))}`, summary: 'Updates deposit and withdrawal settings for a vault you lead.', status: 'full' };
+    }
+    case 'vaultDistribute': {
+      const n = big(action.usd);
+      b.detail('Vault', str(action.vaultAddress)).detail('Amount', n === 0n ? '0 (close the vault)' : usd(action.usd), str(action.usd));
+      if (n === 0n) b.warn('caution', 'close_vault', 'An amount of 0 closes the vault and returns funds to followers.');
+      return { title: n === 0n ? `Close vault ${shortAddress(str(action.vaultAddress))}` : `Distribute ${usd(action.usd)} from vault ${shortAddress(str(action.vaultAddress))}`, summary: 'Distributes vault funds to its followers.', status: 'full' };
+    }
+    case 'registerReferrer':
+      b.detail('Referral code', str(action.code));
+      return { title: `Create referral code ${str(action.code)}`, summary: 'Registers a referral code for your account.', status: 'full' };
+    case 'setDisplayName':
+      b.detail('Display name', str(action.displayName) || '(removed)');
+      return { title: str(action.displayName) ? `Set leaderboard name to "${str(action.displayName)}"` : 'Remove leaderboard name', summary: 'Changes the public name shown for your account on the leaderboard.', status: 'full' };
+    case 'spotUser': {
+      const optOut = (action.toggleSpotDusting as Wire | undefined)?.optOut;
+      b.detail('Spot dusting', optOut ? 'Opt out' : 'Opt in');
+      return { title: `${optOut ? 'Opt out of' : 'Opt in to'} spot dusting`, summary: 'Controls whether tiny spot balances ("dust") are automatically converted.', status: typeof optOut === 'boolean' ? 'full' : 'partial' };
+    }
+    case 'subAccountModify':
+      b.detail('Sub-account', str(action.subAccountUser)).detail('New name', str(action.name));
+      return { title: `Rename sub-account ${shortAddress(str(action.subAccountUser))} to "${str(action.name)}"`, summary: 'Renames one of your sub-accounts.', status: 'full' };
+    case 'evmUserModify':
+      b.detail('HyperEVM blocks', action.usingBigBlocks ? 'Large (slower, higher gas limit)' : 'Small (fast)');
+      return { title: `Use ${action.usingBigBlocks ? 'large' : 'small'} HyperEVM blocks`, summary: 'Chooses which HyperEVM block type your EVM transactions go into (affects deploying large contracts).', status: 'full' };
     case 'noop':
       return { title: 'Hyperliquid no-op', summary: 'Consumes a nonce without doing anything (used to invalidate pending actions).', status: 'full' };
   }
@@ -317,20 +424,46 @@ async function describeL1Action(action: Wire, b: PreviewBuilder, info: Hyperliqu
   return { title: `Hyperliquid action: ${type}`, summary: 'An unrecognised Hyperliquid L1 action.', status: 'partial' };
 }
 
-async function marginCheck(b: PreviewBuilder, info: HyperliquidInfo | undefined, account: string | null, coin: string | null, notional: number, reduceOnly: boolean) {
-  if (!info || !account || !coin || reduceOnly || !Number.isFinite(notional)) return;
+/** Checks the order against the account: margin for perps (per DEX), balances for spot. */
+async function fundsCheck(b: PreviewBuilder, info: HyperliquidInfo | undefined, account: string | null, asset: ResolvedAsset, spec: { isBuy: boolean; price: string; size: string; reduceOnly: boolean }) {
+  const price = Number(spec.price), size = Number(spec.size), notional = price * size;
+  if (!info || !account || spec.reduceOnly || !Number.isFinite(notional)) return;
+  if (asset.kind === 'spot' && asset.base && asset.quote && info.spotClearinghouseState) {
+    let balances;
+    try { balances = (await info.spotClearinghouseState(account)).balances; } catch { return; }
+    const free = (token: number) => { const x = balances.find(bal => bal.token === token); return x ? Number(x.total) - Number(x.hold) : 0; };
+    const [token, need] = spec.isBuy ? [asset.quote, notional] : [asset.base, size];
+    const have = free(token.index);
+    b.detail(`Available ${token.name}`, formatDecimalString(String(have)));
+    if (have < need) b.warn('caution', 'insufficient_balance', `This order needs ${formatDecimalString(String(need))} ${token.name} but only ${formatDecimalString(String(have))} is available in spot. It may be rejected.`);
+    return;
+  }
+  if (asset.kind !== 'perp' || !asset.midKey) return;
+  let mode: string | undefined;
+  try { mode = await info.userAbstraction?.(account); } catch { mode = undefined; }
+  if (mode === 'unifiedAccount' || mode === 'portfolioMargin') {
+    b.detail('Account mode', mode === 'unifiedAccount' ? 'Unified account (collateral shared)' : 'Portfolio margin (collateral shared)');
+    b.note('Margin was not checked per market because this account shares collateral across spot, perps and DEXes.');
+    return;
+  }
   let state;
-  try { state = await info.clearinghouseState(account); } catch { return; }
+  try { state = await info.clearinghouseState(account, asset.dex); } catch { return; }
   const withdrawable = Number(state.withdrawable);
-  b.detail('Account value', formatUsd(Number(state.marginSummary.accountValue))).detail('Available margin', formatUsd(withdrawable));
+  const where = asset.dex ? ` on ${asset.dexFullName ?? asset.dex}` : '';
+  b.detail(`Account value${where}`, formatUsd(Number(state.marginSummary.accountValue))).detail(`Available margin${where}`, formatUsd(withdrawable));
+  const coin = asset.midKey;
   const position = state.assetPositions.find(p => p.position.coin === coin)?.position;
+  const leverage = position?.leverage.value ?? asset.maxLeverage;
   if (position) {
     b.detail(`Current ${coin} position`, `${formatDecimalString(position.szi)} @ ${formatDecimalString(position.entryPx ?? '?')} (${position.leverage.value}× ${position.leverage.type})`);
     if (position.liquidationPx) b.detail(`Current ${coin} liquidation price`, formatDecimalString(position.liquidationPx));
-    const required = notional / position.leverage.value;
-    b.detail('Margin required (approx.)', formatUsd(required));
-    if (required > withdrawable) b.warn('caution', 'insufficient_margin', `This order needs about ${formatUsd(required)} of margin at ${position.leverage.value}×, but only ${formatUsd(withdrawable)} is available. It may be rejected.`);
-  } else if (notional > withdrawable * 50) {
-    b.warn('caution', 'insufficient_margin', `The order's notional (${formatUsd(notional)}) is very large compared with the available margin (${formatUsd(withdrawable)}). It may be rejected.`);
+  }
+  if (!leverage) return;
+  const required = notional / leverage;
+  b.detail(position ? 'Margin required (approx.)' : 'Margin required at max leverage (approx.)', `${formatUsd(required)} at ${leverage}×`);
+  if (required > withdrawable) {
+    const msg = `This order needs about ${formatUsd(required)} of margin at ${leverage}×${position ? '' : ' (the maximum)'}, but only ${formatUsd(withdrawable)} is available${where}. It may be rejected.`;
+    // HIP-3 DEX accounts can be funded via DEX abstraction, which this check does not see.
+    b.warn(asset.dex ? 'info' : 'caution', 'insufficient_margin', asset.dex ? `${msg} (If DEX abstraction is on, collateral may come from your main account.)` : msg);
   }
 }

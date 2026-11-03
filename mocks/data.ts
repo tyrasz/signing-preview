@@ -41,8 +41,27 @@ export function mockHyperliquidInfo(): StaticHyperliquidInfo {
         { name: '@107', index: 107, tokens: [150, 0] },
       ],
     },
-    allMids: { BTC: '98000', ETH: '3500', SOL: '180', HYPE: '40', 'PURR/USDC': '0.2', '@107': '40' },
+    allMids: { BTC: '98000', ETH: '3500', SOL: '180', HYPE: '40', 'PURR/USDC': '0.2', '@107': '40', '#232050': '0.62', '#221530': '0.41' },
+    // HIP-3: index 0 is the main DEX; asset IDs are 100000 + dexIndex * 10000 + index.
+    perpDexs: [null, { name: 'xyz', fullName: 'XYZ' }],
+    dexMeta: { xyz: { universe: [{ name: 'xyz:TSLA', szDecimals: 3, maxLeverage: 20 }, { name: 'xyz:GOLD', szDecimals: 4, maxLeverage: 25 }] } },
+    dexMids: { xyz: { 'xyz:TSLA': '300', 'xyz:GOLD': '3100' } },
+    // Shapes copied from live outcomeMeta (2026-11-03); asset ID = 100000000 + 10 * outcome + side.
+    outcomeMeta: {
+      outcomes: [
+        { outcome: 23205, name: 'Recurring', description: 'class:priceBinary|underlying:SOL|expiry:20261103-0600|targetPrice:94.882|period:1d', sideSpecs: [{ name: 'Yes' }, { name: 'No' }], quoteToken: 'USDC' },
+        { outcome: 22153, name: 'template:sportsContestParticipant2', description: 'participant:Atletico Madrid', sideSpecs: [{ name: 'Yes' }, { name: 'No' }], quoteToken: 'USDC' },
+        { outcome: 22152, name: 'template fallback', description: 'other', sideSpecs: [{ name: 'Yes' }, { name: 'No' }], quoteToken: 'USDC' },
+      ],
+      questions: [
+        { question: 563, name: 'template:sportsContestResult', description: 'competition:UEFA Champions League|contestType:Match|participantA:Atletico Madrid|participantB:FC Bayern Munich|scheduledStart:20261103-2000', fallbackOutcome: 22152, namedOutcomes: [22153] },
+      ],
+    },
+    spotBalances: { [ALICE]: [{ coin: 'USDC', token: 0, total: '1200', hold: '200' }, { coin: 'HYPE', token: 150, total: '5', hold: '0' }] },
+    abstraction: { [BOB]: 'unifiedAccount' },
     clearinghouse: {
+      [`xyz:${ALICE}`]: { marginSummary: { accountValue: '100', totalNtlPos: '0', totalMarginUsed: '0' }, withdrawable: '100', assetPositions: [] },
+      [BOB]: { marginSummary: { accountValue: '10', totalNtlPos: '0', totalMarginUsed: '0' }, withdrawable: '10', assetPositions: [] },
       [ALICE]: {
         marginSummary: { accountValue: '5000', totalNtlPos: '1750', totalMarginUsed: '175' },
         withdrawable: '3200',
@@ -113,6 +132,9 @@ export function buildSamples(now = Date.now()): Sample[] {
   const order = { type: 'order', orders: [{ a: 0, b: true, p: '97500', s: '0.01', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' };
   const orderNonce = now - 1000;
   const leverage = { type: 'updateLeverage', asset: 1, isCross: true, leverage: 30 };
+  const hip3Order = { type: 'order', orders: [{ a: 110000, b: true, p: '300', s: '1', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' };
+  const outcomeOrder = { type: 'order', orders: [{ a: 100232050, b: true, p: '0.55', s: '10', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' };
+  const borrow = { type: 'borrowLend', operation: 'borrow', token: 150, amount: '2' };
   const stopLoss = { type: 'order', orders: [{ a: 1, b: false, p: '3100', s: '0.5', r: true, t: { trigger: { isMarket: true, triggerPx: '3150', tpsl: 'sl' } } }], grouping: 'na', builder: { b: BUILDER, f: 10 } };
   const arb = CCTP_NETWORKS[42161];
   const fwd = pad(CCTP.hyperCoreForwarder as Hex);
@@ -177,6 +199,16 @@ export function buildSamples(now = Date.now()): Sample[] {
       request: typed(agent(l1ActionHash(stopLoss, orderNonce))), context: { hyperliquid: { action: stopLoss, nonce: orderNonce } } },
     { id: 'hl-leverage', group: 'HyperCore', label: 'L1: set ETH leverage to 30×', chainId: 42161,
       request: typed(agent(l1ActionHash(leverage, orderNonce))), context: { hyperliquid: { action: leverage, nonce: orderNonce } } },
+    { id: 'hl-hip3-order', group: 'HyperCore', label: 'L1 order on a HIP-3 market (xyz:TSLA)', chainId: 42161,
+      request: typed(agent(l1ActionHash(hip3Order, orderNonce))), context: { hyperliquid: { action: hip3Order, nonce: orderNonce } } },
+    { id: 'hl-outcome-order', group: 'HyperCore', label: 'L1 order on an outcome market', chainId: 42161,
+      request: typed(agent(l1ActionHash(outcomeOrder, orderNonce))), context: { hyperliquid: { action: outcomeOrder, nonce: orderNonce } } },
+    { id: 'hl-borrow', group: 'HyperCore', label: 'L1: borrow 2 HYPE', chainId: 42161,
+      request: typed(agent(l1ActionHash(borrow, orderNonce))), context: { hyperliquid: { action: borrow, nonce: orderNonce } } },
+    { id: 'hl-staking-link', group: 'HyperCore', label: 'Link to a staking account (risky)', chainId: 42161,
+      request: typed(userSigned('LinkStakingUser', [['hyperliquidChain', 'string'], ['user', 'address'], ['isFinalize', 'bool'], ['nonce', 'uint64']], { user: BOB, isFinalize: false, nonce: now })) },
+    { id: 'hl-portfolio-margin', group: 'HyperCore', label: 'Switch to portfolio margin', chainId: 42161,
+      request: typed(userSigned('UserSetAbstraction', [['hyperliquidChain', 'string'], ['user', 'address'], ['abstraction', 'string'], ['nonce', 'uint64']], { user: ALICE, abstraction: 'portfolioMargin', nonce: now })) },
     { id: 'hl-order-opaque', group: 'HyperCore', label: 'L1 action without the action (hash only)', chainId: 42161,
       request: typed(agent(l1ActionHash(order, orderNonce))) },
     { id: 'hl-order-mismatch', group: 'HyperCore', label: 'L1 action that does not match its hash', chainId: 42161,

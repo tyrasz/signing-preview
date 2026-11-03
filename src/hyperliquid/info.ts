@@ -1,4 +1,4 @@
-import type { ClearinghouseState, HyperliquidInfo, PerpAssetMeta, SpotPair, SpotToken } from '../types.ts';
+import type { ClearinghouseState, HyperliquidInfo, OutcomeMeta, PerpAssetMeta, PerpDex, SpotBalance, SpotPair, SpotToken } from '../types.ts';
 
 export const INFO_URLS = {
   mainnet: 'https://api.hyperliquid.xyz/info',
@@ -35,29 +35,51 @@ export class HttpHyperliquidInfo implements HyperliquidInfo {
     }
     return value;
   }
-  meta() { return this.post<{ universe: PerpAssetMeta[] }>({ type: 'meta' }, true); }
+  meta(dex?: string) { return this.post<{ universe: PerpAssetMeta[] }>(dex ? { type: 'meta', dex } : { type: 'meta' }, true); }
   spotMeta() { return this.post<{ tokens: SpotToken[]; universe: SpotPair[] }>({ type: 'spotMeta' }, true); }
-  allMids() { return this.post<Record<string, string>>({ type: 'allMids' }, false); }
-  clearinghouseState(user: string) { return this.post<ClearinghouseState>({ type: 'clearinghouseState', user }, false); }
+  allMids(dex?: string) { return this.post<Record<string, string>>(dex ? { type: 'allMids', dex } : { type: 'allMids' }, false); }
+  clearinghouseState(user: string, dex?: string) { return this.post<ClearinghouseState>(dex ? { type: 'clearinghouseState', user, dex } : { type: 'clearinghouseState', user }, false); }
+  perpDexs() { return this.post<(PerpDex | null)[]>({ type: 'perpDexs' }, true); }
+  outcomeMeta() { return this.post<OutcomeMeta>({ type: 'outcomeMeta' }, true); }
+  spotClearinghouseState(user: string) { return this.post<{ balances: SpotBalance[] }>({ type: 'spotClearinghouseState', user }, false); }
+  userAbstraction(user: string) { return this.post<'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>({ type: 'userAbstraction', user }, false); }
 }
 
 /** Fixed in-memory data, for tests and demos. */
+export interface StaticInfoData {
+  meta: { universe: PerpAssetMeta[] };
+  spotMeta: { tokens: SpotToken[]; universe: SpotPair[] };
+  allMids: Record<string, string>;
+  clearinghouse: Record<string, ClearinghouseState>;
+  perpDexs?: (PerpDex | null)[];
+  /** Per HIP-3 DEX name. */
+  dexMeta?: Record<string, { universe: PerpAssetMeta[] }>;
+  dexMids?: Record<string, Record<string, string>>;
+  outcomeMeta?: OutcomeMeta;
+  spotBalances?: Record<string, SpotBalance[]>;
+  abstraction?: Record<string, 'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>;
+}
+
 export class StaticHyperliquidInfo implements HyperliquidInfo {
-  private data: {
-    meta: { universe: PerpAssetMeta[] };
-    spotMeta: { tokens: SpotToken[]; universe: SpotPair[] };
-    allMids: Record<string, string>;
-    clearinghouse: Record<string, ClearinghouseState>;
-  };
-  constructor(data: StaticHyperliquidInfo['data']) {
+  private data: StaticInfoData;
+  constructor(data: StaticInfoData) {
     this.data = data;
   }
-  async meta() { return this.data.meta; }
+  async meta(dex?: string) {
+    if (!dex) return this.data.meta;
+    const m = this.data.dexMeta?.[dex];
+    if (!m) throw new Error('No mock meta for dex ' + dex);
+    return m;
+  }
   async spotMeta() { return this.data.spotMeta; }
-  async allMids() { return this.data.allMids; }
-  async clearinghouseState(user: string) {
-    const state = this.data.clearinghouse[user.toLowerCase()];
+  async allMids(dex?: string) { return dex ? this.data.dexMids?.[dex] ?? {} : this.data.allMids; }
+  async clearinghouseState(user: string, dex?: string) {
+    const state = this.data.clearinghouse[(dex ? dex + ':' : '') + user.toLowerCase()];
     if (!state) throw new Error('No mock clearinghouse state for ' + user);
     return state;
   }
+  async perpDexs() { return this.data.perpDexs ?? [null]; }
+  async outcomeMeta() { return this.data.outcomeMeta ?? { outcomes: [], questions: [] }; }
+  async spotClearinghouseState(user: string) { return { balances: this.data.spotBalances?.[user.toLowerCase()] ?? [] }; }
+  async userAbstraction(user: string) { return this.data.abstraction?.[user.toLowerCase()] ?? 'default'; }
 }

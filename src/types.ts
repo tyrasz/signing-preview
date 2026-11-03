@@ -147,11 +147,26 @@ export interface ClearinghouseState {
   assetPositions: { position: { coin: string; szi: string; leverage: { type: string; value: number }; entryPx: string | null; liquidationPx: string | null } }[];
 }
 
+export interface PerpDex { name: string; fullName?: string }
+export interface OutcomeSpec { outcome: number; name: string; description: string; sideSpecs: { name: string }[]; quoteToken?: string }
+export interface OutcomeQuestion { question: number; name: string; description: string; fallbackOutcome: number; namedOutcomes: number[] }
+export interface OutcomeMeta { outcomes: OutcomeSpec[]; questions: OutcomeQuestion[] }
+export interface SpotBalance { coin: string; token: number; total: string; hold: string }
+
 export interface HyperliquidInfo {
-  meta(): Promise<{ universe: PerpAssetMeta[] }>;
+  /** Perp universe; `dex` selects a builder-deployed (HIP-3) perp DEX. */
+  meta(dex?: string): Promise<{ universe: PerpAssetMeta[] }>;
   spotMeta(): Promise<{ tokens: SpotToken[]; universe: SpotPair[] }>;
-  allMids(): Promise<Record<string, string>>;
-  clearinghouseState(user: string): Promise<ClearinghouseState>;
+  /** Mid prices; `dex` selects a HIP-3 perp DEX (keys look like "xyz:TSLA"). */
+  allMids(dex?: string): Promise<Record<string, string>>;
+  clearinghouseState(user: string, dex?: string): Promise<ClearinghouseState>;
+  /** HIP-3 perp DEXes; index 0 is the main DEX (null). */
+  perpDexs?(): Promise<(PerpDex | null)[]>;
+  /** Outcome (prediction) markets. */
+  outcomeMeta?(): Promise<OutcomeMeta>;
+  spotClearinghouseState?(user: string): Promise<{ balances: SpotBalance[] }>;
+  /** Account mode: collateral is shared across spot/perps/DEXes for unifiedAccount and portfolioMargin. */
+  userAbstraction?(user: string): Promise<'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>;
 }
 
 export interface Dependencies {
