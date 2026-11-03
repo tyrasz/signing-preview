@@ -135,6 +135,8 @@ export function buildSamples(now = Date.now()): Sample[] {
   const hip3Order = { type: 'order', orders: [{ a: 110000, b: true, p: '300', s: '1', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' };
   const outcomeOrder = { type: 'order', orders: [{ a: 100232050, b: true, p: '0.55', s: '10', r: false, t: { limit: { tif: 'Gtc' } } }], grouping: 'na' };
   const borrow = { type: 'borrowLend', operation: 'borrow', token: 150, amount: '2' };
+  const agentSend = { type: 'agentSendAsset', destination: BOB, sourceDex: '', destinationDex: 'spot', token: 'USDC:0x6d1e7cde53ba9467b783cb7c530ce054', amount: '25', fromSubAccount: '', nonce: orderNonce };
+  const setOracle = { type: 'perpDeploy', setOracle: { dex: 'xyz', oraclePxs: [['xyz:GOLD', '3100'], ['xyz:TSLA', '300']], markPxs: [], externalPerpPxs: [] } };
   const stopLoss = { type: 'order', orders: [{ a: 1, b: false, p: '3100', s: '0.5', r: true, t: { trigger: { isMarket: true, triggerPx: '3150', tpsl: 'sl' } } }], grouping: 'na', builder: { b: BUILDER, f: 10 } };
   const arb = CCTP_NETWORKS[42161];
   const fwd = pad(CCTP.hyperCoreForwarder as Hex);
@@ -209,6 +211,10 @@ export function buildSamples(now = Date.now()): Sample[] {
       request: typed(userSigned('LinkStakingUser', [['hyperliquidChain', 'string'], ['user', 'address'], ['isFinalize', 'bool'], ['nonce', 'uint64']], { user: BOB, isFinalize: false, nonce: now })) },
     { id: 'hl-portfolio-margin', group: 'HyperCore', label: 'Switch to portfolio margin', chainId: 42161,
       request: typed(userSigned('UserSetAbstraction', [['hyperliquidChain', 'string'], ['user', 'address'], ['abstraction', 'string'], ['nonce', 'uint64']], { user: ALICE, abstraction: 'portfolioMargin', nonce: now })) },
+    { id: 'hl-agent-send', group: 'HyperCore', label: 'Agent-signed asset transfer', chainId: 42161,
+      request: typed(agent(l1ActionHash(agentSend, orderNonce))), context: { hyperliquid: { action: agentSend, nonce: orderNonce } } },
+    { id: 'hl-set-oracle', group: 'HyperCore', label: 'HIP-3 deployer: update oracle prices', chainId: 42161,
+      request: typed(agent(l1ActionHash(setOracle, orderNonce))), context: { hyperliquid: { action: setOracle, nonce: orderNonce } } },
     { id: 'hl-order-opaque', group: 'HyperCore', label: 'L1 action without the action (hash only)', chainId: 42161,
       request: typed(agent(l1ActionHash(order, orderNonce))) },
     { id: 'hl-order-mismatch', group: 'HyperCore', label: 'L1 action that does not match its hash', chainId: 42161,

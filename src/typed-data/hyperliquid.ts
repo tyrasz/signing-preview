@@ -3,6 +3,7 @@ import { chainName, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
 import { l1ActionHash } from '../hyperliquid/action-hash.ts';
 import { describeOrder, findSpotToken, resolveAsset, TIF_LABELS, type ResolvedAsset } from '../hyperliquid/assets.ts';
 import type { HyperliquidInfo, Network } from '../types.ts';
+import { describeMoreL1 } from './hyperliquid-admin.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv } from './common.ts';
 
 const PREFIX = 'HyperliquidTransaction:';
@@ -112,9 +113,9 @@ export const hyperliquidUserSignedAdapter: TypedAdapter = async (data, env) => {
       b.detail('Agent (API wallet)', agent).detail('Agent name', name || '(unnamed)');
       checkNonce(b, env, m.nonce, 'Nonce');
       const requester = env.context.origin ? ` requested by ${env.context.origin}` : '';
-      b.warn('caution', 'approve_agent', `${shortAddress(agent)} will be able to place and cancel orders for your account${requester}. Agents cannot withdraw, but a malicious agent can still lose money by trading. The Hyperliquid app uses this for "Enable trading"; only approve it on sites you trust.`);
+      b.warn('caution', 'approve_agent', `${shortAddress(agent)} will be able to place and cancel orders for your account${requester}. An agent can sign trading and other account actions for you (Hyperliquid's SDKs include agent-signed asset transfers), so treat this as giving the site access to your account. The Hyperliquid app uses this for "Enable trading"; only approve it on sites you trust.`);
       if (!name) b.note('An unnamed agent replaces your previous unnamed agent.');
-      return out(`Authorise ${shortAddress(agent)} to trade for you`, `Approves an API wallet ("agent") that can sign trading actions on your Hyperliquid account without asking your wallet again.`);
+      return out(`Authorise ${shortAddress(agent)} to act for your account`, `Approves an API wallet ("agent") that can sign trading and other account actions on your Hyperliquid account without asking your wallet again.`);
     }
     case 'ApproveBuilderFee': {
       const builder = str(m.builder), rate = str(m.maxFeeRate);
@@ -419,6 +420,8 @@ async function describeL1Action(action: Wire, b: PreviewBuilder, info: Hyperliqu
     case 'noop':
       return { title: 'Hyperliquid no-op', summary: 'Consumes a nonce without doing anything (used to invalidate pending actions).', status: 'full' };
   }
+  const more = await describeMoreL1(type, action, b, info, env);
+  if (more) return more;
   for (const [key, value] of Object.entries(action)) if (key !== 'type') b.detail(key, str(value));
   b.warn('caution', 'l1_unknown_action', `Action type "${type}" is not recognised. Its fields are listed as signed.`);
   return { title: `Hyperliquid action: ${type}`, summary: 'An unrecognised Hyperliquid L1 action.', status: 'partial' };

@@ -203,13 +203,13 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
     case 8: {
       const [token, variant, nonce] = f as [bigint, number, bigint];
       b.detail('Token index', token.toString()).detail('Variant', String(variant)).detail('Create nonce', nonce.toString());
-      b.warn('caution', 'finalize_evm_contract', 'Links a HyperCore token to a HyperEVM contract. This is a token-deployer operation and is irreversible.');
+      b.warn('caution', 'finalize_evm_contract', 'Links a HyperCore token to a HyperEVM contract. This is a token-deployer operation.');
       return { title: `Finalize EVM contract link for token #${token}`, summary: 'Token deployer action.' };
     }
     case 9: {
       const [wallet, name] = f as [string, string];
       b.detail('API wallet', wallet).detail('Name', name || '(unnamed)');
-      b.warn('danger', 'add_api_wallet', `${shortAddress(wallet)} will be able to place and cancel orders for this account. Only add wallets you control.`);
+      b.warn('danger', 'add_api_wallet', `${shortAddress(wallet)} will be able to sign trading and other account actions for this account. Only add wallets you control.`);
       return { title: `Authorise API wallet ${shortAddress(wallet)}`, summary: 'Grants trading authority on HyperCore to another key.' };
     }
     case 10:
