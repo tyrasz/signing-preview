@@ -1,5 +1,7 @@
 # signing-preview
 
+[![CI](https://github.com/tyrasz/signing-preview/actions/workflows/ci.yml/badge.svg)](https://github.com/tyrasz/signing-preview/actions/workflows/ci.yml) [![Live verification](https://github.com/tyrasz/signing-preview/actions/workflows/verify-live.yml/badge.svg)](https://github.com/tyrasz/signing-preview/actions/workflows/verify-live.yml)
+
 Turns any wallet signing request into a human-readable preview before the user signs. It covers Ethereum, Arbitrum One, HyperEVM (chain 999) and Hyperliquid's native HyperCore actions, with special handling for Arbitrum → Hyperliquid deposits.
 
 It takes a standard EIP-1193 request (`{ method, params }`), the same object every dApp sends to every wallet. It returns plain JSON that any wallet, extension or backend can render.
@@ -246,6 +248,17 @@ Still not verified live:
 - Recipient blacklist state.
 - `CctpExtensionV2`. Its source isn't published, so a sponsored deposit's recipient can't be decoded from the signature.
 - Circle's fee API (`iris-api.circle.com`), which this environment couldn't reach.
+
+## Continuous integration
+
+- **`.github/workflows/ci.yml`** runs on every push to `main` and on pull requests, on Node 22 and 24: `npm ci`, typecheck, tests and the browser build. It needs no network beyond npm.
+- **`.github/workflows/verify-live.yml`** runs `npm run verify:live` daily at 03:41 UTC, and on demand from the Actions tab ("Run workflow").
+  - It is read-only against Arbitrum One, HyperEVM and `api.hyperliquid.xyz`, and fails when the deployed contracts, fees or markets no longer match the previewer.
+  - The log is kept as a run artifact for 30 days.
+  - A failed scheduled run opens an issue titled "Live verification failed", or comments on the existing open one.
+  - Calls retry only on rate limiting, so a throttled public RPC is not reported as a contract change. If a public RPC is down, the run fails and the log says which call.
+
+Actions are pinned to commit SHAs (with the version in a comment), and workflows get read-only permissions except the issue-reporting job.
 
 ## Layout
 

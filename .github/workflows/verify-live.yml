@@ -1,0 +1,65 @@
+name: Live verification
+
+# Read-only checks against the deployed Circle CCTP / Hyperliquid contracts and APIs
+# (Arbitrum One, HyperEVM, api.hyperliquid.xyz). Nothing is signed with a real key or broadcast.
+# Fails when the chain and the previewer disagree, e.g. after a fee, address or market change.
+
+on:
+  schedule:
+    - cron: '41 3 * * *' # daily at 03:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-live
+  cancel-in-progress: false
+
+jobs:
+  verify-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Verify against live contracts and APIs
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run verify:live 2>&1 | tee verify-live.log
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-live-log
+          path: verify-live.log
+          retention-days: 30
+
+  report-failure:
+    needs: verify-live
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Live verification failed"
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          body="The scheduled live verification failed: $RUN_URL. The run log is attached to the run as the verify-live-log artifact. A failure means the deployed contracts or APIs no longer match what the previewer expects, or a public RPC was unavailable."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

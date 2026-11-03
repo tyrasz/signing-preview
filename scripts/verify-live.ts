@@ -16,7 +16,7 @@ import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
 const RPC = 'https://arb1.arbitrum.io/rpc';
-const client = createPublicClient({ transport: http(RPC) });
+const client = createPublicClient({ transport: http(RPC, { retryCount: 6, retryDelay: 2000 }) });
 const USDC: Address = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831';
 const EXT: Address = '0xA95d9c1F655341597C94393fDdc30cf3c08E4fcE';
 const TMV2: Address = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d';
@@ -46,14 +46,22 @@ const pad = (a: Address) => `0x${a.slice(2).padStart(64, '0')}` as Hex;
 interface Case { id: string; via: 'ext' | 'tmv2'; amount: string; batch?: string; maxFee: string; hook?: Hex; dex?: number; validBefore?: bigint; finality?: number }
 if (await client.getCode({ address: account.address })) throw new Error('test address unexpectedly has code');
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-async function rpc(body: unknown) {
-  for (let i = 0; i < 6; i++) {
-    const res = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    if (res.status !== 429) return res.json();
+/**
+ * JSON-RPC POST that retries only on rate limiting (HTTP 429 or a "rate limit" error message), so a throttled
+ * call is never mistaken for a contract revert. Shared public RPCs throttle CI runners more often.
+ */
+async function jsonRpc(url: string, body: unknown): Promise<any> {
+  for (let i = 0; i < 8; i++) {
+    const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    if (res.status !== 429) {
+      const json = await res.json();
+      if (!/rate limit/i.test(String(json?.error?.message ?? ''))) return json;
+    }
     await sleep(3000 * (i + 1));
   }
-  throw new Error('rate limited');
+  throw new Error(`rate limited by ${url} after 8 attempts`);
 }
+const rpc = (body: unknown) => jsonRpc(RPC, body);
 const block = await client.getBlock();
 const T = block.timestamp;
 const cases: Case[] = [
@@ -131,7 +139,7 @@ for (const r of rows as any[]) {
 }
 
 console.log('\n# Deployed configuration');
-const hl = createPublicClient({ transport: http('https://rpc.hyperliquid.xyz/evm') });
+const hl = createPublicClient({ transport: http('https://rpc.hyperliquid.xyz/evm', { retryCount: 6, retryDelay: 2000 }) });
 const H = { usdc: '0xb88339CB7199b77E23DB6E890353E22632Ba630f', cdw: '0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24' } as const;
 const readAt = (c: typeof client, address: Address, sig: string, args: unknown[] = []) => c.readContract({ address, abi: parseAbi([sig]), functionName: sig.match(/function (\w+)/)![1], args } as never) as Promise<unknown>;
 check(String(await readAt(client, EXT, 'function token() view returns (address)')).toLowerCase() === USDC.toLowerCase(), 'CctpExtension.token() is Arbitrum USDC');
@@ -160,15 +168,15 @@ for (const [label, recipient, dex, expectRevert] of [
   ['recipient = zero', '0x0000000000000000000000000000000000000000', 0, 'Invalid recipient: zero address'],
 ] as const) {
   await sleep(1200);
-  const res = await fetch('https://rpc.hyperliquid.xyz/evm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call',
-    params: [{ from: me, to: H.cdw, data: encodeFunctionData({ abi: depositFor, functionName: 'depositFor', args: [recipient as Address, amt, dex] }) }, 'latest', override] }) }).then(x => x.json());
+  const res = await jsonRpc('https://rpc.hyperliquid.xyz/evm', { jsonrpc: '2.0', id: 1, method: 'eth_call',
+    params: [{ from: me, to: H.cdw, data: encodeFunctionData({ abi: depositFor, functionName: 'depositFor', args: [recipient as Address, amt, dex] }) }, 'latest', override] });
   const got = res.error ? String(res.error.message).replace('execution reverted: ', '') : null;
   check(got === expectRevert, label.padEnd(34), got ? `reverts: ${got}` : 'succeeds');
 }
 
 console.log('\n# HyperCore markets: every live asset ID resolves to a named market with a mid price');
 {
-  const info = new HttpHyperliquidInfo();
+  const info = new HttpHyperliquidInfo(undefined, { retries: 6 });
   const [meta, spot, dexs, om] = await Promise.all([info.meta(), info.spotMeta(), info.perpDexs(), info.outcomeMeta()]);
   const ids: [string, number][] = [];
   meta.universe.forEach((_, i) => ids.push(['main-DEX perps', i]));
@@ -202,7 +210,7 @@ console.log('\n# HyperCore -> other chains via Circle CCTP (CoreDepositWallet.co
     const expected = HYPERCORE_CCTP_WITHDRAWAL.cctpMaxFeeRaw + (HYPERCORE_CCTP_WITHDRAWAL.forwardFeeByDomain[d] ?? HYPERCORE_CCTP_WITHDRAWAL.defaultForwardFeeRaw);
     check(live === expected, `withdrawal fee to CCTP domain ${d} matches the previewer`, `live ${live}, previewer ${expected}`);
   }
-  const spot = await new HttpHyperliquidInfo().spotMeta();
+  const spot = await new HttpHyperliquidInfo(undefined, { retries: 6 }).spotMeta();
   check(spot.tokens.find(t => t.index === 0)?.evmContract?.address.toLowerCase() === H.cdw.toLowerCase(), "USDC's HyperEVM link is Circle's CoreDepositWallet");
   check(spot.tokens.find(t => t.name === 'HYPE')?.evmContract === null, 'native HYPE has no EVM contract link (uses 0x2222…)');
   const magic = '0x' + '636374702d666f7277617264'.padEnd(48, '0');
@@ -220,8 +228,8 @@ console.log('\n# HyperCore -> other chains via Circle CCTP (CoreDepositWallet.co
     const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [me, JSON.stringify(typed)] }, {}, {});
     const predictedFail = p.warnings.some(w => fail.has(w.code));
     await sleep(1000);
-    const res = await fetch(hlRpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call',
-      params: [{ from: SYS, to: H.cdw, data: encodeFunctionData({ abi: cdwAbi, functionName: 'coreReceiveWithData', args: [me, padHex(me), domain, parseUnits(amount, 6), 1n, data as Hex] }) }, 'latest'] }) }).then(x => x.json());
+    const res = await jsonRpc(hlRpc, { jsonrpc: '2.0', id: 1, method: 'eth_call',
+      params: [{ from: SYS, to: H.cdw, data: encodeFunctionData({ abi: cdwAbi, functionName: 'coreReceiveWithData', args: [me, padHex(me), domain, parseUnits(amount, 6), 1n, data as Hex] }) }, 'latest'] });
     const reverted = !!res.error;
     check(predictedFail === reverted, label.padEnd(34), reverted ? `reverts: ${String(res.error.message).replace('execution reverted: ', '')}` : 'succeeds');
   }

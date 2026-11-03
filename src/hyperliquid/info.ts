@@ -11,24 +11,30 @@ export class HttpHyperliquidInfo implements HyperliquidInfo {
   private url: string;
   private fetchImpl: typeof fetch;
   private ttlMs: number;
-  constructor(url: string = INFO_URLS.mainnet, options: { fetchImpl?: typeof fetch; ttlMs?: number } = {}) {
+  private retries: number;
+  private retryDelayMs: number;
+  /** `retries` retries only HTTP 429 responses (off by default so previews stay fast). */
+  constructor(url: string = INFO_URLS.mainnet, options: { fetchImpl?: typeof fetch; ttlMs?: number; retries?: number; retryDelayMs?: number } = {}) {
     this.url = url;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.ttlMs = options.ttlMs ?? 30_000;
+    this.retries = options.retries ?? 0;
+    this.retryDelayMs = options.retryDelayMs ?? 2000;
   }
   private post<T>(body: Record<string, unknown>, cacheable: boolean): Promise<T> {
     const key = JSON.stringify(body);
     const hit = this.cache.get(key);
     if (cacheable && hit && Date.now() - hit.at < this.ttlMs) return hit.value as Promise<T>;
-    const value = this.fetchImpl(this.url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: key,
-      signal: AbortSignal.timeout(10_000),
-    }).then(async res => {
+    const attempt = async (n: number): Promise<T> => {
+      const res = await this.fetchImpl(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: key, signal: AbortSignal.timeout(10_000) });
+      if (res.status === 429 && n < this.retries) {
+        await new Promise(r => setTimeout(r, this.retryDelayMs * (n + 1)));
+        return attempt(n + 1);
+      }
       if (!res.ok) throw new Error(`Hyperliquid info ${body.type} failed: HTTP ${res.status}`);
       return res.json() as Promise<T>;
-    });
+    };
+    const value = attempt(0);
     if (cacheable) {
       this.cache.set(key, { at: Date.now(), value });
       value.catch(() => this.cache.delete(key));

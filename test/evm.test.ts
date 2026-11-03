@@ -151,3 +151,14 @@ test('CoreWriter details from Hyperliquid\'s action table: outcome operation (17
   const wallet = await send(raw(9, 'address, string', [BOB, '']));
   assert.match(detail(wallet, 'Name')!, /becomes your main API wallet/);
 });
+
+test('HttpHyperliquidInfo retries HTTP 429 only when asked to', async () => {
+  const { HttpHyperliquidInfo } = await import('../src/hyperliquid/info.ts');
+  let calls = 0;
+  const flaky = (async () => { calls++; return calls < 3 ? new Response('busy', { status: 429 }) : new Response(JSON.stringify({ BTC: '1' })); }) as typeof fetch;
+  assert.deepEqual(await new HttpHyperliquidInfo('http://info.invalid', { fetchImpl: flaky, retries: 3, retryDelayMs: 1 }).allMids(), { BTC: '1' });
+  assert.equal(calls, 3);
+  calls = 0;
+  await assert.rejects(new HttpHyperliquidInfo('http://info.invalid', { fetchImpl: flaky }).allMids(), /HTTP 429/);
+  assert.equal(calls, 1);
+});
