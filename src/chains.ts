@@ -7,6 +7,10 @@ export const CHAINS: Record<number, { name: string; nativeSymbol: string; native
   1: { name: 'Ethereum', nativeSymbol: 'ETH', nativeDecimals: 18 },
   42161: { name: 'Arbitrum One', nativeSymbol: 'ETH', nativeDecimals: 18 },
   999: { name: 'HyperEVM', nativeSymbol: 'HYPE', nativeDecimals: 18 },
+  // Testnets (CCTP routes to HyperCore testnet).
+  11155111: { name: 'Ethereum Sepolia', nativeSymbol: 'ETH', nativeDecimals: 18 },
+  421614: { name: 'Arbitrum Sepolia', nativeSymbol: 'ETH', nativeDecimals: 18 },
+  998: { name: 'HyperEVM Testnet', nativeSymbol: 'HYPE', nativeDecimals: 18 },
 };
 
 export function chainName(chainId: number): string {
@@ -41,26 +45,85 @@ export function parseSpotSystemAddress(address: string): number | null {
   return Number.parseInt(a.slice(4), 16);
 }
 
+// Circle CCTP V2 + HyperCore deployments. Sources (snapshot 2026-10-29, saved in
+// research/arbitrum-deposit-v1/sources/docs): contract-addresses.md, usdc-addresses.md,
+// hypercore-addresses.md. Contract behaviour: circlefin/hyperevm-circle-contracts @ ffcc978
+// (still master on 2026-11-03) and circlefin/evm-cctp-contracts @ a92a2b4.
+export interface HyperEvmDeployment {
+  chainId: number;
+  name: string;
+  usdc: string;
+  /** CctpForwarder: must be both mintRecipient and destinationCaller for HyperCore deposits. */
+  forwarder: string;
+  /** CoreDepositWallet: credits HyperCore; rejected as a forward recipient. */
+  coreDepositWallet: string;
+}
+
+export const HYPEREVM_MAINNET: HyperEvmDeployment = {
+  chainId: 999, name: 'HyperEVM', usdc: '0xb88339cb7199b77e23db6e890353e22632ba630f',
+  forwarder: '0xb21d281dedb17ae5b501f6aa8256fe38c4e45757', coreDepositWallet: '0x6b9e773128f453f5c2c60935ee2de2cbc5390a24',
+};
+export const HYPEREVM_TESTNET: HyperEvmDeployment = {
+  chainId: 998, name: 'HyperEVM Testnet', usdc: '0x2b3370ee501b4a559b57d449569354196457d8ab',
+  forwarder: '0x02e39ecb8368b41bf68ff99ff351ac9864e5e2a2', coreDepositWallet: '0x0b80659a4076e9e93c7dbe0f10675a16a3e5c206',
+};
+
+export interface CctpSourceNetwork {
+  name: string;
+  domain: number;
+  testnet: boolean;
+  usdc: string;
+  tokenMessengerV2: string;
+  /** Arbitrum only: batchDepositForBurnWithAuth (EIP-3009 ReceiveWithAuthorization). */
+  cctpExtension?: string;
+  /** Arbitrum only: relayer-submitted sponsored deposits. */
+  cctpExtensionV2?: string;
+  hyperEvm: HyperEvmDeployment;
+  /** Documented fees for deposits to HyperCore (Circle's fee API returns the live values). */
+  fees: { fastFeeBps: number; forwardFeeRaw: bigint; forwardFeeDynamic: boolean };
+}
+
+export const CCTP_NETWORKS: Record<number, CctpSourceNetwork> = {
+  1: { name: 'Ethereum', domain: 0, testnet: false, usdc: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+    tokenMessengerV2: '0x28b5a0e9c621a5badaa536219b3a228c8168cf5d', hyperEvm: HYPEREVM_MAINNET,
+    fees: { fastFeeBps: 1, forwardFeeRaw: 200_000n, forwardFeeDynamic: true } },
+  42161: { name: 'Arbitrum One', domain: 3, testnet: false, usdc: '0xaf88d065e77c8cc2239327c5edb3a432268e5831',
+    tokenMessengerV2: '0x28b5a0e9c621a5badaa536219b3a228c8168cf5d',
+    cctpExtension: '0xa95d9c1f655341597c94393fddc30cf3c08e4fce', cctpExtensionV2: '0x3289e443a95b28bcedacc4b33c689b0c9b84ffab',
+    hyperEvm: HYPEREVM_MAINNET, fees: { fastFeeBps: 0, forwardFeeRaw: 200_000n, forwardFeeDynamic: false } },
+  11155111: { name: 'Ethereum Sepolia', domain: 0, testnet: true, usdc: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238',
+    tokenMessengerV2: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa', hyperEvm: HYPEREVM_TESTNET,
+    fees: { fastFeeBps: 1, forwardFeeRaw: 200_000n, forwardFeeDynamic: true } },
+  421614: { name: 'Arbitrum Sepolia', domain: 3, testnet: true, usdc: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d',
+    tokenMessengerV2: '0x8fe6b999dc680ccfdd5bf7eb0974218be2542daa',
+    cctpExtension: '0x8e4e3d0e95c1bec4f3ec7f69aa48473e0ab6eb8d', cctpExtensionV2: '0xc1fec4e5daf8796a490653359536f9c2a9c158ae',
+    hyperEvm: HYPEREVM_TESTNET, fees: { fastFeeBps: 0, forwardFeeRaw: 200_000n, forwardFeeDynamic: false } },
+};
+
 export const CCTP = {
-  /** TokenMessengerV2 is deployed at the same address on Ethereum and Arbitrum. */
-  tokenMessengerV2: '0x28b5a0e9c621a5badaa536219b3a228c8168cf5d',
-  /** Circle's forwarder on HyperEVM that credits minted USDC to HyperCore. */
-  hyperCoreForwarder: '0xb21d281dedb17ae5b501f6aa8256fe38c4e45757',
+  /** TokenMessengerV2 is deployed at the same address on Ethereum and Arbitrum (mainnets). */
+  tokenMessengerV2: CCTP_NETWORKS[42161].tokenMessengerV2,
+  hyperCoreForwarder: HYPEREVM_MAINNET.forwarder,
   usdcByChain: {
-    1: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
-    42161: '0xaf88d065e77c8cc2239327c5edb3a432268e5831',
-    999: '0xb88339cb7199b77e23db6e890353e22632ba630f',
+    1: CCTP_NETWORKS[1].usdc, 42161: CCTP_NETWORKS[42161].usdc, 999: HYPEREVM_MAINNET.usdc,
+    11155111: CCTP_NETWORKS[11155111].usdc, 421614: CCTP_NETWORKS[421614].usdc, 998: HYPEREVM_TESTNET.usdc,
   } as Record<number, string>,
-  domains: { 0: 'Ethereum', 1: 'Avalanche', 2: 'OP Mainnet', 3: 'Arbitrum', 6: 'Base', 7: 'Polygon PoS', 19: 'HyperEVM' } as Record<number, string>,
+  domains: { 0: 'Ethereum', 1: 'Avalanche', 2: 'OP Mainnet', 3: 'Arbitrum', 5: 'Solana', 6: 'Base', 7: 'Polygon PoS', 19: 'HyperEVM' } as Record<number, string>,
   hyperEvmDomain: 19,
-  /** Destination DEX field of the forwarding hook. */
+  /** CoreDepositWallet: 0 = perps (enabled by default), uint32.max = spot; other DEX IDs fall back to spot unless enabled. */
   dexes: { 0: 'perps', 4294967295: 'spot' } as Record<number, string>,
-  finality: { 1000: 'fast (soft finality)', 2000: 'standard (hard finality)' } as Record<number, string>,
+  /** HyperCore USDC system address (token index 0); CoreDepositWallet rejects it as a recipient. */
+  usdcSystemAddress: '0x2000000000000000000000000000000000000000',
+  /** CoreDepositWallet MAX_TRANSFER_VALUE_FROM_EVM = uint64.max / 100 (6-decimal units). */
+  maxTransferFromEvm: ((1n << 64n) - 1n) / 100n,
 } as const;
 
 export const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
 
 const BUILTIN_TOKENS: Record<number, TokenInfo[]> = {
+  11155111: [{ address: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', symbol: 'USDC', decimals: 6, name: 'USD Coin (testnet)' }],
+  421614: [{ address: '0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d', symbol: 'USDC', decimals: 6, name: 'USD Coin (testnet)' }],
+  998: [{ address: '0x2b3370ee501b4a559b57d449569354196457d8ab', symbol: 'USDC', decimals: 6, name: 'USD Coin (testnet)' }],
   1: [
     { address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', symbol: 'USDC', decimals: 6, name: 'USD Coin' },
     { address: '0xdac17f958d2ee523a2206206994597c13d831ec7', symbol: 'USDT', decimals: 6, name: 'Tether USD' },

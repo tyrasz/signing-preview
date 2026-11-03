@@ -3,7 +3,7 @@ import { CHAINS, chainName } from '../chains.ts';
 import type { AssetChange, Dependencies, Preview, PreviewContext, SimulationSummary } from '../types.ts';
 import { tokenInfo, type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
-import { cctpAdapter } from './cctp.ts';
+import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
 import { bridge2Adapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
 
 /** Order matters: specific routes before generic ERC-20 shapes. */
@@ -12,6 +12,7 @@ export const ADAPTERS: Adapter[] = [
   nativeAdapter,
   bridge2Adapter,
   cctpAdapter,
+  cctpExtensionAdapter,
   coreWriterAdapter,
   erc20Adapter,
   unknownCallAdapter,

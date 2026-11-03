@@ -1,7 +1,7 @@
 // MOCK DATA ONLY. Addresses, token IDs, prices and balances below are invented
 // for demos and tests (except well-known public contract addresses).
 import { encodeAbiParameters, encodeFunctionData, pad, parseAbi, parseAbiParameters, type Hex } from 'viem';
-import { CCTP, HYPERLIQUID, PERMIT2, spotSystemAddress } from '../src/chains.ts';
+import { CCTP, CCTP_NETWORKS, HYPERLIQUID, PERMIT2, spotSystemAddress } from '../src/chains.ts';
 import { l1ActionHash } from '../src/hyperliquid/action-hash.ts';
 import { StaticHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { MockSimulator } from '../src/simulation.ts';
@@ -54,6 +54,11 @@ export function mockHyperliquidInfo(): StaticHyperliquidInfo {
 
 const ERC20 = parseAbi(['function transfer(address to, uint256 amount)', 'function approve(address spender, uint256 amount)']);
 const CCTP_ABI = parseAbi(['function depositForBurnWithHook(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold, bytes hookData)']);
+const CCTP_EXTENSION = parseAbi([
+  'struct Auth { uint256 amount; uint256 authValidAfter; uint256 authValidBefore; bytes32 authNonce; uint8 v; bytes32 r; bytes32 s; }',
+  'struct Burn { uint256 amount; uint32 destinationDomain; bytes32 mintRecipient; bytes32 destinationCaller; uint256 maxFee; uint32 minFinalityThreshold; bytes hookData; }',
+  'function batchDepositForBurnWithAuth(Auth _receiveWithAuthorizationData, Burn _depositForBurnData)',
+]);
 const CORE_WRITER = parseAbi(['function sendRawAction(bytes data)']);
 const MAX = (1n << 256n) - 1n;
 
@@ -109,7 +114,29 @@ export function buildSamples(now = Date.now()): Sample[] {
   const orderNonce = now - 1000;
   const leverage = { type: 'updateLeverage', asset: 1, isCross: true, leverage: 30 };
   const stopLoss = { type: 'order', orders: [{ a: 1, b: false, p: '3100', s: '0.5', r: true, t: { trigger: { isMarket: true, triggerPx: '3150', tpsl: 'sl' } } }], grouping: 'na', builder: { b: BUILDER, f: 10 } };
+  const arb = CCTP_NETWORKS[42161];
+  const fwd = pad(CCTP.hyperCoreForwarder as Hex);
+  const nowS = BigInt(Math.floor(now / 1000));
+  const validAfter = nowS > 3600n ? nowS - 3600n : 0n;
+  // Circle's Arbitrum -> HyperCore guide: step 3 (sign ReceiveWithAuthorization) and step 4 (CctpExtension deposit).
+  const receiveAuth = {
+    domain: { name: 'USD Coin', version: '2', chainId: 42161, verifyingContract: ARB_USDC },
+    types: { EIP712Domain: domainType, ReceiveWithAuthorization: [{ name: 'from', type: 'address' }, { name: 'to', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'validAfter', type: 'uint256' }, { name: 'validBefore', type: 'uint256' }, { name: 'nonce', type: 'bytes32' }] },
+    primaryType: 'ReceiveWithAuthorization',
+    message: { from: ALICE, to: arb.cctpExtension, value: '10000000', validAfter: String(validAfter), validBefore: String(nowS + 3600n), nonce: '0x' + 'ab'.repeat(32) },
+  };
+  // Mock signature values (the previewer does not verify signatures).
+  const extensionDeposit = (hook: Hex) => encodeFunctionData({ abi: CCTP_EXTENSION, functionName: 'batchDepositForBurnWithAuth', args: [
+    { amount: 10_000_000n, authValidAfter: validAfter, authValidBefore: nowS + 3600n, authNonce: ('0x' + 'ab'.repeat(32)) as Hex, v: 27, r: ('0x' + '11'.repeat(32)) as Hex, s: ('0x' + '22'.repeat(32)) as Hex },
+    { amount: 10_000_000n, destinationDomain: 19, mintRecipient: fwd, destinationCaller: fwd, maxFee: 200_000n, minFinalityThreshold: 1000, hookData: hook },
+  ] });
   return [
+    { id: 'cctp-guide-sign', group: 'Arbitrum → Hyperliquid', label: 'Circle guide step 3: sign USDC authorization', chainId: 42161,
+      request: typed(receiveAuth) },
+    { id: 'cctp-guide-deposit', group: 'Arbitrum → Hyperliquid', label: 'Circle guide step 4: CctpExtension deposit 10 USDC', chainId: 42161,
+      request: tx(42161, arb.cctpExtension!, extensionDeposit(cctpHook(ALICE, 0))) },
+    { id: 'cctp-guide-no-recipient', group: 'Arbitrum → Hyperliquid', label: 'CctpExtension deposit with header-only hook (stuck)', chainId: 42161,
+      request: tx(42161, arb.cctpExtension!, extensionDeposit(('0x' + '636374702d666f7277617264'.padEnd(48, '0') + '0000000000000000') as Hex)) },
     { id: 'bridge2-deposit', group: 'Arbitrum → Hyperliquid', label: 'Deposit 100 USDC via Bridge2', chainId: 42161,
       request: tx(42161, ARB_USDC, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [HYPERLIQUID.bridge2, 100_000_000n] })) },
     { id: 'bridge2-below-min', group: 'Arbitrum → Hyperliquid', label: 'Deposit 3 USDC (below minimum)', chainId: 42161,

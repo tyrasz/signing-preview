@@ -5,9 +5,10 @@ import { normalizeTransaction, previewTransaction, RequestError } from './evm/tr
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
+import { eip3009Adapter } from './typed-data/eip3009.ts';
 import { previewMessage } from './message.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, permitAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, permitAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'] as const;
