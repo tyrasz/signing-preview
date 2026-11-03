@@ -160,7 +160,7 @@ Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulat
 
 Checked against `@nktkas/hyperliquid` 0.33.3 (every exchange action) and `hyperliquid-python-sdk` 0.24.0:
 - **Wallet-signed actions: 17/17.**
-- **L1 actions: 28/42.** All user-facing ones are covered. The 14 not specifically decoded are deployer, validator and agent-only actions; agent-signed actions never reach a user's wallet.
+- **L1 actions: 27/42.** All user-facing ones are covered. The 15 not specifically decoded are deployer, validator and agent-only actions; agent-signed actions never reach a user's wallet.
 - **CoreWriter actions: 15/15.**
 
 The EIP-712 field lists and wire fields match the SDK, and L1 hashes match 19 Python SDK vectors (`test/fixtures`). `npm run verify:live` resolves every live asset ID to a named market with a live mid price. On 2026-11-03 that was 235 perps, 349 spot pairs, 321 HIP-3 perps on 10 DEXes, and 636 outcome sides.
