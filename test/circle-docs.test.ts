@@ -1,4 +1,5 @@
-// Golden tests built from Circle's documentation, copied verbatim where marked:
+// Golden tests built from Circle's documentation, copied verbatim where marked (those excerpts are
+// Circle's, quoted so the tests reproduce the documented transactions exactly):
 //   "Transfer USDC from Arbitrum to HyperCore" (developers.circle.com, snapshot 2026-10-29)
 //   "Transfer USDC from Ethereum to HyperCore" (same snapshot)
 //   "Circle Forwarding Service for CCTP" (same snapshot)

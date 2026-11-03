@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "description": "Human-readable previews of EVM and Hyperliquid signing requests (Ethereum, Arbitrum, HyperEVM, HyperCore)",
+  "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=22.18" },
+  "engines": {
+    "node": ">=22.18"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./interceptor": "./src/interceptor.ts"
