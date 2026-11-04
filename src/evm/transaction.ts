@@ -5,6 +5,7 @@ import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './eff
 import { type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
+import { universalRouterAdapter } from './universal-router.ts';
 import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
 import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
 
@@ -18,6 +19,7 @@ export const ADAPTERS: Adapter[] = [
   cctpExtensionAdapter,
   coreWriterAdapter,
   erc20Adapter,
+  universalRouterAdapter,
   abiAdapter,
   unknownCallAdapter,
 ];
@@ -102,6 +104,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       const simulated = [...await netChanges(sim.transfers, tx, deps, b), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b)];
       if (simulated.length || !assetChanges.length) assetChanges = simulated;
       approvals = await approvalChanges((sim.approvals ?? []).map(approval => ({ approval, callTo: tx.to })), tx, deps, sim.approvalState);
+      // Approvals the decoded request already shows (e.g. a router's Permit2 permit step) are not hidden.
+      for (const a of approvals) if (d.declaredApprovals?.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender))) a.direct = true;
       approvalWarnings(b, approvals, context.now);
       b.note('Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
     }

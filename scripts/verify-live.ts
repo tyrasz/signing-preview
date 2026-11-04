@@ -11,7 +11,9 @@
 //  6. Checks the curated token list's decimals against each token contract, on-chain metadata reads and proxy
 //     detection on deployed contracts, and the Sourcify / OpenChain / 4byte (and, with ETHERSCAN_API_KEY,
 //     Etherscan) response shapes. A service that can't be reached is skipped, unless VERIFY_LIVE_STRICT=1 (CI).
-//  7. Simulates a Uniswap Universal Router Permit2 permit (an approval set along the way) and an ERC-721 transfer.
+//  7. Simulates a Uniswap Universal Router Permit2 permit (read back from Permit2) and an ERC-721 transfer.
+//  8. Decodes recent real Universal Router transactions on Ethereum and compares each headline ("Swap X for Y")
+//     with what the receipt and balance changes show was paid and received.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
 // ethereum-rpc.publicnode.com (or ETHEREUM_RPC_URL), rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus
 // sourcify.dev, api.openchain.xyz and www.4byte.directory for step 6 (behind a proxy, run with
@@ -24,7 +26,8 @@ import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
 import type { RpcClient } from '../src/rpc.ts';
 import { abiAdapter } from '../src/evm/abi-adapter.ts';
-import { RpcSimulator } from '../src/simulation.ts';
+import { parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { UNIVERSAL_ROUTERS } from '../src/evm/universal-router.ts';
 import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
@@ -399,8 +402,11 @@ console.log('\n7. Simulated NFT transfers and approvals set along the way');
   const execute = encodeFunctionData({ abi: parseAbi(['function execute(bytes commands, bytes[] inputs, uint256 deadline)']), functionName: 'execute', args: ['0x0a', [input], BigInt(now + 3600)] });
   const ur = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: signer.address, to: UR, data: execute, chainId: '0xa4b1' }] }, { now: now * 1000 }, { tokens, simulator });
   const a = ur.approvals?.[0];
-  check(a?.kind === 'permit2' && a.allowance === 'unlimited' && !a.direct && a.expiration === expiration && a.basis === 'simulated_state' && ur.warnings.some(w => w.code === 'hidden_unlimited_approval'),
-    'Permit2 allowance set by a router'.padEnd(34), a ? `${a.symbol} -> ${a.spender}: ${a.allowance}, direct ${a.direct}, ${a.basis}` : `no approval; simulation ${ur.simulation?.status} ${ur.simulation?.revertReason ?? ''}`);
+  // The router decoder shows the permit as a step, so the allowance read back from Permit2 counts as shown (direct),
+  // not as set along the way; the decoder's own note covers it.
+  const codesUr = ur.warnings.map(w => w.code);
+  check(a?.kind === 'permit2' && a.allowance === 'unlimited' && a.direct && a.expiration === expiration && a.basis === 'simulated_state' && codesUr.includes('router_permit2_allowance') && !codesUr.includes('hidden_unlimited_approval'),
+    'Permit2 allowance via the router'.padEnd(34), a ? `${a.symbol} -> ${a.spender}: ${a.allowance}, direct ${a.direct}, ${a.basis} | "${ur.title}"` : `no approval; simulation ${ur.simulation?.status} ${ur.simulation?.revertReason ?? ''}`);
   await sleep(1000);
   // ERC-721: BAYC #1 moved by its current owner. The collection name comes from the contract; BAYC also emits an
   // approval-clearing event on transfer, which must not be listed.
@@ -411,6 +417,48 @@ console.log('\n7. Simulated NFT transfers and approvals set along the way');
   const nft = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: owner, to: BAYC, data: transfer, chainId: '0x1' }] }, {}, { tokens, simulator });
   const moved = nft.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} (${c.standard})`).join(', ');
   check(moved === 'out 1 BAYC #1 (erc721)' && !nft.approvals?.length, 'ERC-721 transfer (BAYC #1)'.padEnd(34), `${moved || 'no changes'}${nft.approvals?.length ? `; approvals: ${nft.approvals.length}` : ''}`);
+}
+
+console.log('\n8. Recent real Uniswap Universal Router transactions on Ethereum');
+{
+  const tokens = new ChainedTokenRegistry([new StaticTokenRegistry(), new OnchainTokenRegistry(live)]);
+  const routers = Object.entries(UNIVERSAL_ROUTERS).filter(([, v]) => v.chainId === 1).map(([a]) => a);
+  const sym = async (a: string) => a === 'native' ? 'ETH' : (await tokens.get(1, a))?.symbol ?? a;
+  let n = BigInt(String(await live.call(1, 'eth_blockNumber', []))) - 2n;
+  const txs: { hash: string; from: string; to: string; input: Hex; value: string; ts: number }[] = [];
+  for (let i = 0; i < 40 && txs.length < 10; i++, n--) {
+    const blk = await live.call(1, 'eth_getBlockByNumber', ['0x' + n.toString(16), true]) as { timestamp: string; transactions: { hash: string; from: string; to: string | null; input: Hex; value: string }[] };
+    for (const t of blk.transactions) if (t.to && routers.includes(t.to.toLowerCase()) && txs.length < 10) txs.push({ ...t, to: t.to, ts: Number(blk.timestamp) });
+  }
+  const bad: string[] = [];
+  let matched = 0, unheadlined = 0;
+  for (const t of txs) {
+    const r = await live.call(1, 'eth_getTransactionReceipt', [t.hash]) as { status: string; blockNumber: string; gasUsed: string; effectiveGasPrice: string; logs: { address: string; topics: string[]; data: string }[] };
+    if (r.status !== '0x1') continue; // reverted: nothing moved to compare with
+    const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: t.from, to: t.to, data: t.input, value: t.value, chainId: '0x1' }] }, { now: t.ts * 1000 }, { tokens });
+    if (p.decoding.status !== 'full') { bad.push(`${t.hash}: not fully decoded (${p.details.filter(d => /not decoded|could not|Unknown/.test(d.value)).map(d => d.value).join('; ')})`); continue; }
+    const m = /^Swap (?:up to )?(?:[\d,.]+ )?(\S+) for (?:at least )?[\d,.]+ (\S+)$/.exec(p.title);
+    if (!m) { unheadlined++; continue; }
+    // What the sender paid and received: token transfer logs, plus native ETH from balance changes (Uniswap v4 and
+    // unwraps pay ETH out as internal transfers). Outputs flagged as going elsewhere are checked at that address.
+    const from = t.from.toLowerCase(), bn = BigInt(r.blockNumber);
+    const bal = async (a: string, b: bigint) => BigInt(String(await live.call(1, 'eth_getBalance', [a, '0x' + b.toString(16)])));
+    const net = new Map<string, bigint>();
+    const logs = parseLogs(r.logs);
+    for (const x of logs.transfers) { if (x.from === from) net.set(x.asset, (net.get(x.asset) ?? 0n) - x.raw); if (x.to === from) net.set(x.asset, (net.get(x.asset) ?? 0n) + x.raw); }
+    const ethIn = (await bal(from, bn)) - (await bal(from, bn - 1n)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice);
+    net.set('native', (net.get('native') ?? 0n) + ethIn); // value paid shows as a negative balance change
+    const paid = await Promise.all([...net].filter(([, v]) => v < 0n).map(([k]) => sym(k)));
+    const got = await Promise.all([...net].filter(([, v]) => v > 0n).map(([k]) => sym(k)));
+    for (const a of new Set([...(p.warnings.find(w => w.code === 'output_to_other')?.message ?? '').matchAll(/0x[0-9a-fA-F]{40}/g)].map(x => x[0].toLowerCase()))) {
+      if ((await bal(a, bn)) > (await bal(a, bn - 1n))) got.push('ETH');
+      for (const x of logs.transfers) if (x.to === a) got.push(await sym(x.asset));
+    }
+    if (paid.includes(m[1]) && got.includes(m[2])) matched++;
+    else bad.push(`${t.hash}: "${p.title}" but the chain shows paid ${paid.join('+') || 'nothing'}, received ${got.join('+') || 'nothing'}`);
+  }
+  check(txs.length > 0, 'recent router transactions found'.padEnd(34), `${txs.length} in the last 40 blocks`);
+  check(bad.length === 0, 'real swaps decode and match'.padEnd(34), `${matched} matched${unheadlined ? `, ${unheadlined} multi-step without a single headline` : ''}${bad.length ? ' | ' + bad.join(' | ') : ''}`);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

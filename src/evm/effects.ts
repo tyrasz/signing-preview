@@ -1,6 +1,6 @@
 // What a simulated transaction does to the account: balance changes (fungible and NFT) and the permissions it
 // leaves in place. Shared by single transactions and EIP-5792 batches.
-import { formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
+import { formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, TokenInfo } from '../types.ts';
 import { tokenInfo, tokenSourceWarnings } from './common.ts';
@@ -125,7 +125,8 @@ export function approvalWarnings(b: PreviewBuilder, approvals: ApprovalChange[],
   for (const a of approvals) {
     if (a.direct || a.revoked) continue;
     const who = shortAddress(a.spender);
-    const until = a.expiration && a.expiration * 1000 > nowMs ? ` until ${new Date(a.expiration * 1000).toISOString().slice(0, 10)}` : '';
+    const date = a.expiration ? utcDate(a.expiration) : null;
+    const until = a.expiration && a.expiration * 1000 > nowMs ? (date ? ` until ${date}` : ' with no expiry') : '';
     const via = a.kind === 'permit2' ? ' through Permit2' : '';
     if (a.kind === 'operator') add('danger', 'hidden_approval_for_all', `${who} can transfer every NFT you hold in ${a.symbol}`);
     else if (a.kind === 'erc721') add('caution', 'hidden_nft_approval', `${who} can transfer your ${a.allowance}`);

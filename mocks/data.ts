@@ -254,6 +254,12 @@ export function buildSamples(now = Date.now()): Sample[] {
       request: tx(1, BOB, '0x', 250_000_000_000_000_000n) },
     { id: 'eth-unknown-swap', group: 'Ethereum', label: 'Unknown router call (simulated swap)', chainId: 1,
       request: tx(1, ROUTER, '0x3593564c00000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000') },
+    { id: 'eth-uniswap-swap', group: 'Ethereum', label: 'Uniswap: swap 1 ETH for USDC (Universal Router)', chainId: 1,
+      // WRAP_ETH then V3_SWAP_EXACT_IN (WETH -0.05%-> USDC), as the Uniswap SDK encodes it.
+      request: tx(1, '0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af', encodeFunctionData({ abi: parseAbi(['function execute(bytes commands, bytes[] inputs, uint256 deadline) payable']), functionName: 'execute', args: ['0x0b00', [
+        encodeAbiParameters(parseAbiParameters('address, uint256'), ['0x0000000000000000000000000000000000000002', 1n << 255n]),
+        encodeAbiParameters(parseAbiParameters('address, uint256, uint256, bytes, bool'), ['0x0000000000000000000000000000000000000001', 1n << 255n, 3_150_000_000n, `${ETH_WETH}0001f4${ETH_USDC.slice(2)}` as Hex, false]),
+      ], BigInt(Math.floor(now / 1000) + 1800)] }), 10n ** 18n) },
     { id: 'eth-nft-buy', group: 'Ethereum', label: 'Router call: buy an NFT, Permit2 allowance set along the way (simulated)', chainId: 1,
       request: tx(1, ROUTER, '0x3593564c0000000000000000000000000000000000000000000000000000000000000001') },
     { id: 'eth-reverting', group: 'Ethereum', label: 'Call that will revert (simulated)', chainId: 1,

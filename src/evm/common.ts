@@ -19,6 +19,8 @@ export interface Decoded {
   status: 'full' | 'partial' | 'opaque';
   b: PreviewBuilder;
   assetChanges: AssetChange[];
+  /** Approvals the decoded request itself shows (e.g. a router's Permit2 permit step), so they aren't "hidden". */
+  declaredApprovals?: { kind: 'erc20' | 'permit2' | 'erc721' | 'operator'; token: string; spender: string }[];
 }
 
 export interface AdapterEnv {

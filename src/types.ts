@@ -57,7 +57,10 @@ export interface ApprovalChange {
   /** Permit2 expiry (unix seconds). */
   expiration?: number;
   revoked: boolean;
-  /** True when the approval is the call itself (e.g. approve()), false when another call set it along the way. */
+  /**
+   * True when the decoded request shows the approval (approve(), or a router's Permit2 permit step); false when
+   * another call set it along the way, unseen.
+   */
   direct: boolean;
   /** simulated_state: read from the token after the simulated transaction; simulated_events: from approval events. */
   basis: 'simulated_events' | 'simulated_state';

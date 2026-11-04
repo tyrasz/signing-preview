@@ -109,6 +109,7 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | Off-chain approvals | ERC-2612 / DAI `Permit`, Permit2 `PermitSingle/Batch/TransferFrom` | Spender, amount and expiry; flags unlimited or long-lived permissions and owner mismatches. |
 | Messages | `personal_sign`, SIWE, `eth_sign` | Readable text; SIWE domain vs. requesting origin (phishing); `eth_sign` is always danger. |
 | Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. The calls are simulated **in order in one block**, so "approve, then swap" isn't shown as failing, and balance changes are netted across the batch. **Danger** when a call in an all-or-nothing (`atomicRequired`) batch would fail, since then none take effect; **caution** for a non-atomic batch, where the other calls may still go through. A custom simulator without `simulateBatch` simulates only the first call and says why. |
+| Uniswap **Universal Router** | `execute(commands, inputs[, deadline])` on the official routers (current router with Uniswap v4, and v1.2) on Ethereum and Arbitrum | One headline for the trade ("Swap 1 ETH for at least 3,150 USDC"), summing split routes and following chained hops through wrap/unwrap, then every command as a step: v2/v3/v4 swaps with fee tiers, Permit2 permits and transfers, wrap/unwrap, sweep, pay, fee portions, balance checks, sub-plans, v3/v4 position-manager calls, and v1.2's NFT-marketplace purchases. **Caution** when output goes to another address, when the minimum received is 0 (no slippage protection), when the deadline has passed, or for a Permit2 allowance to an address other than the router; **danger** for a fee portion of 10% or more. Command IDs differ between router versions (0x10 is a Seaport purchase on v1.2 and a v4 swap now), so only known router addresses are decoded. |
 | Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
 | | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
@@ -309,6 +310,16 @@ What the contracts imply, and what the preview reports:
   - simulated on its own, the deposit reverts with "ERC20: transfer amount exceeds allowance", which is what batch previews used to show;
   - simulated in order, the batch succeeds, and its balance change is the simulated "out 10 USDC";
   - the allowance left afterwards reads "none", from USDC itself; the event alone would have said 10 USDC.
+- **Uniswap Universal Router.**
+  - The command table and every input layout come from the routers' verified sources on Sourcify (`Commands.sol`, `Dispatcher.sol`, and v4-periphery's `V4Router`/`Actions`), for both versions.
+  - On 2026-11-04, recent real router transactions were decoded: 15 on Ethereum and 12 on Arbitrum. For every successful one, the token paid and the token received in the headline matched the receipt's transfer logs. Native ETH, which Uniswap v4 and unwraps pay out as internal transfers, was checked through balance changes.
+  - Every "output goes to another address" caution was confirmed by that address's balance change.
+  - That data surfaced four fixes:
+    - Permit2 expiries of 2^48−1 ("never") broke date formatting.
+    - v4's max-uint128 "no limit" printed as a 39-digit amount.
+    - Routes that mix v3 and v4 through an unwrap needed WETH and ETH treated as one asset.
+    - An Arbitrum round trip (sell Dory for USDC, add USDC, buy Dory back) produced "Swap Dory for Dory". Headlines are now checked against what the wallet pays and receives; refunds of the input token are allowed. When they disagree, the title lists the flow instead: "Uniswap: pay Dory + USDC, receive Dory (10 steps)".
+  - `npm run verify:live` repeats the comparison daily on the latest Ethereum router transactions.
 - **NFTs and approvals set along the way.**
   - A Permit2 permit, signed by a throwaway key and run through Uniswap's Universal Router on Arbitrum (command `0x0a`), is listed as an unlimited USDC allowance for the router, with its expiry, and flagged as set along the way.
   - BAYC #1, moved by its current owner on Ethereum, shows as "out 1 BAYC #1", with the name read from the contract. BAYC's approval-clearing event is not listed.
@@ -358,7 +369,8 @@ Actions are pinned to commit SHAs (with the version in a comment), and workflows
 
 ```
 src/preview.ts            entry point: routes EIP-1193 methods
-src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, any verified ABI)
+src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, Uniswap Universal Router, any verified ABI)
+src/evm/effects.ts        simulated balance changes (fungible and NFT) and approvals left in place
 src/tokens.ts             token registries: token lists, on-chain metadata, impersonation check
 src/abi.ts                ABI sources (Sourcify, Etherscan, static), proxy detection, signature databases
 src/rpc.ts                JSON-RPC client and the lookup cache
