@@ -36,20 +36,33 @@ export class JsonRpcClient implements RpcClient {
   private urls: Record<number, string>;
   private fetchImpl: typeof fetch;
   private timeoutMs: number;
-  constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {}) {
+  private retries: number;
+  private retryDelayMs: number;
+  constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch; timeoutMs?: number; retries?: number; retryDelayMs?: number } = {}) {
     this.urls = urls;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.timeoutMs = options.timeoutMs ?? 8000;
+    this.retries = options.retries ?? 3;
+    this.retryDelayMs = options.retryDelayMs ?? 400;
   }
   has(chainId: number) { return !!this.urls[chainId]; }
+  /** Public RPCs (HyperEVM's in particular) rate-limit; a throttled call is retried a few times, briefly. */
   async call(chainId: number, method: string, params: unknown[]): Promise<unknown> {
     const url = this.urls[chainId];
     if (!url) throw new Error(`No RPC URL for chain ${chainId}`);
-    const res = await this.fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(this.timeoutMs),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
-    if (!res.ok) throw new Error(`${method}: HTTP ${res.status}`);
-    const body = await res.json() as { result?: unknown; error?: { message?: string } };
-    if (body.error) throw Object.assign(new Error(`${method}: ${body.error.message ?? 'error'}`), { rpcError: body.error });
-    return body.result;
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(this.timeoutMs),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+      const limited = res.status === 429;
+      const body = limited ? undefined : res.ok ? await res.json() as { result?: unknown; error?: { code?: number; message?: string } } : undefined;
+      if ((limited || /rate limit|too many requests/i.test(body?.error?.message ?? '')) && attempt < this.retries) {
+        await new Promise(r => setTimeout(r, this.retryDelayMs * 2 ** attempt));
+        continue;
+      }
+      if (!res.ok) throw new Error(`${method}: HTTP ${res.status}`);
+      if (body!.error && !/rate limit|too many requests/i.test(body!.error.message ?? '')) throw Object.assign(new Error(`${method}: ${body!.error.message ?? 'error'}`), { rpcError: body!.error });
+      if (body!.error) throw new Error(`${method}: rate limited`);
+      return body!.result;
+    }
   }
 }

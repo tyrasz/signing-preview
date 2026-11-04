@@ -6,6 +6,8 @@ import { l1ActionHash } from '../src/hyperliquid/action-hash.ts';
 import { StaticHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { MockSimulator } from '../src/simulation.ts';
 import type { PreviewContext, SigningRequest, SimulationResult } from '../src/types.ts';
+import type { RpcClient } from '../src/rpc.ts';
+import { toFunctionSelector } from 'viem';
 
 export const ALICE = '0xa11ce00000000000000000000000000000000001';
 export const BOB = '0xb0b0000000000000000000000000000000000002';
@@ -15,6 +17,8 @@ export const SPENDER = '0x5bad000000000000000000000000000000000005';
 export const ROUTER = '0x7e57000000000000000000000000000000000006';
 export const POOL = '0x9001000000000000000000000000000000000007';
 const MOCK_PURR_EVM = '0x9b498c3c8a0b8cd8ba1d9851d40d186f1872b44e';
+const KINETIQ_SM = '0x393d0b87ed38fc779fd9611144ae649ba6082109', HYPERLEND_POOL = '0x00a89d7a5a02160f20150ebea7a2b5e4879a1a8b';
+const HYPERLEND_DEBT_USDC = '0xd612513cb3b2c52abcd6d4b338374c09ada4657d', HYPEREVM_USDC = '0xb88339cb7199b77e23db6e890353e22632ba630f';
 const MOCK_NFT = '0x4e47000000000000000000000000000000000721';
 
 const ARB_USDC = CCTP.usdcByChain[42161];
@@ -228,6 +232,14 @@ export function buildSamples(now = Date.now()): Sample[] {
     { id: 'hl-order-mismatch', group: 'HyperCore', label: 'L1 action that does not match its hash', chainId: 42161,
       request: typed(agent(l1ActionHash({ ...order, orders: [{ ...order.orders[0], s: '5' }] }, orderNonce))), context: { hyperliquid: { action: order, nonce: orderNonce } } },
 
+    { id: 'kinetiq-stake', group: 'HyperEVM', label: 'Kinetiq: stake 10 HYPE for kHYPE', chainId: 999,
+      request: tx(999, KINETIQ_SM, '0x3a4b66f1', 10n ** 19n) },
+    { id: 'kinetiq-unstake', group: 'HyperEVM', label: 'Kinetiq: unstake 100 kHYPE (7-day queue)', chainId: 999,
+      request: tx(999, KINETIQ_SM, encodeFunctionData({ abi: parseAbi(['function queueWithdrawal(uint256)']), functionName: 'queueWithdrawal', args: [100n * 10n ** 18n] })) },
+    { id: 'hyperlend-borrow', group: 'HyperEVM', label: 'HyperLend: borrow 3,000 USDC (health factor drops)', chainId: 999,
+      request: tx(999, HYPERLEND_POOL, encodeFunctionData({ abi: parseAbi(['function borrow(address,uint256,uint256,uint16,address)']), functionName: 'borrow', args: [HYPEREVM_USDC as Hex, 3_000_000_000n, 2n, 0, ALICE as Hex] })) },
+    { id: 'hyperlend-delegation', group: 'HyperEVM', label: 'HyperLend: credit delegation to another address', chainId: 999,
+      request: tx(999, HYPERLEND_DEBT_USDC, encodeFunctionData({ abi: parseAbi(['function approveDelegation(address,uint256)']), functionName: 'approveDelegation', args: [SPENDER as Hex, (1n << 256n) - 1n] })) },
     { id: 'evm-hype-to-core', group: 'HyperEVM', label: 'Move 3 HYPE to HyperCore', chainId: 999,
       request: tx(999, HYPERLIQUID.hypeSystemAddress, '0x', 3n * 10n ** 18n) },
     { id: 'evm-purr-to-core', group: 'HyperEVM', label: 'Move PURR to HyperCore (system address)', chainId: 999,
@@ -271,6 +283,45 @@ export function buildSamples(now = Date.now()): Sample[] {
 }
 
 /** Canned simulation results for the samples above. */
+/**
+ * Mock HyperEVM reads for the Kinetiq and HyperLend demo samples (values shaped like the live contracts on
+ * 2026-11-04): kHYPE at 1.0276 HYPE, a 5 HYPE minimum, a 7-day queue; ALICE with $10,000 of WHYPE collateral and
+ * $4,000 of USDC debt on HyperLend (health factor 2.0).
+ */
+export function mockHyperEvmRpc(): RpcClient {
+  const sel = (s: string) => toFunctionSelector(`function ${s}`);
+  const u = (v: bigint) => encodeAbiParameters([{ type: 'uint256' }], [v]);
+  const a = (x: string) => encodeAbiParameters([{ type: 'address' }], [x as Hex]);
+  const E = 10n ** 18n, RATE = 1_027_590_248_920_605_756n;
+  const ACCOUNTANT = '0x9209648ec9d448ef57116b73a2f081835643dc7a', PROVIDER = '0x72c98246a98bfe64022a3190e7710e157497170c', ORACLE = '0xc9fb4fbe842d57eac1df3e641a281827493a630e';
+  const reserve = encodeAbiParameters(parseAbiParameters('(uint256, uint128, uint128, uint128, uint128, uint128, uint40, uint16, address, address, address, address, uint128, uint128, uint128)'),
+    [[(6n << 48n) | (7800n << 16n) | 7500n, 0n, 0n, 0n, 0n, 0n, 0, 1, '0x000000000000000000000000000000000000a5dc', '0x0000000000000000000000000000000000000000', HYPERLEND_DEBT_USDC as Hex, '0x0000000000000000000000000000000000000000', 0n, 0n, 0n]]);
+  const answers: Record<string, Hex | ((d: Hex) => Hex)> = {
+    [`${KINETIQ_SM}:${sel('stakingAccountant()')}`]: a(ACCOUNTANT), [`${KINETIQ_SM}:${sel('minStakeAmount()')}`]: u(5n * E), [`${KINETIQ_SM}:${sel('maxStakeAmount()')}`]: u(0n),
+    [`${KINETIQ_SM}:${sel('stakingPaused()')}`]: u(0n), [`${KINETIQ_SM}:${sel('whitelistEnabled()')}`]: u(0n), [`${KINETIQ_SM}:${sel('withdrawalPaused()')}`]: u(0n),
+    [`${KINETIQ_SM}:${sel('unstakeFeeRate()')}`]: u(0n), [`${KINETIQ_SM}:${sel('withdrawalDelay()')}`]: u(604_800n), [`${KINETIQ_SM}:${sel('quickWithdrawalDelay()')}`]: u(129_600n),
+    [`${KINETIQ_SM}:${sel('minWithdrawalAmount()')}`]: u(0n), [`${KINETIQ_SM}:${sel('nextWithdrawalId(address)')}`]: u(0n),
+    [`${ACCOUNTANT}:${sel('HYPEToKHYPE(uint256)')}`]: d => u(BigInt('0x' + d.slice(10)) * E / RATE),
+    [`${ACCOUNTANT}:${sel('kHYPEToHYPE(uint256)')}`]: d => u(BigInt('0x' + d.slice(10)) * RATE / E),
+    [`${HYPERLEND_POOL}:${sel('getUserAccountData(address)')}`]: encodeAbiParameters(parseAbiParameters('uint256, uint256, uint256, uint256, uint256, uint256'), [10_000n * 10n ** 8n, 4_000n * 10n ** 8n, 3_500n * 10n ** 8n, 8000n, 7500n, 2n * E]),
+    [`${PROVIDER}:${sel('getPriceOracle()')}`]: a(ORACLE), [`${ORACLE}:${sel('getAssetPrice(address)')}`]: u(10n ** 8n),
+    [`${HYPERLEND_POOL}:${sel('getReserveData(address)')}`]: reserve, [`${HYPERLEND_POOL}:${sel('getUserEMode(address)')}`]: u(0n),
+    [`${HYPERLEND_POOL}:${sel('getReserveVariableDebtToken(address)')}`]: a(HYPERLEND_DEBT_USDC),
+    [`${HYPERLEND_DEBT_USDC}:${sel('POOL()')}`]: a(HYPERLEND_POOL), [`${HYPERLEND_DEBT_USDC}:${sel('UNDERLYING_ASSET_ADDRESS()')}`]: a(HYPEREVM_USDC),
+    [`${HYPERLEND_DEBT_USDC}:${sel('name()')}`]: encodeAbiParameters([{ type: 'string' }], ['HyperLend HyperEVM Variable Debt USDC']),
+  };
+  return {
+    has: chainId => chainId === 999,
+    async call(_chainId, method, params) {
+      if (method !== 'eth_call') throw new Error(`mock RPC: ${method} not supported`);
+      const { to, data } = params[0] as { to: string; data: Hex };
+      const r = answers[`${to.toLowerCase()}:${data.slice(0, 10)}`];
+      if (r === undefined) throw Object.assign(new Error('execution reverted'), { rpcError: { code: 3, message: 'execution reverted' } });
+      return typeof r === 'function' ? r(data) : r;
+    },
+  };
+}
+
 export function mockSimulator(): MockSimulator {
   const samples = buildSamples(0);
   const call = (id: string) => {

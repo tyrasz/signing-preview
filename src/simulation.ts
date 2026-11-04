@@ -1,5 +1,6 @@
 import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, parseAbi, type Hex } from 'viem';
 import { PERMIT2 } from './chains.ts';
+import { knownError } from './errors.ts';
 import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
 // Event topics (keccak256 of the signature).
@@ -21,9 +22,16 @@ type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: 
  * Balance changes are derived from Transfer events, so fee-on-transfer and rebasing tokens can differ.
  * Batches run as consecutive calls in one simulated block, so each call sees the previous calls' effects.
  */
+/** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1). */
+export class BatchSimulationUnsupported extends Error {
+  constructor(chainId: number) { super(`The RPC for chain ${chainId} has no eth_simulateV1, so batch calls can't be simulated in order`); this.name = 'BatchSimulationUnsupported'; }
+}
+
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
   private fetchImpl: typeof fetch;
+  /** Chains whose RPC answered "method not found" for eth_simulateV1 (e.g. HyperEVM's public RPC). */
+  private noSimulate = new Set<number>();
   constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch } = {}) {
     this.urls = urls;
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -37,13 +45,18 @@ export class RpcSimulator implements Simulator {
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
     const url = this.urls[chainId];
     if (!url) return null;
+    if (this.noSimulate.has(chainId)) return this.ethCallFallback(url, chainId, reqs);
     const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }));
     const res = await this.fetchImpl(url, {
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls }], traceTransfers: true, validation: false }, 'latest'] }),
     });
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-    const body = await res.json() as { result?: { calls: RawCallResult[] }[]; error?: { message: string } };
+    const body = await res.json() as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
+    if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
+      this.noSimulate.add(chainId);
+      return this.ethCallFallback(url, chainId, reqs);
+    }
     const results = body.result?.[0]?.calls;
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const source = `eth_simulateV1 @ chain ${chainId}`;
@@ -52,6 +65,28 @@ export class RpcSimulator implements Simulator {
       : { status: 'success', source, gasUsed: BigInt(result.gasUsed), ...parseLogs(result.logs ?? []) });
     try { await this.readApprovalState(url, reqs, parsed); } catch { /* keep the event-based values */ }
     return parsed;
+  }
+
+  /**
+   * Without eth_simulateV1, eth_call still says whether a single call succeeds and why it would revert, but nothing
+   * about transfers. Calls in a batch depend on each other, so only a single call can be checked this way.
+   */
+  private async ethCallFallback(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
+    if (reqs.length > 1) throw new BatchSimulationUnsupported(chainId);
+    const req = reqs[0];
+    const res = await this.fetchImpl(url, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }, 'latest'] }),
+    });
+    if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+    const body = await res.json() as { result?: string; error?: { code?: number; message?: string; data?: Hex } };
+    const source = `eth_call @ chain ${chainId} (the RPC has no eth_simulateV1)`;
+    if (!body.error) return [{ status: 'success', source, transfers: [], limited: true }];
+    // A revert comes back as an error carrying the revert data; anything else is a transport or node problem.
+    const message = body.error.message ?? '';
+    if (!/revert/i.test(message) && !body.error.data) throw new Error(`eth_call failed: ${message}`);
+    const reason = decodeRevert(body.error.data) ?? (message.replace(/^execution reverted:?\s*/i, '') || undefined);
+    return [{ status: 'reverted', source, revertReason: reason, transfers: [], limited: true }];
   }
 
   /**
@@ -155,13 +190,13 @@ export function parseLogs(logs: Log[]): { transfers: SimulatedTransfer[]; nftTra
 
 const ERRORS = parseAbi(['error Error(string message)', 'error Panic(uint256 code)']);
 
-function decodeRevert(data: Hex | undefined): string | undefined {
+export function decodeRevert(data: Hex | undefined): string | undefined {
   if (!data || data === '0x') return undefined;
   try {
     const decoded = decodeErrorResult({ abi: ERRORS, data });
     return decoded.errorName === 'Error' ? String(decoded.args[0]) : `Panic(0x${(decoded.args[0] as bigint).toString(16)})`;
   } catch {
-    return `custom error ${data.slice(0, 10)}`;
+    return knownError(data) ?? `custom error ${data.slice(0, 10)}`;
   }
 }
 

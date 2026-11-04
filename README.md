@@ -103,6 +103,9 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | USDC gasless transfers | EIP-3009 `TransferWithAuthorization` / `ReceiveWithAuthorization` / `CancelAuthorization` | Amount, spender/recipient, validity window; warns that a transfer authorization works like sending the payment. |
 | HyperCore **user-signed** actions | `eth_signTypedData_v4`, `HyperliquidSignTransaction` domain | All 17 types in `@nktkas/hyperliquid` 0.33.3: `Withdraw` (net of the 1 USDC fee), `UsdSend`, `SpotSend` (including HyperCore → HyperEVM via system address), `UsdClassTransfer`, `SendAsset`, `SendToEvmWithData`, `ApproveAgent`, `ApproveBuilderFee`, `TokenDelegate`, `CDeposit`/`CWithdraw`, `UserSetAbstraction`, `UserDexAbstraction`, `UserPortfolioMargin`, `LinkStakingUser` (danger: the staking account can later lock this account), `StakingLinkDisableTradingUser` (danger: irreversible), `ConvertToMultiSigUser`, `SendMultiSig`; unknown types list every field. Checks: imitation domains, testnet, expired or future timestamps, a token ID that doesn't match its label. |
 | HyperCore **L1** actions | `Agent { source, connectionId }`, `Exchange` domain | **When the original action is supplied** (see below): orders (limit, trigger TP/SL, builder fee), cancels, modify, leverage, isolated margin, top-up margin, TWAP, scheduled cancel, borrow/lend, vault create/modify/distribute/transfer, sub-account transfers (USDC and spot), rename, rewards, referrals, display name, spot dusting, HyperEVM block size. Markets are resolved on main perps, spot, **HIP-3 builder DEXes** and **outcome markets**. Perp orders are margin-checked on their own DEX (skipped for unified/portfolio-margin accounts); spot orders are checked against spot balances. Deployer, validator, agent and outcome-share actions are decoded too, with warnings for oracle updates, trading halts, fee-recipient and permission changes, market settlement, HYPE-spending auctions and backstop-liquidator deposits. |
+| HyperEVM, **Kinetiq** liquid staking | `stake`, `queueWithdrawal`, `confirmWithdrawal` / `batchConfirmWithdrawals`, `instantUnstake`, `redelegate` on the StakingManager | "Stake 10 HYPE for ≈ 9.7315 kHYPE", "Unstake 100 kHYPE: ≈ 102.759 HYPE claimable in 7 days", "Instant unstake … for ≈ X HYPE (0.1% fee)". With an RPC, live values: rate, fees, delays (7 days, or 36 hours when Kinetiq's buffer covers it), Kinetiq's own instant-unstake quote, and when each queued withdrawal becomes claimable. **"This will fail"** for a stake below the minimum (5 HYPE), an amount that isn't a multiple of 0.00000001 HYPE (HyperCore keeps 8 decimals), paused staking or withdrawals, a claim that isn't ready, an empty instant-unstake buffer or a quote below your minimum. |
+| HyperEVM, **HyperLend** | Pool `supply`, `withdraw`, `borrow`, `repay` (and `…WithPermit`, `repayWithATokens`), collateral and e-mode switches, `approvePositionManager`, `liquidationCall`; the native-HYPE gateway | Plain-language actions ("Borrow 3,000 USDC from HyperLend", "Withdraw all your WHYPE"), "all" for max amounts, and the **health factor before → after**, from your live position, oracle prices and each market's liquidation threshold (e-mode aware). **Danger** below 1.1; **caution** below 1.5; **"this will fail"** when HyperLend would refuse (borrowing beyond the limit, leaving HF < 1). **Caution** for a position manager, which can switch your collateral and e-mode. Gateway calls are trusted only when the contract's verified source is a WrappedTokenGateway pointing at HyperLend's Pool. |
+| Credit delegation (HyperLend, any Aave-style market) | `approveDelegation` on a debt token; `DelegationWithSig` signatures | **Danger**: the delegatee can borrow in your name, against your collateral, and the debt is yours. Named as HyperLend when the debt token's Pool is HyperLend's and lists it. |
 | HyperEVM → HyperCore | CoreWriter `sendRawAction` | All CoreWriter actions (IDs 1–13 and 15–17), with 1e8 price/size scaling. Notes that HyperCore runs the action asynchronously, so a failure there doesn't revert the EVM transaction. |
 | HyperEVM → HyperCore | HYPE to `0x2222…`, ERC-20 to `0x20…<index>` | "Move X to HyperCore". **Danger** if the token isn't the contract linked to that index. |
 | Ethereum / Arbitrum / HyperEVM | ERC-20 transfer/approve/transferFrom, `setApprovalForAll`, WETH, Permit2 `approve`, native sends, contract creation | Amounts with the token's symbol and decimals. Warns on unlimited approvals, zero-value transfers and transfers to the token contract itself. |
@@ -182,6 +185,15 @@ Any RPC works if it supports `eth_simulateV1`, which simulation needs. Verificat
 Public endpoints can rate-limit or change without notice; use your own provider in production.
 
 ## Contract and token lookups
+
+**HyperEVM.** The public RPC (`rpc.hyperliquid.xyz/evm`) has no `eth_simulateV1` or trace methods, only `eth_call`.
+- `RpcSimulator` notices this once and checks single transactions with `eth_call` instead. That tells whether the call succeeds and why it would revert, but gives no balance changes.
+- In a batch, only the first call can be checked that way; the others are marked not simulated.
+- Reverts with **custom errors** are named from the verified sources: Kinetiq's facets, HyperLend's Aave `Errors` library and OpenZeppelin. For example, "MustBeDivisibleBy1e10: the HYPE amount must be a multiple of 0.00000001 HYPE" or "HealthFactorLowerThanLiquidationThreshold".
+- Protocol decoders read live state with `eth_call` themselves, so they don't need simulation.
+- The read-only client retries briefly when rate-limited, and keeps results for 15 seconds within a preview.
+
+**Diamond routers.** When a contract's ABI lacks the called function, the resolver asks the contract for its facet (EIP-2535 `facetAddress`, or `getFacetAddress` as on Kinetiq's router) and uses that facet's verified ABI.
 
 **Tokens** are looked up in order, first hit wins:
 1. The built-in list (`src/chains.ts`).
@@ -310,6 +322,15 @@ What the contracts imply, and what the preview reports:
   - simulated on its own, the deposit reverts with "ERC20: transfer amount exceeds allowance", which is what batch previews used to show;
   - simulated in order, the batch succeeds, and its balance change is the simulated "out 10 USDC";
   - the allowance left afterwards reads "none", from USDC itself; the event alone would have said 10 USDC.
+- **Kinetiq and HyperLend (HyperEVM).**
+  - The docs sites weren't reachable from this environment, so identities were taken from the contracts themselves:
+    - Kinetiq's StakingManager reports kHYPE as its token (`tokenAddress()`), and that kHYPE is both the address in Kinetiq's docs and Hyperliquid's own HyperCore link (spot token #121).
+    - HyperLend's PoolAddressesProvider returns this Pool and calls itself "HyperLend Market". Its debt tokens point back to the Pool and use Aave's exact `DelegationWithSig` typehash.
+  - Every function decoded here comes from verified source on Sourcify: Kinetiq's 7 facets, the instant-unstake pool, StakingAccountant and kHYPE, and HyperLend's `PoolInstance` and hTokens. HyperLend's debt-token implementation isn't on Sourcify; its functions were confirmed in its bytecode.
+  - On 2026-11-04, the decoders' predictions matched `eth_call` on the live contracts in every case tried:
+    - Kinetiq stakes below the minimum (`BelowMinimum`), not 8-decimal (`MustBeDivisibleBy1e10`), unstaking without kHYPE (`InsufficientTokenBalance`), claiming an unknown withdrawal (`InvalidWithdrawal`).
+    - For two real HyperLend borrowers, the health-factor formula reproduced the Pool's own value to within 0.02%. Withdrawing all of a borrower's collateral was predicted to fail (HF → 0) and the chain refused it with `HealthFactorLowerThanLiquidationThreshold`.
+  - `npm run verify:live` (step 9) repeats these checks daily.
 - **Uniswap Universal Router.**
   - The command table and every input layout come from the routers' verified sources on Sourcify (`Commands.sol`, `Dispatcher.sol`, and v4-periphery's `V4Router`/`Actions`), for both versions.
   - On 2026-11-04, recent real router transactions were decoded: 15 on Ethereum and 12 on Arbitrum. For every successful one, the token paid and the token received in the headline matched the receipt's transfer logs. Native ETH, which Uniswap v4 and unwraps pay out as internal transfers, was checked through balance changes.
@@ -345,6 +366,11 @@ What the contracts imply, and what the preview reports:
   - Two actions newer than SDK 0.33.3, `cDeposit2` (agent staking) and `trailingStop`, which are now decoded.
 - **Failed HyperCore → other-chain withdrawals.** On mainnet the route is unused right now. A scan of 160,000 HyperEVM blocks (about two days) found no `CrossChainWithdraw` events and no CCTP burns by the `CoreDepositWallet`, even though it emitted thousands of deposit events. So there were no real failures to inspect, and the testnet endpoints were not reachable from this environment. Circle documents that a withdrawal below the fee makes the HyperEVM step revert. Hyperliquid's docs make correct use of `sendToEvmWithData` the caller's responsibility. Neither documents a refund, so the preview flags these cases as danger and says the funds are at risk.
 
+Not covered on HyperEVM yet:
+- HyperLend's isolated (Fraxlend-style) pools, and Kinetiq products other than kHYPE staking (such as the vkHYPE vault): their addresses weren't available without the docs sites.
+- The native-HYPE gateway's address. Gateway calls are recognised by their Pool argument and verified source instead.
+- Simulated balance changes on HyperEVM, which need an RPC that supports `eth_simulateV1`.
+
 Still not verified live:
 - What actually happens to the debited HyperCore balance when the HyperEVM withdrawal step reverts (see above).
 - The CCTP attestation and `CctpForwarder.mintAndForward` itself, because minting needs Circle's attestation signature.
@@ -371,6 +397,8 @@ Actions are pinned to commit SHAs (with the version in a comment), and workflows
 src/preview.ts            entry point: routes EIP-1193 methods
 src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, Uniswap Universal Router, any verified ABI)
 src/evm/effects.ts        simulated balance changes (fungible and NFT) and approvals left in place
+src/evm/kinetiq.ts        Kinetiq staking; src/evm/hyperlend.ts HyperLend, gateway and credit delegation
+src/evm/onchain.ts        cached read-only contract calls for decoders; src/errors.ts known custom errors
 src/tokens.ts             token registries: token lists, on-chain metadata, impersonation check
 src/abi.ts                ABI sources (Sourcify, Etherscan, static), proxy detection, signature databases
 src/rpc.ts                JSON-RPC client and the lookup cache

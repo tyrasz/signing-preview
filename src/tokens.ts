@@ -110,7 +110,8 @@ export class ChainedTokenRegistry implements TokenRegistry {
   }
 }
 
-const normalise = (s: string) => s.toUpperCase().replace(/[^A-Z0-9]/g, '');
+// Look-alike characters common in token symbols (USD₮0) count as the letter they imitate.
+const normalise = (s: string) => s.replace(/₮/g, 'T').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
 /**
  * A token whose self-reported (on-chain) symbol copies a curated token on the same chain, from a different

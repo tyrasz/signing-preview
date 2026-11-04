@@ -140,6 +140,44 @@ export class ContractAbiResolver implements AbiResolver {
     this.ttlMs = options.ttlMs ?? 10 * 60_000;
     this.retryMs = options.retryMs ?? 30_000;
   }
+  private facets = new TtlCache<Promise<string | null>>();
+
+  /**
+   * The ABI for one call. When the address's ABI lacks the function, asks the contract which facet holds it:
+   * EIP-2535 `facetAddress(bytes4)`, or `getFacetAddress(bytes4)` as on Kinetiq's StakingManager router. The
+   * facet's verified ABI is added to the router's.
+   */
+  async resolveCall(chainId: number, address: string, selector: string): Promise<ContractAbi | null> {
+    const base = await this.resolve(chainId, address);
+    const has = (abi: readonly unknown[] | undefined) => (abi as { type?: string; name?: string; inputs?: unknown[] }[] | undefined)?.some(i => {
+      if (i.type !== 'function') return false;
+      try { return toFunctionSelector(i as never) === selector.toLowerCase(); } catch { return false; }
+    }) ?? false;
+    if (has(base?.abi) || !this.rpc?.has(chainId)) return base;
+    const facet = await this.facetFor(chainId, address.toLowerCase(), selector.toLowerCase());
+    if (!facet) return base;
+    const f = await this.resolve(chainId, facet);
+    if (!f || !has(f.abi)) return base;
+    return { abi: [...(base?.abi ?? []), ...f.abi], name: base?.name ?? f.name, source: `${f.source} via facet ${f.name ?? facet}`, verified: f.verified, implementation: facet };
+  }
+
+  private facetFor(chainId: number, address: string, selector: string): Promise<string | null> {
+    const key = `${chainId}:${address}:${selector}`;
+    const hit = this.facets.get(key);
+    if (hit) return hit;
+    let expire = (_ttl: number) => {};
+    const value = (async () => {
+      for (const lookup of ['0xcdffacc6', '0x7a070c2d']) { // facetAddress(bytes4), getFacetAddress(bytes4)
+        const r = await this.rpc!.call(chainId, 'eth_call', [{ to: address, data: lookup + selector.slice(2).padEnd(64, '0') }, 'latest']).then(String, e => { if (isRpcError(e)) return '0x'; throw e; });
+        const facet = /^0x[0-9a-f]{64}$/i.test(r) && !/^0x0{64}$/.test(r) ? '0x' + r.slice(26).toLowerCase() : null;
+        if (facet && String(await this.rpc!.call(chainId, 'eth_getCode', [facet, 'latest'])).length > 2) return facet;
+      }
+      return null;
+    })().catch(() => { expire(this.retryMs); return null; });
+    expire = this.facets.set(key, value, this.ttlMs);
+    return value;
+  }
+
   /** Cached for ttlMs; a result affected by a network failure (source or proxy lookup) only for retryMs. */
   resolve(chainId: number, address: string): Promise<ContractAbi | null> {
     const key = `${chainId}:${address.toLowerCase()}`;

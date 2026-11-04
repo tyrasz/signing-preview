@@ -8,3 +8,8 @@ export type * from './types.ts';
 export { JsonRpcClient, isRpcError, type RpcClient } from './rpc.ts';
 export { OnchainTokenRegistry, TokenListRegistry, ChainedTokenRegistry, impersonatedToken, decodeStringOrBytes32 } from './tokens.ts';
 export { ContractAbiResolver, SourcifyAbiSource, EtherscanAbiSource, StaticAbiSource, OpenChainSignatures, FourByteSignatures, ChainedSignatures, COMMON_SIGNATURES, canonicalSignature, detectProxy, PROXY_SLOTS, type AbiSource, type ProxyInfo } from './abi.ts';
+export { KINETIQ } from './evm/kinetiq.ts';
+export { HYPERLEND } from './evm/hyperlend.ts';
+export { UNIVERSAL_ROUTERS } from './evm/universal-router.ts';
+export { KNOWN_ERRORS, knownError } from './errors.ts';
+export { BatchSimulationUnsupported } from './simulation.ts';

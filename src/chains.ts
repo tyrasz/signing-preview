@@ -162,6 +162,18 @@ const BUILTIN_TOKENS: Record<number, TokenInfo[]> = {
   999: [
     { address: '0xb88339cb7199b77e23db6e890353e22632ba630f', symbol: 'USDC', decimals: 6, name: 'USD Coin' },
     { address: '0x5555555555555555555555555555555555555555', symbol: 'WHYPE', decimals: 18, name: 'Wrapped HYPE' },
+    // Linked to HyperCore spot tokens by Hyperliquid itself (spotMeta evmContract), on-chain symbol/decimals checked
+    // 2026-11-04 (verify-live re-checks decimals). kHYPE is also the address in Kinetiq's docs.
+    { address: '0xfd739d4e423301ce9385c1fb8850539d657c296d', symbol: 'kHYPE', decimals: 18, name: 'Kinetiq Staked HYPE' },
+    { address: '0x9fdbda0a5e284c32744d2f17ee5c74b284993463', symbol: 'UBTC', decimals: 8, name: 'Unit Bitcoin' },
+    { address: '0xbe6727b535545c67d5caa73dea54865b92cf7907', symbol: 'UETH', decimals: 18, name: 'Unit Ethereum' },
+    { address: '0x068f321fa8fb9f0d135f290ef6a3e2813e1c8a29', symbol: 'USOL', decimals: 9, name: 'Unit Solana' },
+    { address: '0xb8ce59fc3717ada4c02eadf9682a9e934f625ebb', symbol: 'USDT0', decimals: 6, name: 'USD₮0' },
+    { address: '0x5d3a1ff2b6bab83b63cd9ad0787074081a52ef34', symbol: 'USDe', decimals: 18, name: 'USDeOFT' },
+    { address: '0x111111a1a0667d36bd57c0a9f569b98057111111', symbol: 'USDH', decimals: 6, name: 'USDH' },
+    { address: '0xb50a96253abdf803d85efcdce07ad8becbc52bd5', symbol: 'USDHL', decimals: 6, name: 'Hyper USD' },
+    { address: '0x02c6a2fa58cc01a18b8d9e00ea48d65e4df26c70', symbol: 'feUSD', decimals: 18, name: 'feUSD' },
+    { address: '0x0ad339d66bf4aed5ce31c64bc37b3244b6394a77', symbol: 'USR', decimals: 18, name: 'Resolv USD' },
   ],
 };
 

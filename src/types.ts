@@ -202,6 +202,11 @@ export interface SimulationResult {
    * USDC, OpenZeppelin 5 tokens and Permit2 lower an allowance without an event when it is spent.
    */
   approvalState?: SimulatedApproval[];
+  /**
+   * Only success or failure is known (the RPC has no eth_simulateV1, so the call was checked with eth_call):
+   * no transfers, approvals or gas.
+   */
+  limited?: boolean;
 }
 
 export interface Simulator {
@@ -262,6 +267,11 @@ export interface ContractAbi {
 
 export interface AbiResolver {
   resolve(chainId: number, address: string): Promise<ContractAbi | null>;
+  /**
+   * The ABI for a call to `selector`. Diamond-style routers (EIP-2535 and similar) keep each function in a separate
+   * facet contract, so the address's own ABI may lack it.
+   */
+  resolveCall?(chainId: number, address: string, selector: string): Promise<ContractAbi | null>;
 }
 
 /**
@@ -285,6 +295,8 @@ export interface SignatureResolver {
 }
 
 export interface Dependencies {
+  /** Read-only JSON-RPC, for protocol state such as exchange rates or a lending position's health factor. */
+  rpc?: import('./rpc.ts').RpcClient;
   tokens?: TokenRegistry;
   abis?: AbiResolver;
   signatures?: SignatureResolver;

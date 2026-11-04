@@ -118,7 +118,9 @@ export const abiAdapter: Adapter = async (tx, env) => {
   const { abis, signatures } = env.deps;
   if (!abis && !signatures) return null;
   let contract = null;
-  try { contract = abis ? await abis.resolve(tx.chainId, tx.to) : null; } catch { contract = null; }
+  try {
+    contract = !abis ? null : abis.resolveCall ? await abis.resolveCall(tx.chainId, tx.to, selectorOf(tx.data)!) : await abis.resolve(tx.chainId, tx.to);
+  } catch { contract = null; }
   const b = new PreviewBuilder();
   let call = contract ? decodeStrict(contract.abi, tx.data) : null;
   let basis: 'verified' | 'signature' = 'verified';

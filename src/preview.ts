@@ -7,9 +7,10 @@ import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
 import { eip3009Adapter } from './typed-data/eip3009.ts';
+import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts';
 import { previewMessage } from './message.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, permitAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, permitAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'] as const;
@@ -69,7 +70,7 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   };
 }
 
-const SKIPPED_IN_BATCH = 'This call was not simulated: it may depend on the calls before it, and the configured simulator can only run one call at a time.';
+const SKIPPED_IN_BATCH = "This call was not simulated: it may depend on the calls before it, and the simulator (or this chain's RPC) can only check one call at a time.";
 
 /**
  * EIP-5792 wallet_sendCalls: preview each call, then summarise. Calls are simulated in order in one block, so a
@@ -95,7 +96,9 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
         presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));
       } catch (error) {
         results = null;
-        presets = txs.map(() => ({ error: error instanceof Error ? error.message : String(error) }));
+        presets = (error as Error)?.name === 'BatchSimulationUnsupported'
+          ? txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH })) // e.g. HyperEVM: eth_call can check call 1 alone
+          : txs.map(() => ({ error: error instanceof Error ? error.message : String(error) }));
       }
     } else {
       presets = txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH }));

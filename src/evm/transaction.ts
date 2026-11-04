@@ -6,6 +6,8 @@ import { type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { universalRouterAdapter } from './universal-router.ts';
+import { kinetiqAdapter } from './kinetiq.ts';
+import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
 import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
 import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
 
@@ -18,6 +20,10 @@ export const ADAPTERS: Adapter[] = [
   cctpAdapter,
   cctpExtensionAdapter,
   coreWriterAdapter,
+  kinetiqAdapter,
+  hyperlendPoolAdapter,
+  hyperlendGatewayAdapter,
+  creditDelegationAdapter,
   erc20Adapter,
   universalRouterAdapter,
   abiAdapter,
@@ -72,7 +78,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   if (!CHAINS[tx.chainId]) b.warn('caution', 'unsupported_chain', `Chain ${tx.chainId} is not one of the supported networks (Ethereum, Arbitrum One, HyperEVM). Token names and routes were not checked for it.`);
   if (context.account && !sameAddress(context.account, tx.from)) b.warn('danger', 'sender_mismatch', `The transaction's sender (${tx.from}) is not the connected account (${context.account}).`);
   if (context.chainId && context.chainId !== tx.chainId) b.warn('caution', 'chain_mismatch', `The transaction targets ${chainName(tx.chainId)}, but the wallet is on ${chainName(context.chainId)}.`);
-  if (tx.value > 0n && tx.data !== '0x' && d.decoder !== 'weth_deposit') {
+  if (tx.value > 0n && tx.data !== '0x' && !['weth_deposit', 'kinetiq_stake'].includes(d.decoder)) {
     const chain = CHAINS[tx.chainId];
     b.detail('Native value attached', `${formatUnits(tx.value, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? ''}`.trim(), tx.value.toString());
   }
@@ -100,6 +106,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }) };
     if (sim.status === 'reverted') {
       b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
+    } else if (sim.limited) {
+      b.note("Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
     } else {
       const simulated = [...await netChanges(sim.transfers, tx, deps, b), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b)];
       if (simulated.length || !assetChanges.length) assetChanges = simulated;

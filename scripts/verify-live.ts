@@ -14,11 +14,13 @@
 //  7. Simulates a Uniswap Universal Router Permit2 permit (read back from Permit2) and an ERC-721 transfer.
 //  8. Decodes recent real Universal Router transactions on Ethereum and compares each headline ("Swap X for Y")
 //     with what the receipt and balance changes show was paid and received.
+//  9. Kinetiq and HyperLend on HyperEVM: identities, facets and typehashes, and the decoders' predictions (rate,
+//     minimum, precision, health factor) against eth_call results on the live contracts.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
 // ethereum-rpc.publicnode.com (or ETHEREUM_RPC_URL), rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus
 // sourcify.dev, api.openchain.xyz and www.4byte.directory for step 6 (behind a proxy, run with
 // NODE_USE_ENV_PROXY=1 on Node >= 22.21).
-import { createPublicClient, http, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
+import { createPublicClient, http, formatUnits, toFunctionSelector, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { builtinTokens, CHAINS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
@@ -28,6 +30,8 @@ import type { RpcClient } from '../src/rpc.ts';
 import { abiAdapter } from '../src/evm/abi-adapter.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { UNIVERSAL_ROUTERS } from '../src/evm/universal-router.ts';
+import { KINETIQ } from '../src/evm/kinetiq.ts';
+import { HYPERLEND } from '../src/evm/hyperlend.ts';
 import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
@@ -459,6 +463,69 @@ console.log('\n8. Recent real Uniswap Universal Router transactions on Ethereum'
   }
   check(txs.length > 0, 'recent router transactions found'.padEnd(34), `${txs.length} in the last 40 blocks`);
   check(bad.length === 0, 'real swaps decode and match'.padEnd(34), `${matched} matched${unheadlined ? `, ${unheadlined} multi-step without a single headline` : ''}${bad.length ? ' | ' + bad.join(' | ') : ''}`);
+}
+
+console.log('\n9. Kinetiq and HyperLend on HyperEVM');
+{
+  const tokens = new ChainedTokenRegistry([new StaticTokenRegistry(), new OnchainTokenRegistry(live)]);
+  const simulator = new RpcSimulator({ 999: urls[999] });
+  const deps = { tokens, rpc: live, simulator };
+  const hlCall = async (to: string, sig: string, args: unknown[] = []) => readAt(hl, to as Address, sig, args);
+  const k = KINETIQ[999];
+  check(String(await hlCall(k.stakingManager, 'function tokenAddress() view returns (address)')).toLowerCase() === k.kHYPE, 'Kinetiq StakingManager mints kHYPE'.padEnd(34));
+  const facetOf = async (fn: string) => String(await hlCall(k.stakingManager, 'function getFacetAddress(bytes4) view returns (address)', [toFunctionSelector(`function ${fn}`)]));
+  const missing = [];
+  for (const fn of ['stake()', 'stake(address)', 'queueWithdrawal(uint256)', 'confirmWithdrawal(uint256)', 'batchConfirmWithdrawals(uint256[])', 'instantUnstake(uint256,uint256)', 'redelegate(address,address,uint256)']) if (/^0x0{40}$/.test(await facetOf(fn))) missing.push(fn);
+  check(!missing.length, 'Kinetiq decoded functions exist'.padEnd(34), missing.length ? `no facet for ${missing.join(', ')}` : '7 selectors resolve to facets');
+  const RICH = '0x5555555555555555555555555555555555555555'; // WHYPE holds HYPE: a sender for eth_call
+  const stake = (value: bigint) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: RICH, to: k.stakingManager, data: '0x3a4b66f1', value: toHex(value), chainId: '0x3e7' }] }, {}, deps);
+  const ok = await stake(10n ** 19n);
+  check(/^Stake 10 HYPE for ≈ [\d.]+ kHYPE$/.test(ok.title) && ok.simulation?.status === 'success', 'Kinetiq stake 10 HYPE'.padEnd(34), `"${ok.title}", eth_call ${ok.simulation?.status}`);
+  for (const [label, value, code, chain] of [['below the minimum', 2n * 10n ** 18n, 'kinetiq_below_minimum', 'BelowMinimum'], ['not 8-decimal', 10n ** 19n + 1n, 'kinetiq_amount_precision', 'MustBeDivisibleBy1e10']] as const) {
+    await sleep(500);
+    const p = await stake(value);
+    check(p.warnings.some(w => w.code === code) && (p.simulation?.revertReason ?? '').startsWith(chain), `Kinetiq stake ${label}`.padEnd(34), `decoder: ${p.warnings.some(w => w.code === code) ? 'will fail' : 'no warning'}; chain: ${p.simulation?.revertReason ?? p.simulation?.status}`);
+  }
+
+  const m = HYPERLEND[999];
+  check(String(await hlCall(m.addressesProvider, 'function getMarketId() view returns (string)')) === 'HyperLend Market' && String(await hlCall(m.addressesProvider, 'function getPool() view returns (address)')).toLowerCase() === m.pool,
+    'HyperLend provider -> Pool'.padEnd(34));
+  const debt = String(await hlCall(m.pool, 'function getReserveVariableDebtToken(address) view returns (address)', [H.usdc]));
+  check(String(await hlCall(debt, 'function DELEGATION_WITH_SIG_TYPEHASH() view returns (bytes32)')) === keccak256(toHex('DelegationWithSig(address delegatee,uint256 value,uint256 nonce,uint256 deadline)')),
+    'HyperLend debt token delegation'.padEnd(34), `USDC debt token ${debt}: Aave DelegationWithSig typehash`);
+  // A live borrower from recent Borrow events.
+  const BORROW = keccak256(toHex('Borrow(address,address,address,uint256,uint8,uint256,uint16)'));
+  const head = BigInt(String(await live.call(999, 'eth_blockNumber', [])));
+  let borrower: string | undefined;
+  for (let to = head; !borrower && to > head - 30_000n; to -= 1000n) {
+    const logs = await live.call(999, 'eth_getLogs', [{ address: m.pool, topics: [BORROW], fromBlock: '0x' + (to - 999n).toString(16), toBlock: '0x' + to.toString(16) }]) as { topics: string[] }[];
+    for (const l of logs.reverse()) {
+      const user = '0x' + l.topics[2].slice(26);
+      const [collateral, debtBase, , lt, , hf] = await hlCall(m.pool, 'function getUserAccountData(address) view returns (uint256,uint256,uint256,uint256,uint256,uint256)', [user]) as bigint[];
+      if (debtBase > 0n && hf < 10n ** 20n) {
+        borrower = user;
+        const formula = collateral * lt * 10n ** 18n / (debtBase * 10_000n);
+        const diff = Number(formula > hf ? formula - hf : hf - formula) / Number(hf);
+        check(diff < 0.001, 'HyperLend health-factor formula'.padEnd(34), `borrower ${user}: Pool ${formatUnits(hf, 18)}, formula ${formatUnits(formula, 18)}`);
+        break;
+      }
+    }
+  }
+  // Withdrawing all of a collateral asset the borrower holds: the decoder's health-factor estimate decides whether
+  // it predicts a failure, and eth_call says whether HyperLend actually refuses it.
+  let collateralAsset: string | undefined;
+  if (borrower) {
+    for (const asset of await hlCall(m.pool, 'function getReservesList() view returns (address[])') as string[]) {
+      const hToken = String(await hlCall(m.pool, 'function getReserveAToken(address) view returns (address)', [asset]));
+      if ((await hlCall(hToken, 'function balanceOf(address) view returns (uint256)', [borrower]) as bigint) > 0n) { collateralAsset = asset; break; }
+    }
+  }
+  if (borrower && collateralAsset) {
+    const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: borrower, to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function withdraw(address,uint256,address)']), functionName: 'withdraw', args: [collateralAsset as Address, 2n ** 256n - 1n, borrower as Address] }), chainId: '0x3e7' }] }, {}, deps);
+    const predicted = p.warnings.some(w => w.code === 'lending_will_fail'), reverted = p.simulation?.status === 'reverted';
+    // Only meaningful when the borrower's debt depends on WHYPE collateral: then both must say it fails.
+    check(predicted === reverted || (!predicted && !p.details.some(d => d.label === 'Health factor (estimated)')), 'HyperLend withdraw-all prediction'.padEnd(34), `decoder: ${predicted ? 'will fail' : 'ok'} (${p.details.find(d => d.label === 'Health factor (estimated)')?.value ?? 'no HF'}); chain: ${p.simulation?.revertReason ?? p.simulation?.status}`);
+  } else console.log('skip HyperLend withdraw check: no recent borrower with supplied collateral found');
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

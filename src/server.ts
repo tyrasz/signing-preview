@@ -134,6 +134,7 @@ export function liveDependencies(env = process.env): Dependencies {
   const online = env.SIGNING_PREVIEW_OFFLINE_LOOKUPS !== '1';
   const abiSources: AbiSource[] = online ? [new SourcifyAbiSource(), ...(env.ETHERSCAN_API_KEY ? [new EtherscanAbiSource(env.ETHERSCAN_API_KEY)] : [])] : [];
   return {
+    rpc,
     tokens: new ChainedTokenRegistry(tokenSources),
     abis: new ContractAbiResolver({ sources: abiSources, rpc }),
     signatures: new ChainedSignatures(online ? [new OpenChainSignatures(), new FourByteSignatures()] : []),
@@ -144,8 +145,8 @@ export function liveDependencies(env = process.env): Dependencies {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const mode = process.env.SIGNING_PREVIEW_MODE === 'live' ? 'live' : 'mock';
-  const { buildSamples, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
-  const deps: Dependencies = mode === 'live' ? liveDependencies() : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() } };
+  const { buildSamples, mockHyperEvmRpc, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
+  const deps: Dependencies = mode === 'live' ? liveDependencies() : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() }, rpc: mockHyperEvmRpc() };
   const port = Number(process.env.PORT ?? 8787);
   const host = process.env.HOST ?? '127.0.0.1';
   createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true })
