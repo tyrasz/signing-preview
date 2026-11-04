@@ -212,3 +212,50 @@ test('Network failures are retried, not cached as "not a token" / "no ABI" / "no
   sourcifyDown = false;
   assert.equal((await resolver.resolve(1, TOKEN))?.name, 'L2Pool');
 });
+
+// Recorded 2026-11-04: 4byte's entries for 0xa9059cbb (newest first, as the API returns them) and OpenChain's
+// filtered answer. address and uint256 are both one 32-byte word, so "workMyDirefulOwner(uint256,uint256)" fits any
+// transfer(address,uint256) calldata exactly; only the source ranking can tell them apart.
+const FOURBYTE_A9059CBB = { count: 6, next: null, previous: null, results: [
+  { id: 1111734, text_signature: 'workMyDirefulOwner(uint256,uint256)' }, { id: 844280, text_signature: 'join_tg_invmru_haha_fd06787(address,bool)' },
+  { id: 313067, text_signature: 'func_2093253501(bytes)' }, { id: 161159, text_signature: 'transfer(bytes4[9],bytes5[6],int48[11])' },
+  { id: 31780, text_signature: 'many_msg_babbage(bytes1)' }, { id: 145, text_signature: 'transfer(address,uint256)' },
+] };
+const OPENCHAIN_A9059CBB = { ok: true, result: { function: { '0xa9059cbb': [{ name: 'transfer(address,uint256)', filtered: false, hasVerifiedContract: true }] }, event: {} } };
+
+test('Selector collisions that fit the same calldata are resolved by source trust, as seen in live data', async () => {
+  const json = (body: unknown) => (async () => new Response(JSON.stringify(body))) as unknown as typeof fetch;
+  const down = (async () => { throw new TypeError('fetch failed'); }) as unknown as typeof fetch;
+  const fourByte = new FourByteSignatures({ fetchImpl: json(FOURBYTE_A9059CBB) });
+  assert.equal((await fourByte.lookup('0xa9059cbb'))[0], 'transfer(address,uint256)', '4byte results are oldest first');
+  const data = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: [BOB, 5n] });
+  const tx = { chainId: 42161, from: ALICE, to: '0x4000000000000000000000000000000000000004', data, value: 0n };
+  const run = (signatures: Dependencies['signatures']) => abiAdapter(tx, { deps: { signatures }, context: {} });
+
+  // OpenChain (spam-filtered) outranks 4byte: transfer, with no ambiguity.
+  const both = await run(new ChainedSignatures([new OpenChainSignatures({ fetchImpl: json(OPENCHAIN_A9059CBB) }), fourByte], { builtIn: false }));
+  assert.equal(both?.title, 'Call transfer on 0x4000…0004');
+  assert.ok(!both!.b.warnings.some(w => w.code === 'ambiguous_signature'));
+  assert.equal(both!.b.details.find(d => d.label === 'ABI source')?.value, 'OpenChain signature database (unverified)');
+
+  // OpenChain unreachable: 4byte alone, the oldest registration is shown and the collision is called out.
+  const only4byte = await run(new ChainedSignatures([new OpenChainSignatures({ fetchImpl: down }), new FourByteSignatures({ fetchImpl: json(FOURBYTE_A9059CBB) })], { builtIn: false }));
+  assert.equal(only4byte?.title, 'Call transfer on 0x4000…0004');
+  assert.equal(only4byte?.status, 'partial');
+  assert.match(only4byte!.b.warnings.find(w => w.code === 'ambiguous_signature')!.message, /transfer\(address,uint256\), is shown; also possible: workMyDirefulOwner\(uint256,uint256\)/);
+
+  // Two fitting names from a source with no age order: neither is named.
+  const tie = await run(new ChainedSignatures([new OpenChainSignatures({ fetchImpl: json({ ok: true, result: { function: { '0xa9059cbb': [{ name: 'transfer(address,uint256)' }, { name: 'workMyDirefulOwner(uint256,uint256)' }] } } }) })], { builtIn: false }));
+  assert.equal(tie?.status, 'opaque');
+  assert.match(tie!.title, /or similar/);
+});
+
+test('The built-in signature list has no selector collisions', async () => {
+  const { toFunctionSelector } = await import('viem');
+  const bySelector = new Map<string, string>();
+  for (const sig of (await import('../src/abi.ts')).COMMON_SIGNATURES) {
+    const sel = toFunctionSelector(`function ${sig}`);
+    assert.ok(!bySelector.has(sel), `${sig} collides with ${bySelector.get(sel)}`);
+    bySelector.set(sel, sig);
+  }
+});

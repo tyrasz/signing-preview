@@ -110,7 +110,7 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | Messages | `personal_sign`, SIWE, `eth_sign` | Readable text; SIWE domain vs. requesting origin (phishing); `eth_sign` is always danger. |
 | Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. |
 | Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
-| | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata. When several functions fit, the preview says so and names none. |
+| | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
 
 ### Hyperliquid L1 actions: the one real limit
@@ -160,7 +160,7 @@ Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulat
 | `ETHERSCAN_API_KEY` | Adds Etherscan (API v2: Ethereum, Arbitrum and HyperEVM with one key) after Sourcify. |
 | `SIGNING_PREVIEW_OFFLINE_LOOKUPS=1` | Don't call Sourcify, Etherscan, OpenChain or 4byte. The built-in signature list still works. |
 
-`liveDependencies()` was run against Arbitrum One and HyperEVM on 2026-11-03: token metadata, proxy detection, simulation and signature decoding all worked. The `/info` client is checked live by `npm run verify:live`. The public ABI and signature services were not reachable from that environment (see below).
+`liveDependencies()` was run against Arbitrum One and HyperEVM, with Sourcify, OpenChain and 4byte, on 2026-11-04. Token metadata, proxy detection, verified-ABI and signature decoding and simulation all worked. A first preview of an uncached contract took 0.4–1.4 s. The `/info` client is checked live by `npm run verify:live`. Ethereum mainnet hasn't been run live yet, because no Ethereum RPC was reachable.
 
 ## Contract and token lookups
 
@@ -190,6 +190,13 @@ A decoded call must re-encode to exactly the calldata being signed, or it's disc
 
 Anyone can register a name in those databases, so these previews are `partial` and carry a caution.
 
+Checking that a guess re-encodes to the calldata is not enough on its own. Different functions can share a selector *and* an argument layout, because `address` and `uint256` are both one 32-byte word. For example, 4byte lists `workMyDirefulOwner(uint256,uint256)` under `transfer(address,uint256)`'s selector, and it fits every transfer exactly. So candidates are ranked by source:
+1. The built-in list.
+2. OpenChain, with its spam filter on. Its `hasVerifiedContract` flag is not used, because spam collisions carry it too.
+3. 4byte, oldest registration first. Entries can't be backdated, so the genuine function usually predates the collisions; `transfer(address,uint256)` is entry #145, from 2016.
+
+The most trusted source with a fit decides. If 4byte alone has several fits, the oldest is shown with an `ambiguous_signature` caution naming the others. If several fit in a source without an age order, none is named.
+
 **Amounts** are shown in token units when a parameter's name says which token it is in:
 - the single token or asset parameter (Aave)
 - `tokenIn`/`tokenOut` (Uniswap V3)
@@ -217,7 +224,13 @@ Results are cached: tokens and ABIs for 10 minutes, signatures for an hour. A ne
   - The built-in tokens' decimals match each token contract on Arbitrum One and HyperEVM.
   - On-chain metadata reads work, including Arbitrum USDT, which calls itself "USD₮0".
   - Proxy detection resolves Arbitrum USDC (ZeppelinOS slot), TokenMessengerV2, the Aave V3 Pool, `CoreDepositWallet` and `CctpForwarder` (all EIP-1967). It correctly reports `CctpExtension` as not a proxy.
-- **Lookups, not verified live yet:** the Sourcify, Etherscan, OpenChain and 4byte response formats. Those hosts weren't reachable from the development environment. The parsers are tested against the documented response shapes, and the scheduled live-verification workflow checks them on GitHub's runners, failing if any is unreachable or parses differently.
+- **ABI and signature services, verified live (2026-11-04):**
+  - Sourcify, OpenChain and 4byte responses match the parsers, including Sourcify's 404 for unverified addresses.
+  - Sourcify has verified sources for Uniswap SwapRouter02, Universal Router, Permit2, Multicall3, the Aave V3 Pool implementation (`L2PoolInstance`) and Circle's TokenMessengerV2 and USDC implementations on Arbitrum, and WHYPE on HyperEVM. It doesn't have Circle's `CoreDepositWallet` implementation on HyperEVM, which has its own decoder here anyway.
+  - The live 4byte data exposed the selector-collision case above; it is now a recorded test and a live check.
+- **Not verified live yet:**
+  - Etherscan, which needs an API key.
+  - Ethereum mainnet token and proxy lookups, because no Ethereum RPC was reachable.
 - There is no threat-intelligence feed. Warnings are rule-based observations, and `attention: 'none'` doesn't mean "safe".
 
 ## HyperCore coverage
@@ -278,7 +291,7 @@ What the contracts imply, and what the preview reports:
 - **Deployed configuration.** `CctpExtension` points at USDC and `TokenMessengerV2`. The forwarder routes USDC to `CoreDepositWallet`. The USDC system address is `0x2000…0000`. Perps forwarding is enabled. The forwarding fee is 0.20 USDC and the new-account fee is 0.
 - **HyperEVM.** `CoreDepositWallet.depositFor` was called (with a USDC balance override) for new-account perps and spot deposits, which succeed, and for the system address, the wallet itself and zero, which revert with the reasons the preview cites.
 
-- **Token metadata and proxies.** See [What was verified](#what-was-verified-and-what-wasnt). The ABI and signature services are checked by the same script wherever they're reachable.
+- **Token metadata, proxies, ABIs and signatures.** See [What was verified](#what-was-verified-and-what-wasnt). Sourcify, OpenChain and 4byte are checked by the same script, including that a plain `transfer` still decodes as `transfer` despite 4byte's colliding spam entries.
 
 - **HyperCore → other chains.** `CoreDepositWallet.coreReceiveWithData` is the HyperEVM step of Circle's withdrawal. It was called on HyperEVM from the USDC system address, and each outcome checked against the preview. **8/8 matched:**
   - success

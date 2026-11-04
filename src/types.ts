@@ -191,9 +191,24 @@ export interface AbiResolver {
   resolve(chainId: number, address: string): Promise<ContractAbi | null>;
 }
 
+/**
+ * A function signature for a selector, with how far its source is trusted. Different functions can share a selector
+ * and the same argument layout (address and uint256 are both one 32-byte word), so decoding alone can't choose.
+ */
+export interface SignatureCandidate {
+  signature: string;
+  /** 0: built-in list; 1: a database that filters spam (OpenChain); 2: an open registry (4byte, or unknown). */
+  tier: number;
+  /** Candidates of this tier are in trust order, e.g. oldest registration first, so the first may be preferred. */
+  ordered?: boolean;
+  source?: string;
+}
+
 /** Function signature database (selector -> text signatures such as "transfer(address,uint256)"). */
 export interface SignatureResolver {
   lookup(selector: string): Promise<string[]>;
+  /** Ranked lookup. Resolvers without it are treated as an unranked open registry (tier 2). */
+  candidates?(selector: string): Promise<SignatureCandidate[]>;
 }
 
 export interface Dependencies {

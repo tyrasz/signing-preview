@@ -19,6 +19,7 @@ import { builtinTokens, CHAINS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry }
 import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
 import type { RpcClient } from '../src/rpc.ts';
+import { abiAdapter } from '../src/evm/abi-adapter.ts';
 import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
@@ -310,6 +311,14 @@ console.log('\n6. Token metadata, proxy detection, ABI and signature services');
   await service('4byte', 'https://www.4byte.directory/api/v1/signatures/?hex_signature=0xa9059cbb', async () => {
     const sigs = await new FourByteSignatures().lookup('0xa9059cbb');
     check(sigs.includes('transfer(address,uint256)'), '4byte: 0xa9059cbb is transfer', `${sigs.length} result(s)`);
+    // 4byte also lists spam for this selector that fits the same calldata (e.g. workMyDirefulOwner(uint256,uint256)).
+    // Ranking must still pick transfer, with OpenChain and with 4byte alone (oldest registration).
+    const data = encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [nobody, 5n] });
+    const tx = { chainId: 42161, from: nobody, to: '0x4000000000000000000000000000000000000004', data, value: 0n };
+    for (const [label, sources] of [['OpenChain + 4byte', [new OpenChainSignatures(), new FourByteSignatures()]], ['4byte alone', [new FourByteSignatures()]]] as const) {
+      const r = await abiAdapter(tx, { deps: { signatures: new ChainedSignatures([...sources], { builtIn: false }) }, context: {} });
+      check(r?.title === 'Call transfer on 0x4000…0004', `selector collisions, ${label}`.padEnd(34), `${r?.title}; ${r?.b.warnings.map(w => w.code).join(', ')}`);
+    }
   });
   if (process.env.ETHERSCAN_API_KEY) {
     await service('Etherscan', 'https://api.etherscan.io/v2/chainlist', async () => {

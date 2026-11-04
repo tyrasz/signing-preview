@@ -2,7 +2,7 @@
 // signature databases are a fallback and are marked unverified, because different functions can share a selector.
 import { keccak256, toFunctionSelector, toFunctionSignature, toHex } from 'viem';
 import { isRpcError, TtlCache, type RpcClient } from './rpc.ts';
-import type { AbiResolver, ContractAbi, SignatureResolver } from './types.ts';
+import type { AbiResolver, ContractAbi, SignatureCandidate, SignatureResolver } from './types.ts';
 
 export interface AbiSource {
   lookup(chainId: number, address: string): Promise<ContractAbi | null>;
@@ -177,7 +177,10 @@ export class ContractAbiResolver implements AbiResolver {
   }
 }
 
-/** OpenChain signature database (https://openchain.xyz). */
+/**
+ * OpenChain signature database (https://openchain.xyz), with its spam filter on. Its `hasVerifiedContract` flag is
+ * not used: spam collisions such as "permit8355429682040(address,uint256)" for 0xa9059cbb carry it too.
+ */
 export class OpenChainSignatures implements SignatureResolver {
   private fetchImpl: typeof fetch;
   private base: string;
@@ -191,9 +194,16 @@ export class OpenChainSignatures implements SignatureResolver {
     const body = await res.json() as { ok?: boolean; result?: { function?: Record<string, { name: string }[] | null> } };
     return (body.result?.function?.[selector.toLowerCase()] ?? []).map(x => x.name);
   }
+  async candidates(selector: string): Promise<SignatureCandidate[]> {
+    return (await this.lookup(selector)).map(signature => ({ signature, tier: 1, source: 'OpenChain' }));
+  }
 }
 
-/** 4byte.directory signature database. */
+/**
+ * 4byte.directory signature database. Anyone can register a signature and there is no spam filter, but entries
+ * can't be backdated, so results are returned oldest registration first: a genuine function usually predates the
+ * collisions crafted for it (0xa9059cbb: "transfer(address,uint256)" is #145 from 2016, the spam is younger).
+ */
 export class FourByteSignatures implements SignatureResolver {
   private fetchImpl: typeof fetch;
   private base: string;
@@ -204,8 +214,11 @@ export class FourByteSignatures implements SignatureResolver {
   async lookup(selector: string): Promise<string[]> {
     const res = await this.fetchImpl(`${this.base}?hex_signature=${selector}`, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) throw new Error(`4byte HTTP ${res.status}`);
-    const body = await res.json() as { results?: { text_signature: string }[] };
-    return (body.results ?? []).map(x => x.text_signature);
+    const body = await res.json() as { results?: { id?: number; text_signature: string }[] };
+    return [...(body.results ?? [])].sort((a, b) => (a.id ?? Infinity) - (b.id ?? Infinity)).map(x => x.text_signature);
+  }
+  async candidates(selector: string): Promise<SignatureCandidate[]> {
+    return (await this.lookup(selector)).map(signature => ({ signature, tier: 2, ordered: true, source: '4byte' }));
   }
 }
 
@@ -249,12 +262,15 @@ export function canonicalSignature(sig: string): string {
   try { return toFunctionSignature(`function ${sig.replace(/^function\s+/, '')}`); } catch { return sig.replace(/\s+/g, ''); }
 }
 
-/** Combines signature sources (built-in list first, then databases), de-duplicated, keeping order. */
+/**
+ * Combines signature sources: the built-in list (tier 0), then databases by their tier. Duplicates (same function,
+ * with or without parameter names) keep the most trusted entry.
+ */
 export class ChainedSignatures implements SignatureResolver {
   private sources: SignatureResolver[];
   private builtIn: Map<string, string[]> | null = null;
   private useBuiltIn: boolean;
-  private cache = new TtlCache<Promise<string[]>>();
+  private cache = new TtlCache<Promise<SignatureCandidate[]>>();
   private ttlMs: number;
   private retryMs: number;
   constructor(sources: SignatureResolver[], options: { builtIn?: boolean; ttlMs?: number; retryMs?: number } = {}) {
@@ -274,20 +290,25 @@ export class ChainedSignatures implements SignatureResolver {
     }
     return this.builtIn.get(selector.toLowerCase()) ?? [];
   }
-  /** Cached per selector; if a database could not be reached, only for retryMs. */
-  lookup(selector: string): Promise<string[]> {
+  async lookup(selector: string): Promise<string[]> {
+    return (await this.candidates(selector)).map(c => c.signature);
+  }
+  /** Most trusted first. Cached per selector; if a database could not be reached, only for retryMs. */
+  candidates(selector: string): Promise<SignatureCandidate[]> {
     const key = selector.toLowerCase();
     const hit = this.cache.get(key);
     if (hit) return hit;
     let expire = (_ttl: number) => {};
     const value = (async () => {
-      const out = [...await this.builtInFor(key)];
+      const all: SignatureCandidate[] = (await this.builtInFor(key)).map(signature => ({ signature, tier: 0, source: 'built-in' }));
       for (const s of this.sources) {
         try {
-          for (const sig of await s.lookup(key)) if (!out.some(o => canonicalSignature(o) === canonicalSignature(sig))) out.push(sig);
+          all.push(...(s.candidates ? await s.candidates(key) : (await s.lookup(key)).map(signature => ({ signature, tier: 2 }))));
         } catch { expire(this.retryMs); }
       }
-      return out;
+      all.sort((a, b) => a.tier - b.tier); // stable: keeps each source's own order within a tier
+      const seen = new Set<string>();
+      return all.filter(c => { const k = canonicalSignature(c.signature); if (seen.has(k)) return false; seen.add(k); return true; });
     })();
     expire = this.cache.set(key, value, this.ttlMs);
     return value;

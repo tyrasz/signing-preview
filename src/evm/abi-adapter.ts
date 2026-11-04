@@ -1,10 +1,9 @@
-import { decodeFunctionData, encodeFunctionData, parseAbiItem, toFunctionSelector, type Abi, type AbiFunction, type AbiParameter, type Hex } from 'viem';
+import { decodeFunctionData, encodeFunctionData, parseAbiItem, toFunctionSelector, toFunctionSignature, type Abi, type AbiFunction, type AbiParameter, type Hex } from 'viem';
 import { formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import type { TokenInfo } from '../types.ts';
-import { COMMON_SIGNATURES } from '../abi.ts';
+import type { SignatureCandidate, TokenInfo } from '../types.ts';
 import { decoded, nativeAmount, selectorOf, tokenInfo, tokenSourceWarnings, type Adapter, type AdapterEnv, type Tx } from './common.ts';
 
-interface Call { fn: AbiFunction; args: readonly unknown[]; sig?: string }
+interface Call { fn: AbiFunction; args: readonly unknown[] }
 
 const MAX_DETAILS = 40;
 const SENSITIVE = new Map<string, string>([
@@ -28,7 +27,7 @@ function decodeStrict(abi: readonly unknown[], data: Hex): Call | null {
 }
 
 function fromSignature(sig: string, data: Hex): Call | null {
-  try { const c = decodeStrict([parseAbiItem(`function ${sig}`)], data); return c && { ...c, sig }; } catch { return null; }
+  try { return decodeStrict([parseAbiItem(`function ${sig}`)], data); } catch { return null; }
 }
 
 const isAddress = (v: unknown): v is string => typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v);
@@ -110,6 +109,7 @@ async function renderValue(b: PreviewBuilder, env: AdapterEnv, tx: Tx, name: str
   b.detail(name, typeof v === 'bigint' ? v.toString() : JSON.stringify(v, (_k, x) => typeof x === 'bigint' ? x.toString() : x));
 }
 
+const typesOf = (c: Call) => toFunctionSignature(c.fn); // canonical, e.g. exactInputSingle((address,address,uint24,...))
 const describeCall = (c: Call) => `${c.fn.name}(${c.fn.inputs.map(i => i.name || i.type).join(', ')})`;
 
 /** Decodes calls to any contract using a verified ABI, or (marked unverified) a public signature database. */
@@ -122,24 +122,36 @@ export const abiAdapter: Adapter = async (tx, env) => {
   const b = new PreviewBuilder();
   let call = contract ? decodeStrict(contract.abi, tx.data) : null;
   let basis: 'verified' | 'signature' = 'verified';
+  let guess: SignatureCandidate | undefined;
+  let rivals: Call[] = [];
   if (!call && signatures) {
-    let sigs: string[] = [];
-    try { sigs = await signatures.lookup(selectorOf(tx.data)!); } catch { sigs = []; }
+    const selector = selectorOf(tx.data)!;
+    let cands: SignatureCandidate[] = [];
+    try { cands = signatures.candidates ? await signatures.candidates(selector) : (await signatures.lookup(selector)).map(signature => ({ signature, tier: 2 })); } catch { cands = []; }
+    // Keep candidates that reproduce the calldata exactly. Several can: address and uint256 are both one 32-byte
+    // word, so e.g. 4byte's spam "workMyDirefulOwner(uint256,uint256)" fits every transfer(address,uint256).
     const seen = new Set<string>();
-    const matches = sigs.map(s => fromSignature(s, tx.data)).filter((c): c is Call => {
-      if (!c) return false;
-      const key = `${c.fn.name}(${c.fn.inputs.map(i => i.type).join(',')})`; // sources can repeat a function under other parameter names
-      if (seen.has(key)) return false;
+    const fits = cands.flatMap(c => {
+      const decodedCall = fromSignature(c.signature, tx.data);
+      if (!decodedCall) return [];
+      const key = typesOf(decodedCall); // sources can repeat a function under other parameter names
+      if (seen.has(key)) return [];
       seen.add(key);
-      return true;
-    });
-    if (matches.length > 1) {
-      b.detail('Contract', tx.to).detail('Function selector', selectorOf(tx.data)!).detail('Possible functions', matches.map(m => `${m.fn.name}(${m.fn.inputs.map(i => i.type).join(',')})`).join(' | '));
-      b.warn('caution', 'ambiguous_signature', 'Several known functions share this selector and all fit the data, so which one is called cannot be told without the verified contract source.');
-      return decoded({ title: `Call ${matches[0].fn.name} or similar on ${shortAddress(tx.to)}`, summary: 'Calls a function identified only by its selector; several candidates fit.', decoder: 'abi_signature', status: 'opaque', b });
+      return [{ cand: c, call: decodedCall }];
+    }).sort((a, b) => a.cand.tier - b.cand.tier);
+    if (fits.length) {
+      // The most trusted source decides; candidates found only in less trusted sources are ignored.
+      const top = fits.filter(f => f.cand.tier === fits[0].cand.tier);
+      if (top.length > 1 && !top.every(f => f.cand.ordered)) {
+        b.detail('Contract', tx.to).detail('Function selector', selector).detail('Possible functions', top.map(f => typesOf(f.call)).join(' | '));
+        b.warn('caution', 'ambiguous_signature', 'Several known functions share this selector and all fit the data, so which one is called cannot be told without the verified contract source.');
+        return decoded({ title: `Call ${top[0].call.fn.name} or similar on ${shortAddress(tx.to)}`, summary: 'Calls a function identified only by its selector; several candidates fit.', decoder: 'abi_signature', status: 'opaque', b });
+      }
+      call = top[0].call;
+      guess = top[0].cand;
+      rivals = top.slice(1).map(f => f.call);
+      basis = 'signature';
     }
-    call = matches[0] ?? null;
-    basis = 'signature';
   }
   if (!call) return null;
 
@@ -147,8 +159,8 @@ export const abiAdapter: Adapter = async (tx, env) => {
   const contractLabel = contract?.name ?? (tokenSelf ? tokenSelf.symbol : shortAddress(tx.to));
   b.detail('Contract', contract?.name ? `${contract.name} (${tx.to})` : tx.to, tx.to).detail('Function', describeCall(call));
   if (contract?.implementation) b.detail('Proxy implementation', contract.implementation);
-  const builtIn = basis === 'signature' && COMMON_SIGNATURES.includes(call.sig ?? '');
-  b.detail('ABI source', basis === 'verified' ? contract!.source : builtIn ? 'built-in list of common functions (unverified for this contract)' : 'public signature database (unverified)');
+  const builtIn = guess?.tier === 0;
+  b.detail('ABI source', basis === 'verified' ? contract!.source : builtIn ? 'built-in list of common functions (unverified for this contract)' : `${guess?.source ? guess.source + ' ' : 'public '}signature database (unverified)`);
   if (tokenSelf) tokenSourceWarnings(b, tx.chainId, tokenSelf);
   if (tx.value > 0n) b.detail('Value sent', nativeAmount(tx.chainId, tx.value), tx.value.toString());
   await renderArgs(b, env, tx, call.fn.inputs, call.args);
@@ -162,6 +174,7 @@ export const abiAdapter: Adapter = async (tx, env) => {
     }
   }
   if (basis === 'signature') b.warn('caution', 'unverified_signature', `The function was identified by its selector${builtIn ? ' from a list of common functions' : ' from a public signature database'}, not from this contract's verified source. The name "${call.fn.name}" is a guess that fits the data.`);
+  if (rivals.length) b.warn('caution', 'ambiguous_signature', `${rivals.length + 1} functions registered for this selector fit the data. The earliest registered, ${typesOf(call)}, is shown; also possible: ${rivals.slice(0, 3).map(typesOf).join(', ')}${rivals.length > 3 ? ` and ${rivals.length - 3} more` : ''}.`);
   const sensitive = SENSITIVE.get(call.fn.name);
   if (sensitive) b.warn('caution', 'sensitive_function', sensitive);
   if (contract?.source.startsWith('sourcify') || contract?.source === 'etherscan' || contract?.source.includes(' via ')) b.note(`Decoded with the verified ABI from ${contract.source}.`);
