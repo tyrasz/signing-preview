@@ -1,6 +1,6 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress } from '../format.ts';
 import { CHAINS, chainName } from '../chains.ts';
-import type { AssetChange, Dependencies, Preview, PreviewContext, SimulationSummary, TokenInfo } from '../types.ts';
+import type { AssetChange, Dependencies, Preview, PreviewContext, SimulatedTransfer, SimulationResult, SimulationSummary, TokenInfo } from '../types.ts';
 import { tokenInfo, tokenSourceWarnings, type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
@@ -51,7 +51,13 @@ export function normalizeTransaction(raw: unknown, context: PreviewContext, fall
   return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value') };
 }
 
-export async function previewTransaction(tx: Tx, deps: Dependencies, context: PreviewContext, method: string): Promise<Preview> {
+/**
+ * A simulation outcome computed by the caller, e.g. a batch simulated in order. `result: null` means not covered;
+ * `skipped` explains why this call was deliberately not simulated.
+ */
+export type PresetSimulation = { result: SimulationResult | null } | { error: string } | { skipped: string };
+
+export async function previewTransaction(tx: Tx, deps: Dependencies, context: PreviewContext, method: string, preset?: PresetSimulation): Promise<Preview> {
   const env = { deps, context };
   let result: Decoded | null = null;
   for (const adapter of ADAPTERS) {
@@ -70,23 +76,30 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 
   let assetChanges = d.assetChanges;
   let simulation: SimulationSummary | undefined;
-  if (deps.simulator) {
+  let outcome = preset;
+  if (!outcome && deps.simulator) {
     try {
-      const sim = await deps.simulator.simulate({ chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value });
-      // null means this simulator does not cover the call: show the decoded request only.
-      if (sim) {
-        simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }) };
-        if (sim.status === 'reverted') {
-          b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
-        } else {
-          const simulated = await netChanges(sim.transfers, tx, deps, b);
-          if (simulated.length || !assetChanges.length) assetChanges = simulated;
-          b.note('Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
-        }
-      }
+      outcome = { result: await deps.simulator.simulate(simulationRequest(tx)) };
     } catch (error) {
-      simulation = { status: 'unavailable', source: 'simulator', error: error instanceof Error ? error.message : String(error) };
-      b.warn('info', 'simulation_unavailable', 'The transaction could not be simulated, so balance changes are based on the decoded request only.');
+      outcome = { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+  if (outcome && 'skipped' in outcome) {
+    simulation = { status: 'unavailable', source: 'simulator', error: outcome.skipped };
+    b.warn('info', 'simulation_skipped', outcome.skipped);
+  } else if (outcome && 'error' in outcome) {
+    simulation = { status: 'unavailable', source: 'simulator', error: outcome.error };
+    b.warn('info', 'simulation_unavailable', 'The transaction could not be simulated, so balance changes are based on the decoded request only.');
+  } else if (outcome?.result) {
+    // A null result means this simulator does not cover the call: show the decoded request only.
+    const sim = outcome.result;
+    simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }) };
+    if (sim.status === 'reverted') {
+      b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
+    } else {
+      const simulated = await netChanges(sim.transfers, tx, deps, b);
+      if (simulated.length || !assetChanges.length) assetChanges = simulated;
+      b.note('Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
     }
   }
   return {
@@ -98,8 +111,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   };
 }
 
+export const simulationRequest = (tx: Tx) => ({ chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value });
+
 /** Nets simulated transfers into per-asset changes for the sender. */
-async function netChanges(transfers: { asset: string; from: string; to: string; raw: bigint }[], tx: Tx, deps: Dependencies, b: PreviewBuilder): Promise<AssetChange[]> {
+export async function netChanges(transfers: SimulatedTransfer[], tx: Pick<Tx, 'chainId' | 'from'>, deps: Dependencies, b: PreviewBuilder): Promise<AssetChange[]> {
   const net = new Map<string, bigint>();
   for (const t of transfers) {
     const asset = t.asset.toLowerCase();

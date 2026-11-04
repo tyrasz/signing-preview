@@ -5,9 +5,12 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 /** eth_simulateV1 with traceTransfers reports native transfers as ERC-20 logs from this address. */
 const NATIVE_PSEUDO_TOKEN = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
+type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
+
 /**
  * Simulates against a JSON-RPC node with eth_simulateV1 (traceTransfers on, validation off).
  * Balance changes are derived from Transfer events, so fee-on-transfer and rebasing tokens can differ.
+ * Batches run as consecutive calls in one simulated block, so each call sees the previous calls' effects.
  */
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
@@ -17,22 +20,27 @@ export class RpcSimulator implements Simulator {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
   async simulate(req: SimulationRequest): Promise<SimulationResult | null> {
-    const url = this.urls[req.chainId];
+    return (await this.simulateBatch([req]))?.[0] ?? null;
+  }
+  async simulateBatch(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
+    if (!reqs.length) return [];
+    const chainId = reqs[0].chainId;
+    if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
+    const url = this.urls[chainId];
     if (!url) return null;
-    const call = { from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) };
+    const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }));
     const res = await this.fetchImpl(url, {
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls: [call] }], traceTransfers: true, validation: false }, 'latest'] }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls }], traceTransfers: true, validation: false }, 'latest'] }),
     });
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-    const body = await res.json() as { result?: { calls: { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } }[] }[]; error?: { message: string } };
-    if (body.error || !body.result?.[0]?.calls?.[0]) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'empty result'}`);
-    const result = body.result[0].calls[0];
-    const source = `eth_simulateV1 @ chain ${req.chainId}`;
-    if (result.status !== '0x1') {
-      return { status: 'reverted', source, gasUsed: BigInt(result.gasUsed), revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] };
-    }
-    return { status: 'success', source, gasUsed: BigInt(result.gasUsed), transfers: parseTransfers(result.logs ?? []) };
+    const body = await res.json() as { result?: { calls: RawCallResult[] }[]; error?: { message: string } };
+    const results = body.result?.[0]?.calls;
+    if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
+    const source = `eth_simulateV1 @ chain ${chainId}`;
+    return results.map(result => result.status !== '0x1'
+      ? { status: 'reverted', source, gasUsed: BigInt(result.gasUsed), revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] }
+      : { status: 'success', source, gasUsed: BigInt(result.gasUsed), transfers: parseTransfers(result.logs ?? []) });
   }
 }
 
@@ -70,5 +78,10 @@ export class MockSimulator implements Simulator {
   }
   async simulate(req: SimulationRequest): Promise<SimulationResult | null> {
     return this.fixtures.get(MockSimulator.key(req)) ?? null;
+  }
+  /** Per-call fixtures, in order; null unless every call has one. */
+  async simulateBatch(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
+    const results = reqs.map(r => this.fixtures.get(MockSimulator.key(r)));
+    return results.every(r => r) ? results as SimulationResult[] : null;
   }
 }

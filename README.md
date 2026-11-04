@@ -108,7 +108,7 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | Ethereum / Arbitrum / HyperEVM | ERC-20 transfer/approve/transferFrom, `setApprovalForAll`, WETH, Permit2 `approve`, native sends, contract creation | Amounts with the token's symbol and decimals. Warns on unlimited approvals, zero-value transfers and transfers to the token contract itself. |
 | Off-chain approvals | ERC-2612 / DAI `Permit`, Permit2 `PermitSingle/Batch/TransferFrom` | Spender, amount and expiry; flags unlimited or long-lived permissions and owner mismatches. |
 | Messages | `personal_sign`, SIWE, `eth_sign` | Readable text; SIWE domain vs. requesting origin (phishing); `eth_sign` is always danger. |
-| Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. |
+| Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. The calls are simulated **in order in one block**, so "approve, then swap" isn't shown as failing, and balance changes are netted across the batch. **Danger** when a call in an all-or-nothing (`atomicRequired`) batch would fail, since then none take effect; **caution** for a non-atomic batch, where the other calls may still go through. A custom simulator without `simulateBatch` simulates only the first call and says why. |
 | Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
 | | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
@@ -294,6 +294,9 @@ What the contracts imply, and what the preview reports:
   - Burned amount equal to the previewed outflow.
   - "Will get stuck" exactly when the burn succeeds with an invalid hook.
   - The emitted `DepositForBurn` events carry the previewed amount, fee cap, finality, forwarder addresses and hook.
+- **Batches.** An EIP-5792 batch of "approve `TokenMessengerV2`, then deposit 10 USDC to HyperCore" was run through `RpcSimulator` on Arbitrum One:
+  - simulated on its own, the deposit reverts with "ERC20: transfer amount exceeds allowance", which is what batch previews used to show;
+  - simulated in order, the batch succeeds, and its balance change is the simulated "out 10 USDC".
 - **Ethereum.** The `TokenMessengerV2` route from Circle's Ethereum guide, with a USDC balance override standing in for funding: perps, spot, standard finality, header-only hook (gets stuck), empty hook and `maxFee ≥ amount` (both revert). **6/6 match the preview**, by the same criteria.
 - **Deployed configuration.** `CctpExtension` points at USDC and `TokenMessengerV2`. The forwarder routes USDC to `CoreDepositWallet`. The USDC system address is `0x2000…0000`. Perps forwarding is enabled. The forwarding fee is 0.20 USDC and the new-account fee is 0.
 - **HyperEVM.** `CoreDepositWallet.depositFor` was called (with a USDC balance override) for new-account perps and spot deposits, which succeed, and for the system address, the wallet itself and zero, which revert with the reasons the preview cites.

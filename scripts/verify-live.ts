@@ -3,6 +3,7 @@
 //  2. Simulates Circle's Arbitrum -> HyperCore guide transactions (and known mistakes) with eth_simulateV1 on
 //     Arbitrum One, funding a fresh throwaway address from a large USDC holder inside the simulation only, and the
 //     Ethereum -> HyperCore TokenMessengerV2 route on Ethereum (funded with a USDC balance override).
+//     It also simulates an EIP-5792 batch (approve + deposit) in order with RpcSimulator.
 //  3. Checks CoreDepositWallet's recipient rules on HyperEVM with eth_call + a USDC balance/allowance override.
 //  4. Resolves every live HyperCore asset ID (perps, spot, HIP-3, outcomes) to a named, priced market.
 //  5. Checks HyperCore -> other-chain withdrawal fees and runs CoreDepositWallet's HyperEVM withdrawal step
@@ -22,6 +23,7 @@ import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
 import type { RpcClient } from '../src/rpc.ts';
 import { abiAdapter } from '../src/evm/abi-adapter.ts';
+import { RpcSimulator } from '../src/simulation.ts';
 import { HttpHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { resolveAsset } from '../src/hyperliquid/assets.ts';
 
@@ -165,6 +167,24 @@ for (const r of rows as any[]) {
   const predictedStuck = r.preview.warnings.includes('danger:cctp_bad_hook');
   const outflow = reverted ? r.preview.amountOut === '' : r.preview.amountOut === r.burned;
   check(predictedRevert === reverted && predictedStuck === !!stuck && outflow, r.id.padEnd(24), `${r.chain} | preview: ${r.preview.attention} "${r.preview.title}"`);
+}
+
+console.log('\n# EIP-5792 batch on Arbitrum One: approve + CCTP deposit, via RpcSimulator');
+{
+  const simulator = new RpcSimulator({ 42161: RPC });
+  const amount = 10_000_000n;
+  const approveData = encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [TMV2, amount] });
+  const burnData = encodeFunctionData({ abi: TMV2_ABI, functionName: 'depositForBurnWithHook', args: [amount, 19, pad(FWD), USDC, pad(FWD), 200_000n, 1000, encodeForwardHookData(FUNDER, 0)] });
+  // On its own the deposit fails for lack of an allowance; that is what batch previews used to show for call 2.
+  const alone = await simulator.simulate({ chainId: 42161, from: FUNDER, to: TMV2, data: burnData, value: 0n });
+  check(alone?.status === 'reverted', 'the deposit alone reverts'.padEnd(34), alone?.revertReason ?? alone?.status ?? 'not simulated');
+  await sleep(1000);
+  const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: FUNDER, atomicRequired: true, calls: [{ to: USDC, data: approveData }, { to: TMV2, data: burnData }] }] },
+    { now: Number(T) * 1000 }, { tokens: new StaticTokenRegistry(), simulator });
+  const bad = p.warnings.filter(w => ['simulation_reverted', 'batch_will_fail', 'simulation_unavailable'].includes(w.code)).map(w => w.code);
+  check(p.simulation?.status === 'success' && !bad.length, 'in order, the batch succeeds'.padEnd(34), `${p.simulation?.status}, gas ${p.simulation?.gasUsed}${bad.length ? ', ' + bad.join(', ') : ''} | "${p.title}"`);
+  const changes = p.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} (${c.basis})`).join(', ');
+  check(changes === 'out 10 USDC (simulated_events)', 'batch balance change'.padEnd(34), changes);
 }
 
 console.log('\n# Deployed configuration');

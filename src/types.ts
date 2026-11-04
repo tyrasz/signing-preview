@@ -140,6 +140,12 @@ export interface SimulationResult {
 export interface Simulator {
   /** Resolves null when this simulator does not cover the call (e.g. no RPC for that chain). Rejects on failure. */
   simulate(request: SimulationRequest): Promise<SimulationResult | null>;
+  /**
+   * Simulates calls in order in one block, each seeing the state the previous ones left (EIP-5792 batches, e.g.
+   * approve then swap). Resolves one result per call, or null when this simulator does not cover the chain.
+   * Simulators without it can't preview later batch calls faithfully, so only the first call is simulated.
+   */
+  simulateBatch?(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
 }
 
 // Hyperliquid /info shapes (subset used here).

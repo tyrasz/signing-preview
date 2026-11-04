@@ -268,6 +268,10 @@ export function mockSimulator(): MockSimulator {
     const p = (samples.find(s => s.id === id)!.request.params as Record<string, string>[])[0];
     return MockSimulator.key({ chainId: Number(p.chainId), to: p.to, data: p.data });
   };
+  const batchCall = (id: string, i: number) => {
+    const b = (samples.find(s => s.id === id)!.request.params as { chainId: string; calls: Record<string, string>[] }[])[0];
+    return MockSimulator.key({ chainId: Number(b.chainId), to: b.calls[i].to, data: b.calls[i].data });
+  };
   const ok = (transfers: SimulationResult['transfers'], gasUsed: bigint): SimulationResult => ({ status: 'success', source: 'mock', gasUsed, transfers });
   return new MockSimulator({
     [call('eth-send')]: ok([{ asset: 'native', from: ALICE, to: BOB, raw: 250_000_000_000_000_000n }], 21_000n),
@@ -277,5 +281,8 @@ export function mockSimulator(): MockSimulator {
     ], 182_331n),
     [call('eth-reverting')]: { status: 'reverted', source: 'mock', gasUsed: 31_208n, revertReason: 'Airdrop already claimed', transfers: [] },
     [call('bridge2-deposit')]: ok([{ asset: ARB_USDC, from: ALICE, to: HYPERLIQUID.bridge2, raw: 100_000_000n }], 51_204n),
+    // EIP-5792 batch, simulated in order: the approval, then the deposit.
+    [batchCall('arb-batch', 0)]: ok([], 46_123n),
+    [batchCall('arb-batch', 1)]: ok([{ asset: ARB_USDC, from: ALICE, to: HYPERLIQUID.bridge2, raw: 20_000_000n }], 34_412n),
   });
 }

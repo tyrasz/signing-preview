@@ -1,7 +1,7 @@
 import { attentionOf, PreviewBuilder } from './format.ts';
 import { chainName } from './chains.ts';
-import type { Dependencies, Preview, PreviewContext, SigningRequest, Warning } from './types.ts';
-import { normalizeTransaction, previewTransaction, RequestError } from './evm/transaction.ts';
+import type { AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
+import { netChanges, normalizeTransaction, previewTransaction, RequestError, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
@@ -68,23 +68,69 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   };
 }
 
-/** EIP-5792 wallet_sendCalls: preview each call, then summarise. */
+const SKIPPED_IN_BATCH = 'This call was not simulated: it may depend on the calls before it, and the configured simulator can only run one call at a time.';
+
+/**
+ * EIP-5792 wallet_sendCalls: preview each call, then summarise. Calls are simulated in order in one block, so a
+ * call sees what the earlier ones did (an approval before a swap). Simulating them one by one would show the swap
+ * as failing.
+ */
 async function previewBatch(raw: unknown, context: PreviewContext, deps: Dependencies): Promise<Preview> {
   if (!raw || typeof raw !== 'object' || !Array.isArray((raw as Record<string, unknown>).calls)) throw new RequestError('wallet_sendCalls needs { calls: [...] }');
-  const batch = raw as { chainId?: string; from?: string; calls: unknown[] };
+  const batch = raw as { chainId?: string; from?: string; atomicRequired?: boolean; calls: unknown[] };
   if (batch.calls.length === 0 || batch.calls.length > 32) throw new RequestError('wallet_sendCalls must contain 1 to 32 calls');
   const chainId = batch.chainId !== undefined ? Number(BigInt(batch.chainId)) : context.chainId;
+  const txs = batch.calls.map(call => normalizeTransaction(call, context, batch.from, chainId));
+
+  // Simulate the whole batch in order when the simulator can; otherwise only the first call is independent.
+  let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);
+  let results: SimulationResult[] | null = null;
+  const sameChain = txs.every(t => t.chainId === txs[0].chainId);
+  if (deps.simulator && txs.length > 1) {
+    if (deps.simulator.simulateBatch && sameChain) {
+      try {
+        results = await deps.simulator.simulateBatch(txs.map(simulationRequest));
+        if (results && results.length !== txs.length) throw new Error(`the simulator returned ${results.length} results for ${txs.length} calls`);
+        presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));
+      } catch (error) {
+        results = null;
+        presets = txs.map(() => ({ error: error instanceof Error ? error.message : String(error) }));
+      }
+    } else {
+      presets = txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH }));
+    }
+  }
   const calls: Preview[] = [];
-  for (const call of batch.calls) calls.push(await previewTransaction(normalizeTransaction(call, context, batch.from, chainId), deps, context, 'wallet_sendCalls'));
-  const warnings: Warning[] = calls.flatMap((c, i) => c.warnings.map(w => ({ ...w, message: `Call ${i + 1}: ${w.message}` })));
+  for (const [i, tx] of txs.entries()) calls.push(await previewTransaction(tx, deps, context, 'wallet_sendCalls', presets[i]));
+
+  const b = new PreviewBuilder();
+  let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
+  let simulation: SimulationSummary | undefined;
+  if (results) {
+    const failed = results.findIndex(r => r.status === 'reverted');
+    const gasUsed = results.reduce((sum, r) => sum + (r.gasUsed ?? 0n), 0n);
+    simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
+      ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
+    b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (failed === -1) {
+      // Net across the batch: an intermediate token received by one call and spent by the next nets out.
+      if (txs.every(t => t.from === txs[0].from)) assetChanges = await netChanges(results.flatMap(r => r.transfers), txs[0], deps, b);
+    } else if (batch.atomicRequired) {
+      b.warn('danger', 'batch_will_fail', `This batch is all-or-nothing, and call ${failed + 1} is expected to fail, so none of the calls would take effect. You would still pay the network fee.`);
+    } else {
+      b.warn('caution', 'batch_partial_failure', `Call ${failed + 1} is expected to fail. The batch is not marked all-or-nothing, so the wallet may still carry out the other calls, leaving them in effect without it.`);
+    }
+  }
+  const warnings: Warning[] = [...b.warnings, ...calls.flatMap((c, i) => c.warnings.map(w => ({ ...w, message: `Call ${i + 1}: ${w.message}` })))];
   const statuses = calls.map(c => c.decoding.status);
   return {
     schema: 'signing-preview/1', method: 'wallet_sendCalls', kind: 'batch',
     network: chainId ? { kind: 'evm', chainId, name: chainName(chainId) } : null,
     title: calls.length === 1 ? calls[0].title : `${calls.length} actions: ${calls.map(c => c.title).join(' → ')}`,
-    summary: `Runs ${calls.length} call${calls.length === 1 ? '' : 's'} in order. ${calls.map((c, i) => `(${i + 1}) ${c.summary}`).join(' ')}`,
-    details: [], assetChanges: calls.flatMap(c => c.assetChanges), warnings, attention: attentionOf(warnings),
-    decoding: { status: statuses.every(s => s === 'full') ? 'full' : statuses.every(s => s === 'opaque') ? 'opaque' : 'partial', decoder: 'batch', notes: [] },
+    summary: `Runs ${calls.length} call${calls.length === 1 ? '' : 's'} in order${batch.atomicRequired ? ', all or nothing' : ''}. ${calls.map((c, i) => `(${i + 1}) ${c.summary}`).join(' ')}`,
+    details: [], assetChanges, warnings, attention: attentionOf(warnings),
+    decoding: { status: statuses.every(s => s === 'full') ? 'full' : statuses.every(s => s === 'opaque') ? 'opaque' : 'partial', decoder: 'batch', notes: b.notes },
+    ...(simulation && { simulation }),
     calls,
   };
 }
