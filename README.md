@@ -160,7 +160,14 @@ Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulat
 | `ETHERSCAN_API_KEY` | Adds Etherscan (API v2: Ethereum, Arbitrum and HyperEVM with one key) after Sourcify. |
 | `SIGNING_PREVIEW_OFFLINE_LOOKUPS=1` | Don't call Sourcify, Etherscan, OpenChain or 4byte. The built-in signature list still works. |
 
-`liveDependencies()` was run against Arbitrum One and HyperEVM, with Sourcify, OpenChain and 4byte, on 2026-11-04. Token metadata, proxy detection, verified-ABI and signature decoding and simulation all worked. A first preview of an uncached contract took 0.4–1.4 s. The `/info` client is checked live by `npm run verify:live`. Ethereum mainnet hasn't been run live yet, because no Ethereum RPC was reachable.
+`liveDependencies()` was run against Ethereum, Arbitrum One and HyperEVM, with Sourcify, OpenChain and 4byte, on 2026-11-04. Token metadata, proxy detection, verified-ABI and signature decoding and simulation all worked. A first preview of an uncached contract took 0.4–1.8 s. The `/info` client is checked live by `npm run verify:live`.
+
+Any RPC works if it supports `eth_simulateV1`, which simulation needs. Verification used these public, keyless endpoints:
+- Ethereum: `https://ethereum-rpc.publicnode.com` (PublicNode)
+- Arbitrum: `https://arb1.arbitrum.io/rpc`
+- HyperEVM: `https://rpc.hyperliquid.xyz/evm`
+
+Public endpoints can rate-limit or change without notice; use your own provider in production.
 
 ## Contract and token lookups
 
@@ -223,14 +230,13 @@ Results are cached: tokens and ABIs for 10 minutes, signatures for an hour. A ne
 - **Lookups, verified live (2026-11-03):**
   - The built-in tokens' decimals match each token contract on Arbitrum One and HyperEVM.
   - On-chain metadata reads work, including Arbitrum USDT, which calls itself "USD₮0".
-  - Proxy detection resolves Arbitrum USDC (ZeppelinOS slot), TokenMessengerV2, the Aave V3 Pool, `CoreDepositWallet` and `CctpForwarder` (all EIP-1967). It correctly reports `CctpExtension` as not a proxy.
+  - Proxy detection resolves USDC (ZeppelinOS slot) and TokenMessengerV2 and the Aave V3 Pool (EIP-1967) on Ethereum and Arbitrum, plus `CoreDepositWallet` and `CctpForwarder` on HyperEVM. It correctly reports `CctpExtension` as not a proxy.
+  - The built-in Ethereum tokens' decimals match their contracts, and MKR's legacy `bytes32` `symbol()` decodes as "MKR".
 - **ABI and signature services, verified live (2026-11-04):**
   - Sourcify, OpenChain and 4byte responses match the parsers, including Sourcify's 404 for unverified addresses.
-  - Sourcify has verified sources for Uniswap SwapRouter02, Universal Router, Permit2, Multicall3, the Aave V3 Pool implementation (`L2PoolInstance`) and Circle's TokenMessengerV2 and USDC implementations on Arbitrum, and WHYPE on HyperEVM. It doesn't have Circle's `CoreDepositWallet` implementation on HyperEVM, which has its own decoder here anyway.
+  - Sourcify has verified sources for Uniswap SwapRouter02, Universal Router, Permit2, Multicall3, the Aave V3 Pool implementation (`L2PoolInstance`) and Circle's TokenMessengerV2 and USDC implementations on Arbitrum, the Aave V3 Pool (`PoolInstance`) on Ethereum, and WHYPE on HyperEVM. It doesn't have Circle's `CoreDepositWallet` implementation on HyperEVM, which has its own decoder here anyway.
   - The live 4byte data exposed the selector-collision case above; it is now a recorded test and a live check.
-- **Not verified live yet:**
-  - Etherscan, which needs an API key.
-  - Ethereum mainnet token and proxy lookups, because no Ethereum RPC was reachable.
+- **Not verified live yet:** Etherscan, which needs an API key.
 - There is no threat-intelligence feed. Warnings are rule-based observations, and `attention: 'none'` doesn't mean "safe".
 
 ## HyperCore coverage
@@ -280,7 +286,7 @@ What the contracts imply, and what the preview reports:
 
 ### Live verification (2026-11-03)
 
-`npm run verify:live` checks the previewer against the deployed contracts. It is read-only: it uses a fresh throwaway key and never broadcasts. It needs network access to `arb1.arbitrum.io` and `rpc.hyperliquid.xyz`, and exits non-zero on any disagreement.
+`npm run verify:live` checks the previewer against the deployed contracts. It is read-only: it uses a fresh throwaway key and never broadcasts. It needs network access to `arb1.arbitrum.io`, `ethereum-rpc.publicnode.com` (or set `ETHEREUM_RPC_URL`), `rpc.hyperliquid.xyz` and `api.hyperliquid.xyz`, plus `sourcify.dev`, `api.openchain.xyz` and `www.4byte.directory`. It exits non-zero on any disagreement.
 
 - **Circle docs.** All seven pages used here were re-fetched and are identical to the 2026-10-29 snapshot.
 - **Arbitrum One.** `eth_simulateV1` runs the guide's transactions and 9 variants: perps, spot, standard finality, batch split, header-only hook, empty hook, `maxFee ≥ amount`, indivisible batch, expired authorization, low `maxFee`, and the `TokenMessengerV2` route with and without a hook. **12/12 match the preview.**
@@ -288,6 +294,7 @@ What the contracts imply, and what the preview reports:
   - Burned amount equal to the previewed outflow.
   - "Will get stuck" exactly when the burn succeeds with an invalid hook.
   - The emitted `DepositForBurn` events carry the previewed amount, fee cap, finality, forwarder addresses and hook.
+- **Ethereum.** The `TokenMessengerV2` route from Circle's Ethereum guide, with a USDC balance override standing in for funding: perps, spot, standard finality, header-only hook (gets stuck), empty hook and `maxFee ≥ amount` (both revert). **6/6 match the preview**, by the same criteria.
 - **Deployed configuration.** `CctpExtension` points at USDC and `TokenMessengerV2`. The forwarder routes USDC to `CoreDepositWallet`. The USDC system address is `0x2000…0000`. Perps forwarding is enabled. The forwarding fee is 0.20 USDC and the new-account fee is 0.
 - **HyperEVM.** `CoreDepositWallet.depositFor` was called (with a USDC balance override) for new-account perps and spot deposits, which succeed, and for the system address, the wallet itself and zero, which revert with the reasons the preview cites.
 
@@ -313,7 +320,7 @@ Still not verified live:
 - What actually happens to the debited HyperCore balance when the HyperEVM withdrawal step reverts (see above).
 - The CCTP attestation and `CctpForwarder.mintAndForward` itself, because minting needs Circle's attestation signature.
 - Fallback to spot for DEX IDs that aren't enabled; HyperEVM's RPC has no trace API to observe it.
-- Recipient blacklist state.
+- USDC blacklisting on the destination. A blacklisted *sender* is caught by simulation: on Ethereum, a transfer from a USDC-blacklisted address previewed as "simulation reverted: Blacklistable: account is blacklisted". Whether a blacklisted HyperCore recipient blocks the mint is not checked.
 - `CctpExtensionV2`. Its source isn't published, so a sponsored deposit's recipient can't be decoded from the signature.
 - Circle's fee API (`iris-api.circle.com`), which this environment couldn't reach.
 
@@ -321,7 +328,7 @@ Still not verified live:
 
 - **`.github/workflows/ci.yml`** runs on every push to `main` and on pull requests, on Node 22 and 24: `npm ci`, typecheck, tests and the browser build. It needs no network beyond npm.
 - **`.github/workflows/verify-live.yml`** runs `npm run verify:live` daily at 03:41 UTC, and on demand from the Actions tab ("Run workflow").
-  - It is read-only against Arbitrum One, HyperEVM and `api.hyperliquid.xyz`, and fails when the deployed contracts, fees or markets no longer match the previewer.
+  - It is read-only against Ethereum, Arbitrum One, HyperEVM and `api.hyperliquid.xyz`, and fails when the deployed contracts, fees or markets no longer match the previewer.
   - The log is kept as a run artifact for 30 days.
   - A failed scheduled run opens an issue titled "Live verification failed", or comments on the existing open one.
   - Calls retry only on rate limiting, so a throttled public RPC is not reported as a contract change. If a public RPC is down, the run fails and the log says which call.

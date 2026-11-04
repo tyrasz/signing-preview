@@ -1,7 +1,8 @@
 name: Live verification
 
 # Read-only checks against the deployed Circle CCTP / Hyperliquid contracts and APIs
-# (Arbitrum One, HyperEVM, api.hyperliquid.xyz). Nothing is signed with a real key or broadcast.
+# (Ethereum, Arbitrum One, HyperEVM, api.hyperliquid.xyz) and the Sourcify / OpenChain / 4byte lookup services.
+# Nothing is signed with a real key or broadcast.
 # Fails when the chain and the previewer disagree, e.g. after a fee, address or market change.
 
 on:

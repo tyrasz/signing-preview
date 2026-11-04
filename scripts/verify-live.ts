@@ -1,7 +1,8 @@
 // Opt-in live check (network): `npm run verify:live`. Read-only, nothing is signed with a real key or broadcast.
 //  1. Reads the deployed CCTP / HyperCore configuration the previewer relies on.
 //  2. Simulates Circle's Arbitrum -> HyperCore guide transactions (and known mistakes) with eth_simulateV1 on
-//     Arbitrum One, funding a fresh throwaway address from a large USDC holder inside the simulation only.
+//     Arbitrum One, funding a fresh throwaway address from a large USDC holder inside the simulation only, and the
+//     Ethereum -> HyperCore TokenMessengerV2 route on Ethereum (funded with a USDC balance override).
 //  3. Checks CoreDepositWallet's recipient rules on HyperEVM with eth_call + a USDC balance/allowance override.
 //  4. Resolves every live HyperCore asset ID (perps, spot, HIP-3, outcomes) to a named, priced market.
 //  5. Checks HyperCore -> other-chain withdrawal fees and runs CoreDepositWallet's HyperEVM withdrawal step
@@ -10,8 +11,9 @@
 //     detection on deployed contracts, and the Sourcify / OpenChain / 4byte (and, with ETHERSCAN_API_KEY,
 //     Etherscan) response shapes. A service that can't be reached is skipped, unless VERIFY_LIVE_STRICT=1 (CI).
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
-// rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus sourcify.dev, api.openchain.xyz and www.4byte.directory
-// for step 6 (behind a proxy, run with NODE_USE_ENV_PROXY=1 on Node >= 22.21).
+// ethereum-rpc.publicnode.com (or ETHEREUM_RPC_URL), rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus
+// sourcify.dev, api.openchain.xyz and www.4byte.directory for step 6 (behind a proxy, run with
+// NODE_USE_ENV_PROXY=1 on Node >= 22.21).
 import { createPublicClient, http, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
@@ -30,6 +32,9 @@ const EXT: Address = '0xA95d9c1F655341597C94393fDdc30cf3c08E4fcE';
 const TMV2: Address = '0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d';
 const FWD: Address = '0xb21D281DEdb17AE5B501F6AA8256fe38C4e45757';
 const FUNDER: Address = '0x2Df1c51E09aECF9cacB7bc98cB1742757f163dF7'; // large USDC holder, used only inside the simulation
+const ETH_RPC = process.env.ETHEREUM_RPC_URL ?? 'https://ethereum-rpc.publicnode.com';
+const ETH_USDC: Address = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+const USDC_BALANCE_SLOT = 9n; // FiatTokenV2_2 balanceAndBlacklistStates mapping (same on Ethereum and HyperEVM)
 const account = privateKeyToAccount(generatePrivateKey()); // fresh key: well-known test keys can carry EIP-7702 code on Arbitrum
 const ERC20 = parseAbi(['function transfer(address,uint256)', 'function approve(address,uint256)', 'function balanceOf(address) view returns (uint256)']);
 const TMV2_ABI = parseAbi(['function depositForBurnWithHook(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold, bytes hookData)']);
@@ -51,7 +56,7 @@ function encodeForwardHookData(hyperCoreMintRecipient?: `0x${string}`, hyperCore
 }
 const pad = (a: Address) => `0x${a.slice(2).padStart(64, '0')}` as Hex;
 
-interface Case { id: string; via: 'ext' | 'tmv2'; amount: string; batch?: string; maxFee: string; hook?: Hex; dex?: number; validBefore?: bigint; finality?: number }
+interface Case { id: string; via: 'ext' | 'tmv2'; amount: string; batch?: string; maxFee: string; hook?: Hex; dex?: number; validBefore?: bigint; finality?: number; chain?: 'eth' }
 if (await client.getCode({ address: account.address })) throw new Error('test address unexpectedly has code');
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 /**
@@ -69,9 +74,13 @@ async function jsonRpc(url: string, body: unknown): Promise<any> {
   }
   throw new Error(`rate limited by ${url} after 8 attempts`);
 }
-const rpc = (body: unknown) => jsonRpc(RPC, body);
 const block = await client.getBlock();
 const T = block.timestamp;
+const ethBlock = await createPublicClient({ transport: http(ETH_RPC, { retryCount: 6, retryDelay: 2000 }) }).getBlock();
+const NETS = {
+  arb: { name: 'Arbitrum One', chainId: 42161, hex: '0xa4b1', rpc: RPC, usdc: USDC, block, T },
+  eth: { name: 'Ethereum', chainId: 1, hex: '0x1', rpc: ETH_RPC, usdc: ETH_USDC, block: ethBlock, T: ethBlock.timestamp },
+} as const;
 const cases: Case[] = [
   { id: 'guide-perps-10', via: 'ext', amount: '10', maxFee: '0.2' },
   { id: 'guide-spot-10', via: 'ext', amount: '10', maxFee: '0.2', dex: 4294967295 },
@@ -85,6 +94,13 @@ const cases: Case[] = [
   { id: 'low-maxfee', via: 'ext', amount: '10', maxFee: '0.1' },
   { id: 'tmv2-hook', via: 'tmv2', amount: '10', maxFee: '0.2' },
   { id: 'tmv2-empty-hook', via: 'tmv2', amount: '10', maxFee: '0.2', hook: '0x' },
+  // Ethereum -> HyperCore (Circle's Ethereum guide): fast fee 1 bp + 0.20 USDC forwarding, so maxFee 0.25 on 10 USDC.
+  { id: 'eth-perps-10', chain: 'eth', via: 'tmv2', amount: '10', maxFee: '0.25' },
+  { id: 'eth-spot-10', chain: 'eth', via: 'tmv2', amount: '10', maxFee: '0.25', dex: 4294967295 },
+  { id: 'eth-standard-finality', chain: 'eth', via: 'tmv2', amount: '10', maxFee: '0.25', finality: 2000 },
+  { id: 'eth-header-only-hook', chain: 'eth', via: 'tmv2', amount: '10', maxFee: '0.25', hook: encodeForwardHookData() },
+  { id: 'eth-empty-hook', chain: 'eth', via: 'tmv2', amount: '10', maxFee: '0.25', hook: '0x' },
+  { id: 'eth-maxfee-ge-amount', chain: 'eth', via: 'tmv2', amount: '1', maxFee: '1' },
 ];
 
 const deps = { tokens: new StaticTokenRegistry() };
@@ -92,8 +108,11 @@ const rows = [];
 for (const c of cases) {
   const amount = parseUnits(c.amount, 6), batch = parseUnits(c.batch ?? c.amount, 6), maxFee = parseUnits(c.maxFee, 6);
   const hook = c.hook ?? encodeForwardHookData(account.address, c.dex ?? 0);
-  const funding = { from: FUNDER, to: USDC, data: encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [account.address, amount] }) };
-  const calls: { from: Address; to: Address; data: Hex }[] = [funding];
+  const net = NETS[c.chain ?? 'arb'];
+  const calls: { from: Address; to: Address; data: Hex }[] = [];
+  // Arbitrum: a large holder sends the USDC inside the simulation. Ethereum: the balance is set by state override.
+  const stateOverrides = c.chain === 'eth' ? { [ETH_USDC]: { stateDiff: { [keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [account.address, USDC_BALANCE_SLOT]))]: padHex(toHex(amount)) } } } : undefined;
+  if (!stateOverrides) calls.push({ from: FUNDER, to: USDC, data: encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [account.address, amount] }) });
   let request;
   if (c.via === 'ext') {
     const validAfter = T - 3600n, validBefore = c.validBefore ?? T + 3600n, nonce = ('0x' + c.id.split('').map(ch => ch.charCodeAt(0).toString(16)).join('').padEnd(64, '0').slice(0, 64)) as Hex;
@@ -107,24 +126,25 @@ for (const c of cases) {
     calls.push({ from: account.address, to: EXT, data });
     request = { method: 'eth_sendTransaction', params: [{ from: account.address, to: EXT, data, chainId: '0xa4b1' }] };
   } else {
-    calls.push({ from: account.address, to: USDC, data: encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [TMV2, amount] }) });
-    const data = encodeFunctionData({ abi: TMV2_ABI, functionName: 'depositForBurnWithHook', args: [amount, 19, pad(FWD), USDC, pad(FWD), maxFee, c.finality ?? 1000, hook] });
+    calls.push({ from: account.address, to: net.usdc, data: encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [TMV2, amount] }) });
+    const data = encodeFunctionData({ abi: TMV2_ABI, functionName: 'depositForBurnWithHook', args: [amount, 19, pad(FWD), net.usdc, pad(FWD), maxFee, c.finality ?? 1000, hook] });
     calls.push({ from: account.address, to: TMV2, data });
-    request = { method: 'eth_sendTransaction', params: [{ from: account.address, to: TMV2, data, chainId: '0xa4b1' }] };
+    request = { method: 'eth_sendTransaction', params: [{ from: account.address, to: TMV2, data, chainId: net.hex }] };
   }
-  calls.push({ from: account.address, to: USDC, data: encodeFunctionData({ abi: ERC20, functionName: 'balanceOf', args: [account.address] }) });
+  calls.push({ from: account.address, to: net.usdc, data: encodeFunctionData({ abi: ERC20, functionName: 'balanceOf', args: [account.address] }) });
   await sleep(1500);
-  const res = await rpc({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls }], validation: false }, toHex(block.number)] });
-  if (res.error) { rows.push({ id: c.id, error: res.error.message }); continue; }
+  const res = await jsonRpc(net.rpc, { jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ ...(stateOverrides && { stateOverrides }), calls }], validation: false }, toHex(net.block.number)] });
+  if (res.error) { rows.push({ id: c.id, net: net.name, error: res.error.message }); continue; }
   const results = res.result[0].calls;
   const main = results[results.length - 2];
   let revert = null;
   if (main.status !== '0x1') { try { revert = decodeErrorResult({ abi: ERRORS, data: main.error?.data ?? main.returnData }).args[0]; } catch { revert = main.error?.message ?? main.returnData; } }
   const burns = (main.logs ?? []).flatMap((l: { address: string; topics: Hex[]; data: Hex }) => { try { const e = decodeEventLog({ abi: [DEPOSIT_FOR_BURN], data: l.data, topics: l.topics as [Hex] }); return [e.args]; } catch { return []; } });
   const balanceAfter = BigInt(results[results.length - 1].returnData);
-  const p = await previewRequest(request, { chainId: 42161, account: account.address, now: Number(T) * 1000 }, deps);
+  const p = await previewRequest(request, { chainId: net.chainId, account: account.address, now: Number(net.T) * 1000 }, deps);
   rows.push({
     id: c.id,
+    net: net.name,
     chain: main.status === '0x1' ? 'success' : `revert: ${revert}`,
     burnEvents: burns.length,
     burned: (amount - balanceAfter).toString(),
@@ -135,8 +155,9 @@ for (const c of cases) {
 let failures = 0;
 const check = (ok: boolean, label: string, detail = '') => { if (!ok) failures++; console.log(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? '  ' + detail : ''}`); };
 
-console.log(`\n# Arbitrum One simulations at block ${block.number}`);
+let shownNet = '';
 for (const r of rows as any[]) {
+  if (r.net !== shownNet) { shownNet = r.net; const n = Object.values(NETS).find(x => x.name === r.net)!; console.log(`\n# ${n.name} simulations at block ${n.block.number}`); }
   if (r.error) { check(false, r.id, r.error); continue; }
   const reverted = r.chain !== 'success';
   const predictedRevert = r.preview.title.includes('will fail');
@@ -245,7 +266,7 @@ console.log('\n# HyperCore -> other chains via Circle CCTP (CoreDepositWallet.co
 
 console.log('\n6. Token metadata, proxy detection, ABI and signature services');
 {
-  const urls: Record<number, string> = { 42161: RPC, 999: 'https://rpc.hyperliquid.xyz/evm' };
+  const urls: Record<number, string> = { 1: ETH_RPC, 42161: RPC, 999: 'https://rpc.hyperliquid.xyz/evm' };
   // Same RpcClient contract as JsonRpcClient (node errors carry rpcError), with the rate-limit retries above.
   const live: RpcClient = { has: c => !!urls[c], async call(c, method, params) {
     const r = await jsonRpc(urls[c], { jsonrpc: '2.0', id: 1, method, params });
@@ -254,16 +275,19 @@ console.log('\n6. Token metadata, proxy detection, ABI and signature services');
   } };
   const onchain = new OnchainTokenRegistry(live);
   // A wrong curated decimals value would misstate every amount of that token, so compare with the contract.
-  for (const chain of [42161, 999]) {
+  for (const chain of [1, 42161, 999]) {
     for (const t of builtinTokens(chain)) {
       const got = await onchain.get(chain, t.address);
       check(got?.decimals === t.decimals, `${t.symbol} on ${CHAINS[chain].name}: ${t.decimals} decimals`.padEnd(34), got ? `contract says ${got.symbol}, ${got.decimals}` : 'no metadata');
     }
   }
   check(await onchain.get(42161, TMV2) === undefined, 'a non-token contract has no token metadata');
+  const mkr = await onchain.get(1, '0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2');
+  check(mkr?.symbol === 'MKR' && mkr.decimals === 18, 'MKR: legacy bytes32 symbol() decoded', mkr ? `${mkr.symbol}, ${mkr.name}` : 'no metadata');
 
   const AAVE_POOL: Address = '0x794a61358D6845594F94dc1DB02A252b5b4814aD';
   for (const [chain, address, label, method] of [
+    [1, ETH_USDC, 'Ethereum USDC', 'zeppelinos'], [1, TMV2, 'Ethereum TokenMessengerV2', 'eip1967'], [1, '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2', 'Ethereum Aave V3 Pool', 'eip1967'],
     [42161, USDC, 'Arbitrum USDC', 'zeppelinos'], [42161, TMV2, 'TokenMessengerV2', 'eip1967'], [42161, EXT, 'CctpExtension', null],
     [42161, AAVE_POOL, 'Aave V3 Pool', 'eip1967'], [999, H.cdw, 'CoreDepositWallet', 'eip1967'], [999, FWD, 'CctpForwarder', 'eip1967'],
   ] as const) {
