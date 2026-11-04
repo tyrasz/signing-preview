@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { previewRequest } from './preview.ts';
@@ -13,7 +13,15 @@ import { JsonRpcClient } from './rpc.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry, TokenListRegistry } from './tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource, type AbiSource } from './abi.ts';
 
-const ROOT = fileURLToPath(new URL('..', import.meta.url));
+/** The package root, where demo/ and openapi.json live: one level above src/, three above dist/lib/src/. */
+const ROOT = [new URL('..', import.meta.url), new URL('../../..', import.meta.url)].map(u => fileURLToPath(u))
+  .find(p => existsSync(join(p, 'openapi.json'))) ?? fileURLToPath(new URL('..', import.meta.url));
+let openapi: string | undefined;
+/** The OpenAPI 3.1 document for this server (openapi.json in the package). */
+export function openApiDocument(): Record<string, unknown> {
+  openapi ??= readFileSync(join(ROOT, 'openapi.json'), 'utf8');
+  return JSON.parse(openapi);
+}
 const MAX_BODY = 256 * 1024;
 const TYPES: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.map': 'application/json' };
 
@@ -38,6 +46,7 @@ export function createPreviewServer(options: ServerOptions) {
       const url = new URL(req.url ?? '/', 'http://localhost');
       if (req.method === 'OPTIONS') return void res.writeHead(204).end();
       if (req.method === 'GET' && url.pathname === '/v1/health') return json(res, 200, { status: 'ok' });
+      if (req.method === 'GET' && url.pathname === '/v1/openapi.json') return json(res, 200, openApiDocument());
       if (req.method === 'POST' && url.pathname === '/v1/preview') return await handlePreview(req, res, options.deps);
       if (req.method === 'GET' && url.pathname === '/v1/samples' && options.samples) return json(res, 200, options.samples());
       if (req.method === 'GET' && options.serveDemo) return await serveStatic(url.pathname, res);
@@ -52,6 +61,7 @@ async function handlePreview(req: IncomingMessage, res: ServerResponse, deps: De
   if (!(req.headers['content-type'] ?? '').includes('application/json')) return json(res, 415, { error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Send application/json' } });
   let body: { request?: unknown; context?: PreviewContext };
   try { body = JSON.parse(await readBody(req)); } catch (error) {
+    if (error instanceof BodyTooLarge) res.setHeader('connection', 'close');
     return json(res, error instanceof BodyTooLarge ? 413 : 400, { error: { code: 'INVALID_JSON', message: error instanceof Error ? error.message : 'Invalid JSON' } });
   }
   if (!body || typeof body !== 'object' || !body.request) return json(res, 400, { error: { code: 'INVALID_REQUEST', message: 'Body must be { request: { method, params }, context? }' } });
@@ -88,10 +98,11 @@ class BodyTooLarge extends Error {}
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    let size = 0;
+    let size = 0, tooLarge = false;
     req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return; // discard the rest, so the client still receives the 413
       size += chunk.length;
-      if (size > MAX_BODY) { reject(new BodyTooLarge(`Body exceeds ${MAX_BODY} bytes`)); req.destroy(); return; }
+      if (size > MAX_BODY) { tooLarge = true; chunks.length = 0; reject(new BodyTooLarge(`Body exceeds ${MAX_BODY} bytes`)); return; }
       chunks.push(chunk);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
@@ -141,14 +152,4 @@ export function liveDependencies(env = process.env): Dependencies {
     hyperliquid: { mainnet: new HttpHyperliquidInfo(INFO_URLS.mainnet), testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
     ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs) }),
   };
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const mode = process.env.SIGNING_PREVIEW_MODE === 'live' ? 'live' : 'mock';
-  const { buildSamples, mockHyperEvmRpc, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
-  const deps: Dependencies = mode === 'live' ? liveDependencies() : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() }, rpc: mockHyperEvmRpc() };
-  const port = Number(process.env.PORT ?? 8787);
-  const host = process.env.HOST ?? '127.0.0.1';
-  createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true })
-    .listen(port, host, () => console.log(`signing-preview (${mode} data) on http://${host}:${port}  ·  POST /v1/preview`));
 }

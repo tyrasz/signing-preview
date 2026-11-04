@@ -1,0 +1,14 @@
+{
+  // Library build: compiled ES modules and type declarations in dist/lib (npm run build:lib).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist/lib",
+    "rootDir": ".",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src", "mocks"]
+}

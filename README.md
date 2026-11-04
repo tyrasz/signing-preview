@@ -16,7 +16,19 @@ This project started in [tyrasz/transaction-lab](https://github.com/tyrasz/trans
 
 ## Quickstart
 
-Requires Node.js 22.18 or later, which runs TypeScript directly.
+**Use it in your project.** The package isn't on npm yet; it installs straight from GitHub, which builds it on install:
+
+```bash
+npm install github:tyrasz/signing-preview
+```
+
+```bash
+npx signing-preview
+```
+
+The second command starts the HTTP API and demo, with mock data unless `SIGNING_PREVIEW_MODE=live` is set. Installed packages need Node.js 22 or later.
+
+**Work on it.** Developing needs Node.js 22.18 or later, which runs the TypeScript sources directly.
 
 ```bash
 npm install
@@ -54,8 +66,23 @@ curl -s localhost:8787/v1/preview -H 'content-type: application/json' -d '{
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/preview` | Body `{ request, context? }` returns a `Preview`. Malformed requests return `400 INVALID_REQUEST`. |
+| `GET /v1/openapi.json` | The OpenAPI 3.1 document for this API. |
 | `GET /v1/health` | Liveness check. |
 | `GET /v1/samples` | The demo's mock requests. |
+
+**OpenAPI.** [`openapi.json`](openapi.json) describes the whole API in OpenAPI 3.1: every request and response schema, error codes, and two live HyperEVM examples (a HyperLend borrow and a Kinetiq stake). Load it into Swagger UI, Postman or Insomnia, or generate types or clients from it. For TypeScript types (`components['schemas']['Preview']`, `paths['/v1/preview']`):
+
+```bash
+npx openapi-typescript openapi.json -o signing-preview-api.ts
+```
+
+For other languages, [OpenAPI Generator](https://openapi-generator.tech) builds clients for Python, Go, Kotlin, Swift and more; it needs Java.
+
+The document is hand-written and tested against the code:
+- `test/openapi.test.ts` validates it against the OpenAPI 3.1 meta-schema.
+- Every sample request goes through the real HTTP server, and each response must match the `Preview` schema exactly. Undocumented fields fail the test.
+- Every error response is checked too.
+- The `Preview` format is versioned by its `schema` field (`signing-preview/1`). New optional fields can appear within a version.
 
 CORS defaults to `*`, so pages, extensions (`chrome-extension://…`) and apps can all call it. Set `CORS_ORIGIN` to restrict it. The API never signs anything. Its outbound calls go only to the RPC and Hyperliquid URLs configured on the server; callers can't supply URLs.
 
@@ -73,19 +100,39 @@ const provider = withSigningPreview(window.ethereum, {
 
 The interceptor fills in `chainId` and `account` with the non-prompting `eth_chainId` and `eth_accounts` calls. If the preview service fails, `confirm` still receives an explicit "Preview unavailable" preview; the request is never forwarded silently.
 
-**3. In-process library.** For a wallet or extension that runs the previewer locally, without the API (`dist/signing-preview.js` is a browser bundle of the same code):
+**3. In-process library.** For a wallet, extension or backend that runs the previewer itself, without the API. The package ships compiled ES modules with TypeScript declarations:
 
 ```ts
-import { previewRequest, StaticTokenRegistry, HttpHyperliquidInfo, RpcSimulator } from 'signing-preview';
+import { previewRequest, StaticTokenRegistry, HttpHyperliquidInfo, RpcSimulator, JsonRpcClient } from 'signing-preview';
 
 const preview = await previewRequest(request, { chainId: 42161, account, origin }, {
   tokens: new StaticTokenRegistry(),
   hyperliquid: { mainnet: new HttpHyperliquidInfo() },
   simulator: new RpcSimulator({ 1: ETH_RPC, 42161: ARB_RPC }),   // optional
+  rpc: new JsonRpcClient({ 999: HYPEREVM_RPC }),                 // optional: live protocol state (HyperLend, Kinetiq)
 });
 ```
 
-`npm run build` produces `dist/interceptor.js` and `dist/signing-preview.js`.
+Or take the same set-up as the server's live mode:
+
+```ts
+import { liveDependencies } from 'signing-preview/server';
+const deps = liveDependencies({ ARBITRUM_RPC_URL, HYPEREVM_RPC_URL });
+```
+
+| Import | Contents | Runs in |
+|---|---|---|
+| `signing-preview` | `previewRequest`, registries, simulators, ABI and signature sources, all types | Node and browsers |
+| `signing-preview/interceptor` | `withSigningPreview`, `remotePreview` | Browsers (no dependencies) |
+| `signing-preview/server` | `createPreviewServer`, `liveDependencies`, `openApiDocument` | Node |
+| `signing-preview/openapi.json` | The OpenAPI document | anywhere |
+| `npx signing-preview` | The HTTP API and demo | Node |
+
+`dist/signing-preview.js` and `dist/interceptor.js` are browser bundles of the same code, included in the package, for pages that load scripts directly.
+
+`npm run check:package`, which also runs in CI, packs the library and installs the tarball into a fresh project. There it imports it from plain JavaScript, type-checks a TypeScript consumer against the published declarations, and starts the `signing-preview` command.
+
+**Publishing to npm.** This is the maintainer's call. Choose the package name (`signing-preview`, or a scope such as `@tyrasz/signing-preview`), remove `"private": true` from `package.json`, and run `npm publish`. The `prepare` script builds the library and bundles first.
 
 ## What is decoded
 
@@ -406,7 +453,8 @@ src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2,
 src/hyperliquid/          /info client, asset resolution, L1 action hash
 src/simulation.ts         eth_simulateV1 simulator + mock
 src/interceptor.ts        dependency-free EIP-1193 wrapper
-src/server.ts             HTTP API + demo server
+src/server.ts             HTTP API + demo server (src/cli.ts starts it: npm start / npx signing-preview)
+openapi.json              OpenAPI 3.1 document for the HTTP API
 mocks/data.ts             mock market/account data and sample requests
 demo/                     demo dApp + wallet UI
 ```

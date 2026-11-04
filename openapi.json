@@ -1,0 +1,927 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "signing-preview",
+    "version": "0.1.0",
+    "summary": "Human-readable previews of EVM and Hyperliquid signing requests.",
+    "description": "Send any EIP-1193 signing request (the `{ method, params }` object a dApp passes to `provider.request()`) and get back a plain-JSON preview that a wallet, extension or backend can show before the user signs.\n\nCovers Ethereum, Arbitrum One, HyperEVM and Hyperliquid HyperCore: transactions (`eth_sendTransaction`, `eth_signTransaction`), EIP-5792 batches (`wallet_sendCalls`), EIP-712 typed data (`eth_signTypedData_v4` / `_v3`), and messages (`personal_sign`, `eth_sign`).\n\n`attention` is a display hint, not a security verdict: `none` does not mean \"safe\". Amounts with `basis: \"requested\"` come from the request itself; `simulated_events` and `simulated_state` come from a simulation of the latest block and can differ from the final result.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8787",
+      "description": "Local server (`npm start`, or `npx signing-preview`)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "preview",
+      "description": "Signing previews"
+    },
+    {
+      "name": "meta",
+      "description": "Service information"
+    }
+  ],
+  "paths": {
+    "/v1/preview": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "preview",
+        "summary": "Preview a signing request",
+        "description": "Returns a preview for any request. Methods that are not signing requests return `kind: \"unsupported\"`. Malformed requests return 400.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewRequest"
+              },
+              "examples": {
+                "hyperlendBorrow": {
+                  "summary": "HyperLend: borrow 500 USDC (HyperEVM)",
+                  "value": {
+                    "request": {
+                      "method": "eth_sendTransaction",
+                      "params": [
+                        {
+                          "from": "0xe9b71f2246d6f559bf4a0ebb7d2694da6fa56bfa",
+                          "to": "0x00A89d7a5A02160f20150EbEA7a2b5E4879A1A8b",
+                          "data": "0xa415bcad000000000000000000000000b88339cb7199b77e23db6e890353e22632ba630f000000000000000000000000000000000000000000000000000000001dcd650000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000e9b71f2246d6f559bf4a0ebb7d2694da6fa56bfa",
+                          "chainId": "0x3e7"
+                        }
+                      ]
+                    },
+                    "context": {
+                      "origin": "https://app.hyperlend.finance"
+                    }
+                  }
+                },
+                "kinetiqStake": {
+                  "summary": "Kinetiq: stake 2 HYPE (below the minimum)",
+                  "value": {
+                    "request": {
+                      "method": "eth_sendTransaction",
+                      "params": [
+                        {
+                          "from": "0x9a1dbc6a6e7e59f6beb23db0d00b603fc90e94d0",
+                          "to": "0x393D0B87Ed38fc779FD9611144aE649BA6082109",
+                          "data": "0x3a4b66f1",
+                          "value": "0x1bc16d674ec80000",
+                          "chainId": "0x3e7"
+                        }
+                      ]
+                    },
+                    "context": {
+                      "origin": "https://kinetiq.xyz"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The preview.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Preview"
+                },
+                "examples": {
+                  "hyperlendBorrow": {
+                    "summary": "Live response, 2026-11-04: health factor 3.56 → 2.99, eth_call succeeds",
+                    "value": {
+                      "schema": "signing-preview/1",
+                      "method": "eth_sendTransaction",
+                      "kind": "transaction",
+                      "network": {
+                        "kind": "evm",
+                        "chainId": 999,
+                        "name": "HyperEVM"
+                      },
+                      "title": "Borrow 500 USDC from HyperLend",
+                      "summary": "Borrows 500 USDC from HyperLend against your collateral.",
+                      "details": [
+                        {
+                          "label": "Protocol",
+                          "value": "HyperLend (Pool 0x00a89d7a5a02160f20150ebea7a2b5e4879a1a8b)",
+                          "raw": "0x00a89d7a5a02160f20150ebea7a2b5e4879a1a8b"
+                        },
+                        {
+                          "label": "Borrow",
+                          "value": "500 USDC",
+                          "raw": "500000000"
+                        },
+                        {
+                          "label": "Interest rate",
+                          "value": "variable"
+                        },
+                        {
+                          "label": "Health factor (estimated)",
+                          "value": "3.56 → 2.99"
+                        }
+                      ],
+                      "assetChanges": [
+                        {
+                          "direction": "in",
+                          "account": "0xe9b71f2246d6f559bf4a0ebb7d2694da6fa56bfa",
+                          "amount": "500",
+                          "symbol": "USDC",
+                          "raw": "500000000",
+                          "asset": "0xb88339cb7199b77e23db6e890353e22632ba630f",
+                          "basis": "requested"
+                        }
+                      ],
+                      "warnings": [],
+                      "attention": "none",
+                      "decoding": {
+                        "status": "full",
+                        "decoder": "hyperlend_borrow",
+                        "notes": [
+                          "Borrowed amounts accrue interest. If the health factor falls below 1, part of the collateral can be liquidated.",
+                          "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request."
+                        ]
+                      },
+                      "simulation": {
+                        "status": "success",
+                        "source": "eth_call @ chain 999 (the RPC has no eth_simulateV1)"
+                      }
+                    }
+                  },
+                  "kinetiqStake": {
+                    "summary": "Live response, 2026-11-04: below the 5 HYPE minimum, the chain reverts with BelowMinimum",
+                    "value": {
+                      "schema": "signing-preview/1",
+                      "method": "eth_sendTransaction",
+                      "kind": "transaction",
+                      "network": {
+                        "kind": "evm",
+                        "chainId": 999,
+                        "name": "HyperEVM"
+                      },
+                      "title": "Stake 2 HYPE for ≈ 1.9463 kHYPE",
+                      "summary": "Stakes 2 HYPE with Kinetiq and mints kHYPE to you.",
+                      "details": [
+                        {
+                          "label": "Protocol",
+                          "value": "Kinetiq liquid staking (StakingManager 0x393d0b87ed38fc779fd9611144ae649ba6082109)",
+                          "raw": "0x393d0b87ed38fc779fd9611144ae649ba6082109"
+                        },
+                        {
+                          "label": "You stake",
+                          "value": "2 HYPE",
+                          "raw": "2000000000000000000"
+                        },
+                        {
+                          "label": "You receive (at the current rate)",
+                          "value": "1.946301069030993794 kHYPE",
+                          "raw": "1946301069030993794"
+                        },
+                        {
+                          "label": "Rate",
+                          "value": "1 kHYPE = 1.027590248920605756 HYPE"
+                        }
+                      ],
+                      "assetChanges": [
+                        {
+                          "direction": "out",
+                          "account": "0x9a1dbc6a6e7e59f6beb23db0d00b603fc90e94d0",
+                          "amount": "2",
+                          "symbol": "HYPE",
+                          "raw": "2000000000000000000",
+                          "asset": "native",
+                          "basis": "requested"
+                        },
+                        {
+                          "direction": "in",
+                          "account": "0x9a1dbc6a6e7e59f6beb23db0d00b603fc90e94d0",
+                          "amount": "1.946301069030993794",
+                          "symbol": "kHYPE",
+                          "raw": "1946301069030993794",
+                          "asset": "0xfd739d4e423301ce9385c1fb8850539d657c296d",
+                          "basis": "requested"
+                        }
+                      ],
+                      "warnings": [
+                        {
+                          "severity": "caution",
+                          "code": "kinetiq_below_minimum",
+                          "message": "This will fail: the minimum stake is 5 HYPE."
+                        },
+                        {
+                          "severity": "danger",
+                          "code": "simulation_reverted",
+                          "message": "The transaction is expected to fail: BelowMinimum: the amount is below the minimum. You would still pay the network fee."
+                        }
+                      ],
+                      "attention": "danger",
+                      "decoding": {
+                        "status": "full",
+                        "decoder": "kinetiq_stake",
+                        "notes": [
+                          "kHYPE grows in HYPE value as staking rewards accrue. To get HYPE back, queue a withdrawal (about 7 days) or unstake instantly for a fee."
+                        ]
+                      },
+                      "simulation": {
+                        "status": "reverted",
+                        "source": "eth_call @ chain 999 (the RPC has no eth_simulateV1)",
+                        "revertReason": "BelowMinimum: the amount is below the minimum"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "413": {
+            "$ref": "#/components/responses/TooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "health",
+        "summary": "Liveness check",
+        "responses": {
+          "200": {
+            "description": "The server is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "const": "ok"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "openapi",
+        "summary": "This document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/samples": {
+      "get": {
+        "tags": [
+          "meta"
+        ],
+        "operationId": "samples",
+        "summary": "Sample requests (demo server only)",
+        "description": "Served when the server runs with samples enabled (`npm start`). Each sample can be sent to `/v1/preview` as `{ request, context }`.",
+        "responses": {
+          "200": {
+            "description": "Sample requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Sample"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "PreviewRequest": {
+        "type": "object",
+        "required": [
+          "request"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/SigningRequest"
+          },
+          "context": {
+            "$ref": "#/components/schemas/PreviewContext"
+          }
+        }
+      },
+      "SigningRequest": {
+        "type": "object",
+        "required": [
+          "method"
+        ],
+        "description": "An EIP-1193 request, exactly as a dApp sends it. Params by method:\n- `eth_sendTransaction`, `eth_signTransaction`: `[transaction]` (`from`, `to`, `data`, `value`, `chainId`; hex quantities)\n- `wallet_sendCalls`: `[{ version, chainId, from, atomicRequired?, calls: [{ to, data, value }] }]`\n- `eth_signTypedData_v4`, `eth_signTypedData_v3`: `[address, typedData]` (typed data as a JSON string or object)\n- `personal_sign`: `[message, address]`; `eth_sign`: `[address, message]`",
+        "properties": {
+          "method": {
+            "type": "string",
+            "examples": [
+              "eth_sendTransaction",
+              "wallet_sendCalls",
+              "eth_signTypedData_v4",
+              "personal_sign"
+            ]
+          },
+          "params": {
+            "description": "Method parameters, as in EIP-1193."
+          }
+        }
+      },
+      "PreviewContext": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "What the wallet knows about the request. Unknown fields are ignored by the server.",
+        "properties": {
+          "chainId": {
+            "type": "integer",
+            "description": "The wallet's active chain, used when the request has no chainId."
+          },
+          "origin": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Origin of the dApp asking for the signature (checked against SIWE domains)."
+          },
+          "account": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]{40}$",
+            "description": "The connected account. A different `from` is flagged."
+          },
+          "hyperliquid": {
+            "type": "object",
+            "required": [
+              "action",
+              "nonce"
+            ],
+            "additionalProperties": false,
+            "description": "For Hyperliquid L1 actions, which are signed as an opaque hash: the original action, decoded only if it hashes to the signed connectionId.",
+            "properties": {
+              "action": {
+                "type": "object"
+              },
+              "nonce": {
+                "type": "integer"
+              },
+              "vaultAddress": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]{40}$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "expiresAfter": {
+                "oneOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "Preview": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "method",
+          "kind",
+          "network",
+          "title",
+          "summary",
+          "details",
+          "assetChanges",
+          "warnings",
+          "attention",
+          "decoding"
+        ],
+        "properties": {
+          "schema": {
+            "const": "signing-preview/1",
+            "description": "Format version. New optional fields can appear within a version."
+          },
+          "method": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "transaction",
+              "batch",
+              "typed_data",
+              "message",
+              "unsupported"
+            ]
+          },
+          "network": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Network"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": {
+            "type": "string",
+            "description": "Plain-language headline, e.g. \"Borrow 500 USDC from HyperLend\"."
+          },
+          "summary": {
+            "type": "string"
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Detail"
+            }
+          },
+          "assetChanges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetChange"
+            }
+          },
+          "approvals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApprovalChange"
+            },
+            "description": "Permissions held after the transaction, from simulation. Absent when there are none or no simulator covers the chain."
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Warning"
+            }
+          },
+          "attention": {
+            "enum": [
+              "none",
+              "info",
+              "caution",
+              "danger"
+            ],
+            "description": "The most severe warning. A display hint, not a security verdict."
+          },
+          "decoding": {
+            "$ref": "#/components/schemas/Decoding"
+          },
+          "simulation": {
+            "$ref": "#/components/schemas/SimulationSummary"
+          },
+          "calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Preview"
+            },
+            "description": "Batches (`wallet_sendCalls`): one preview per call."
+          }
+        }
+      },
+      "Network": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "chainId",
+              "name"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "evm"
+              },
+              "chainId": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "name",
+              "testnet"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "hypercore"
+              },
+              "name": {
+                "type": "string"
+              },
+              "testnet": {
+                "type": "boolean"
+              }
+            }
+          }
+        ]
+      },
+      "Detail": {
+        "type": "object",
+        "required": [
+          "label",
+          "value"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string",
+            "description": "Formatted for display."
+          },
+          "raw": {
+            "type": "string",
+            "description": "Exact machine value (integer, full address, hex) when `value` is formatted."
+          }
+        }
+      },
+      "AssetChange": {
+        "type": "object",
+        "required": [
+          "direction",
+          "account",
+          "amount",
+          "symbol",
+          "basis"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "enum": [
+              "in",
+              "out"
+            ]
+          },
+          "account": {
+            "type": "string"
+          },
+          "amount": {
+            "type": "string",
+            "description": "Formatted amount, e.g. \"1,500\"."
+          },
+          "symbol": {
+            "type": "string",
+            "description": "Token symbol; NFTs read like \"BAYC #42\"."
+          },
+          "raw": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Exact integer in the smallest unit, as a decimal string."
+          },
+          "asset": {
+            "type": "string",
+            "description": "Token or collection address, or \"native\"."
+          },
+          "basis": {
+            "enum": [
+              "requested",
+              "simulated_events",
+              "mock"
+            ],
+            "description": "Where the number comes from. Requested amounts are not settled amounts."
+          },
+          "standard": {
+            "enum": [
+              "native",
+              "erc20",
+              "erc721",
+              "erc1155"
+            ]
+          },
+          "tokenId": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Exact integer in the smallest unit, as a decimal string."
+          }
+        }
+      },
+      "ApprovalChange": {
+        "type": "object",
+        "required": [
+          "kind",
+          "owner",
+          "spender",
+          "token",
+          "allowance",
+          "revoked",
+          "direct",
+          "basis"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "erc20",
+              "permit2",
+              "erc721",
+              "operator"
+            ],
+            "description": "operator: setApprovalForAll on a whole collection."
+          },
+          "owner": {
+            "type": "string"
+          },
+          "spender": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "allowance": {
+            "type": "string",
+            "description": "\"unlimited\", \"250 USDC\", \"BAYC #42\", \"all NFTs in the collection\", \"none\" or \"revoked\"."
+          },
+          "raw": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Exact integer in the smallest unit, as a decimal string."
+          },
+          "tokenId": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Exact integer in the smallest unit, as a decimal string."
+          },
+          "expiration": {
+            "type": "integer",
+            "description": "Permit2 expiry, unix seconds."
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "direct": {
+            "type": "boolean",
+            "description": "True when the decoded request shows the approval; false when another call set it along the way (flagged)."
+          },
+          "basis": {
+            "enum": [
+              "simulated_events",
+              "simulated_state"
+            ]
+          }
+        }
+      },
+      "Warning": {
+        "type": "object",
+        "required": [
+          "severity",
+          "code",
+          "message"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "enum": [
+              "info",
+              "caution",
+              "danger"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable identifier, e.g. \"credit_delegation\", \"liquidation_risk\", \"simulation_reverted\"."
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Decoding": {
+        "type": "object",
+        "required": [
+          "status",
+          "decoder",
+          "notes"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "enum": [
+              "full",
+              "partial",
+              "opaque"
+            ],
+            "description": "full: every field understood; partial: some fields or an unverified source; opaque: not decoded."
+          },
+          "decoder": {
+            "type": "string",
+            "description": "Which decoder produced the preview, e.g. \"hyperlend_borrow\", \"uniswap_universal_router\", \"abi_verified\"."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SimulationSummary": {
+        "type": "object",
+        "required": [
+          "status",
+          "source"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "enum": [
+              "success",
+              "reverted",
+              "unavailable"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "description": "e.g. \"eth_simulateV1 @ chain 42161\", or \"eth_call @ chain 999 …\" where the RPC cannot simulate."
+          },
+          "gasUsed": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "Exact integer in the smallest unit, as a decimal string."
+          },
+          "revertReason": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "Sample": {
+        "type": "object",
+        "required": [
+          "id",
+          "group",
+          "label",
+          "request"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "group": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "chainId": {
+            "type": "integer"
+          },
+          "request": {
+            "$ref": "#/components/schemas/SigningRequest"
+          },
+          "context": {
+            "type": "object"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "enum": [
+                  "INVALID_JSON",
+                  "INVALID_REQUEST",
+                  "UNSUPPORTED_MEDIA_TYPE",
+                  "NOT_FOUND",
+                  "INTERNAL"
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed JSON, or a request that cannot be previewed (e.g. a transaction without `from`).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooLarge": {
+        "description": "The body is larger than 256 KiB.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "The body is not `application/json`.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Internal": {
+        "description": "Unexpected server error.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}
