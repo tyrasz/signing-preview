@@ -3,7 +3,7 @@ export { ADAPTERS, RequestError } from './evm/transaction.ts';
 export { StaticTokenRegistry, CHAINS, HYPERLIQUID, CCTP, PERMIT2, spotSystemAddress } from './chains.ts';
 export { HttpHyperliquidInfo, StaticHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
 export { l1ActionHash } from './hyperliquid/action-hash.ts';
-export { RpcSimulator, MockSimulator } from './simulation.ts';
+export { RpcSimulator, MockSimulator, parseLogs, parseTransfers } from './simulation.ts';
 export type * from './types.ts';
 export { JsonRpcClient, isRpcError, type RpcClient } from './rpc.ts';
 export { OnchainTokenRegistry, TokenListRegistry, ChainedTokenRegistry, impersonatedToken, decodeStringOrBytes32 } from './tokens.ts';

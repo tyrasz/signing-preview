@@ -112,6 +112,7 @@ const preview = await previewRequest(request, { chainId: 42161, account, origin 
 | Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
 | | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
+| Simulated effects (any transaction) | `eth_simulateV1` logs and state | Balance changes for native, ERC-20, **ERC-721 and ERC-1155** (e.g. "+1 BAYC #42"). **Permissions left in place**: ERC-20 and Permit2 allowances, single-NFT approvals and `setApprovalForAll`, read back from the tokens after the simulated transaction. One set *along the way* by another call (a router writing a Permit2 allowance, a smart account's `execute`) is flagged: unlimited allowances and single NFTs with **caution**, all-NFT approvals with **danger**. |
 
 ### Hyperliquid L1 actions: the one real limit
 
@@ -128,7 +129,8 @@ A dApp or integrator that holds the action can pass it as `context.hyperliquid =
   network: { kind: 'evm', chainId, name } | { kind: 'hypercore', name, testnet } | null,
   title, summary,                       // plain-language headline and sentence
   details: [{ label, value, raw? }],    // raw = exact integer/hex when value is formatted
-  assetChanges: [{ direction, account, amount, symbol, raw?, asset?, basis }],
+  assetChanges: [{ direction, account, amount, symbol, raw?, asset?, basis, standard?, tokenId? }],
+  approvals?: [{ kind, owner, spender, token, symbol?, allowance, raw?, tokenId?, expiration?, revoked, direct, basis }],
   warnings: [{ severity: 'info' | 'caution' | 'danger', code, message }],
   attention: 'none' | 'info' | 'caution' | 'danger',   // display hint, not a security verdict
   decoding: { status: 'full' | 'partial' | 'opaque', decoder, notes },
@@ -142,6 +144,15 @@ A dApp or integrator that holds the action can pass it as `context.hyperliquid =
 - `simulated_events`: transfer events from `eth_simulateV1`.
 
 Neither is a measured final balance. Fee-on-transfer or rebasing tokens, and state changes before inclusion, can differ.
+
+NFT changes carry `standard` (`erc721`/`erc1155`) and the full `tokenId`. `symbol` reads like "BAYC #42", with long IDs shortened. Collection names come from the contracts and are easy to copy, so a received, named NFT gets an info note.
+
+`approvals` lists the permissions the account holds **after** the transaction, one per token and spender, or per NFT:
+- `kind` is `erc20`, `permit2`, `erc721` (one NFT) or `operator` (every NFT of a collection).
+- `allowance` reads like "unlimited", "250 USDC", "BAYC #42", "all NFTs in the collection", "none" (used up or set to zero) or "revoked".
+- `direct` is true when the approval is the call itself, such as `approve()`. Those are already flagged by their decoders, so only `direct: false` approvals add warnings.
+
+Events alone can be stale: USDC, OpenZeppelin 5 tokens and Permit2 lower an allowance without an event when it's spent, and older OpenZeppelin tokens emit one on every spend. So `RpcSimulator` reads the real values back with a second simulation pass (`allowance`, Permit2 `allowance`, `isApprovedForAll`, `getApproved`) after each call, and `basis` is then `simulated_state`. A token without these view functions keeps the event value (`simulated_events`). Permit2 events are only accepted from the canonical Permit2 contract.
 
 ## Mock and live data
 
@@ -296,7 +307,11 @@ What the contracts imply, and what the preview reports:
   - The emitted `DepositForBurn` events carry the previewed amount, fee cap, finality, forwarder addresses and hook.
 - **Batches.** An EIP-5792 batch of "approve `TokenMessengerV2`, then deposit 10 USDC to HyperCore" was run through `RpcSimulator` on Arbitrum One:
   - simulated on its own, the deposit reverts with "ERC20: transfer amount exceeds allowance", which is what batch previews used to show;
-  - simulated in order, the batch succeeds, and its balance change is the simulated "out 10 USDC".
+  - simulated in order, the batch succeeds, and its balance change is the simulated "out 10 USDC";
+  - the allowance left afterwards reads "none", from USDC itself; the event alone would have said 10 USDC.
+- **NFTs and approvals set along the way.**
+  - A Permit2 permit, signed by a throwaway key and run through Uniswap's Universal Router on Arbitrum (command `0x0a`), is listed as an unlimited USDC allowance for the router, with its expiry, and flagged as set along the way.
+  - BAYC #1, moved by its current owner on Ethereum, shows as "out 1 BAYC #1", with the name read from the contract. BAYC's approval-clearing event is not listed.
 - **Ethereum.** The `TokenMessengerV2` route from Circle's Ethereum guide, with a USDC balance override standing in for funding: perps, spot, standard finality, header-only hook (gets stuck), empty hook and `maxFee ≥ amount` (both revert). **6/6 match the preview**, by the same criteria.
 - **Deployed configuration.** `CctpExtension` points at USDC and `TokenMessengerV2`. The forwarder routes USDC to `CoreDepositWallet`. The USDC system address is `0x2000…0000`. Perps forwarding is enabled. The forwarding fee is 0.20 USDC and the new-account fee is 0.
 - **HyperEVM.** `CoreDepositWallet.depositFor` was called (with a USDC balance override) for new-account perps and spot deposits, which succeed, and for the system address, the wallet itself and zero, which revert with the reasons the preview cites.

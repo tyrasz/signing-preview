@@ -1,7 +1,8 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress } from '../format.ts';
 import { CHAINS, chainName } from '../chains.ts';
-import type { AssetChange, Dependencies, Preview, PreviewContext, SimulatedTransfer, SimulationResult, SimulationSummary, TokenInfo } from '../types.ts';
-import { tokenInfo, tokenSourceWarnings, type Adapter, type Decoded, type Tx } from './common.ts';
+import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationResult, SimulationSummary } from '../types.ts';
+import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
+import { type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
@@ -75,6 +76,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   }
 
   let assetChanges = d.assetChanges;
+  let approvals: ApprovalChange[] = [];
   let simulation: SimulationSummary | undefined;
   let outcome = preset;
   if (!outcome && deps.simulator) {
@@ -97,39 +99,20 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     if (sim.status === 'reverted') {
       b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
     } else {
-      const simulated = await netChanges(sim.transfers, tx, deps, b);
+      const simulated = [...await netChanges(sim.transfers, tx, deps, b), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b)];
       if (simulated.length || !assetChanges.length) assetChanges = simulated;
+      approvals = await approvalChanges((sim.approvals ?? []).map(approval => ({ approval, callTo: tx.to })), tx, deps, sim.approvalState);
+      approvalWarnings(b, approvals, context.now);
       b.note('Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
     }
   }
   return {
     schema: 'signing-preview/1', method, kind: 'transaction',
     network: { kind: 'evm', chainId: tx.chainId, name: chainName(tx.chainId) },
-    title: d.title, summary: d.summary, details: b.details, assetChanges, warnings: b.warnings, attention: attentionOf(b.warnings),
+    title: d.title, summary: d.summary, details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings: b.warnings, attention: attentionOf(b.warnings),
     decoding: { status: d.status, decoder: d.decoder, notes: b.notes },
     ...(simulation && { simulation }),
   };
 }
 
 export const simulationRequest = (tx: Tx) => ({ chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value });
-
-/** Nets simulated transfers into per-asset changes for the sender. */
-export async function netChanges(transfers: SimulatedTransfer[], tx: Pick<Tx, 'chainId' | 'from'>, deps: Dependencies, b: PreviewBuilder): Promise<AssetChange[]> {
-  const net = new Map<string, bigint>();
-  for (const t of transfers) {
-    const asset = t.asset.toLowerCase();
-    if (sameAddress(t.from, tx.from)) net.set(asset, (net.get(asset) ?? 0n) - t.raw);
-    if (sameAddress(t.to, tx.from)) net.set(asset, (net.get(asset) ?? 0n) + t.raw);
-  }
-  const out: AssetChange[] = [];
-  const env = { deps, context: {} };
-  for (const [asset, delta] of net) {
-    if (delta === 0n) continue;
-    const chain = CHAINS[tx.chainId];
-    const info = asset === 'native' ? { symbol: chain?.nativeSymbol ?? 'native', decimals: chain?.nativeDecimals ?? 18 } : await tokenInfo(env, tx.chainId, asset);
-    if (asset !== 'native') tokenSourceWarnings(b, tx.chainId, info as TokenInfo | undefined);
-    const abs = delta < 0n ? -delta : delta;
-    out.push({ direction: delta < 0n ? 'out' : 'in', account: tx.from, amount: info ? formatUnits(abs, info.decimals) : abs.toString(), symbol: info?.symbol ?? asset, raw: abs.toString(), asset, basis: 'simulated_events' });
-  }
-  return out;
-}

@@ -36,6 +36,31 @@ export interface AssetChange {
   asset?: string;
   /** Where the number comes from. Requested amounts are not settled amounts. */
   basis: 'requested' | 'simulated_events' | 'mock';
+  /** Set for simulated changes. NFTs (erc721/erc1155) also carry the token ID; `symbol` then reads e.g. "BAYC #42". */
+  standard?: 'native' | 'erc20' | 'erc721' | 'erc1155';
+  tokenId?: string;
+}
+
+/** A permission the transaction leaves in place (or removes), from simulated approval events. */
+export interface ApprovalChange {
+  /** erc20 / permit2: an allowance; erc721: one NFT; operator: every NFT of a collection (setApprovalForAll). */
+  kind: 'erc20' | 'permit2' | 'erc721' | 'operator';
+  owner: string;
+  spender: string;
+  /** The token or collection. */
+  token: string;
+  symbol?: string;
+  /** Human-readable: "unlimited", "250 USDC", "BAYC #42", "all NFTs in the collection", "none" (allowance zero: revoked or used up) or "revoked". */
+  allowance: string;
+  raw?: string;
+  tokenId?: string;
+  /** Permit2 expiry (unix seconds). */
+  expiration?: number;
+  revoked: boolean;
+  /** True when the approval is the call itself (e.g. approve()), false when another call set it along the way. */
+  direct: boolean;
+  /** simulated_state: read from the token after the simulated transaction; simulated_events: from approval events. */
+  basis: 'simulated_events' | 'simulated_state';
 }
 
 export type Network =
@@ -61,6 +86,8 @@ export interface Preview {
   summary: string;
   details: Detail[];
   assetChanges: AssetChange[];
+  /** Permissions the transaction leaves in place, from simulation (state after the transaction). */
+  approvals?: ApprovalChange[];
   warnings: Warning[];
   /** Highest warning severity, or 'none'. A display hint, not a security verdict. */
   attention: 'none' | Severity;
@@ -111,6 +138,8 @@ export interface TokenInfo {
 
 export interface TokenRegistry {
   get(chainId: number, address: string): TokenInfo | undefined | Promise<TokenInfo | undefined>;
+  /** NFT collection name/symbol (self-reported by the contract when read on-chain). */
+  collection?(chainId: number, address: string): Promise<{ symbol?: string; name?: string } | undefined>;
 }
 
 export interface SimulationRequest {
@@ -129,12 +158,47 @@ export interface SimulatedTransfer {
   raw: bigint;
 }
 
+export interface SimulatedNftTransfer {
+  standard: 'erc721' | 'erc1155';
+  collection: string;
+  from: string;
+  to: string;
+  tokenId: bigint;
+  /** 1 for ERC-721. */
+  amount: bigint;
+}
+
+export interface SimulatedApproval {
+  kind: 'erc20' | 'permit2' | 'erc721' | 'operator';
+  /** The contract that emitted the event: the token, or Permit2. */
+  emitter: string;
+  token: string;
+  owner: string;
+  spender: string;
+  /** erc20 / permit2 allowance (0 = revoked). */
+  amount?: bigint;
+  tokenId?: bigint;
+  /** operator: granted (true) or revoked (false). */
+  approved?: boolean;
+  expiration?: number;
+}
+
 export interface SimulationResult {
   status: 'success' | 'reverted';
   source: string;
   gasUsed?: bigint;
   revertReason?: string;
+  /** Fungible transfers (ERC-20 and native). */
   transfers: SimulatedTransfer[];
+  nftTransfers?: SimulatedNftTransfer[];
+  /** Approval events in emission order. */
+  approvals?: SimulatedApproval[];
+  /**
+   * The actual permission state after this call, read from the token (allowance, Permit2 allowance,
+   * isApprovedForAll, getApproved) for every permission the batch has touched so far. Events alone can be stale:
+   * USDC, OpenZeppelin 5 tokens and Permit2 lower an allowance without an event when it is spent.
+   */
+  approvalState?: SimulatedApproval[];
 }
 
 export interface Simulator {

@@ -32,13 +32,15 @@ function renderBody(p) {
   const warnings = p.warnings.map(w => `<div class="warning ${w.severity}" role="${w.severity === 'danger' ? 'alert' : 'note'}"><strong>${esc(w.severity)}:</strong> ${esc(w.message)}</div>`).join('');
   const changes = p.assetChanges.length ? `<div class="changes">${p.assetChanges.map(c => `<div class="change ${c.direction}"><span>${c.direction === 'out' ? 'You send' : 'You receive'} <small>(${esc(c.basis.replace('_', ' '))})</small></span><span class="amt">${c.direction === 'out' ? '−' : '+'}${esc(c.amount)} ${esc(c.symbol)}</span></div>`).join('')}</div>` : '';
   const details = p.details.length ? `<dl>${p.details.map(d => `<dt>${esc(d.label)}</dt><dd>${/^0x[0-9a-f]{20,}$/i.test(d.value) ? `<code>${esc(d.value)}</code>` : esc(d.value)}</dd>`).join('')}</dl>` : '';
+  const short = a => `${a.slice(0, 6)}…${a.slice(-4)}`;
+  const approvals = p.approvals?.length ? `<div class="changes">${p.approvals.map(a => `<div class="change approval${a.revoked ? ' revoked' : ''}"><span>${a.revoked ? 'Permission removed' : 'Permission left in place'} <small>(${a.direct ? 'this call' : 'set along the way'})</small></span><span class="amt">${esc(short(a.spender))} → ${esc(a.allowance === 'unlimited' ? `unlimited ${a.symbol ?? ''}` : a.allowance)}</span></div>`).join('')}</div>` : '';
   const sim = p.simulation ? `<div class="network">Simulation: <span class="chip">${esc(p.simulation.status)}</span>${p.simulation.gasUsed ? `<span class="chip">gas ${esc(p.simulation.gasUsed)}</span>` : ''}</div>` : '';
   const calls = p.calls ? p.calls.map((c, i) => `<div class="call"><div class="network">Call ${i + 1}</div><div class="title" style="font-size:15px">${esc(c.title)}</div>${c.details.length ? `<dl>${c.details.map(d => `<dt>${esc(d.label)}</dt><dd>${esc(d.value)}</dd>`).join('')}</dl>` : ''}</div>`).join('') : '';
   return `
     <div class="network">${net}<span class="chip">${esc(p.method)}</span><span class="chip">decoded: ${esc(p.decoding.status)}</span><span class="badge ${p.attention}">${ATTENTION[p.attention]}</span></div>
     <div class="title">${esc(p.title)}</div>
     <p class="summary">${esc(p.summary)}</p>
-    ${warnings}${changes}${sim}${details}${calls}
+    ${warnings}${changes}${approvals}${sim}${details}${calls}
     ${p.decoding.notes.length ? `<div class="network">${p.decoding.notes.map(esc).join(' ')}</div>` : ''}`;
 }
 

@@ -43,6 +43,23 @@ export class OnchainTokenRegistry implements TokenRegistry {
     expire = this.cache.set(key, value, this.ttlMs);
     return value;
   }
+  private collections = new TtlCache<Promise<{ symbol?: string; name?: string } | undefined>>();
+  /** NFT collection symbol/name (ERC-721 metadata; many ERC-1155 contracts have neither). Self-reported. */
+  collection(chainId: number, address: string): Promise<{ symbol?: string; name?: string } | undefined> {
+    const key = `${chainId}:${address.toLowerCase()}`;
+    const hit = this.collections.get(key);
+    if (hit) return hit;
+    let expire = (_ttl: number) => {};
+    const value = (async () => {
+      if (!this.rpc.has(chainId)) return undefined;
+      const call = (data: string) => this.rpc.call(chainId, 'eth_call', [{ to: address, data }, 'latest']).then(r => String(r), e => { if (isRpcError(e)) return '0x'; throw e; });
+      const [sym, nm] = await Promise.all([call(SELECTORS.symbol), call(SELECTORS.name)]);
+      const symbol = decodeStringOrBytes32(sym) ?? undefined, name = decodeStringOrBytes32(nm) ?? undefined;
+      return symbol || name ? { symbol, name } : undefined;
+    })().catch(() => { expire(this.retryMs); return undefined; });
+    expire = this.collections.set(key, value, this.ttlMs);
+    return value;
+  }
   private async read(chainId: number, address: string): Promise<TokenInfo | undefined> {
     if (!this.rpc.has(chainId)) return undefined;
     // A revert means "no such function"; any other failure rejects, so the miss is not cached for long.
@@ -81,6 +98,13 @@ export class ChainedTokenRegistry implements TokenRegistry {
         const hit = await r.get(chainId, address);
         if (hit) return hit;
       } catch { /* try the next source */ }
+    }
+    return undefined;
+  }
+  async collection(chainId: number, address: string): Promise<{ symbol?: string; name?: string } | undefined> {
+    for (const r of this.registries) {
+      if (!r.collection) continue;
+      try { const hit = await r.collection(chainId, address); if (hit) return hit; } catch { /* next */ }
     }
     return undefined;
   }

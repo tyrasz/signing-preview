@@ -15,6 +15,7 @@ export const SPENDER = '0x5bad000000000000000000000000000000000005';
 export const ROUTER = '0x7e57000000000000000000000000000000000006';
 export const POOL = '0x9001000000000000000000000000000000000007';
 const MOCK_PURR_EVM = '0x9b498c3c8a0b8cd8ba1d9851d40d186f1872b44e';
+const MOCK_NFT = '0x4e47000000000000000000000000000000000721';
 
 const ARB_USDC = CCTP.usdcByChain[42161];
 const ARB_USDT = '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9';
@@ -253,6 +254,8 @@ export function buildSamples(now = Date.now()): Sample[] {
       request: tx(1, BOB, '0x', 250_000_000_000_000_000n) },
     { id: 'eth-unknown-swap', group: 'Ethereum', label: 'Unknown router call (simulated swap)', chainId: 1,
       request: tx(1, ROUTER, '0x3593564c00000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000') },
+    { id: 'eth-nft-buy', group: 'Ethereum', label: 'Router call: buy an NFT, Permit2 allowance set along the way (simulated)', chainId: 1,
+      request: tx(1, ROUTER, '0x3593564c0000000000000000000000000000000000000000000000000000000000000001') },
     { id: 'eth-reverting', group: 'Ethereum', label: 'Call that will revert (simulated)', chainId: 1,
       request: tx(1, POOL, '0x4e71d92d') },
     { id: 'siwe-phish', group: 'Ethereum', label: 'Sign-in message for a different site', chainId: 1,
@@ -279,6 +282,10 @@ export function mockSimulator(): MockSimulator {
       { asset: ETH_USDC, from: ALICE, to: POOL, raw: 1_000_000_000n },
       { asset: ETH_WETH, from: POOL, to: ALICE, raw: 284_350_000_000_000_000n },
     ], 182_331n),
+    // A router buys an NFT with USDC and, along the way, records an unlimited Permit2 allowance for itself.
+    [call('eth-nft-buy')]: { ...ok([{ asset: ETH_USDC, from: ALICE, to: POOL, raw: 1_500_000_000n }], 214_870n),
+      nftTransfers: [{ standard: 'erc721', collection: MOCK_NFT, from: POOL, to: ALICE, tokenId: 4242n, amount: 1n }],
+      approvals: [{ kind: 'permit2', emitter: PERMIT2, token: ETH_USDC, owner: ALICE, spender: ROUTER, amount: (1n << 160n) - 1n, expiration: 1_798_761_600 }] },
     [call('eth-reverting')]: { status: 'reverted', source: 'mock', gasUsed: 31_208n, revertReason: 'Airdrop already claimed', transfers: [] },
     [call('bridge2-deposit')]: ok([{ asset: ARB_USDC, from: ALICE, to: HYPERLIQUID.bridge2, raw: 100_000_000n }], 51_204n),
     // EIP-5792 batch, simulated in order: the approval, then the deposit.

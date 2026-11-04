@@ -11,6 +11,7 @@
 //  6. Checks the curated token list's decimals against each token contract, on-chain metadata reads and proxy
 //     detection on deployed contracts, and the Sourcify / OpenChain / 4byte (and, with ETHERSCAN_API_KEY,
 //     Etherscan) response shapes. A service that can't be reached is skipped, unless VERIFY_LIVE_STRICT=1 (CI).
+//  7. Simulates a Uniswap Universal Router Permit2 permit (an approval set along the way) and an ERC-721 transfer.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
 // ethereum-rpc.publicnode.com (or ETHEREUM_RPC_URL), rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus
 // sourcify.dev, api.openchain.xyz and www.4byte.directory for step 6 (behind a proxy, run with
@@ -185,6 +186,9 @@ console.log('\n# EIP-5792 batch on Arbitrum One: approve + CCTP deposit, via Rpc
   check(p.simulation?.status === 'success' && !bad.length, 'in order, the batch succeeds'.padEnd(34), `${p.simulation?.status}, gas ${p.simulation?.gasUsed}${bad.length ? ', ' + bad.join(', ') : ''} | "${p.title}"`);
   const changes = p.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} (${c.basis})`).join(', ');
   check(changes === 'out 10 USDC (simulated_events)', 'batch balance change'.padEnd(34), changes);
+  // USDC lowers the allowance without an Approval event when it is spent: the state read must say none is left.
+  const left = (p.approvals ?? []).map(a => `${a.symbol} ${a.allowance} (${a.basis})`).join(', ');
+  check(left === 'USDC none (simulated_state)', 'allowance left after the batch'.padEnd(34), left || 'no approvals');
 }
 
 console.log('\n# Deployed configuration');
@@ -284,15 +288,16 @@ console.log('\n# HyperCore -> other chains via Circle CCTP (CoreDepositWallet.co
   }
 }
 
+const urls: Record<number, string> = { 1: ETH_RPC, 42161: RPC, 999: 'https://rpc.hyperliquid.xyz/evm' };
+// Same RpcClient contract as JsonRpcClient (node errors carry rpcError), with the rate-limit retries above.
+const live: RpcClient = { has: c => !!urls[c], async call(c, method, params) {
+  const r = await jsonRpc(urls[c], { jsonrpc: '2.0', id: 1, method, params });
+  if (r.error) throw Object.assign(new Error(`${method}: ${r.error.message}`), { rpcError: r.error });
+  return r.result;
+} };
+
 console.log('\n6. Token metadata, proxy detection, ABI and signature services');
 {
-  const urls: Record<number, string> = { 1: ETH_RPC, 42161: RPC, 999: 'https://rpc.hyperliquid.xyz/evm' };
-  // Same RpcClient contract as JsonRpcClient (node errors carry rpcError), with the rate-limit retries above.
-  const live: RpcClient = { has: c => !!urls[c], async call(c, method, params) {
-    const r = await jsonRpc(urls[c], { jsonrpc: '2.0', id: 1, method, params });
-    if (r.error) throw Object.assign(new Error(`${method}: ${r.error.message}`), { rpcError: r.error });
-    return r.result;
-  } };
   const onchain = new OnchainTokenRegistry(live);
   // A wrong curated decimals value would misstate every amount of that token, so compare with the contract.
   for (const chain of [1, 42161, 999]) {
@@ -373,6 +378,39 @@ console.log('\n6. Token metadata, proxy detection, ABI and signature services');
       check(await es.lookup(42161, nobody) === null, 'Etherscan: unverified address is a clean miss');
     });
   } else console.log('skip Etherscan: ETHERSCAN_API_KEY not set');
+}
+
+console.log('\n7. Simulated NFT transfers and approvals set along the way');
+{
+  const tokens = new ChainedTokenRegistry([new StaticTokenRegistry(), new OnchainTokenRegistry(live)]);
+  const simulator = new RpcSimulator({ 1: ETH_RPC, 42161: RPC });
+  // Uniswap Universal Router command 0x0a (PERMIT2_PERMIT): the router sets a Permit2 allowance mid-transaction,
+  // signed here by a fresh throwaway key.
+  const PERMIT2_ADDR: Address = '0x000000000022D473030F116dDEE9F6B43aC78BA3', UR: Address = '0xA51afAFe0263b40EdaEf0Df8781eA9aa03E381a3';
+  const signer = privateKeyToAccount(generatePrivateKey());
+  const now = Number(T), expiration = now + 30 * 86400, max160 = (1n << 160n) - 1n;
+  const details = { token: USDC, amount: max160, expiration, nonce: 0 };
+  const permit = { details, spender: UR, sigDeadline: BigInt(now + 3600) };
+  const signature = await signer.signTypedData({ domain: { name: 'Permit2', chainId: 42161, verifyingContract: PERMIT2_ADDR },
+    types: { PermitDetails: [{ name: 'token', type: 'address' }, { name: 'amount', type: 'uint160' }, { name: 'expiration', type: 'uint48' }, { name: 'nonce', type: 'uint48' }],
+      PermitSingle: [{ name: 'details', type: 'PermitDetails' }, { name: 'spender', type: 'address' }, { name: 'sigDeadline', type: 'uint256' }] },
+    primaryType: 'PermitSingle', message: permit });
+  const input = encodeAbiParameters([{ type: 'tuple', components: [{ name: 'details', type: 'tuple', components: [{ name: 'token', type: 'address' }, { name: 'amount', type: 'uint160' }, { name: 'expiration', type: 'uint48' }, { name: 'nonce', type: 'uint48' }] }, { name: 'spender', type: 'address' }, { name: 'sigDeadline', type: 'uint256' }] }, { type: 'bytes' }], [permit, signature]);
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute(bytes commands, bytes[] inputs, uint256 deadline)']), functionName: 'execute', args: ['0x0a', [input], BigInt(now + 3600)] });
+  const ur = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: signer.address, to: UR, data: execute, chainId: '0xa4b1' }] }, { now: now * 1000 }, { tokens, simulator });
+  const a = ur.approvals?.[0];
+  check(a?.kind === 'permit2' && a.allowance === 'unlimited' && !a.direct && a.expiration === expiration && a.basis === 'simulated_state' && ur.warnings.some(w => w.code === 'hidden_unlimited_approval'),
+    'Permit2 allowance set by a router'.padEnd(34), a ? `${a.symbol} -> ${a.spender}: ${a.allowance}, direct ${a.direct}, ${a.basis}` : `no approval; simulation ${ur.simulation?.status} ${ur.simulation?.revertReason ?? ''}`);
+  await sleep(1000);
+  // ERC-721: BAYC #1 moved by its current owner. The collection name comes from the contract; BAYC also emits an
+  // approval-clearing event on transfer, which must not be listed.
+  const BAYC: Address = '0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D';
+  const ownerWord = String(await live.call(1, 'eth_call', [{ to: BAYC, data: '0x6352211e' + '1'.padStart(64, '0') }, 'latest']));
+  const owner = ('0x' + ownerWord.slice(26)) as Address;
+  const transfer = encodeFunctionData({ abi: parseAbi(['function safeTransferFrom(address from, address to, uint256 tokenId)']), functionName: 'safeTransferFrom', args: [owner, '0x1000000000000000000000000000000000000001', 1n] });
+  const nft = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: owner, to: BAYC, data: transfer, chainId: '0x1' }] }, {}, { tokens, simulator });
+  const moved = nft.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} (${c.standard})`).join(', ');
+  check(moved === 'out 1 BAYC #1 (erc721)' && !nft.approvals?.length, 'ERC-721 transfer (BAYC #1)'.padEnd(34), `${moved || 'no changes'}${nft.approvals?.length ? `; approvals: ${nft.approvals.length}` : ''}`);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

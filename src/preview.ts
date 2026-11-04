@@ -1,7 +1,8 @@
 import { attentionOf, PreviewBuilder } from './format.ts';
 import { chainName } from './chains.ts';
-import type { AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
-import { netChanges, normalizeTransaction, previewTransaction, RequestError, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
+import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
+import { normalizeTransaction, previewTransaction, RequestError, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
+import { approvalChanges, netChanges, nftChanges } from './evm/effects.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
@@ -105,6 +106,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
 
   const b = new PreviewBuilder();
   let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
+  let approvals: ApprovalChange[] = [];
   let simulation: SimulationSummary | undefined;
   if (results) {
     const failed = results.findIndex(r => r.status === 'reverted');
@@ -113,8 +115,14 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
     if (failed === -1) {
-      // Net across the batch: an intermediate token received by one call and spent by the next nets out.
-      if (txs.every(t => t.from === txs[0].from)) assetChanges = await netChanges(results.flatMap(r => r.transfers), txs[0], deps, b);
+      // Net across the batch: an intermediate token received by one call and spent by the next nets out, and an
+      // approval used up or revoked by a later call shows its final state. (Each call's warnings already cover
+      // approvals set along the way.)
+      if (txs.every(t => t.from === txs[0].from)) {
+        assetChanges = [...await netChanges(results.flatMap(r => r.transfers), txs[0], deps, b), ...await nftChanges(results.flatMap(r => r.nftTransfers ?? []), txs[0], deps, b)];
+        // The state read after the last call covers every permission touched by the batch.
+        approvals = await approvalChanges(results.flatMap((r, i) => (r.approvals ?? []).map(approval => ({ approval, callTo: txs[i].to }))), txs[0], deps, results[results.length - 1].approvalState);
+      }
     } else if (batch.atomicRequired) {
       b.warn('danger', 'batch_will_fail', `This batch is all-or-nothing, and call ${failed + 1} is expected to fail, so none of the calls would take effect. You would still pay the network fee.`);
     } else {
@@ -128,7 +136,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     network: chainId ? { kind: 'evm', chainId, name: chainName(chainId) } : null,
     title: calls.length === 1 ? calls[0].title : `${calls.length} actions: ${calls.map(c => c.title).join(' → ')}`,
     summary: `Runs ${calls.length} call${calls.length === 1 ? '' : 's'} in order${batch.atomicRequired ? ', all or nothing' : ''}. ${calls.map((c, i) => `(${i + 1}) ${c.summary}`).join(' ')}`,
-    details: [], assetChanges, warnings, attention: attentionOf(warnings),
+    details: [], assetChanges, ...(approvals.length ? { approvals } : {}), warnings, attention: attentionOf(warnings),
     decoding: { status: statuses.every(s => s === 'full') ? 'full' : statuses.every(s => s === 'opaque') ? 'opaque' : 'partial', decoder: 'batch', notes: b.notes },
     ...(simulation && { simulation }),
     calls,
