@@ -1,7 +1,8 @@
 import { withSigningPreview, remotePreview } from '/dist/interceptor.js';
 
 const $ = id => document.getElementById(id);
-const ACCOUNT = '0xa11ce00000000000000000000000000000000001';
+// ?account=0x… lets the mock wallet stand in for any address, e.g. to preview a real position in live mode.
+const ACCOUNT = new URLSearchParams(location.search).get('account')?.match(/^0x[0-9a-fA-F]{40}$/)?.[0] ?? '0xa11ce00000000000000000000000000000000001';
 let samples = [];
 let activeContext = {};
 
