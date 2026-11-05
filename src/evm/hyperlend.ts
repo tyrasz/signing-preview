@@ -5,7 +5,7 @@
 // Aave-style market). With an RPC, positions are read live to show the health factor before and after.
 import { decodeFunctionData, parseAbi } from 'viem';
 import { compactUnits, formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import { CHAINS } from '../chains.ts';
+import { builtinTokens, CHAINS } from '../chains.ts';
 import type { AssetChange, TokenInfo } from '../types.ts';
 import { decoded, tokenInfo, tokenSourceWarnings, type Adapter, type AdapterEnv, type Tx } from './common.ts';
 import { read } from './onchain.ts';
@@ -57,12 +57,23 @@ async function account(env: AdapterEnv, m: Market, user: string): Promise<Accoun
   return r ? { collateral: r[0], debt: r[1], available: r[2], lt: r[3], hf: r[5] } : undefined;
 }
 
+const RESERVE_DATA = 'function getReserveData(address) view returns ((uint256 configuration, uint128 liquidityIndex, uint128 currentLiquidityRate, uint128 variableBorrowIndex, uint128 currentVariableBorrowRate, uint128 currentStableBorrowRate, uint40 lastUpdateTimestamp, uint16 id, address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress, address interestRateStrategyAddress, uint128 accruedToTreasury, uint128 unbacked, uint128 isolationModeTotalDebt))';
+
+/** The hToken and debt token of each reserve: a supply or borrow changes them without naming them. */
+async function reserveTokens(env: AdapterEnv, m: Market, assets: readonly unknown[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const asset of new Set(assets.filter((a): a is string => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a)).map(a => a.toLowerCase()))) {
+    const rd = await read<{ aTokenAddress: string; variableDebtTokenAddress: string }>(env, m.chainId, m.pool, RESERVE_DATA, [asset]);
+    if (rd && !/^0x0{40}$/.test(rd.aTokenAddress)) out.push(rd.aTokenAddress.toLowerCase(), rd.variableDebtTokenAddress.toLowerCase());
+  }
+  return out;
+}
+
 /** Price (base currency, USD with 8 decimals), decimals and the liquidation threshold that applies to `user`. */
 async function risk(env: AdapterEnv, m: Market, asset: string, user: string): Promise<AssetRisk | undefined> {
   const oracle = await read<string>(env, m.chainId, m.provider, 'function getPriceOracle() view returns (address)');
   const price = oracle ? await read<bigint>(env, m.chainId, oracle, 'function getAssetPrice(address) view returns (uint256)', [asset]) : undefined;
-  const rd = await read<{ configuration: { data: bigint }; id: number; aTokenAddress: string; variableDebtTokenAddress: string }>(env, m.chainId, m.pool,
-    'function getReserveData(address) view returns ((uint256 configuration, uint128 liquidityIndex, uint128 currentLiquidityRate, uint128 variableBorrowIndex, uint128 currentVariableBorrowRate, uint128 currentStableBorrowRate, uint40 lastUpdateTimestamp, uint16 id, address aTokenAddress, address stableDebtTokenAddress, address variableDebtTokenAddress, address interestRateStrategyAddress, uint128 accruedToTreasury, uint128 unbacked, uint128 isolationModeTotalDebt))', [asset]);
+  const rd = await read<{ configuration: { data: bigint }; id: number; aTokenAddress: string; variableDebtTokenAddress: string }>(env, m.chainId, m.pool, RESERVE_DATA, [asset]);
   if (price === undefined || !rd) return undefined;
   const cfg = BigInt((rd.configuration as unknown as bigint));
   let lt = (cfg >> 16n) & 0xffffn; // ReserveConfiguration: bits 16-31 liquidation threshold, 48-55 decimals
@@ -116,9 +127,10 @@ export const hyperlendPoolAdapter: Adapter = async (tx, env) => {
   const change = (direction: 'in' | 'out', raw: bigint, t: { symbol: string; info?: TokenInfo }, asset: string) => {
     if (t.info && !isUnlimited(raw)) changes.push({ direction, account: tx.from, amount: formatUnits(raw, t.info.decimals), symbol: t.symbol, raw: raw.toString(), asset: asset.toLowerCase(), basis: 'requested' });
   };
-  const done = (title: string, summary: string, decoder: string) => decoded({ title, summary, decoder, status: 'full', b, assetChanges: changes });
-  const position = async (user: string) => account(env, m, user);
   const fn = call.functionName;
+  const watch = await reserveTokens(env, m, call.args ?? []);
+  const done = (title: string, summary: string, decoder: string) => ({ ...decoded({ title, summary, decoder, status: 'full', b, assetChanges: changes }), watch });
+  const position = async (user: string) => account(env, m, user);
 
   if (fn === 'supply' || fn === 'deposit' || fn === 'supplyWithPermit') {
     const [asset, amount, onBehalfOf] = call.args as unknown as readonly [string, bigint, string];
@@ -275,7 +287,8 @@ export const hyperlendGatewayAdapter: Adapter = async (tx, env) => {
     change('in', amount);
     title = `Borrow ${short(amount)} from HyperLend`; summary = `Borrows W${native} from HyperLend against your collateral and unwraps it to ${native}.`;
   }
-  return decoded({ title, summary, decoder: 'hyperlend_gateway', status: 'full', b, assetChanges: changes });
+  const whype = builtinTokens(tx.chainId).find(t => t.symbol === `W${native}`)?.address;
+  return { ...decoded({ title, summary, decoder: 'hyperlend_gateway', status: 'full', b, assetChanges: changes }), watch: whype ? await reserveTokens(env, m, [whype]) : [] };
 };
 
 /**

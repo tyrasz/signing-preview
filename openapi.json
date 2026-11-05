@@ -96,7 +96,7 @@
                 },
                 "examples": {
                   "hyperlendBorrow": {
-                    "summary": "Live response, 2026-11-04: health factor 3.56 → 2.99, eth_call succeeds",
+                    "summary": "Live response, 2026-11-05: health factor 3.46 → 2.91, simulated through the state-override probe",
                     "value": {
                       "schema": "signing-preview/1",
                       "method": "eth_sendTransaction",
@@ -125,7 +125,7 @@
                         },
                         {
                           "label": "Health factor (estimated)",
-                          "value": "3.56 → 2.99"
+                          "value": "3.46 → 2.91"
                         }
                       ],
                       "assetChanges": [
@@ -133,30 +133,48 @@
                           "direction": "in",
                           "account": "0xe9b71f2246d6f559bf4a0ebb7d2694da6fa56bfa",
                           "amount": "500",
+                          "symbol": "variableDebtHyperEvmUSDC",
+                          "raw": "500000000",
+                          "asset": "0xd612513cb3b2c52abcd6d4b338374c09ada4657d",
+                          "standard": "erc20",
+                          "basis": "simulated_state"
+                        },
+                        {
+                          "direction": "in",
+                          "account": "0xe9b71f2246d6f559bf4a0ebb7d2694da6fa56bfa",
+                          "amount": "500",
                           "symbol": "USDC",
                           "raw": "500000000",
                           "asset": "0xb88339cb7199b77e23db6e890353e22632ba630f",
-                          "basis": "requested"
+                          "standard": "erc20",
+                          "basis": "simulated_state"
                         }
                       ],
-                      "warnings": [],
-                      "attention": "none",
+                      "warnings": [
+                        {
+                          "severity": "info",
+                          "code": "token_metadata_unverified",
+                          "message": "The name \"variableDebtHyperEvmUSDC\" and decimals were read from the token contract itself; anyone can deploy a token with any name."
+                        }
+                      ],
+                      "attention": "info",
                       "decoding": {
                         "status": "full",
                         "decoder": "hyperlend_borrow",
                         "notes": [
                           "Borrowed amounts accrue interest. If the health factor falls below 1, part of the collateral can be liquidated.",
-                          "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request."
+                          "Simulated at the latest block by running the transaction from your address in an eth_call (this chain's RPC has no eth_simulateV1). Balance changes were read for 14 tokens: those the transaction names and this chain's well-known tokens, so a change in another token wouldn't show."
                         ]
                       },
                       "simulation": {
                         "status": "success",
-                        "source": "eth_call @ chain 999 (the RPC has no eth_simulateV1)"
+                        "source": "eth_call with a state-override probe @ chain 999 (the RPC has no eth_simulateV1)",
+                        "gasUsed": "430642"
                       }
                     }
                   },
                   "kinetiqStake": {
-                    "summary": "Live response, 2026-11-04: below the 5 HYPE minimum, the chain reverts with BelowMinimum",
+                    "summary": "Live response, 2026-11-05: below the 5 HYPE minimum, the simulation reverts with BelowMinimum",
                     "value": {
                       "schema": "signing-preview/1",
                       "method": "eth_sendTransaction",
@@ -181,12 +199,12 @@
                         },
                         {
                           "label": "You receive (at the current rate)",
-                          "value": "1.946301069030993794 kHYPE",
-                          "raw": "1946301069030993794"
+                          "value": "1.946300817279841185 kHYPE",
+                          "raw": "1946300817279841185"
                         },
                         {
                           "label": "Rate",
-                          "value": "1 kHYPE = 1.027590248920605756 HYPE"
+                          "value": "1 kHYPE = 1.027590381837895457 HYPE"
                         }
                       ],
                       "assetChanges": [
@@ -202,9 +220,9 @@
                         {
                           "direction": "in",
                           "account": "0x9a1dbc6a6e7e59f6beb23db0d00b603fc90e94d0",
-                          "amount": "1.946301069030993794",
+                          "amount": "1.946300817279841185",
                           "symbol": "kHYPE",
-                          "raw": "1946301069030993794",
+                          "raw": "1946300817279841185",
                           "asset": "0xfd739d4e423301ce9385c1fb8850539d657c296d",
                           "basis": "requested"
                         }
@@ -231,7 +249,8 @@
                       },
                       "simulation": {
                         "status": "reverted",
-                        "source": "eth_call @ chain 999 (the RPC has no eth_simulateV1)",
+                        "source": "eth_call with a state-override probe @ chain 999 (the RPC has no eth_simulateV1)",
+                        "gasUsed": "79335",
                         "revertReason": "BelowMinimum: the amount is below the minimum"
                       }
                     }
@@ -637,9 +656,10 @@
             "enum": [
               "requested",
               "simulated_events",
+              "simulated_state",
               "mock"
             ],
-            "description": "Where the number comes from. Requested amounts are not settled amounts."
+            "description": "Where the number comes from: the request itself (not a settled amount), transfer events of a simulation, balances read before and after a simulation (chains whose RPC can only run eth_call, such as HyperEVM), or mock data."
           },
           "standard": {
             "enum": [

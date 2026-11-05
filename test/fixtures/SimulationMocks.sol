@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+// Contracts for test/simulation-probe.test.ts, run in an in-process EVM behind a fake JSON-RPC node.
+
+interface IERC1271 { function isValidSignature(bytes32, bytes calldata) external view returns (bytes4); }
+interface IERC721Receiver { function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4); }
+
+/// ERC-20 that is also WETH-like (deposit / withdraw native).
+contract Token {
+    string public symbol;
+    uint8 public decimals;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(string memory s, uint8 d) { symbol = s; decimals = d; }
+    function mint(address to, uint256 v) external { balanceOf[to] += v; }
+    function transfer(address to, uint256 v) external returns (bool) { _move(msg.sender, to, v); return true; }
+    function approve(address spender, uint256 v) external returns (bool) { allowance[msg.sender][spender] = v; return true; }
+    function transferFrom(address from, address to, uint256 v) external returns (bool) {
+        uint256 a = allowance[from][msg.sender];
+        if (a != type(uint256).max) { require(a >= v, "allowance"); allowance[from][msg.sender] = a - v; }
+        _move(from, to, v);
+        return true;
+    }
+    function deposit() external payable { balanceOf[msg.sender] += msg.value; }
+    function withdraw(uint256 v) external { require(balanceOf[msg.sender] >= v, "balance"); balanceOf[msg.sender] -= v; payable(msg.sender).transfer(v); }
+    function _move(address from, address to, uint256 v) internal { require(balanceOf[from] >= v, "balance"); balanceOf[from] -= v; balanceOf[to] += v; }
+}
+
+/// Pulls an asset and credits shares in itself (the target is the share token, so it's named by the call).
+contract Vault is Token {
+    Token public immutable asset;
+    constructor(Token a) Token("vUSD", 6) { asset = a; }
+    function deposit(uint256 amount) external { asset.transferFrom(msg.sender, address(this), amount); balanceOf[msg.sender] += amount; }
+}
+
+/// Aave-like: supply mints a receipt token the calldata doesn't mention.
+contract Pool {
+    Token public immutable asset;
+    Token public immutable receipt;
+    constructor(Token a, Token r) { asset = a; receipt = r; }
+    function supply(uint256 amount) external { asset.transferFrom(msg.sender, address(this), amount); receipt.mint(msg.sender, amount); }
+}
+
+contract NFT {
+    mapping(uint256 => address) public ownerOf;
+    mapping(uint256 => address) public getApproved;
+    mapping(address => mapping(address => bool)) public isApprovedForAll;
+    mapping(address => uint256) public balanceOf;
+
+    function supportsInterface(bytes4 id) external pure returns (bool) { return id == 0x80ac58cd || id == 0x01ffc9a7; }
+    function mint(address to, uint256 id) external { ownerOf[id] = to; balanceOf[to]++; }
+    /// Sells token `id` for 1 ether, minting it safely (a recipient with code is asked first).
+    function buy(uint256 id) external payable {
+        require(msg.value == 1 ether, "price");
+        require(ownerOf[id] == address(0), "sold");
+        ownerOf[id] = msg.sender;
+        balanceOf[msg.sender]++;
+        if (msg.sender.code.length > 0) require(IERC721Receiver(msg.sender).onERC721Received(msg.sender, address(0), id, "") == 0x150b7a02, "receiver");
+    }
+    function safeTransferFrom(address from, address to, uint256 id) external {
+        require(ownerOf[id] == from && (msg.sender == from || isApprovedForAll[from][msg.sender] || getApproved[id] == msg.sender), "auth");
+        ownerOf[id] = to;
+        balanceOf[from]--;
+        balanceOf[to]++;
+        getApproved[id] = address(0);
+    }
+    function approve(address spender, uint256 id) external { require(ownerOf[id] == msg.sender, "owner"); getApproved[id] = spender; }
+    function setApprovalForAll(address operator, bool approved) external { isApprovedForAll[msg.sender][operator] = approved; }
+}
+
+/// Permit2's allowance layout and signature rule: ecrecover for accounts without code, ERC-1271 for the rest.
+contract Permit2Like {
+    struct Allowance { uint160 amount; uint48 expiration; uint48 nonce; }
+    mapping(address => mapping(address => mapping(address => Allowance))) public allowance;
+
+    function permit(address owner, address token, address spender, uint160 amount, uint48 expiration, bytes calldata sig) external {
+        bytes32 h = keccak256(abi.encode(owner, token, spender, amount, expiration));
+        if (owner.code.length == 0) {
+            require(sig.length == 65, "sig");
+            require(ecrecover(h, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64])) == owner, "sig");
+        } else {
+            require(IERC1271(owner).isValidSignature(h, sig) == 0x1626ba7e, "1271");
+        }
+        allowance[owner][token][spender] = Allowance(amount, expiration, allowance[owner][token][spender].nonce + 1);
+    }
+}
+
+/// A router that records the caller's signed Permit2 allowance for itself (the "along the way" pattern).
+contract Router {
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    function permitSelf(address token, uint160 amount, uint48 expiration, bytes calldata sig) external {
+        Permit2Like(PERMIT2).permit(msg.sender, token, address(this), amount, expiration, sig);
+    }
+}
+
+/// Only accounts without code may claim.
+contract EoaOnly {
+    Token public immutable token;
+    constructor(Token t) { token = t; }
+    function claim() external { require(msg.sender.code.length == 0, "EOA only"); token.mint(msg.sender, 1e6); }
+}
+
+contract Reverter {
+    function fail() external pure { revert("nope"); }
+}

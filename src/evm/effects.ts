@@ -7,9 +7,11 @@ import { tokenInfo, tokenSourceWarnings } from './common.ts';
 import { approvalKey } from '../simulation.ts';
 
 interface Account { chainId: number; from: string }
+/** simulated_events: from transfer logs; simulated_state: from balances read before and after (SimulationProbe). */
+type Basis = 'simulated_events' | 'simulated_state';
 
 /** Nets simulated fungible transfers into per-asset changes for the account. */
-export async function netChanges(transfers: SimulatedTransfer[], account: Account, deps: Dependencies, b: PreviewBuilder): Promise<AssetChange[]> {
+export async function netChanges(transfers: SimulatedTransfer[], account: Account, deps: Dependencies, b: PreviewBuilder, basis: Basis = 'simulated_events'): Promise<AssetChange[]> {
   const net = new Map<string, bigint>();
   for (const t of transfers) {
     const asset = t.asset.toLowerCase();
@@ -25,7 +27,7 @@ export async function netChanges(transfers: SimulatedTransfer[], account: Accoun
     if (asset !== 'native') tokenSourceWarnings(b, account.chainId, info as TokenInfo | undefined);
     const abs = delta < 0n ? -delta : delta;
     out.push({ direction: delta < 0n ? 'out' : 'in', account: account.from, amount: info ? formatUnits(abs, info.decimals) : abs.toString(), symbol: info?.symbol ?? asset, raw: abs.toString(), asset,
-      standard: asset === 'native' ? 'native' : 'erc20', basis: 'simulated_events' });
+      standard: asset === 'native' ? 'native' : 'erc20', basis });
   }
   return out;
 }
@@ -42,7 +44,7 @@ async function collectionLabel(deps: Dependencies, chainId: number, address: str
 }
 
 /** Nets NFT transfers per token ID: ERC-721 in/out, ERC-1155 by amount. Shown as e.g. "BAYC #42". */
-export async function nftChanges(transfers: SimulatedNftTransfer[], account: Account, deps: Dependencies, b: PreviewBuilder): Promise<AssetChange[]> {
+export async function nftChanges(transfers: SimulatedNftTransfer[], account: Account, deps: Dependencies, b: PreviewBuilder, basis: Basis = 'simulated_events'): Promise<AssetChange[]> {
   const net = new Map<string, { t: SimulatedNftTransfer; delta: bigint }>();
   for (const t of transfers) {
     const key = `${t.standard}:${t.collection.toLowerCase()}:${t.tokenId}`;
@@ -59,7 +61,7 @@ export async function nftChanges(transfers: SimulatedNftTransfer[], account: Acc
     if (c.named && delta > 0n) namedIncoming = true;
     const abs = delta < 0n ? -delta : delta;
     out.push({ direction: delta < 0n ? 'out' : 'in', account: account.from, amount: abs.toString(), symbol: `${c.label} #${shortId(t.tokenId)}`, raw: abs.toString(),
-      asset: t.collection.toLowerCase(), standard: t.standard, tokenId: t.tokenId.toString(), basis: 'simulated_events' });
+      asset: t.collection.toLowerCase(), standard: t.standard, tokenId: t.tokenId.toString(), basis });
   }
   // Scam airdrops copy famous collection names, so a received NFT's name proves nothing.
   if (namedIncoming) b.warn('info', 'nft_metadata_unverified', 'NFT collection names come from the contracts themselves and are easy to copy; check the collection address before trusting a received NFT.');

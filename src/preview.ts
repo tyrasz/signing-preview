@@ -1,7 +1,8 @@
 import { attentionOf, PreviewBuilder } from './format.ts';
 import { chainName } from './chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
-import { normalizeTransaction, previewTransaction, RequestError, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
+import { decodeTransaction, normalizeTransaction, previewTransaction, RequestError, simulationRequest, stateBasisNote, type PresetSimulation } from './evm/transaction.ts';
+import type { Decoded } from './evm/common.ts';
 import { approvalChanges, netChanges, nftChanges } from './evm/effects.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
@@ -83,6 +84,9 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   if (batch.calls.length === 0 || batch.calls.length > 32) throw new RequestError('wallet_sendCalls must contain 1 to 32 calls');
   const chainId = batch.chainId !== undefined ? Number(BigInt(batch.chainId)) : context.chainId;
   const txs = batch.calls.map(call => normalizeTransaction(call, context, batch.from, chainId));
+  // Decoded first: decoders name tokens the calls change without mentioning them, which state-reading simulators need.
+  const decoded: Decoded[] = [];
+  for (const tx of txs) decoded.push(await decodeTransaction(tx, deps, context));
 
   // Simulate the whole batch in order when the simulator can; otherwise only the first call is independent.
   let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);
@@ -91,7 +95,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   if (deps.simulator && txs.length > 1) {
     if (deps.simulator.simulateBatch && sameChain) {
       try {
-        results = await deps.simulator.simulateBatch(txs.map(simulationRequest));
+        results = await deps.simulator.simulateBatch(txs.map((tx, i) => simulationRequest(tx, decoded[i])));
         if (results && results.length !== txs.length) throw new Error(`the simulator returned ${results.length} results for ${txs.length} calls`);
         presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));
       } catch (error) {
@@ -105,7 +109,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     }
   }
   const calls: Preview[] = [];
-  for (const [i, tx] of txs.entries()) calls.push(await previewTransaction(tx, deps, context, 'wallet_sendCalls', presets[i]));
+  for (const [i, tx] of txs.entries()) calls.push(await previewTransaction(tx, deps, context, 'wallet_sendCalls', presets[i], decoded[i]));
 
   const b = new PreviewBuilder();
   let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
@@ -117,12 +121,14 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (results[0].basis === 'state') b.note(stateBasisNote({ tokensRead: Math.max(...results.map(r => r.tokensRead ?? 0)) }));
     if (failed === -1) {
       // Net across the batch: an intermediate token received by one call and spent by the next nets out, and an
       // approval used up or revoked by a later call shows its final state. (Each call's warnings already cover
       // approvals set along the way.)
       if (txs.every(t => t.from === txs[0].from)) {
-        assetChanges = [...await netChanges(results.flatMap(r => r.transfers), txs[0], deps, b), ...await nftChanges(results.flatMap(r => r.nftTransfers ?? []), txs[0], deps, b)];
+        const basis = results[0].basis === 'state' ? 'simulated_state' as const : 'simulated_events' as const;
+        assetChanges = [...await netChanges(results.flatMap(r => r.transfers), txs[0], deps, b, basis), ...await nftChanges(results.flatMap(r => r.nftTransfers ?? []), txs[0], deps, b, basis)];
         // The state read after the last call covers every permission touched by the batch.
         approvals = await approvalChanges(results.flatMap((r, i) => (r.approvals ?? []).map(approval => ({ approval, callTo: txs[i].to }))), txs[0], deps, results[results.length - 1].approvalState);
       }

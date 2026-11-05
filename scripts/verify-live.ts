@@ -16,6 +16,8 @@
 //     with what the receipt and balance changes show was paid and received.
 //  9. Kinetiq and HyperLend on HyperEVM: identities, facets and typehashes, and the decoders' predictions (rate,
 //     minimum, precision, health factor) against eth_call results on the live contracts.
+// 10. HyperEVM simulation (SimulationProbe through eth_call state overrides): a Kinetiq stake against Kinetiq's own
+//     quote, a USDC transfer and an approve + HyperLend supply batch, from real holders found in recent blocks.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
 // ethereum-rpc.publicnode.com (or ETHEREUM_RPC_URL), rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus
 // sourcify.dev, api.openchain.xyz and www.4byte.directory for step 6 (behind a proxy, run with
@@ -526,6 +528,50 @@ console.log('\n9. Kinetiq and HyperLend on HyperEVM');
     // Only meaningful when the borrower's debt depends on WHYPE collateral: then both must say it fails.
     check(predicted === reverted || (!predicted && !p.details.some(d => d.label === 'Health factor (estimated)')), 'HyperLend withdraw-all prediction'.padEnd(34), `decoder: ${predicted ? 'will fail' : 'ok'} (${p.details.find(d => d.label === 'Health factor (estimated)')?.value ?? 'no HF'}); chain: ${p.simulation?.revertReason ?? p.simulation?.status}`);
   } else console.log('skip HyperLend withdraw check: no recent borrower with supplied collateral found');
+}
+
+console.log('\n10. HyperEVM simulation with the state-override probe (the RPC has no eth_simulateV1)');
+{
+  const tokens = new ChainedTokenRegistry([new StaticTokenRegistry(), new OnchainTokenRegistry(live)]);
+  const deps = { tokens, rpc: live, simulator: new RpcSimulator({ 999: urls[999] }) };
+  const E = 10n ** 18n, k = KINETIQ[999], m = HYPERLEND[999];
+  const send = (from: string, to: string, data: Hex, value = 0n) => previewRequest({ method: 'eth_sendTransaction', params: [{ from, to, data, value: toHex(value), chainId: '0x3e7' }] }, {}, deps);
+  const moved = (p: Awaited<ReturnType<typeof send>>) => p.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} (${c.basis})`).join(', ');
+  // Real holders without code: a HYPE holder among recent senders, and a recent USDC recipient.
+  const head = BigInt(String(await live.call(999, 'eth_blockNumber', [])));
+  const eoa = async (a: string) => String(await live.call(999, 'eth_getCode', [a, 'latest'])) === '0x';
+  let hypeHolder: string | undefined, usdcHolder: string | undefined;
+  for (let n = head - 2n; n > head - 600n && !(hypeHolder && usdcHolder); n -= 3n) {
+    const blk = await live.call(999, 'eth_getBlockByNumber', [toHex(n), true]) as { transactions: { from: string }[] };
+    for (const t of blk.transactions) if (!hypeHolder && BigInt(String(await live.call(999, 'eth_getBalance', [t.from, 'latest']))) >= 12n * E && await eoa(t.from)) hypeHolder = t.from.toLowerCase();
+    if (usdcHolder) continue;
+    const receipts = await live.call(999, 'eth_getBlockReceipts', [toHex(n)]) as { logs: { address: string; topics: string[] }[] }[];
+    for (const l of receipts.flatMap(r => r.logs)) {
+      if (usdcHolder || l.address.toLowerCase() !== H.usdc.toLowerCase() || l.topics.length !== 3 || l.topics[0] !== keccak256(toHex('Transfer(address,address,uint256)'))) continue;
+      const to = '0x' + l.topics[2].slice(26);
+      if ((await readAt(hl, H.usdc, 'function balanceOf(address) view returns (uint256)', [to]) as bigint) >= 2_000_000n && await eoa(to)) usdcHolder = to;
+    }
+  }
+  if (hypeHolder) {
+    const accountant = String(await readAt(hl, k.stakingManager as Address, 'function stakingAccountant() view returns (address)'));
+    const quote = await readAt(hl, accountant as Address, 'function HYPEToKHYPE(uint256) view returns (uint256)', [10n * E]) as bigint;
+    const p = await send(hypeHolder, k.stakingManager, '0x3a4b66f1', 10n * E);
+    const kIn = p.assetChanges.find(c => c.asset === k.kHYPE && c.direction === 'in');
+    check(p.simulation?.status === 'success' && p.assetChanges.some(c => c.asset === 'native' && c.direction === 'out' && c.raw === (10n * E).toString() && c.basis === 'simulated_state') && kIn?.raw === quote.toString(),
+      'probe: Kinetiq stake 10 HYPE'.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE`);
+  } else console.log('skip probe stake: no recent EOA sender holding 12 HYPE');
+  if (usdcHolder) {
+    const t = await send(usdcHolder, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] }));
+    check(t.simulation?.status === 'success' && moved(t) === 'out 1 USDC (simulated_state)', 'probe: USDC transfer of 1'.padEnd(34), moved(t));
+    const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: usdcHolder, atomicRequired: true, calls: [
+      { to: H.usdc, data: encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [m.pool as Address, 1_000_000n] }) },
+      { to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function supply(address,uint256,address,uint16)']), functionName: 'supply', args: [H.usdc, 1_000_000n, usdcHolder as Address, 0] }) },
+    ] }] }, {}, deps);
+    const hIn = batch.assetChanges.find(c => c.direction === 'in');
+    // The hUSDC isn't in the calldata: HyperLend's decoder watches it. Aave-style scaled balances round by a unit or two.
+    check(batch.simulation?.status === 'success' && batch.assetChanges.some(c => c.direction === 'out' && c.raw === '1000000') && !!hIn && Math.abs(Number(hIn.raw) - 1_000_000) <= 2,
+      'probe: approve + HyperLend supply'.padEnd(34), `${batch.simulation?.status}: ${moved(batch)}`);
+  } else console.log('skip probe USDC checks: no recent EOA holding 2 USDC');
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

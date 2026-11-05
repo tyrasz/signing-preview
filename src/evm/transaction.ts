@@ -1,6 +1,6 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS, chainName } from '../chains.ts';
-import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationResult, SimulationSummary } from '../types.ts';
+import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegationEffects } from './eip7702.ts';
@@ -99,14 +99,19 @@ export function normalizeTransaction(raw: unknown, context: PreviewContext, fall
  */
 export type PresetSimulation = { result: SimulationResult | null } | { error: string } | { skipped: string };
 
-export async function previewTransaction(tx: Tx, deps: Dependencies, context: PreviewContext, method: string, preset?: PresetSimulation): Promise<Preview> {
+/** Runs the decoders; the generic unknown-call decoder always answers, so this always resolves. */
+export async function decodeTransaction(tx: Tx, deps: Dependencies, context: PreviewContext): Promise<Decoded> {
   const env = { deps, context };
-  let result: Decoded | null = null;
   for (const adapter of ADAPTERS) {
-    result = await adapter(tx, env);
-    if (result) break;
+    const result = await adapter(tx, env);
+    if (result) return result;
   }
-  const d = result!;
+  throw new Error('no decoder answered');
+}
+
+/** `decoded`: the result of decodeTransaction when the caller already has it (batches decode before simulating). */
+export async function previewTransaction(tx: Tx, deps: Dependencies, context: PreviewContext, method: string, preset?: PresetSimulation, decoded?: Decoded): Promise<Preview> {
+  const d = decoded ?? await decodeTransaction(tx, deps, context);
   const b = d.b;
   if (!CHAINS[tx.chainId]) b.warn('caution', 'unsupported_chain', `Chain ${tx.chainId} is not one of the supported networks (Ethereum, Arbitrum One, HyperEVM). Token names and routes were not checked for it.`);
   if (context.account && !sameAddress(context.account, tx.from)) b.warn('danger', 'sender_mismatch', `The transaction's sender (${tx.from}) is not the connected account (${context.account}).`);
@@ -141,7 +146,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   if (!outcome && delegation && deps.simulator) outcome = { skipped: 'This transaction carries an EIP-7702 authorization list, which the simulator does not apply, so it was not simulated.' };
   if (!outcome && deps.simulator) {
     try {
-      outcome = { result: await deps.simulator.simulate(simulationRequest(tx)) };
+      outcome = { result: await deps.simulator.simulate(simulationRequest(tx, d)) };
     } catch (error) {
       outcome = { error: error instanceof Error ? error.message : String(error) };
     }
@@ -159,15 +164,16 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     if (sim.status === 'reverted') {
       b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
     } else if (sim.limited) {
-      b.note("Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
+      b.note(sim.note ?? "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
     } else {
-      const simulated = [...await netChanges(sim.transfers, tx, deps, b), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b)];
+      const basis = sim.basis === 'state' ? 'simulated_state' as const : 'simulated_events' as const;
+      const simulated = [...await netChanges(sim.transfers, tx, deps, b, basis), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b, basis)];
       if (simulated.length || !assetChanges.length) assetChanges = simulated;
       approvals = await approvalChanges((sim.approvals ?? []).map(approval => ({ approval, callTo: tx.to })), tx, deps, sim.approvalState);
       // Approvals the decoded request already shows (e.g. a router's Permit2 permit step) are not hidden.
       for (const a of approvals) if (d.declaredApprovals?.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender))) a.direct = true;
       approvalWarnings(b, approvals, context.now);
-      b.note('Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
+      b.note(sim.basis === 'state' ? stateBasisNote(sim) : 'Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
     }
   }
   return {
@@ -179,4 +185,14 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   };
 }
 
-export const simulationRequest = (tx: Tx) => ({ chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value });
+/** The simulation request for a call, with the tokens its decoder knows it changes (for state-reading simulators). */
+export function simulationRequest(tx: Tx, d?: Decoded): SimulationRequest {
+  const watch = new Set<string>(d?.watch ?? []);
+  for (const c of d?.assetChanges ?? []) if (/^0x[0-9a-fA-F]{40}$/.test(c.asset ?? '')) watch.add(c.asset!.toLowerCase());
+  for (const a of d?.declaredApprovals ?? []) { watch.add(a.token.toLowerCase()); watch.add(a.spender.toLowerCase()); }
+  return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }) };
+}
+
+/** For results measured from balances (SimulationProbe) rather than logs. */
+export const stateBasisNote = (sim: Pick<SimulationResult, 'tokensRead'>) =>
+  `Simulated at the latest block by running the transaction from your address in an eth_call (this chain's RPC has no eth_simulateV1). Balance changes were read for ${sim.tokensRead ?? 0} token${sim.tokensRead === 1 ? '' : 's'}: those the transaction names and this chain's well-known tokens, so a change in another token wouldn't show.`;

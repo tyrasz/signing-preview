@@ -1,6 +1,7 @@
 import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, parseAbi, type Hex } from 'viem';
 import { PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
+import { ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
 import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
 // Event topics (keccak256 of the signature).
@@ -17,21 +18,27 @@ const NATIVE_PSEUDO_TOKEN = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
 type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
 
-/**
- * Simulates against a JSON-RPC node with eth_simulateV1 (traceTransfers on, validation off).
- * Balance changes are derived from Transfer events, so fee-on-transfer and rebasing tokens can differ.
- * Batches run as consecutive calls in one simulated block, so each call sees the previous calls' effects.
- */
-/** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1). */
+/** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1 or state overrides). */
 export class BatchSimulationUnsupported extends Error {
-  constructor(chainId: number) { super(`The RPC for chain ${chainId} has no eth_simulateV1, so batch calls can't be simulated in order`); this.name = 'BatchSimulationUnsupported'; }
+  constructor(chainId: number) { super(`The RPC for chain ${chainId} has neither eth_simulateV1 nor eth_call state overrides (or the calls have different senders), so batch calls can't be simulated in order`); this.name = 'BatchSimulationUnsupported'; }
 }
 
+/**
+ * Simulates against a JSON-RPC node with eth_simulateV1 (traceTransfers on, validation off). Balance changes are
+ * derived from Transfer events, so fee-on-transfer and rebasing tokens can differ. Batches run as consecutive calls
+ * in one simulated block, so each call sees the previous calls' effects.
+ *
+ * An RPC without eth_simulateV1 (HyperEVM's public RPC) is simulated with SimulationProbe instead: eth_call with a
+ * state override runs the calls from the sender and reads balances and permissions around each one (see
+ * simulation-probe.ts). Only if the RPC ignores state overrides too is a single call merely checked with eth_call.
+ */
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
   private fetchImpl: typeof fetch;
   /** Chains whose RPC answered "method not found" for eth_simulateV1 (e.g. HyperEVM's public RPC). */
   private noSimulate = new Set<number>();
+  /** ...and that also ignore eth_call state overrides: only success or failure can be checked. */
+  private noProbe = new Set<number>();
   constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch } = {}) {
     this.urls = urls;
     this.fetchImpl = options.fetchImpl ?? fetch;
@@ -45,7 +52,7 @@ export class RpcSimulator implements Simulator {
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
     const url = this.urls[chainId];
     if (!url) return null;
-    if (this.noSimulate.has(chainId)) return this.ethCallFallback(url, chainId, reqs);
+    if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
     const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }));
     const res = await this.fetchImpl(url, {
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
@@ -55,7 +62,7 @@ export class RpcSimulator implements Simulator {
     const body = await res.json() as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
-      return this.ethCallFallback(url, chainId, reqs);
+      return this.withoutSimulateV1(url, chainId, reqs);
     }
     const results = body.result?.[0]?.calls;
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
@@ -67,23 +74,50 @@ export class RpcSimulator implements Simulator {
     return parsed;
   }
 
+  /** One JSON-RPC request, retried briefly when the node rate-limits (HyperEVM's public RPC does). */
+  private async post(url: string, method: string, params: unknown[]): Promise<{ result?: unknown; error?: { code?: number; message?: string; data?: Hex } }> {
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(20_000), body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+      if ((res.status === 429 || res.status >= 500) && attempt < 2) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
+      if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+      return await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
+    }
+  }
+
+  private async withoutSimulateV1(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
+    const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase());
+    if (probeable && !this.noProbe.has(chainId)) {
+      try {
+        const results = await probeSimulate((method, params) => this.post(url, method, params), reqs, decodeRevert);
+        // A contract that refuses senders with code fails under the probe; a plain eth_call says whether it would
+        // really fail.
+        if (reqs.length === 1 && results[0].status === 'reverted' && !results[0].revertReason?.startsWith('insufficient funds')) {
+          const plain = (await this.ethCallFallback(url, chainId, reqs))[0];
+          if (plain.status === 'success') return [{ ...plain, note: "The call succeeds, but its contract treats this simulation's sender differently (it refuses senders with code), so its balance changes couldn't be measured." }];
+        }
+        return results;
+      } catch (e) {
+        if (e instanceof ProbeUnsupported) this.noProbe.add(chainId);
+        else if (!(e instanceof ProbeFailed)) throw e;
+      }
+    }
+    return this.ethCallFallback(url, chainId, reqs);
+  }
+
   /**
-   * Without eth_simulateV1, eth_call still says whether a single call succeeds and why it would revert, but nothing
-   * about transfers. Calls in a batch depend on each other, so only a single call can be checked this way.
+   * Without eth_simulateV1 or state overrides, eth_call still says whether a single call succeeds and why it would
+   * revert, but nothing about transfers. Calls in a batch depend on each other, so only a single call is checked.
    */
   private async ethCallFallback(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
     if (reqs.length > 1) throw new BatchSimulationUnsupported(chainId);
     const req = reqs[0];
-    const res = await this.fetchImpl(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }, 'latest'] }),
-    });
-    if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-    const body = await res.json() as { result?: string; error?: { code?: number; message?: string; data?: Hex } };
+    const body = await this.post(url, 'eth_call', [{ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }, 'latest']);
     const source = `eth_call @ chain ${chainId} (the RPC has no eth_simulateV1)`;
     if (!body.error) return [{ status: 'success', source, transfers: [], limited: true }];
-    // A revert comes back as an error carrying the revert data; anything else is a transport or node problem.
+    // A revert comes back as an error carrying the revert data; anything else is a transport or node problem, except
+    // a sender that can't cover the value, which fails just as surely.
     const message = body.error.message ?? '';
+    if (/insufficient funds/i.test(message)) return [{ status: 'reverted', source, revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true }];
     if (!/revert/i.test(message) && !body.error.data) throw new Error(`eth_call failed: ${message}`);
     const reason = decodeRevert(body.error.data) ?? (message.replace(/^execution reverted:?\s*/i, '') || undefined);
     return [{ status: 'reverted', source, revertReason: reason, transfers: [], limited: true }];

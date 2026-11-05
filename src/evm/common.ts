@@ -33,6 +33,11 @@ export interface Decoded {
   assetChanges: AssetChange[];
   /** Approvals the decoded request itself shows (e.g. a router's Permit2 permit step), so they aren't "hidden". */
   declaredApprovals?: { kind: 'erc20' | 'permit2' | 'erc721' | 'operator'; token: string; spender: string }[];
+  /**
+   * Tokens the call changes without naming them in its calldata (a lending pool's interest-bearing and debt tokens),
+   * for simulators that read balances rather than logs.
+   */
+  watch?: string[];
 }
 
 export interface AdapterEnv {

@@ -34,8 +34,11 @@ export interface AssetChange {
   /** Exact integer amount in the asset's smallest unit, when known. */
   raw?: string;
   asset?: string;
-  /** Where the number comes from. Requested amounts are not settled amounts. */
-  basis: 'requested' | 'simulated_events' | 'mock';
+  /**
+   * Where the number comes from: the request itself (not a settled amount), a simulation's transfer events, or
+   * balances read before and after a simulation (SimulationProbe, on RPCs without eth_simulateV1).
+   */
+  basis: 'requested' | 'simulated_events' | 'simulated_state' | 'mock';
   /** Set for simulated changes. NFTs (erc721/erc1155) also carry the token ID; `symbol` then reads e.g. "BAYC #42". */
   standard?: 'native' | 'erc20' | 'erc721' | 'erc1155';
   tokenId?: string;
@@ -151,6 +154,11 @@ export interface SimulationRequest {
   to: string | null;
   data: string;
   value: bigint;
+  /**
+   * Tokens whose balances and allowances the call may change without naming them in its calldata (e.g. the
+   * HyperLend hToken a supply mints). Only simulators that read state rather than logs need them.
+   */
+  watch?: string[];
 }
 
 export interface SimulatedTransfer {
@@ -207,6 +215,15 @@ export interface SimulationResult {
    * no transfers, approvals or gas.
    */
   limited?: boolean;
+  /**
+   * How transfers and approvals were found: from the simulated logs (default), or from balances and permissions read
+   * before and after the call ('state', see SimulationProbe), which only covers the tokens that were read.
+   */
+  basis?: 'logs' | 'state';
+  /** basis 'state': how many tokens' balances were read. */
+  tokensRead?: number;
+  /** A caveat to show with the preview. */
+  note?: string;
 }
 
 export interface Simulator {

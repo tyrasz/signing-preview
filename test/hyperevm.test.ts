@@ -210,12 +210,14 @@ test('HyperLend native-HYPE gateway: trusted only when verified and pointing at 
 });
 
 // --- HyperEVM infrastructure ------------------------------------------------------------------------------------
-test('Without eth_simulateV1 (HyperEVM), single calls are checked with eth_call and custom errors are named', async () => {
-  const bodies: { method: string }[] = [];
+test('Without eth_simulateV1 or state overrides, single calls are checked with eth_call and custom errors are named', async () => {
+  const bodies: { method: string; params: unknown[] }[] = [];
   const revert = encodeErrorResult({ abi: [parseAbiItem('error MustBeDivisibleBy1e10()')], errorName: 'MustBeDivisibleBy1e10' });
   const fetchImpl = (async (_u: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body)); bodies.push(body);
     if (body.method === 'eth_simulateV1') return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32601, message: 'Method not found' } }));
+    // This RPC ignores state overrides: the probe's call reaches the plain account, which returns nothing.
+    if (body.params[2]) return new Response(JSON.stringify({ result: '0x' }));
     const bad = BigInt(body.params[0].value) % 10n ** 10n !== 0n;
     return new Response(JSON.stringify(bad ? { error: { code: 3, message: 'execution reverted', data: revert } } : { result: '0x' }));
   }) as typeof fetch;
@@ -227,6 +229,7 @@ test('Without eth_simulateV1 (HyperEVM), single calls are checked with eth_call 
   const bad = await send(SM, '0x3a4b66f1', { tokens: new StaticTokenRegistry(), simulator }, 10n * E + 1n);
   assert.match(bad.simulation!.revertReason!, /^MustBeDivisibleBy1e10: the HYPE amount must be a multiple of 0.00000001 HYPE/);
   assert.equal(bodies.filter(b => b.method === 'eth_simulateV1').length, 1, 'eth_simulateV1 is not retried once the RPC said it lacks it');
+  assert.equal(bodies.filter(b => b.params[2]).length, 1, 'nor is the state-override probe once the RPC ignored it');
   // A batch can't be chained with eth_call: the first call is checked, the rest are marked not simulated.
   const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: ALICE, calls: [{ to: SM, data: '0x3a4b66f1', value: toHex(10n * E) }, { to: SM, data: '0x3a4b66f1', value: toHex(10n * E) }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
   assert.deepEqual(batch.calls?.map(c => c.simulation?.status), ['success', 'unavailable']);

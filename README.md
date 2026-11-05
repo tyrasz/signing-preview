@@ -165,7 +165,7 @@ const deps = liveDependencies({ ARBITRUM_RPC_URL, HYPEREVM_RPC_URL });
 | | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
 | Plain-text calldata | data that is entirely printable UTF-8: `data:` URI inscriptions (Ethscriptions and similar), on-chain messages | The text, or for a JSON inscription its protocol operation ("Inscription: edmt emt-batch-transfer enat"), noting that an off-chain indexer decides its effect. Invisible and text-reordering characters are removed and flagged. Full when the recipient has no code; **caution** when it's a contract (it receives the text as input) or can't be checked. |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
-| Simulated effects (any transaction) | `eth_simulateV1` logs and state | Balance changes for native, ERC-20, **ERC-721 and ERC-1155** (e.g. "+1 BAYC #42"). **Permissions left in place**: ERC-20 and Permit2 allowances, single-NFT approvals and `setApprovalForAll`, read back from the tokens after the simulated transaction. One set *along the way* by another call (a router writing a Permit2 allowance, a smart account's `execute`) is flagged: unlimited allowances and single NFTs with **caution**, all-NFT approvals with **danger**. |
+| Simulated effects (any transaction) | `eth_simulateV1` logs and state; on HyperEVM, balances and permissions read before and after through `eth_call` ([how](#contract-and-token-lookups)) | Balance changes for native, ERC-20, **ERC-721 and ERC-1155** (e.g. "+1 BAYC #42"). **Permissions left in place**: ERC-20 and Permit2 allowances, single-NFT approvals and `setApprovalForAll`, read back from the tokens after the simulated transaction. One set *along the way* by another call (a router writing a Permit2 allowance, a smart account's `execute`) is flagged: unlimited allowances and single NFTs with **caution**, all-NFT approvals with **danger**. |
 
 ### Hyperliquid L1 actions: the one real limit
 
@@ -195,8 +195,9 @@ A dApp or integrator that holds the action can pass it as `context.hyperliquid =
 `assetChanges[].basis` says where each number comes from:
 - `requested`: what the signed request asks for.
 - `simulated_events`: transfer events from `eth_simulateV1`.
+- `simulated_state`: balances read before and after the simulated call, on chains whose RPC has no `eth_simulateV1` (HyperEVM; see below).
 
-Neither is a measured final balance. Fee-on-transfer or rebasing tokens, and state changes before inclusion, can differ.
+None is a measured final balance. Fee-on-transfer or rebasing tokens, and state changes before inclusion, can differ.
 
 NFT changes carry `standard` (`erc721`/`erc1155`) and the full `tokenId`. `symbol` reads like "BAYC #42", with long IDs shortened. Collection names come from the contracts and are easy to copy, so a received, named NFT gets an info note.
 
@@ -215,7 +216,7 @@ Events alone can be stale: USDC, OpenZeppelin 5 tokens and Permit2 lower an allo
 SIGNING_PREVIEW_MODE=live ETHEREUM_RPC_URL=… ARBITRUM_RPC_URL=… HYPEREVM_RPC_URL=… npm start
 ```
 
-Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulateV1` on any chain that has an RPC URL configured. Chains without one are previewed from the decoded request only. The RPC URLs also enable on-chain token metadata and proxy detection.
+Live mode reads Hyperliquid's public `/info` API and simulates on any chain that has an RPC URL configured: with `eth_simulateV1`, or, where the RPC lacks it, with `eth_call` and a state override (HyperEVM). Chains without one are previewed from the decoded request only. The RPC URLs also enable on-chain token metadata and proxy detection.
 
 | Variable | Effect |
 |---|---|
@@ -226,7 +227,7 @@ Live mode reads Hyperliquid's public `/info` API and simulates with `eth_simulat
 
 `liveDependencies()` was run against Ethereum, Arbitrum One and HyperEVM, with Sourcify, OpenChain and 4byte, on 2026-11-04. Token metadata, proxy detection, verified-ABI and signature decoding and simulation all worked. A first preview of an uncached contract took 0.4–1.8 s. The `/info` client is checked live by `npm run verify:live`.
 
-Any RPC works if it supports `eth_simulateV1`, which simulation needs. Verification used these public, keyless endpoints:
+Any RPC works if it supports `eth_simulateV1`, or `eth_call` with state overrides. Verification used these public, keyless endpoints:
 - Ethereum: `https://ethereum-rpc.publicnode.com` (PublicNode)
 - Arbitrum: `https://arb1.arbitrum.io/rpc`
 - HyperEVM: `https://rpc.hyperliquid.xyz/evm`
@@ -235,9 +236,21 @@ Public endpoints can rate-limit or change without notice; use your own provider 
 
 ## Contract and token lookups
 
-**HyperEVM.** The public RPC (`rpc.hyperliquid.xyz/evm`) has no `eth_simulateV1` or trace methods, only `eth_call`.
-- `RpcSimulator` notices this once and checks single transactions with `eth_call` instead. That tells whether the call succeeds and why it would revert, but gives no balance changes.
-- In a batch, only the first call can be checked that way; the others are marked not simulated.
+**HyperEVM simulation.** The public RPC (`rpc.hyperliquid.xyz/evm`) has no `eth_simulateV1`, `debug_traceCall` or `trace_call`, and serves only the latest state. It does have `eth_call` with state overrides. `RpcSimulator` notices the missing method once and simulates with **`SimulationProbe`** (`contracts/SimulationProbe.sol`) instead:
+- One `eth_call` sets the probe as the code of the sending account and runs the transaction (or a whole batch, in order) through it, from that account. The target sees the real sender as `msg.sender` and `tx.origin`.
+- Around each call the probe reads the native balance, ERC-20 balances, allowances, Permit2 allowances, `isApprovedForAll`, and NFT ownership and approvals by token ID. The differences become the same balance changes and approvals that `eth_simulateV1`'s logs give, with basis `simulated_state`. Native HYPE received through an internal call (unwrapping WHYPE) shows too, which logs alone don't.
+- Without logs, only what is read is seen: the tokens the calls name (their targets, the addresses in their calldata, nested calldata and packed Uniswap paths), HyperEVM's built-in tokens, and tokens decoders name (HyperLend's hTokens and debt tokens). The preview says how many tokens were read.
+- With code at the account, contracts may treat it differently. The probe answers ERC-1271 `isValidSignature` the way the account's key would (`ecrecover`), and accepts NFTs as an account without code does. A contract that refuses senders with code makes the probe fail; a plain `eth_call` then confirms the call works, and the preview says its balance changes couldn't be measured.
+- Calls run at the latest block's timestamp, so a result that depends on the exact time can differ slightly.
+- An RPC that also ignores state overrides falls back to `eth_call` alone: success or failure and the revert reason, for single calls only.
+- `src/probe-code.ts` holds the compiled bytecode; `npm run build:probe` rebuilds it with the pinned solc, and a test checks it matches the source.
+
+How it was checked:
+- On Ethereum, whose RPC still has the exact state before recent blocks, 240 transactions from one-off senders were simulated at their parent block with the shipped code and compared with their receipts. 237 succeeded as on-chain (the other 3 depended on an earlier transaction in the same block). 231 of the 235 token movements were found, 230 with the exact amount, and no movement was reported that didn't happen. 8 of the 10 approvals were found; the other two were granted and spent in the same transaction. In an earlier run of the same comparison, the probe and `eth_simulateV1` agreed on 232 of 233 outcomes; the other depended on the block time.
+- On HyperEVM, live (`npm run verify:live`, step 10): a Kinetiq stake of 10 HYPE matches Kinetiq's own `HYPEToKHYPE` quote to the wei, a USDC transfer moves exactly 1 USDC, and approve + HyperLend supply in one batch gives −1 USDC and +0.999999 hUSDC (Aave-style balances round). Before that, 8 constructed flows matched independently computed values, including a WHYPE unwrap, a CoreDepositWallet deposit, HYPE to HyperCore and a below-minimum stake.
+- `test/simulation-probe.test.ts` runs the real bytecode in an in-process EVM (`@ethereumjs/evm`) behind a fake HyperEVM-like RPC: transfers, unwrapping, direct and along-the-way approvals (including a forged Permit2 signature), batches, NFTs, reverts, insufficient funds and a contract that refuses senders with code.
+
+**HyperEVM decoding.**
 - Reverts with **custom errors** are named from the verified sources: Kinetiq's facets, HyperLend's Aave `Errors` library and OpenZeppelin. For example, "MustBeDivisibleBy1e10: the HYPE amount must be a multiple of 0.00000001 HYPE" or "HealthFactorLowerThanLiquidationThreshold".
 - Protocol decoders read live state with `eth_call` themselves, so they don't need simulation.
 - The read-only client retries briefly when rate-limited, and keeps results for 15 seconds within a preview.
@@ -345,7 +358,7 @@ Not covered, whatever the sample says:
 - **ERC-4337 UserOperations.** The UserOperations inside a bundler's `handleOps` call aren't previewed one by one, and a smart account's signature over a UserOperation hash isn't an EIP-1193 transaction.
 - **The call part of a self-delegating EIP-7702 transaction.** The delegation is decoded and flagged, but a call to your own address is decoded against the account's current code, not the new delegate's.
 - **Universal Router 1.0** (an older, NFT-era command table). Other DEX routers are shown through their verified ABI (function and arguments), without a swap headline.
-- **Simulation on HyperEVM**: its RPC has no `eth_simulateV1`, so calls are checked with `eth_call` and balance changes come from the decoded request.
+- **Simulation on HyperEVM** reads balances instead of logs (see [HyperEVM simulation](#contract-and-token-lookups)), so a token the transaction doesn't name, and no decoder adds, can be missing; and its RPC serves only the latest state.
 - **Sample size**: about 4% of Ethereum's blocks, 0.5% of Arbitrum's and 1.7% of HyperEVM's in the day.
 
 ## HyperCore coverage
@@ -454,7 +467,6 @@ What the contracts imply, and what the preview reports:
 Not covered on HyperEVM yet:
 - HyperLend's isolated (Fraxlend-style) pools, and Kinetiq products other than kHYPE staking (such as the vkHYPE vault): their addresses weren't available without the docs sites.
 - The native-HYPE gateway's address. Gateway calls are recognised by their Pool argument and verified source instead.
-- Simulated balance changes on HyperEVM, which need an RPC that supports `eth_simulateV1`.
 
 Still not verified live:
 - What actually happens to the debited HyperCore balance when the HyperEVM withdrawal step reverts (see above).
@@ -489,7 +501,8 @@ src/abi.ts                ABI sources (Sourcify, Etherscan, static), proxy detec
 src/rpc.ts                JSON-RPC client and the lookup cache
 src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2, generic
 src/hyperliquid/          /info client, asset resolution, L1 action hash
-src/simulation.ts         eth_simulateV1 simulator + mock
+src/simulation.ts         eth_simulateV1 simulator + mock; src/simulation-probe.ts the eth_call + state-override simulator
+contracts/                SimulationProbe.sol (compiled into src/probe-code.ts by npm run build:probe)
 src/interceptor.ts        dependency-free EIP-1193 wrapper
 src/server.ts             HTTP API + demo server (src/cli.ts starts it: npm start / npx signing-preview)
 openapi.json              OpenAPI 3.1 document for the HTTP API
