@@ -55,7 +55,8 @@ async function delegations(t: T, tag: string): Promise<Record<string, { code: st
 }
 const reqOf = async (t: T, tag: string): Promise<SimulationRequest> => {
   const stateOverrides = await delegations(t, tag);
-  return { chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), gas: BigInt(t.gas), gasPrice: BigInt(t.gasPrice), accessList: t.accessList, ...(stateOverrides && { stateOverrides }) };
+  return { chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), gas: BigInt(t.gas), gasPrice: BigInt(t.gasPrice), accessList: t.accessList, ...(stateOverrides && { stateOverrides }),
+    ...(t.authorizationList?.length && { authorizationList: t.authorizationList }) };
 };
 const net = (transfers: { asset: string; from: string; to: string; raw: bigint }[], who: string) => {
   const m = new Map<string, bigint>();
@@ -81,7 +82,16 @@ for (const b of blocks) {
     taken++;
     const r = receipts.find(x => x.transactionHash === t.hash)!;
     const logs = parseLogs(r.logs);
-    const tokens = net(logs.transfers, from);
+    const logged = net(logs.transfers, from);
+    // What actually moved: the sender's balance of each token across the block (it sent nothing else in it), which
+    // for share-based tokens can differ from the Transfer events by a unit; the events where balanceOf can't be read.
+    const balanceAt = async (token: string, tag: string) => { try { return BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: token, data: `0x70a08231${from.slice(2).padStart(64, '0')}` }, tag]))); } catch { return undefined; } };
+    const actual = new Map<string, bigint>();
+    const actualOf = async (a: string) => {
+      if (!actual.has(a)) { const x = await balanceAt(a, parent), y = await balanceAt(a, b.number); actual.set(a, x !== undefined && y !== undefined ? y - x : (logged.get(a) ?? 0n)); }
+      return actual.get(a)!;
+    };
+    for (const a of logged.keys()) await actualOf(a);
     // Native: the sender's balance across the block, plus the fee it paid (it sent nothing else in this block).
     const bal = async (tag: string) => BigInt(String(await rpc.call(CHAIN, 'eth_getBalance', [from, tag])));
     const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice);
@@ -98,7 +108,12 @@ for (const b of blocks) {
         const got = net(res.transfers, from);
         const nativeGot = got.get('native') ?? 0n;
         got.delete('native');
-        const tokenRows = [...new Set([...tokens.keys(), ...got.keys()])].map(a => ({ token: a, actual: (tokens.get(a) ?? 0n).toString(), simulated: (got.get(a) ?? 0n).toString() }));
+        // Tokens either side saw (a wrap's WETH has no Transfer event, so only the simulation names it).
+        const tokenRows = [];
+        for (const a of new Set([...logged.keys(), ...got.keys()])) {
+          const want = await actualOf(a);
+          if (want !== 0n || got.has(a)) tokenRows.push({ token: a, actual: want.toString(), simulated: (got.get(a) ?? 0n).toString() });
+        }
         row[name] = {
           outcome: res.status === row.receipt, status: res.status, revert: res.revertReason,
           tokens: tokenRows.filter(x => x.actual === x.simulated).length, tokenTotal: tokenRows.length, tokenDiffs: tokenRows.filter(x => x.actual !== x.simulated),

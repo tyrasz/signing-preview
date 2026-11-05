@@ -1,4 +1,5 @@
 import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, parseAbi, type Hex } from 'viem';
+import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
 import { calldataCandidates, ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
@@ -37,12 +38,29 @@ const overridesOf = (reqs: SimulationRequest[]) => {
   return Object.keys(all).length ? all : undefined;
 };
 
-/** A request's own gas limit, gas price and access list, which contracts can observe (gasleft(), tx.gasprice). */
+/** A request's own gas limit, gas price, access list and signed authorizations, as eth_simulateV1 call fields. */
 const simulationFields = (req: SimulationRequest) => ({
   ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
   ...(req.gasPrice !== undefined && { gasPrice: '0x' + req.gasPrice.toString(16) }),
   ...(req.accessList && { accessList: req.accessList }),
+  ...(req.authorizationList?.length && { authorizationList: req.authorizationList }),
 });
+
+/**
+ * The code overrides eth_simulateV1 needs: those of signed authorizations it applies natively are left out, so an
+ * authority's account isn't made to exist beforehand (its refund depends on that).
+ */
+async function simulateV1Overrides(reqs: SimulationRequest[]) {
+  const all = overridesOf(reqs);
+  if (!all) return undefined;
+  for (const r of reqs) for (const a of r.authorizationList ?? []) {
+    try {
+      const authority = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } });
+      delete all[authority.toLowerCase()];
+    } catch { /* unreadable: the chain skips it, and so does the override */ }
+  }
+  return Object.keys(all).length ? all : undefined;
+}
 
 /** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1 or state overrides). */
 export class BatchSimulationUnsupported extends Error {
@@ -101,7 +119,8 @@ export class RpcSimulator implements Simulator {
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
     const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...simulationFields(req) }));
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(chainId).overrides && { blockOverrides: this.at(chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], traceTransfers: true, validation: false }, this.at(chainId).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
+    const stateOverrides = await simulateV1Overrides(reqs);
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(chainId).overrides && { blockOverrides: this.at(chainId).overrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
       return this.withoutSimulateV1(url, chainId, reqs);
@@ -127,7 +146,7 @@ export class RpcSimulator implements Simulator {
       if ((res.status === 429 || res.status >= 500) && await retry()) continue;
       if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
       const body = await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
-      if (body.error && (body.error.code === -32005 || body.error.code === 429 || /rate limit|too many requests/i.test(body.error.message ?? '')) && await retry()) continue;
+      if (body.error && (body.error.code === -32005 || body.error.code === 429 || /rate limit|too many requests|adjustable limit/i.test(body.error.message ?? '')) && await retry()) continue;
       return body;
     }
   }
@@ -224,7 +243,8 @@ export class RpcSimulator implements Simulator {
       for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: READER, to: a.emitter, data: stateCall(a) }); }
       balances.push(balanceReads());
     });
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(reqs[0].chainId).overrides && { blockOverrides: this.at(reqs[0].chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], validation: false }, this.at(reqs[0].chainId).tag]) as { result?: { calls: RawCallResult[] }[] };
+    const stateOverrides = await simulateV1Overrides(reqs);
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(reqs[0].chainId).overrides && { blockOverrides: this.at(reqs[0].chainId).overrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId).tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls;
     if (!out || out.length !== calls.length) return;
     // The re-run must have gone the same way, or its reads describe a different execution.

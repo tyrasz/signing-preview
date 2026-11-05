@@ -165,6 +165,11 @@ export interface SimulationRequest {
   accessList?: { address: string; storageKeys: string[] }[];
   /** Code to give accounts for the simulation (EIP-7702 authorizations: the delegation designator, or none). */
   stateOverrides?: Record<string, { code?: string }>;
+  /**
+   * Signed EIP-7702 authorizations, in JSON-RPC form. Simulators that can apply them natively (eth_simulateV1) do,
+   * so validity, nonces and their gas are exact; the others use `stateOverrides`.
+   */
+  authorizationList?: { address: string; chainId: string; nonce: string; r: string; s: string; yParity: string }[];
 }
 
 export interface SimulatedTransfer {
