@@ -7,6 +7,7 @@ import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } fro
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
+import { smartAccountAdapter } from './smart-account.ts';
 import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
@@ -15,6 +16,7 @@ import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreS
 
 /** Order matters: specific routes before generic ERC-20 shapes. */
 export const ADAPTERS: Adapter[] = [
+  smartAccountAdapter,
   coreDepositWalletAdapter,
   hyperCoreSystemTransferAdapter,
   nativeAdapter,
