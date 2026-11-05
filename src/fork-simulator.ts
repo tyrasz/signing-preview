@@ -77,9 +77,17 @@ export interface ForkSimulatorOptions {
    * accuracy.
    */
   cacheFile?: string;
+  /**
+   * Record every storage read and write of the accepted run, with its gas, in `last.trace` (for diagnosing a gas
+   * difference; slows simulation).
+   */
+  trace?: boolean;
   /** Called after each speculative round with what it still needed (for tuning). */
   onRound?: (round: number, misses: { accounts: string[]; storage: string[]; calls: string[] }, grew: boolean) => void;
 }
+
+/** A storage read or write of a traced run: the call it was in (by index), the contract, slot, value written and gas charged. */
+export interface StorageStep { call: number; op: 'SLOAD' | 'SSTORE'; address: string; slot: string; value?: string; gas: string; refund: string; depth: number }
 
 /** The simulation ran out of its time budget. */
 export class ForkTimeout extends Error {
@@ -393,7 +401,7 @@ export class ForkSimulator implements Simulator {
   private urls: Record<number, string>;
   private opts: Required<Omit<ForkSimulatorOptions, 'profiles' | 'block' | 'header' | 'onRound'>> & Pick<ForkSimulatorOptions, 'block' | 'header' | 'onRound'> & { profiles: Record<number, ChainProfile> };
   /** Counters from the last simulation, for tuning and tests. */
-  last?: { rounds: number; requests: number; ms: number };
+  last?: { rounds: number; requests: number; ms: number; trace?: StorageStep[] };
   /** Tokens that simulations still running have seen in their Transfer logs so far, by request (see discovered()). */
   private seen = new Map<string, Set<string>>();
   /** Values loaded from the cache file when the simulator was created. */
@@ -403,7 +411,7 @@ export class ForkSimulator implements Simulator {
   constructor(urls: Record<number, string>, options: ForkSimulatorOptions = {}) {
     this.urls = urls;
     this.opts = { fetchImpl: options.fetchImpl ?? fetch, batchSize: options.batchSize ?? 20, concurrency: options.concurrency ?? 4, maxRounds: options.maxRounds ?? 24,
-      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', profiles: { ...CHAIN_PROFILES, ...options.profiles } };
+      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', trace: options.trace ?? false, profiles: { ...CHAIN_PROFILES, ...options.profiles } };
     if (this.opts.cacheFile) this.loaded = loadForkCache(this.opts.cacheFile);
   }
 
@@ -501,7 +509,7 @@ export class ForkSimulator implements Simulator {
       const grew = !!run && run.rerun;
       if (misses) this.opts.onRound?.(round, { accounts: [...misses.accounts], storage: [...misses.storage], calls: [...misses.calls] }, grew);
       if (run && (!misses || (!missCount(misses) && !grew))) {
-        this.last = { rounds: round, requests: source.requests, ms: Date.now() - started };
+        this.last = { rounds: round, requests: source.requests, ms: Date.now() - started, ...(run.trace && { trace: run.trace }) };
         return run.results;
       }
       if (run) {
@@ -541,6 +549,20 @@ export class ForkSimulator implements Simulator {
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: forwarded });
+    // Only the calls themselves are traced, not the balance and approval reads around them.
+    let trace: StorageStep[] | undefined, callIndex = 0, recording = false;
+    if (this.opts.trace) {
+      trace = [];
+      evm.events!.on('step', (e: { opcode: { name: string; fee: number; dynamicFee?: bigint }; stack: bigint[]; address: Address; depth: number; gasRefund: bigint }, next?: () => void) => {
+        const op = e.opcode.name;
+        if (recording && (op === 'SLOAD' || op === 'SSTORE')) {
+          const top = e.stack.length - 1;
+          trace!.push({ call: callIndex, op, address: e.address.toString(), slot: `0x${e.stack[top].toString(16)}`, ...(op === 'SSTORE' && { value: `0x${e.stack[top - 1].toString(16)}` }),
+            gas: String(BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n)), refund: String(e.gasRefund), depth: e.depth });
+        }
+        next?.();
+      });
+    }
     const viewOn = async (on: EVM, to: string, data: Hex) => {
       const r = await on.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 1_000_000n, isStatic: true, block });
       return r.execResult.exceptionError ? undefined : r.execResult.returnValue;
@@ -591,8 +613,11 @@ export class ForkSimulator implements Simulator {
       await state.putAccount(sender, senderAccount);
       const authRefund = await this.authorize(state, evm, auths[i], chainId);
       const gasLimit = req.gas ? req.gas - transactionGas({ ...req, data: req.data }, 0n, 0n, false) : GAS;
+      callIndex = i;
+      recording = true;
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block });
+      recording = false;
       const ex = res.execResult;
       const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + authRefund, profile.hardfork !== 'cancun');
       if (ex.exceptionError) {
@@ -649,7 +674,7 @@ export class ForkSimulator implements Simulator {
       }
       results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue) });
     }
-    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun };
+    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, trace };
   }
 
   /**

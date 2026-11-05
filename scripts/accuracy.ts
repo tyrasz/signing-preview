@@ -75,9 +75,10 @@ const rows: Record<string, unknown>[] = [];
 for (const b of blocks) {
   const n = Number(b.number), parent = '0x' + (n - 1).toString(16);
   const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
+  const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000, trace });
   const simulators = ([
     ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time: b.timestamp, feeRecipient: b.miner, prevRandao: b.mixHash, baseFeePerGas: b.baseFeePerGas, gasLimit: b.gasLimit } }) })],
-    ['fork', new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000 })],
+    ['fork', forkAt()],
   ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name) && !(CHAIN === 42161 && name === 'fork'));
   let taken = 0;
   for (const t of b.transactions) {
@@ -132,6 +133,16 @@ for (const b of blocks) {
           approvals: approvals.filter(a => (res.approvals ?? []).some(x => `${x.kind}:${x.token}:${x.spender}` === a)).length, approvalTotal: approvals.length,
           gas: String(res.gasUsed) === row.receiptGas, gasUsed: String(res.gasUsed), ms: Date.now() - t0,
         };
+        // A fork gas difference: keep the call's storage writes, each with its slot's value before the block, to
+        // find the one priced differently (while the RPC still has the state).
+        if (name === 'fork' && String(res.gasUsed) !== row.receiptGas) {
+          try {
+            const traced = forkAt(true);
+            await traced.simulateBatch([...before, target]);
+            const writes = traced.last!.trace!.filter(w => w.call === before.length && w.op === 'SSTORE');
+            (row[name] as Record<string, unknown>).writes = await Promise.all(writes.map(async w => ({ ...w, atParent: String(await rpc.call(CHAIN, 'eth_getStorageAt', [w.address, '0x' + BigInt(w.slot).toString(16).padStart(64, '0'), parent])) })));
+          } catch (e) { (row[name] as Record<string, unknown>).traceError = String(e).slice(0, 120); }
+        }
       } catch (e) {
         row[name] = { error: (e as Error).message.slice(0, 160), ms: Date.now() - t0 };
       }

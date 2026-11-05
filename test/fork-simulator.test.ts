@@ -111,6 +111,14 @@ test('Speculative rounds converge, guesses from earlier simulations cut them, an
   const [, again] = (await warm.simulateBatch([approve, req]))!;
   assert.equal(again.status, 'success');
   assert.ok(warm.last!.rounds <= 2 && warm.last!.rounds <= cold.last!.rounds, `${cold.last!.rounds} cold, ${warm.last!.rounds} warm`);
+  // A traced run lists the call's storage reads and writes with their gas: each balance is read first (2,100 cold),
+  // then written, nonzero to nonzero (2,900) for the sender and zero to nonzero (20,000) for a new recipient.
+  const traced = fork({ trace: true });
+  await traced.simulate({ chainId: 999, from: USER, to: usdc, data: call('transfer', ['0x' + 'b1'.repeat(20), 3n]), value: 0n });
+  const writes = traced.last!.trace!.filter(t => t.op === 'SSTORE');
+  assert.deepEqual(writes.map(t => [t.address, t.gas]), [[usdc, '2900'], [usdc, '20000']]);
+  assert.equal(writes[1].value, '0x3');
+  assert.ok(traced.last!.trace!.filter(t => t.op === 'SLOAD' && t.slot === writes[1].slot).every(t => t.gas === '2100'), 'the recipient’s slot is read cold once');
   // With no speculative rounds allowed, values are fetched one at a time: slower, same answer.
   const [slow] = (await fork({ maxRounds: 0 }).simulateBatch([{ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n }]))!;
   assert.deepEqual(slow.transfers.map(t => [t.asset, t.raw]), [[usdc, 1n]]);
