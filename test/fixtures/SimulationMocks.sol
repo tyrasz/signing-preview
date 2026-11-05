@@ -168,3 +168,12 @@ contract CoreWriterLike {
 contract CoreSender {
     function act(bytes calldata data) external { CoreWriterLike(0x3333333333333333333333333333333333333333).sendRawAction(data); }
 }
+
+/// Checkpoints a recent block hash, as L2 bridges and randomness beacons do: reverts when BLOCKHASH gives nothing.
+contract BlockHashReader {
+    error L1BlockHashNotAvailable();
+    function checkpoint(uint256 n) external view returns (bytes32 h) {
+        h = blockhash(n);
+        if (h == 0) revert L1BlockHashNotAvailable();
+    }
+}

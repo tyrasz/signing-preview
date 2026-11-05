@@ -26,9 +26,9 @@ import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, Simulatio
 
 type Hex = `0x${string}`;
 interface AccountData { balance: bigint; nonce: bigint; code: Uint8Array }
-interface Misses { accounts: Set<string>; storage: Set<string>; calls: Set<string> }
-const newMisses = (): Misses => ({ accounts: new Set(), storage: new Set(), calls: new Set() });
-const missCount = (m: Misses) => m.accounts.size + m.storage.size + m.calls.size;
+interface Misses { accounts: Set<string>; storage: Set<string>; calls: Set<string>; blocks: Set<number> }
+const newMisses = (): Misses => ({ accounts: new Set(), storage: new Set(), calls: new Set(), blocks: new Set() });
+const missCount = (m: Misses) => m.accounts.size + m.storage.size + m.calls.size + m.blocks.size;
 
 export interface ChainProfile {
   /** EVM rules, e.g. 'cancun' (HyperEVM) or 'osaka' (Ethereum). */
@@ -44,12 +44,19 @@ export interface ChainProfile {
 /** HyperEVM's read precompiles (0x…0800 onward: positions, spot balances, prices, L1 block number...). */
 const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).toString(16).padStart(40, '0')}`);
 
+/**
+ * HyperCore read precompile gas, measured on HyperEVM mainnet (2026-11-05) with a contract reading gasleft() around
+ * STATICCALLs to six of them (inputs of 0-64 bytes, outputs of 32-256): 1,000 + 33 per input and output byte, on top
+ * of the warm access (100; they are warm from the start). With it, real transactions' gas matches their receipts.
+ */
+const hyperCoreReadGas = (input: number, output: number) => 1000n + 33n * BigInt(input + output);
+
 /** Measured on each chain (2026-11-05): HyperEVM runs Cancun rules (no CLZ, no BLS precompiles); Ethereum, Osaka. */
 export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   1: { hardfork: 'osaka', blockTime: 12 },
   11155111: { hardfork: 'osaka', blockTime: 12 },
-  999: { hardfork: 'cancun', blockTime: 1, forwardedPrecompiles: HYPERCORE_READS, precompileGas: (i, o) => 2000n + 65n * BigInt(i + o) },
-  998: { hardfork: 'cancun', blockTime: 1, forwardedPrecompiles: HYPERCORE_READS, precompileGas: (i, o) => 2000n + 65n * BigInt(i + o) },
+  999: { hardfork: 'cancun', blockTime: 1, forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
+  998: { hardfork: 'cancun', blockTime: 1, forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
 
 export interface ForkSimulatorOptions {
@@ -130,6 +137,8 @@ class Guesses<V> {
 const GUESS_ACCOUNTS = new Guesses<{ balance: bigint; nonce: bigint; hasCode: boolean }>(20_000);
 const GUESS_STORAGE = new Guesses<Uint8Array>(200_000);
 const GUESS_CALLS = new Guesses<{ ok: boolean; data: Uint8Array }>(20_000);
+/** Block hashes by chain and number, for BLOCKHASH: a past block's hash doesn't change. */
+const BLOCK_HASHES = new Guesses<Uint8Array>(5_000);
 
 /** What the cache file holds, most recent first, within these limits (about 25 MB). */
 const SAVED = { accounts: 20_000, storage: 100_000, calls: 10_000, codeHexChars: 16_000_000 };
@@ -192,6 +201,7 @@ class StateSource {
   accounts = new Map<string, AccountData>();
   storage = new Map<string, Uint8Array>();
   calls = new Map<string, { ok: boolean; data: Uint8Array }>();
+  blocks = new Map<number, Uint8Array>();
   requests = 0;
   /** Code given to accounts for this simulation (EIP-7702 delegation designators), instead of theirs. */
   codeOverrides = new Map<string, Uint8Array>();
@@ -232,6 +242,15 @@ class StateSource {
     for (const k of m.storage) {
       const [a, slot] = k.split('_');
       jobs.push({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: r => { this.setStorage(k, unpadBytes(hexToBytes(r as Hex))); } });
+    }
+    for (const n of m.blocks) {
+      const known = BLOCK_HASHES.get(`${this.chainId}:${n}`);
+      if (known) { this.blocks.set(n, known); continue; }
+      jobs.push({ method: 'eth_getBlockByNumber', params: [`0x${n.toString(16)}`, false], done: r => {
+        const h = hexToBytes(((r as { hash?: Hex } | null)?.hash ?? `0x${'00'.repeat(32)}`) as Hex);
+        this.blocks.set(n, h);
+        if (r) BLOCK_HASHES.set(`${this.chainId}:${n}`, h);
+      } });
     }
     for (const k of m.calls) {
       const [to, data] = k.split('_');
@@ -548,7 +567,18 @@ export class ForkSimulator implements Simulator {
       const gas = profile.precompileGas?.(input.data.length, c.data.length) ?? 2000n;
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
-    const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: forwarded });
+    // BLOCKHASH: the recent blocks' hashes, fetched like the rest of the state (the EVM checks the 256-block window).
+    const blockchain = {
+      getBlock: async (n: number) => {
+        let h = source.blocks.get(n);
+        if (!h && misses) { misses.blocks.add(n); h = BLOCK_HASHES.get(`${chainId}:${n}`) ?? new Uint8Array(32); }
+        if (!h) { await source.fetch({ ...newMisses(), blocks: new Set([n]) }); h = source.blocks.get(n)!; }
+        return { hash: () => h };
+      },
+      putBlock: async () => {},
+      shallowCopy() { return this; },
+    };
+    const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: forwarded, blockchain });
     // Only the calls themselves are traced, not the balance and approval reads around them.
     let trace: StorageStep[] | undefined, callIndex = 0, recording = false;
     if (this.opts.trace) {
@@ -573,7 +603,7 @@ export class ForkSimulator implements Simulator {
     // second EVM, instead of running everything again with the token watched from the start.
     let pre: EVM | undefined;
     const balanceBefore = async (token: string, owner: string) => {
-      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: forwarded });
+      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: forwarded, blockchain });
       const r = await viewOn(pre, token, `0x70a08231${owner.slice(2).padStart(64, '0')}` as Hex);
       return r ? word(r) : undefined;
     };

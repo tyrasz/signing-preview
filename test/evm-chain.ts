@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createEVM, type EVM } from '@ethereumjs/evm';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft } from '@ethereumjs/util';
-import { encodeAbiParameters, type Hex } from 'viem';
+import { encodeAbiParameters, keccak256, type Hex } from 'viem';
 
 const solc = createRequire(import.meta.url)('solc');
 const out = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources: { 'M.sol': { content: readFileSync(new URL('./fixtures/SimulationMocks.sol', import.meta.url), 'utf8') } },
@@ -64,7 +64,12 @@ export async function testChain(): Promise<TestChain> {
       case 'eth_getTransactionCount': return { result: `0x${((await sm.getAccount(at(p[0])))?.nonce ?? 0n).toString(16)}` };
       case 'eth_getCode': return { result: bytesToHex(await sm.getCode(at(p[0]))) };
       case 'eth_getStorageAt': return { result: bytesToHex(setLengthLeft(await sm.getStorage(at(p[0]), setLengthLeft(hexToBytes(p[1] as Hex), 32)), 32)) };
-      case 'eth_getBlockByNumber': return { result: { number: '0x10', timestamp: '0x65000000', miner: '0x0000000000000000000000000000000000000000', mixHash: `0x${'00'.repeat(32)}`, gasLimit: '0x1c9c380', baseFeePerGas: '0x0' } };
+      case 'eth_getBlockByNumber': {
+        // The chain is at block 16; each block's hash is keccak256 of its number (a 32-byte word).
+        const n = p[0] === 'latest' ? 16n : BigInt(p[0]);
+        if (n > 16n) return { result: null };
+        return { result: { number: `0x${n.toString(16)}`, hash: keccak256(encodeAbiParameters([{ type: 'uint256' }], [n])), timestamp: '0x65000000', miner: '0x0000000000000000000000000000000000000000', mixHash: `0x${'00'.repeat(32)}`, gasLimit: '0x1c9c380', baseFeePerGas: '0x0' } };
+      }
       case 'eth_call': {
         const [tx, , overrides] = params as [{ from?: string; to: string; data: string; value?: string; gas?: string }, string, Record<string, { code?: Hex; balance?: Hex }> | undefined];
         await sm.checkpoint();

@@ -134,6 +134,17 @@ test('Speculative rounds converge, guesses from earlier simulations cut them, an
   assert.equal(forkWins?.basis, 'fork');
 });
 
+test('BLOCKHASH gives the recent blocks’ real hashes (a contract checkpointing one reverts without them)', async () => {
+  const readerAt = await chain.deploy('BlockHashReader');
+  const checkpoint = (n: bigint) => ({ chainId: 999, from: USER, to: readerAt, data: encodeFunctionData({ abi: parseAbi(['function checkpoint(uint256) view returns (bytes32)']), functionName: 'checkpoint', args: [n] }), value: 0n });
+  // The simulated block is the next one (17); block 16's hash comes from the chain.
+  const [latest] = (await fork().simulateBatch([checkpoint(16n)]))!;
+  assert.equal(latest.status, 'success');
+  assert.equal(latest.returnData, keccak256(encodeAbiParameters([{ type: 'uint256' }], [16n])));
+  // The current block's own hash isn't available to it, as on-chain.
+  assert.equal((await fork().simulate(checkpoint(17n)))!.status, 'reverted');
+});
+
 test('EIP-7702: an account delegated to a smart-account contract runs its code (chain 1, Osaka rules)', async () => {
   const executor = await chain.deploy('Executor');
   const transfer = call('transfer', [BOB, 5_000_000n]);
