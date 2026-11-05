@@ -47,7 +47,8 @@ const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).to
 /**
  * HyperCore read precompile gas, measured on HyperEVM mainnet (2026-11-05) with a contract reading gasleft() around
  * STATICCALLs to six of them (inputs of 0-64 bytes, outputs of 32-256): 1,000 + 33 per input and output byte, on top
- * of the warm access (100; they are warm from the start). With it, real transactions' gas matches their receipts.
+ * of the warm access (100; they are warm from the start). With it, real transactions' gas matches their receipts. A
+ * call that fails (missing input, an unknown asset) uses all the gas it is given and returns nothing, also measured.
  */
 const hyperCoreReadGas = (input: number, output: number) => 1000n + 33n * BigInt(input + output);
 
