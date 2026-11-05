@@ -372,6 +372,7 @@ Run on 2026-11-05:
 | `eth_simulateV1`, EIP-7702 transactions only (`--only-type 0x4`) | 21 | 100% | 3/3 | 100% | 5/5 | 0/21 |
 | `eth_simulateV1` on Arbitrum One (`--chain 42161`) | 21 | 100% | 6/6 | 100% | 1/1 | 100% (L2 part) |
 | Both, a later run with signed authorizations passed natively | 46 (34 for `eth_simulateV1`: the node throttled 12) | 100% | 14/14 and 15/15 | 100% | 1/1 | 100% |
+| Both, after the `BLOCKHASH` fix (below) | 74 (71 for `eth_simulateV1`: the node throttled 3) | 100% | 29/29 | 100% | 1/1 | 100% |
 
 - A separate run of 71 transactions gave the same result for `ForkSimulator`: 71/71 outcomes, 22/22 token movements and 71/71 gas. Its one gas difference here is 19,900 (one storage write priced as warm) in a transaction whose outcome and balances are exact; its block's state is gone from the public RPC, so it couldn't be replayed. On any fork gas difference, the harness now re-runs the transaction with `trace: true` and keeps each storage write with its slot's value before the block.
 - A later run found one transaction the fork simulator failed and the chain didn't: a contract checkpointing a recent block hash (`checkpointBlockHash`, reverting with `L1BlockHashNotAvailable()`) got zero from `BLOCKHASH`. Block hashes are now fetched, and that call matches its receipt's gas exactly (48,963).
