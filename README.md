@@ -341,9 +341,9 @@ Results are cached: tokens and ABIs for 10 minutes, signatures for an hour. A ne
 
 ## Simulation accuracy
 
-`npm run accuracy` measures simulation against what actually happened. It replays recent Ethereum transactions from one-off senders at their exact pre-state: on top of the parent block, after the earlier transactions of the same block, with the real block's header. Each one goes through both simulators, `eth_simulateV1` with balances and approvals read back, and `ForkSimulator`. The result is compared with the receipt:
-- the outcome;
-- every token movement of the sender;
+`npm run accuracy` measures simulation against what actually happened. It replays recent Ethereum transactions from one-off senders at their exact pre-state: on top of the parent block, after the earlier transactions of the same block, with the real block's header. Each one goes through both simulators, `eth_simulateV1` with balances and approvals read back, and `ForkSimulator`. The result is compared with what happened:
+- the outcome, from the receipt;
+- every token movement of the sender, from its balances at the block and at its parent (Transfer events where a balance can't be read: share-based tokens such as stETH move a unit less than their event says);
 - the native coin change (the balance across the block, net of the fee);
 - approvals;
 - gas.
@@ -366,9 +366,10 @@ Run on 2026-11-05:
 | `ForkSimulator` | 47 | 100% | 11/11 | 100% | 2/2 | 46/47 |
 | `eth_simulateV1`, EIP-7702 transactions only (`--only-type 0x4`) | 21 | 100% | 3/3 | 100% | 5/5 | 0/21 |
 | `eth_simulateV1` on Arbitrum One (`--chain 42161`) | 21 | 100% | 6/6 | 100% | 1/1 | 100% (L2 part) |
+| Both, a later run with signed authorizations passed natively | 46 (34 for `eth_simulateV1`: the node throttled 12) | 100% | 14/14 and 15/15 | 100% | 1/1 | 100% |
 
 - A separate run of 71 transactions gave the same result for `ForkSimulator`: 71/71 outcomes, 22/22 token movements and 71/71 gas. Its one gas difference here is 19,900 (one storage write priced as warm) in a transaction whose outcome and balances are exact.
-- For EIP-7702 transactions, gas leaves out what processing the authorizations costs: 25,000 each, less 12,500 for an account that already exists, with refunds capped at a fifth of the total. The differences are exactly that.
+- EIP-7702: signed authorizations are passed to `eth_simulateV1` as they are, so the node applies them: their validity, nonces and gas come out exact. The 0/21 gas row above is from before this, when they were applied only as code overrides; gas was then short by exactly what processing the authorizations costs (25,000 each, less 12,500 for an account that already exists). Unsigned authorizations (a request the wallet has yet to sign) and the fork simulator still use overrides, which leave that cost out.
 - On Arbitrum, ArbOS's own transactions are skipped and gas is compared without the receipt's L1 data part; the fork simulator, which doesn't model ArbOS, isn't used there. Arbitrum's public RPC keeps about 30 seconds of state and rate-limits hard, so runs are short (two of 23 transactions were rate-limited in that run; the simulator now retries).
 - What a replay can't show: anything that happens between the preview and inclusion. A price, balance or nonce that moves in between moves the result too.
 
