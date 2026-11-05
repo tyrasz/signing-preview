@@ -158,14 +158,14 @@ const deps = liveDependencies({ ARBITRUM_RPC_URL, HYPEREVM_RPC_URL });
 | Ethereum / Arbitrum / HyperEVM | ERC-20 transfer/approve/transferFrom, `setApprovalForAll`, WETH, Permit2 `approve`, native sends, contract creation | Amounts with the token's symbol and decimals. Warns on unlimited approvals, zero-value transfers and transfers to the token contract itself. |
 | Off-chain approvals | ERC-2612 / DAI `Permit`, Permit2 `PermitSingle/Batch/TransferFrom` | Spender, amount and expiry; flags unlimited or long-lived permissions and owner mismatches. |
 | Messages | `personal_sign`, SIWE, `eth_sign` | Readable text; SIWE domain vs. requesting origin (phishing); `eth_sign` is always danger. |
-| **EIP-7702** account delegation | `authorizationList` in `eth_sendTransaction` (type-4), unsigned or signed | Which account is delegated to which contract (named when its source is verified), on which chain (`chainId` 0 = every chain). **Danger** when your own account would run another contract's code; information for authorizations signed by other accounts (a sponsor relaying them) and for revocations. The simulator doesn't apply authorizations, so such transactions aren't simulated. "Delegate your account to X" when nothing else happens. |
+| **EIP-7702** account delegation | `authorizationList` in `eth_sendTransaction` (type-4), unsigned or signed | Which account is delegated to which contract (named when its source is verified), on which chain (`chainId` 0 = every chain). **Danger** when your own account would run another contract's code; information for authorizations signed by other accounts (a sponsor relaying them) and for revocations. The transaction is simulated with the delegations applied (each authority's code set to the delegation designator), so calls to a delegated account run its new code; not on HyperEVM, which has no EIP-7702. "Delegate your account to X" when nothing else happens. |
 | Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. The calls are simulated **in order in one block**, so "approve, then swap" isn't shown as failing, and balance changes are netted across the batch. **Danger** when a call in an all-or-nothing (`atomicRequired`) batch would fail, since then none take effect; **caution** for a non-atomic batch, where the other calls may still go through. A custom simulator without `simulateBatch` simulates only the first call and says why. |
 | Uniswap **Universal Router** | `execute(commands, inputs[, deadline])` and `executeSigned` on Uniswap's official routers: 2.1.1, 2.1.2 and 2.2.0 (current), 2.0 (Uniswap v4) and 1.2, on Ethereum, Arbitrum and HyperEVM | One headline for the trade ("Swap 1 ETH for at least 3,150 USDC"), summing split routes and following chained hops through wrap/unwrap, then every command as a step: v2/v3/v4 swaps with fee tiers and per-hop minimum prices, Permit2 permits and transfers, wrap/unwrap, sweep, pay, fee portions, balance checks, sub-plans, v3/v4 position-manager calls, **Across bridging** ("…, then bridge to Base"), and v1.2's NFT-marketplace purchases. `executeSigned` shows who signed the route. **Caution** when output goes to another address (on this chain or the bridge's destination), when nothing limits slippage (minimum received 0 and no per-hop prices), when the deadline has passed, or for a Permit2 allowance to an address other than the router; **danger** for a fee portion of 10% or more. Command tables differ between releases (0x10 is a Seaport purchase on 1.2 and a v4 swap now; 2.1 adds fields to every swap), so only known router addresses are decoded, each with its release's table. The original 1.0 router isn't decoded. |
 | Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
 | | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
 | Plain-text calldata | data that is entirely printable UTF-8: `data:` URI inscriptions (Ethscriptions and similar), on-chain messages | The text, or for a JSON inscription its protocol operation ("Inscription: edmt emt-batch-transfer enat"), noting that an off-chain indexer decides its effect. Invisible and text-reordering characters are removed and flagged. Full when the recipient has no code; **caution** when it's a contract (it receives the text as input) or can't be checked. |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
-| Simulated effects (any transaction) | `eth_simulateV1` logs and state; on HyperEVM, balances and permissions read before and after through `eth_call` ([how](#contract-and-token-lookups)) | Balance changes for native, ERC-20, **ERC-721 and ERC-1155** (e.g. "+1 BAYC #42"). **Permissions left in place**: ERC-20 and Permit2 allowances, single-NFT approvals and `setApprovalForAll`, read back from the tokens after the simulated transaction. One set *along the way* by another call (a router writing a Permit2 allowance, a smart account's `execute`) is flagged: unlimited allowances and single NFTs with **caution**, all-NFT approvals with **danger**. |
+| Simulated effects (any transaction) | `eth_simulateV1` logs and state; on HyperEVM, a local EVM over the chain's state ([how](#contract-and-token-lookups)) | Balance changes for native, ERC-20, **ERC-721 and ERC-1155** (e.g. "+1 BAYC #42"). Amounts are the balance differences read from state before and after each call, for every token the events or calldata mention, so share-based tokens are exact and wrapping ETH shows the WETH received (WETH emits `Deposit`, not `Transfer`). **Permissions left in place**: ERC-20 and Permit2 allowances, single-NFT approvals and `setApprovalForAll`, read back from the tokens after the simulated transaction. One set *along the way* by another call (a router writing a Permit2 allowance, a smart account's `execute`) is flagged: unlimited allowances and single NFTs with **caution**, all-NFT approvals with **danger**. |
 
 ### Hyperliquid L1 actions: the one real limit
 
@@ -194,8 +194,8 @@ A dApp or integrator that holds the action can pass it as `context.hyperliquid =
 
 `assetChanges[].basis` says where each number comes from:
 - `requested`: what the signed request asks for.
-- `simulated_events`: transfer events from `eth_simulateV1`.
-- `simulated_state`: balances read before and after the simulated call, on chains whose RPC has no `eth_simulateV1` (HyperEVM; see below).
+- `simulated_state`: balances read from the simulated state before and after the call (the default with a simulator).
+- `simulated_events`: transfer events from `eth_simulateV1`, when the balances couldn't be read back.
 
 None is a measured final balance. Fee-on-transfer or rebasing tokens, and state changes before inclusion, can differ.
 
@@ -335,6 +335,33 @@ Results are cached: tokens and ABIs for 10 minutes, signatures for an hour. A ne
   - The live 4byte data exposed the selector-collision case above; it is now a recorded test and a live check.
 - **Not verified live yet:** Etherscan, which needs an API key.
 - There is no threat-intelligence feed. Warnings are rule-based observations, and `attention: 'none'` doesn't mean "safe".
+
+## Simulation accuracy
+
+`npm run accuracy` measures simulation against what actually happened. It replays recent Ethereum transactions from one-off senders at their exact pre-state: on top of the parent block, after the earlier transactions of the same block, with the real block's header. Each one goes through both simulators, `eth_simulateV1` with balances and approvals read back, and `ForkSimulator`. The result is compared with the receipt:
+- the outcome;
+- every token movement of the sender;
+- the native coin change (the balance across the block, net of the fee);
+- approvals;
+- gas.
+
+Every difference is listed. The public RPC keeps about 128 blocks of state, so only the latest blocks can be replayed.
+
+```bash
+npm run accuracy -- --blocks 20 --per-block 3 --max-index 6
+```
+
+Run on 2026-11-05:
+
+| | Transactions | Outcome | Token movements | Native change | Approvals | Gas exact |
+|---|---|---|---|---|---|---|
+| `eth_simulateV1` | 47 | 100% | 11/11 | 100% | 2/2 | 100% |
+| `ForkSimulator` | 47 | 100% | 11/11 | 100% | 2/2 | 46/47 |
+| `eth_simulateV1`, EIP-7702 transactions only (`--only-type 0x4`) | 21 | 100% | 3/3 | 100% | 5/5 | 0/21 |
+
+- A separate run of 71 transactions gave the same result for `ForkSimulator`: 71/71 outcomes, 22/22 token movements and 71/71 gas. Its one gas difference here is 19,900 (one storage write priced as warm) in a transaction whose outcome and balances are exact.
+- For EIP-7702 transactions, gas leaves out what processing the authorizations costs: 25,000 each, less 12,500 for an account that already exists, with refunds capped at a fifth of the total. The differences are exactly that.
+- What a replay can't show: anything that happens between the preview and inclusion. A price, balance or nonce that moves in between moves the result too.
 
 ## Coverage of real traffic
 

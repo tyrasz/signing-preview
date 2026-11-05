@@ -3,7 +3,7 @@ import { CHAINS, chainName } from '../chains.ts';
 import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
-import { delegationEffects } from './eip7702.ts';
+import { delegationEffects, SUPPORTS_7702 } from './eip7702.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
@@ -143,10 +143,17 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   let outcome = preset;
   // Simulating without the delegation would run the call against the account's old code, so it would show nothing
   // about what the delegate does.
-  if (!outcome && delegation && deps.simulator) outcome = { skipped: 'This transaction carries an EIP-7702 authorization list, which the simulator does not apply, so it was not simulated.' };
+  // With the delegations applied as code overrides, the simulation runs the transaction as it will be: calls to the
+  // account run the delegate's code. Only on chains that apply EIP-7702.
+  if (!outcome && delegation && deps.simulator && !SUPPORTS_7702.has(tx.chainId)) outcome = { skipped: "This chain doesn't apply EIP-7702 authorizations, so the transaction was not simulated." };
   if (!outcome && deps.simulator) {
     try {
-      outcome = { result: await deps.simulator.simulate(simulationRequest(tx, d)) };
+      const request = simulationRequest(tx, d);
+      if (delegation && Object.keys(delegation.codeOverrides).length) {
+        request.stateOverrides = Object.fromEntries(Object.entries(delegation.codeOverrides).map(([a, code]) => [a, { code }]));
+        b.note('Simulated with the EIP-7702 authorizations applied: the delegated accounts run their new code.');
+      }
+      outcome = { result: await deps.simulator.simulate(request) };
     } catch (error) {
       outcome = { error: error instanceof Error ? error.message : String(error) };
     }
@@ -166,7 +173,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     } else if (sim.limited) {
       b.note(sim.note ?? "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
     } else {
-      const basis = sim.basis === 'state' || sim.basis === 'fork' ? 'simulated_state' as const : 'simulated_events' as const;
+      const basis = sim.basis === 'state' || sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
       const simulated = [...await netChanges(sim.transfers, tx, deps, b, basis), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b, basis)];
       if (simulated.length || !assetChanges.length) assetChanges = simulated;
       approvals = await approvalChanges((sim.approvals ?? []).map(approval => ({ approval, callTo: tx.to })), tx, deps, sim.approvalState);
@@ -194,9 +201,10 @@ export function simulationRequest(tx: Tx, d?: Decoded): SimulationRequest {
 }
 
 /** How the simulated balance changes were found, for the preview's notes. */
-export function simulationNote(sim: Pick<SimulationResult, 'basis' | 'tokensRead'>): string {
+export function simulationNote(sim: Pick<SimulationResult, 'basis' | 'tokensRead' | 'balancesRead'>): string {
   if (sim.basis === 'state') return stateBasisNote(sim);
   if (sim.basis === 'fork') return "Simulated in a local EVM over this chain's latest state (its RPC has no eth_simulateV1), in the next block. Balance changes were read from the state before and after, for every token the transaction's events touch; the final result can differ if state changes before inclusion.";
+  if (sim.balancesRead) return 'Simulated at the latest block. Balance changes were read from the state before and after, for every token the transaction\'s events or calldata mention; the final result can differ if state changes before inclusion.';
   return 'Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.';
 }
 

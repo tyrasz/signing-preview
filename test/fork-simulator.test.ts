@@ -118,3 +118,16 @@ test('Speculative rounds converge, guesses from earlier simulations cut them, an
     chain.delayMs = 0;
   }
 });
+
+test('EIP-7702: an account delegated to a smart-account contract runs its code (chain 1, Osaka rules)', async () => {
+  const executor = await chain.deploy('Executor');
+  const transfer = call('transfer', [BOB, 5_000_000n]);
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute(address,bytes)']), functionName: 'execute', args: [usdc as Hex, transfer] });
+  const sim = new ForkSimulator({ 1: URL_ }, { fetchImpl: chain.fetchImpl });
+  const req = { chainId: 1, from: USER, to: USER, data: execute, value: 0n };
+  // Without the delegation the account has no code: the call does nothing.
+  assert.deepEqual((await sim.simulate(req))!.transfers, []);
+  const [delegated] = (await sim.simulateBatch([{ ...req, stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } }]))!;
+  assert.equal(delegated.status, 'success');
+  assert.deepEqual(delegated.transfers.filter(t => t.asset === usdc).map(t => [t.from, t.raw]), [[USER, 5_000_000n]]);
+});

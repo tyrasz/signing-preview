@@ -69,7 +69,8 @@
     "verify:live": "NODE_USE_ENV_PROXY=1 node scripts/verify-live.ts",
     "check:package": "node scripts/check-package.ts",
     "coverage": "NODE_USE_ENV_PROXY=1 node scripts/coverage.ts",
-    "build:probe": "node scripts/build-probe.ts"
+    "build:probe": "node scripts/build-probe.ts",
+    "accuracy": "NODE_USE_ENV_PROXY=1 node scripts/accuracy.ts"
   },
   "dependencies": {
     "@ethereumjs/common": "10.1.3",

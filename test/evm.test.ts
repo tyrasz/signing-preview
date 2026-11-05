@@ -86,7 +86,7 @@ test('RpcSimulator sends eth_simulateV1 and nets ERC-20 and native transfer logs
   const word = (a: string) => '0x' + a.slice(2).padStart(64, '0');
   let sent: { method: string; params: [{ traceTransfers: boolean }] } | undefined;
   const fetchImpl = (async (_url: string, init: RequestInit) => {
-    sent = JSON.parse(String(init.body));
+    sent ??= JSON.parse(String(init.body)); // the simulation itself (a second request reads balances back)
     return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0xc350', returnData: '0x', logs: [
       { address: USDC, topics: [topic, word(ALICE), word(BOB)], data: '0x' + (7_000_000n).toString(16).padStart(64, '0') },
       { address: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', topics: [topic, word(BOB), word(ALICE)], data: '0x' + (10n ** 15n).toString(16).padStart(64, '0') },

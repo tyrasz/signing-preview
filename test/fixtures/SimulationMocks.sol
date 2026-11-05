@@ -140,3 +140,11 @@ contract CoreReader {
         return abi.decode(r, (uint256));
     }
 }
+
+/// A minimal smart-account implementation for EIP-7702: an account delegated to it runs execute() as itself.
+contract Executor {
+    function execute(address target, bytes calldata data) external payable {
+        (bool ok, bytes memory r) = target.call{value: msg.value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+}

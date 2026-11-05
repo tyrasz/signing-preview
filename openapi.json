@@ -659,7 +659,7 @@
               "simulated_state",
               "mock"
             ],
-            "description": "Where the number comes from: the request itself (not a settled amount), transfer events of a simulation, balances read before and after a simulation (chains whose RPC can only run eth_call, such as HyperEVM), or mock data."
+            "description": "Where the number comes from: the request itself (not a settled amount), balances read from the simulated state before and after the call (simulated_state, the default with a simulator), a simulation's transfer events when balances couldn't be read back (simulated_events), or mock data."
           },
           "standard": {
             "enum": [

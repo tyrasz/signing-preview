@@ -1,7 +1,7 @@
 import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, parseAbi, type Hex } from 'viem';
-import { PERMIT2 } from './chains.ts';
+import { builtinTokens, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
-import { ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
+import { calldataCandidates, ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
 import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
 // Event topics (keccak256 of the signature).
@@ -17,6 +17,32 @@ const PERMIT2_LOCKDOWN_TOPIC = '0x89b1add15eff56b3dfe299ad94e01f2b52fbcb80ae1a3b
 const NATIVE_PSEUDO_TOKEN = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
 type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
+
+export interface RpcSimulatorOptions {
+  fetchImpl?: typeof fetch;
+  /**
+   * On chains without eth_simulateV1, simulate with this first (ForkSimulator gives every log there). If it hasn't
+   * finished within `forkBudgetMs` (default 3,500), the probe answers instead, while the fork run carries on in the
+   * background, warming its caches for the next preview.
+   */
+  fork?: FallbackSimulator;
+  forkBudgetMs?: number;
+  /** Replays (accuracy checks): simulate on top of `block` instead of 'latest', with these simulated-block fields. */
+  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string> } | undefined;
+}
+
+/** Code overrides of all the calls (EIP-7702 delegations), applied from the start of the simulated block. */
+const overridesOf = (reqs: SimulationRequest[]) => {
+  const all = Object.assign({}, ...reqs.map(r => r.stateOverrides ?? {})) as Record<string, { code?: string }>;
+  return Object.keys(all).length ? all : undefined;
+};
+
+/** A request's own gas limit, gas price and access list, which contracts can observe (gasleft(), tx.gasprice). */
+const simulationFields = (req: SimulationRequest) => ({
+  ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
+  ...(req.gasPrice !== undefined && { gasPrice: '0x' + req.gasPrice.toString(16) }),
+  ...(req.accessList && { accessList: req.accessList }),
+});
 
 /** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1 or state overrides). */
 export class BatchSimulationUnsupported extends Error {
@@ -43,20 +69,24 @@ export class RpcSimulator implements Simulator {
   private fetchImpl: typeof fetch;
   private fork?: FallbackSimulator;
   private forkBudgetMs: number;
+  private replay?: RpcSimulatorOptions['replay'];
   /** Chains whose RPC answered "method not found" for eth_simulateV1 (e.g. HyperEVM's public RPC). */
   private noSimulate = new Set<number>();
   /** ...and that also ignore eth_call state overrides: only success or failure can be checked. */
   private noProbe = new Set<number>();
-  /**
-   * `fork`: on chains without eth_simulateV1, simulate with this first (ForkSimulator gives every log there). If it
-   * hasn't finished within `forkBudgetMs` (default 3,500), the probe answers instead, while the fork run carries on
-   * in the background, warming its caches for the next preview.
-   */
-  constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch; fork?: FallbackSimulator; forkBudgetMs?: number } = {}) {
+  /** `urls`: an RPC per chain. See RpcSimulatorOptions for the fallback simulator and replays. */
+  constructor(urls: Record<number, string>, options: RpcSimulatorOptions = {}) {
     this.urls = urls;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.fork = options.fork;
     this.forkBudgetMs = options.forkBudgetMs ?? 3500;
+    this.replay = options.replay;
+  }
+
+  /** The block to simulate on top of, and the simulated block's header fields (replays only). */
+  private at(chainId: number): { tag: string; overrides?: Record<string, string> } {
+    const r = this.replay?.(chainId);
+    return r ? { tag: r.block, overrides: r.blockOverrides } : { tag: 'latest' };
   }
   async simulate(req: SimulationRequest): Promise<SimulationResult | null> {
     return (await this.simulateBatch([req]))?.[0] ?? null;
@@ -68,10 +98,10 @@ export class RpcSimulator implements Simulator {
     const url = this.urls[chainId];
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
-    const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }));
+    const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...simulationFields(req) }));
     const res = await this.fetchImpl(url, {
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls }], traceTransfers: true, validation: false }, 'latest'] }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls, ...(this.at(chainId).overrides && { blockOverrides: this.at(chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], traceTransfers: true, validation: false }, this.at(chainId).tag] }),
     });
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
     const body = await res.json() as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
@@ -85,7 +115,7 @@ export class RpcSimulator implements Simulator {
     const parsed: SimulationResult[] = results.map(result => result.status !== '0x1'
       ? { status: 'reverted', source, gasUsed: BigInt(result.gasUsed), revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] }
       : { status: 'success', source, gasUsed: BigInt(result.gasUsed), ...parseLogs(result.logs ?? []) });
-    try { await this.readApprovalState(url, reqs, parsed); } catch { /* keep the event-based values */ }
+    try { await this.readState(url, reqs, parsed); } catch { /* keep the event-based values */ }
     return parsed;
   }
 
@@ -108,7 +138,8 @@ export class RpcSimulator implements Simulator {
       clearTimeout(timer);
       if (first?.r) return first.r;
     }
-    const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase());
+    // The probe takes over the sender's code, so it can't also apply code overrides (EIP-7702 delegations).
+    const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase()) && !overridesOf(reqs);
     if (probeable && !this.noProbe.has(chainId)) {
       try {
         const results = await probeSimulate((method, params) => this.post(url, method, params), reqs, decodeRevert);
@@ -134,7 +165,7 @@ export class RpcSimulator implements Simulator {
   private async ethCallFallback(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
     if (reqs.length > 1) throw new BatchSimulationUnsupported(chainId);
     const req = reqs[0];
-    const body = await this.post(url, 'eth_call', [{ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }, 'latest']);
+    const body = await this.post(url, 'eth_call', [{ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) }, this.at(chainId).tag, ...(req.stateOverrides ? [req.stateOverrides] : [])]);
     const source = `eth_call @ chain ${chainId} (the RPC has no eth_simulateV1)`;
     if (!body.error) return [{ status: 'success', source, transfers: [], limited: true }];
     // A revert comes back as an error carrying the revert data; anything else is a transport or node problem, except
@@ -147,37 +178,73 @@ export class RpcSimulator implements Simulator {
   }
 
   /**
-   * Re-runs the calls with view calls after each one, reading the actual state of every permission the senders
-   * granted so far. Needed because many tokens spend allowances without emitting Approval.
+   * Re-runs the calls in one simulated block with view calls around them, reading the actual state:
+   * - the senders' balances of every token their Transfer logs mention or the calls name, before the first call and
+   *   after each one, so amounts are what balances do (share-based tokens round; WETH-style wrappers emit Deposit and
+   *   Withdrawal rather than Transfer, which logs alone miss);
+   * - every permission the senders granted so far, after each call (many tokens spend allowances without an event).
+   * The reads come from the zero address, so they don't move the senders' nonces. If the re-run's outcomes differ
+   * from the first (the state moved on), the event-based values stand.
    */
-  private async readApprovalState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[]) {
-    const owners = new Set(reqs.map(r => r.from.toLowerCase()));
+  private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[]) {
+    const owners = [...new Set(reqs.map(r => r.from.toLowerCase()))];
     const touched = new Map<string, SimulatedApproval>();
     const after: SimulatedApproval[][] = [];
     for (const r of parsed) {
-      for (const a of r.approvals ?? []) if (owners.has(a.owner)) touched.set(approvalKey(a), a);
+      for (const a of r.approvals ?? []) if (owners.includes(a.owner)) touched.set(approvalKey(a), a);
       after.push([...touched.values()].slice(0, 24));
     }
-    if (!touched.size) return;
+    // Tokens: from the senders' Transfer logs, then the ones the calls name, then the chain's well-known ones.
+    const skip = (a: string) => owners.includes(a) || /^0x0{40}$/.test(a) || BigInt(a) < 0x10000n || a === NATIVE_PSEUDO_TOKEN;
+    const nftCollections = new Set(parsed.flatMap(r => (r.nftTransfers ?? []).map(t => t.collection)));
+    const logged = parsed.flatMap(r => r.transfers.filter(t => t.asset !== 'native' && (owners.includes(t.from) || owners.includes(t.to))).map(t => t.asset));
+    const named = reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(a => a.toLowerCase());
+    const tokens = [...new Set([...logged, ...named, ...builtinTokens(reqs[0].chainId).map(t => t.address.toLowerCase())])].filter(a => !skip(a) && !nftCollections.has(a)).slice(0, 48);
+    const READER = '0x0000000000000000000000000000000000000000';
     const calls: unknown[] = [];
+    const balanceReads = () => owners.flatMap(o => tokens.map(t => { calls.push({ from: READER, to: t, data: `0x70a08231${o.slice(2).padStart(64, '0')}` }); return { owner: o, token: t, index: calls.length - 1 }; }));
+    // ERC-721 contracts count NFTs in balanceOf: those are shown per token ID instead.
+    const nftChecks = tokens.map(t => { calls.push({ from: READER, to: t, data: `0x01ffc9a780ac58cd${'00'.repeat(28)}` }); return calls.length - 1; });
+    const balances: { owner: string; token: string; index: number }[][] = [balanceReads()];
     const reads: { call: number; approval: SimulatedApproval; index: number }[] = [];
+    const callIndex: number[] = [];
     reqs.forEach((req, i) => {
-      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16) });
-      for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: a.owner, to: a.emitter, data: stateCall(a) }); }
+      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...simulationFields(req) });
+      callIndex.push(calls.length - 1);
+      for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: READER, to: a.emitter, data: stateCall(a) }); }
+      balances.push(balanceReads());
     });
     const res = await this.fetchImpl(url, {
       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls }], validation: false }, 'latest'] }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls, ...(this.at(reqs[0].chainId).overrides && { blockOverrides: this.at(reqs[0].chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], validation: false }, this.at(reqs[0].chainId).tag] }),
     });
     const body = await res.json() as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls;
     if (!out || out.length !== calls.length) return;
+    // The re-run must have gone the same way, or its reads describe a different execution.
+    if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success'))) return;
     for (const { call, approval, index } of reads) {
       const r = out[index];
       if (r.status !== '0x1') continue; // non-standard token: keep the event value
       const state = decodeState(approval, r.returnData);
       if (state) (parsed[call].approvalState ??= []).push(state);
     }
+    const word = (r: RawCallResult) => r.status === '0x1' && r.returnData.length >= 66 ? BigInt(r.returnData.slice(0, 66)) : undefined;
+    const isNft = new Set(tokens.filter((_, j) => word(out[nftChecks[j]]) === 1n));
+    parsed.forEach((p, i) => {
+      if (p.status !== 'success') return;
+      for (const [j, b] of balances[i + 1].entries()) {
+        if (isNft.has(b.token)) continue;
+        const x = word(out[balances[i][j].index]), y = word(out[b.index]);
+        if (x === undefined || y === undefined) continue; // balanceOf unreadable: keep the logs
+        // The balance difference replaces whatever the logs said about this token and owner.
+        const target = (reqs[i].to ?? READER).toLowerCase();
+        p.transfers = p.transfers.filter(t => t.asset !== b.token || (t.from !== b.owner && t.to !== b.owner));
+        if (y < x) p.transfers.push({ asset: b.token, from: b.owner, to: target, raw: x - y });
+        else if (y > x) p.transfers.push({ asset: b.token, from: target, to: b.owner, raw: y - x });
+      }
+      p.balancesRead = true;
+    });
   }
 }
 

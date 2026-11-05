@@ -163,6 +163,8 @@ export interface SimulationRequest {
   gas?: bigint;
   gasPrice?: bigint;
   accessList?: { address: string; storageKeys: string[] }[];
+  /** Code to give accounts for the simulation (EIP-7702 authorizations: the delegation designator, or none). */
+  stateOverrides?: Record<string, { code?: string }>;
 }
 
 export interface SimulatedTransfer {
@@ -231,6 +233,8 @@ export interface SimulationResult {
   note?: string;
   /** What the call returned (or its revert data), when the simulator reports it. */
   returnData?: string;
+  /** The amounts were read from balances before and after the call (not taken from the logs). */
+  balancesRead?: boolean;
 }
 
 export interface Simulator {

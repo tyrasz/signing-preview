@@ -121,13 +121,13 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
-    if (results[0].basis === 'state' || results[0].basis === 'fork') b.note(simulationNote({ basis: results[0].basis, tokensRead: Math.max(...results.map(r => r.tokensRead ?? 0)) }));
+    if (results[0].basis === 'state' || results[0].basis === 'fork' || results.some(r => r.balancesRead)) b.note(simulationNote({ basis: results[0].basis, tokensRead: Math.max(...results.map(r => r.tokensRead ?? 0)), balancesRead: results.some(r => r.balancesRead) }));
     if (failed === -1) {
       // Net across the batch: an intermediate token received by one call and spent by the next nets out, and an
       // approval used up or revoked by a later call shows its final state. (Each call's warnings already cover
       // approvals set along the way.)
       if (txs.every(t => t.from === txs[0].from)) {
-        const basis = results[0].basis === 'state' || results[0].basis === 'fork' ? 'simulated_state' as const : 'simulated_events' as const;
+        const basis = results[0].basis === 'state' || results[0].basis === 'fork' || results.every(r => r.balancesRead) ? 'simulated_state' as const : 'simulated_events' as const;
         assetChanges = [...await netChanges(results.flatMap(r => r.transfers), txs[0], deps, b, basis), ...await nftChanges(results.flatMap(r => r.nftTransfers ?? []), txs[0], deps, b, basis)];
         // The state read after the last call covers every permission touched by the batch.
         approvals = await approvalChanges(results.flatMap((r, i) => (r.approvals ?? []).map(approval => ({ approval, callTo: txs[i].to }))), txs[0], deps, results[results.length - 1].approvalState);

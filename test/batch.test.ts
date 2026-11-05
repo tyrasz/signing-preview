@@ -102,7 +102,7 @@ test('RpcSimulator runs a batch as consecutive calls in one eth_simulateV1 block
   let sent: { method: string; params: [{ blockStateCalls: { calls: { to: string }[] }[] }] } | undefined;
   const revert = encodeAbiParameters([{ type: 'string' }], ['Hook data is empty']);
   const fetchImpl = (async (_url: string, init: RequestInit) => {
-    sent = JSON.parse(String(init.body));
+    sent ??= JSON.parse(String(init.body)); // the simulation itself (a second request reads balances back)
     return new Response(JSON.stringify({ result: [{ calls: [
       { status: '0x1', gasUsed: '0xb44b', returnData: '0x', logs: [] },
       { status: '0x0', gasUsed: '0x7a12', returnData: '0x08c379a0' + revert.slice(2), logs: [] },

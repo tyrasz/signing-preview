@@ -116,6 +116,8 @@ class StateSource {
   storage = new Map<string, Uint8Array>();
   calls = new Map<string, { ok: boolean; data: Uint8Array }>();
   requests = 0;
+  /** Code given to accounts for this simulation (EIP-7702 delegation designators), instead of theirs. */
+  codeOverrides = new Map<string, Uint8Array>();
   private url: string; private block: string; private fetchImpl: typeof fetch; private batchSize: number; private concurrency: number; private deadline: number;
   private chainId: number;
   constructor(chainId: number, url: string, block: string, fetchImpl: typeof fetch, batchSize: number, concurrency: number, deadline: number) {
@@ -135,7 +137,7 @@ class StateSource {
     const jobs: Job[] = [];
     const pending: [string, AccountData][] = [];
     for (const a of m.accounts) {
-      const cached = CODE_CACHE.get(`${this.chainId}:${a}`);
+      const cached = this.codeOverrides.get(a) ?? CODE_CACHE.get(`${this.chainId}:${a}`);
       const acc: AccountData = { balance: 0n, nonce: 0n, code: cached ?? new Uint8Array(0) };
       pending.push([a, acc]);
       jobs.push({ method: 'eth_getBalance', params: [a, this.block], done: r => { acc.balance = BigInt(r as string); } });
@@ -182,7 +184,7 @@ class StateSource {
   guessAccount(a: string): AccountData | undefined {
     const g = GUESS_ACCOUNTS.get(`${this.chainId}:${a}`);
     if (!g) return undefined;
-    const code = g.hasCode ? CODE_CACHE.get(`${this.chainId}:${a}`) : new Uint8Array(0);
+    const code = this.codeOverrides.get(a) ?? (g.hasCode ? CODE_CACHE.get(`${this.chainId}:${a}`) : new Uint8Array(0));
     return code ? { balance: g.balance, nonce: g.nonce, code } : undefined;
   }
   guessStorage(k: string) { return GUESS_STORAGE.get(`${this.chainId}:${k}`); }
@@ -332,6 +334,7 @@ export class ForkSimulator implements Simulator {
     const started = Date.now(), deadline = started + this.opts.timeoutMs;
     const tag = this.opts.block?.(chainId) ?? 'latest';
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
+    for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) if (o.code !== undefined) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
     // The senders and targets are certain to be read: fetch them before the first run.
     const first = newMisses();
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.to) first.accounts.add(hexOf(r.to)); }

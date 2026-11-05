@@ -149,15 +149,17 @@ test('RpcSimulator reads the real allowance after each call, so a silently spent
       { status: '0x1', gasUsed: '0x1', returnData: '0x', logs: [{ address: USDC, topics: [T.approval, w(ALICE), w(ROUTER)], data: data(10_000_000n) }] },
       { status: '0x1', gasUsed: '0x1', returnData: '0x', logs: [{ address: USDC, topics: [T.transfer, w(ALICE), w(ROUTER)], data: data(10_000_000n) }] },
     ] }] }));
-    // Second pass: [call 1, allowance read, call 2, allowance read]; the allowance is 10 USDC after call 1 and 0 after call 2.
+    // Second pass: [balance reads, call 1, allowance read, balance reads, call 2, allowance read, balance reads]; the
+    // allowance is 10 USDC after call 1 and 0 after call 2.
     return new Response(JSON.stringify({ result: [{ calls: calls.map((c, i) => ({ status: '0x1', gasUsed: '0x1', logs: [],
-      returnData: c.data.startsWith('0xdd62ed3e') ? data(i === 1 ? 10_000_000n : 0n) : '0x' })) }] }));
+      returnData: c.data.startsWith('0xdd62ed3e') ? data(calls.slice(0, i).some(x => x.data.startsWith('0xdeadbeef')) ? 0n : 10_000_000n) : '0x' })) }] }));
   }) as typeof fetch;
   const simulator = new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl });
   const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [ROUTER, 10_000_000n] });
   const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [{ to: USDC, data: approve }, { to: ROUTER, data: '0xdeadbeef' }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
-  assert.equal(bodies.length, 2, 'a second pass only because approvals were emitted');
-  assert.deepEqual(bodies[1].params[0].blockStateCalls[0].calls.map(c => c.data.slice(0, 10)), [approve.slice(0, 10), '0xdd62ed3e', '0xdeadbeef', '0xdd62ed3e']);
+  assert.equal(bodies.length, 2, 'the simulation, then the state read back');
+  const reads = new Set(['0x70a08231', '0x01ffc9a7']); // balances and NFT checks, around the calls
+  assert.deepEqual(bodies[1].params[0].blockStateCalls[0].calls.map(c => c.data.slice(0, 10)).filter(s => !reads.has(s)), [approve.slice(0, 10), '0xdd62ed3e', '0xdeadbeef', '0xdd62ed3e']);
   assert.deepEqual(p.calls?.[0].approvals?.map(a => [a.allowance, a.basis]), [['10 USDC', 'simulated_state']], 'state after call 1');
   assert.deepEqual(p.approvals?.map(a => [a.allowance, a.revoked, a.basis]), [['none', true, 'simulated_state']], 'state after the batch');
 });

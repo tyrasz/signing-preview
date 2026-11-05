@@ -7,7 +7,7 @@ import { encodeFunctionData, parseAbi, toHex, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
-import type { AbiResolver, Dependencies, Simulator } from '../src/types.ts';
+import type { AbiResolver, Dependencies, SimulationRequest, Simulator } from '../src/types.ts';
 import { ALICE, BOB } from '../mocks/data.ts';
 import { codes, detail, NOW } from './helpers.ts';
 
@@ -57,11 +57,18 @@ test('Signed authorizations: yours is danger, another account’s is information
   assert.ok(codes(elsewhere).includes('eip7702_delegation'));
 });
 
-test('A transaction with an authorization list is not simulated without it; malformed lists are rejected', async () => {
-  const simulator: Simulator = { simulate: async () => ({ status: 'success', source: 'test', transfers: [] }) };
+test('A transaction with an authorization list is simulated with the delegation applied; malformed lists are rejected', async () => {
+  const requests: SimulationRequest[] = [];
+  const simulator: Simulator = { simulate: async r => { requests.push(r); return { status: 'success', source: 'test', transfers: [] }; } };
   const p = await send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x0' }] }, { ...deps, simulator });
-  assert.equal(p.simulation?.status, 'unavailable');
-  assert.ok(codes(p).includes('simulation_skipped'));
+  assert.equal(p.simulation?.status, 'success');
+  assert.deepEqual(requests[0].stateOverrides, { [ALICE]: { code: `0xef0100${DELEGATE.slice(2)}` } });
+  assert.ok(p.decoding.notes.some(n => /EIP-7702 authorizations applied/.test(n)));
+  // A revocation simulates the account without code; HyperEVM (Cancun rules) doesn't apply EIP-7702 at all.
+  await send({ to: ALICE, authorizationList: [{ address: '0x0000000000000000000000000000000000000000', chainId: '0x1', nonce: '0x0' }] }, { ...deps, simulator });
+  assert.deepEqual(requests[1].stateOverrides, { [ALICE]: { code: '0x' } });
+  const hyper = await send({ to: ALICE, chainId: '0x3e7', authorizationList: [{ address: DELEGATE, chainId: '0x3e7', nonce: '0x0' }] }, { ...deps, simulator });
+  assert.ok(codes(hyper).includes('simulation_skipped'));
   // An empty list changes nothing.
   assert.equal((await send({ to: BOB, value: '0x1', authorizationList: [] })).title, 'Send 0.000000000000000001 ETH');
   await assert.rejects(send({ to: ALICE, authorizationList: { address: DELEGATE } }), /"authorizationList" must be an array/);

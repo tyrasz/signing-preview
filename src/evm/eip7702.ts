@@ -40,12 +40,21 @@ export interface DelegationEffects {
   ownRevoke: boolean;
   /** Clause for the summary, e.g. "delegates your account to 0x63c0…32b (EIP7702StatelessDeleGator)". */
   clause: string;
+  /**
+   * The code each authority will have once the authorizations apply (the 0xef0100 delegation designator, or none
+   * for a revocation), for simulating the transaction as it will run.
+   */
+  codeOverrides: Record<string, string>;
 }
+
+/** Chains whose EVM applies EIP-7702 (Prague and later). HyperEVM runs Cancun rules. */
+export const SUPPORTS_7702 = new Set([1, 11155111, 42161, 421614]);
 
 /** Details and warnings for the authorization list; null when there is none. */
 export async function delegationEffects(tx: Tx, deps: Dependencies, b: PreviewBuilder): Promise<DelegationEffects | null> {
   if (!tx.authorizations?.length) return null;
   const clauses: string[] = [];
+  const codeOverrides: Record<string, string> = {};
   let ownDelegate: DelegationEffects['ownDelegate'], ownRevoke = false;
   for (const [i, a] of tx.authorizations.entries()) {
     const authority = await authorityOf(tx, a);
@@ -57,8 +66,12 @@ export async function delegationEffects(tx: Tx, deps: Dependencies, b: PreviewBu
     const account = yours ? 'your account' : `account ${authority}`;
     // chainId 0 is valid on every chain: whoever holds the signed authorization can submit it anywhere.
     const where = a.chainId === 0 ? 'on every EVM chain' : `on ${chainName(a.chainId ?? tx.chainId)}`;
-    if (a.chainId !== undefined && a.chainId !== 0 && a.chainId !== tx.chainId) {
-      b.warn('caution', 'eip7702_other_chain', `Authorization ${i + 1} is for ${chainName(a.chainId)}, not ${chainName(tx.chainId)}. This transaction can't apply it, but anyone holding it can submit it there.`);
+    const applies = a.chainId === undefined || a.chainId === 0 || a.chainId === tx.chainId;
+    if (!applies) {
+      b.warn('caution', 'eip7702_other_chain', `Authorization ${i + 1} is for ${chainName(a.chainId!)}, not ${chainName(tx.chainId)}. This transaction can't apply it, but anyone holding it can submit it there.`);
+    } else {
+      // Later authorizations for the same account win, as on-chain.
+      codeOverrides[authority] = sameAddress(a.address, ZERO) ? '0x' : `0xef0100${a.address.slice(2).toLowerCase()}`;
     }
     if (sameAddress(a.address, ZERO)) {
       b.detail('EIP-7702 delegation', `clear ${account}'s delegation ${where}`, a.address);
@@ -78,5 +91,5 @@ export async function delegationEffects(tx: Tx, deps: Dependencies, b: PreviewBu
     }
     clauses.push(`delegates ${account} to ${shortAddress(a.address)}${name ? ` (${name})` : ''} (EIP-7702)`);
   }
-  return clauses.length ? { ownDelegate, ownRevoke, clause: clauses.join('; ') } : null;
+  return clauses.length ? { ownDelegate, ownRevoke, clause: clauses.join('; '), codeOverrides } : null;
 }
