@@ -170,6 +170,12 @@ export interface SimulationRequest {
    * so validity, nonces and their gas are exact; the others use `stateOverrides`.
    */
   authorizationList?: { address: string; chainId: string; nonce: string; r: string; s: string; yParity: string }[];
+  /**
+   * EIP-7702 authorizations the wallet has yet to sign, all for the sender's account (address zero clears its
+   * delegation; chainId 0 means every chain). Their code is in `stateOverrides`; simulators add what processing them
+   * costs, and ForkSimulator applies them as the chain will.
+   */
+  unsignedAuthorizations?: { address: string; chainId: number }[];
 }
 
 export interface SimulatedTransfer {

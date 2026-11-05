@@ -154,6 +154,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         const signed = (tx.authorizations ?? []).filter(a => a.signature);
         const hex = (v: bigint | number) => `0x${v.toString(16)}`;
         if (signed.length) request.authorizationList = signed.map(a => ({ address: a.address, chainId: hex(a.chainId ?? tx.chainId), nonce: hex(a.nonce ?? 0n), r: a.signature!.r, s: a.signature!.s, yParity: hex(a.signature!.yParity) }));
+        const unsigned = (tx.authorizations ?? []).filter(a => !a.signature);
+        if (unsigned.length) request.unsignedAuthorizations = unsigned.map(a => ({ address: a.address, chainId: a.chainId ?? tx.chainId }));
         b.note('Simulated with the EIP-7702 authorizations applied: the delegated accounts run their new code.');
       }
       outcome = { result: await deps.simulator.simulate(request) };

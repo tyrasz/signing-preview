@@ -6,8 +6,11 @@ import { encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, serialize
 import { privateKeyToAccount, sign } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { PERMIT2, StaticTokenRegistry } from '../src/chains.ts';
-import { RpcSimulator } from '../src/simulation.ts';
-import { CHAIN_PROFILES, ForkSimulator, ForkTimeout } from '../src/fork-simulator.ts';
+import { RpcSimulator, withUnsignedAuthorizationGas } from '../src/simulation.ts';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CHAIN_PROFILES, clearForkCaches, ForkSimulator, ForkTimeout } from '../src/fork-simulator.ts';
 import type { Dependencies, Preview } from '../src/types.ts';
 import { codes, NOW } from './helpers.ts';
 import { compiled, PRECOMPILE, testChain } from './evm-chain.ts';
@@ -135,6 +138,86 @@ test('EIP-7702: an account delegated to a smart-account contract runs its code (
   const [delegated] = (await sim.simulateBatch([{ ...req, stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } }]))!;
   assert.equal(delegated.status, 'success');
   assert.deepEqual(delegated.transfers.filter(t => t.asset === usdc).map(t => [t.from, t.raw]), [[USER, 5_000_000n]]);
+});
+
+test('EIP-7702 authorizations are applied as the chain does: validity, nonces, persistence and their gas', async () => {
+  const executor = await chain.deploy('Executor');
+  const sim = new ForkSimulator({ 1: URL_ }, { fetchImpl: chain.fetchImpl });
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute(address,bytes)']), functionName: 'execute', args: [usdc as Hex, call('transfer', [BOB, 5_000_000n])] });
+  const base = { chainId: 1, from: USER, to: USER, data: execute, value: 0n };
+  const signed = async (key: Hex, nonce: number) => {
+    const a = await privateKeyToAccount(key).signAuthorization({ address: executor as Hex, chainId: 1, nonce });
+    return { address: executor, chainId: '0x1', nonce: toHex(nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) };
+  };
+  // The code override alone (what a simulator without EIP-7702 processing does) costs nothing extra.
+  const [override] = (await sim.simulateBatch([{ ...base, stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } }]))!;
+  // Signed by the sender, with its nonce after this transaction's own (0 → 1): applied. 25,000 for the
+  // authorization, less 12,500 back because the account exists.
+  const [mine] = (await sim.simulateBatch([{ ...base, authorizationList: [await signed(KEY, 1)], stateOverrides: { [USER]: { code: '0x' } } }]))!;
+  assert.equal(mine.status, 'success');
+  // The account called itself, so the other side is unknown: not the account, which would cancel the change out.
+  assert.deepEqual(mine.transfers.filter(t => t.asset === usdc).map(t => [t.from, t.to, t.raw]), [[USER, '0x0000000000000000000000000000000000000000', 5_000_000n]]);
+  assert.equal(mine.gasUsed, override.gasUsed! + 12_500n);
+  // The wallet's own, unsigned: the same gas, and RpcSimulator's estimate from the override's gas agrees.
+  const unsigned = { ...base, unsignedAuthorizations: [{ address: executor, chainId: 1 }], stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } };
+  assert.equal((await sim.simulate(unsigned))!.gasUsed, mine.gasUsed);
+  assert.equal(withUnsignedAuthorizationGas(unsigned, override.gasUsed!), mine.gasUsed);
+  // A stale nonce: the chain skips the authorization (and the override standing in for it), so the call reaches an
+  // account without code and does nothing; the 25,000 is still paid.
+  const [stale] = (await sim.simulateBatch([{ ...base, authorizationList: [await signed(KEY, 0)], stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } }]))!;
+  assert.deepEqual(stale.transfers, []);
+  assert.equal(stale.gasUsed, 21_000n + 25_000n + calldataGas(execute));
+  // Another account's authorization, sponsored by this one: no refund (the account didn't exist), and the delegation
+  // stays for the next call of the batch, which runs the delegate's code as that (empty) account.
+  const OTHER = '0x6666666666666666666666666666666666666666666666666666666666666666' as const;
+  const other = privateKeyToAccount(OTHER).address.toLowerCase();
+  const plain = { chainId: 1, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n };
+  const [without] = (await sim.simulateBatch([plain]))!;
+  const [sponsored, next] = (await sim.simulateBatch([{ ...plain, authorizationList: [await signed(OTHER, 0)] }, { ...base, to: other }]))!;
+  assert.equal(sponsored.gasUsed, without.gasUsed! + 25_000n);
+  assert.equal(next.status, 'reverted');
+  assert.equal(next.revertReason, 'balance');
+});
+
+test('A wallet upgrading its own account and running a batch through it shows the batch’s balance changes', async () => {
+  const executor = await chain.deploy('Executor');
+  const sim = new RpcSimulator({ 1: URL_ }, { fetchImpl: chain.fetchImpl, fork: new ForkSimulator({ 1: URL_ }, { fetchImpl: chain.fetchImpl }) });
+  const tokens1 = new StaticTokenRegistry({ 1: [{ address: usdc, symbol: 'USDC', decimals: 6, name: 'USD Coin' }] });
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute(address,bytes)']), functionName: 'execute', args: [usdc as Hex, call('transfer', [BOB, 5_000_000n])] });
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: USER, to: USER, data: execute, chainId: '0x1', authorizationList: [{ address: executor, chainId: '0x1' }] }] }, { now: NOW }, { tokens: tokens1, simulator: sim });
+  assert.ok(codes(p).includes('eip7702_delegation'));
+  assert.deepEqual(changes(p), [['out', '5', 'USDC', 'simulated_state']]);
+});
+
+const calldataGas = (data: Hex) => { let g = 0n; for (let i = 2; i < data.length; i += 2) g += data.slice(i, i + 2) === '00' ? 4n : 16n; return g; };
+
+test('A cache file keeps what simulations have seen across restarts: the first preview after one is fast', async () => {
+  let hop = '0x0000000000000000000000000000000000000000';
+  for (let i = 1; i <= 8; i++) hop = await chain.deploy('Hop', 'address,uint256', [hop, BigInt(i)]);
+  const req = { chainId: 999, from: USER, to: hop, data: encodeFunctionData({ abi: parseAbi(['function total() view returns (uint256)']), functionName: 'total' }), value: 0n };
+  const file = join(mkdtempSync(join(tmpdir(), 'fork-cache-')), 'cache.json');
+  clearForkCaches();
+  const first = fork({ cacheFile: file });
+  assert.equal(first.loaded, 0);
+  const [r] = (await first.simulateBatch([req]))!;
+  assert.equal(BigInt(r.returnData!), 36n);
+  const cold = first.last!.rounds;
+  first.persist();
+  // A restart: the in-memory caches are gone, and come back from the file.
+  clearForkCaches();
+  const restarted = fork({ cacheFile: file });
+  assert.ok(restarted.loaded > 0);
+  const [again] = (await restarted.simulateBatch([req]))!;
+  assert.equal(BigInt(again.returnData!), 36n);
+  assert.ok(cold >= 8 && restarted.last!.rounds <= 2, `${cold} rounds cold, ${restarted.last!.rounds} after the restart`);
+  // Without the file, a restart starts cold again.
+  clearForkCaches();
+  const blank = fork();
+  await blank.simulateBatch([req]);
+  assert.equal(blank.last!.rounds, cold);
+  // A missing or broken file is no cache, not an error.
+  writeFileSync(file, '{');
+  assert.equal(fork({ cacheFile: file }).loaded, 0);
 });
 
 test('When the fork simulator runs out of budget, the probe reads the tokens it had already seen', async () => {

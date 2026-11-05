@@ -32,6 +32,12 @@ export interface RpcSimulatorOptions {
   replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string> } | undefined;
 }
 
+/**
+ * The counterparty given to a balance change read from state when the call's target is the account itself: the
+ * change is real, but who is on the other side isn't known.
+ */
+export const ELSEWHERE = '0x0000000000000000000000000000000000000000';
+
 /** Code overrides of all the calls (EIP-7702 delegations), applied from the start of the simulated block. */
 const overridesOf = (reqs: SimulationRequest[]) => {
   const all = Object.assign({}, ...reqs.map(r => r.stateOverrides ?? {})) as Record<string, { code?: string }>;
@@ -60,6 +66,20 @@ async function simulateV1Overrides(reqs: SimulationRequest[]) {
     } catch { /* unreadable: the chain skips it, and so does the override */ }
   }
   return Object.keys(all).length ? all : undefined;
+}
+
+/**
+ * The gas of a call whose EIP-7702 authorizations the wallet has yet to sign, from what a simulator measured with
+ * them applied as code overrides (which cost nothing): plus 25,000 for each, less a refund of 12,500 for each that
+ * applies (the sender's account exists), within the refund cap of a fifth of the gas. Exact when the call itself
+ * earns no refund; otherwise the cap can make it slightly high.
+ */
+export function withUnsignedAuthorizationGas(req: SimulationRequest, gasUsed: bigint): bigint {
+  const list = req.unsignedAuthorizations ?? [];
+  if (!list.length) return gasUsed;
+  const used = gasUsed + 25_000n * BigInt(list.length);
+  const refund = 12_500n * BigInt(list.filter(a => a.chainId === 0 || a.chainId === req.chainId).length);
+  return used - (refund < used / 5n ? refund : used / 5n);
 }
 
 /** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1 or state overrides). */
@@ -128,9 +148,12 @@ export class RpcSimulator implements Simulator {
     const results = body.result?.[0]?.calls;
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const source = `eth_simulateV1 @ chain ${chainId}`;
-    const parsed: SimulationResult[] = results.map(result => result.status !== '0x1'
-      ? { status: 'reverted', source, gasUsed: BigInt(result.gasUsed), revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] }
-      : { status: 'success', source, gasUsed: BigInt(result.gasUsed), ...parseLogs(result.logs ?? []) });
+    const parsed: SimulationResult[] = results.map((result, i) => {
+      const gasUsed = withUnsignedAuthorizationGas(reqs[i], BigInt(result.gasUsed));
+      return result.status !== '0x1'
+        ? { status: 'reverted', source, gasUsed, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] }
+        : { status: 'success', source, gasUsed, ...parseLogs(result.logs ?? []) };
+    });
     try { await this.readState(url, reqs, parsed); } catch { /* keep the event-based values */ }
     return parsed;
   }
@@ -265,7 +288,8 @@ export class RpcSimulator implements Simulator {
         const x = word(out[balances[i][j].index]), y = word(out[b.index]);
         if (x === undefined || y === undefined) continue; // balanceOf unreadable: keep the logs
         // The balance difference replaces whatever the logs said about this token and owner.
-        const target = (reqs[i].to ?? READER).toLowerCase();
+        // A call to the account itself (an EIP-7702 account running its own batch) moved the tokens elsewhere.
+        const to = (reqs[i].to ?? READER).toLowerCase(), target = to === b.owner ? ELSEWHERE : to;
         p.transfers = p.transfers.filter(t => t.asset !== b.token || (t.from !== b.owner && t.to !== b.owner));
         if (y < x) p.transfers.push({ asset: b.token, from: b.owner, to: target, raw: x - y });
         else if (y > x) p.transfers.push({ asset: b.token, from: target, to: b.owner, raw: y - x });

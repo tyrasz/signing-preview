@@ -148,3 +148,12 @@ contract Executor {
         if (!ok) assembly { revert(add(r, 32), mload(r)) }
     }
 }
+
+/// Each hop names the next in its storage, as proxies, registries and diamonds do, so a simulator that fetches
+/// state on demand learns one link per round unless it has seen them before.
+contract Hop {
+    Hop public immutable next;
+    uint256 public value;
+    constructor(Hop n, uint256 v) { next = n; value = v; }
+    function total() external view returns (uint256) { return value + (address(next) == address(0) ? 0 : next.total()); }
+}

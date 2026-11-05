@@ -63,6 +63,7 @@ test('A transaction with an authorization list is simulated with the delegation 
   const p = await send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x0' }] }, { ...deps, simulator });
   assert.equal(p.simulation?.status, 'success');
   assert.deepEqual(requests[0].stateOverrides, { [ALICE]: { code: `0xef0100${DELEGATE.slice(2)}` } });
+  assert.deepEqual(requests[0].unsignedAuthorizations, [{ address: DELEGATE, chainId: 1 }]);
   assert.ok(p.decoding.notes.some(n => /EIP-7702 authorizations applied/.test(n)));
   // A revocation simulates the account without code; HyperEVM (Cancun rules) doesn't apply EIP-7702 at all.
   await send({ to: ALICE, authorizationList: [{ address: '0x0000000000000000000000000000000000000000', chainId: '0x1', nonce: '0x0' }] }, { ...deps, simulator });
@@ -74,6 +75,14 @@ test('A transaction with an authorization list is simulated with the delegation 
   await assert.rejects(send({ to: ALICE, authorizationList: { address: DELEGATE } }), /"authorizationList" must be an array/);
   await assert.rejects(send({ to: ALICE, authorizationList: [{ address: '0x1234' }] }), /authorizationList\[0\]\.address must be an address/);
   await assert.rejects(send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: 1, nonce: 0, r: '0x01', s: '0x02' }] }), /is signed but has no yParity/);
+});
+
+test('An unsigned authorization adds its gas to what eth_simulateV1 measured with the override', async () => {
+  const fetchImpl = (async () => new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] }] }] }))) as unknown as typeof fetch;
+  const { RpcSimulator } = await import('../src/simulation.ts');
+  const p = await send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x1' }] }, { ...deps, simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
+  // 21,000 + 25,000, less the 12,500 refund capped at a fifth (9,200), as the chain charges.
+  assert.equal(p.simulation?.gasUsed, '36800');
 });
 
 test('Signed authorizations go to eth_simulateV1 as they are, and their authorities get no code override', async () => {

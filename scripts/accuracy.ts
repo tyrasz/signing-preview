@@ -1,4 +1,4 @@
-// npm run accuracy -- [--chain 1|42161] [--blocks 30] [--per-block 3] [--max-index 8] [--only-type 0x4] [--simulators eth_simulateV1,fork] [--out report.json]
+// npm run accuracy -- [--chain 1|42161] [--blocks 30] [--per-block 3] [--max-index 8] [--only-type 0x4] [--unsigned-7702] [--simulators eth_simulateV1,fork] [--out report.json]
 //
 // How accurate simulation is, measured against what actually happened. Recent Ethereum transactions from one-off
 // senders are replayed at their exact pre-state: on top of the parent block, after the earlier transactions of their
@@ -10,6 +10,8 @@
 // Public RPCs keep only recent state (Ethereum about 128 blocks, ~25 minutes; Arbitrum about 30 seconds), so only
 // the latest blocks can be replayed. On Arbitrum, ArbOS's own transactions are skipped and gas is compared without
 // the L1 data part of the receipt (gasUsedForL1); the fork simulator doesn't model ArbOS, so it runs on Ethereum only.
+// --unsigned-7702 replays the sender's own EIP-7702 authorizations as if the wallet had yet to sign them (code
+// overrides and the request's unsignedAuthorizations), which is how a preview before signing sees them.
 import { writeFileSync } from 'node:fs';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
@@ -22,6 +24,7 @@ const CHAIN = Number(arg('chain', '1'));
 const URL_ = CHAIN === 42161 ? process.env.ARBITRUM_RPC_URL ?? 'https://arb1.arbitrum.io/rpc' : process.env.ETHEREUM_RPC_URL ?? 'https://ethereum-rpc.publicnode.com';
 const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : new Set<string>();
 const BLOCKS = Number(arg('blocks', '30')), PER_BLOCK = Number(arg('per-block', '3')), MAX_INDEX = Number(arg('max-index', '8'));
+const UNSIGNED = process.argv.includes('--unsigned-7702');
 const ONLY_TYPE = arg('only-type', ''), SIMULATORS = arg('simulators', 'eth_simulateV1,fork').split(',');
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 20_000, retries: CHAIN === 42161 ? 8 : 4, retryDelayMs: CHAIN === 42161 ? 1000 : 400 });
 type Hex = `0x${string}`;
@@ -53,10 +56,14 @@ async function delegations(t: T, tag: string): Promise<Record<string, { code: st
   }
   return Object.keys(out).length ? out : undefined;
 }
-const reqOf = async (t: T, tag: string): Promise<SimulationRequest> => {
+const authorityOf = async (a: Auth) => { try { return (await recoverAuthorizationAddress({ authorization: { address: a.address, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r, s: a.s, yParity: Number(a.yParity) } })).toLowerCase(); } catch { return null; } };
+/** Whether every authorization of the transaction is the sender's own (what a wallet would sign for its account). */
+const selfSigned = async (t: T) => !!t.authorizationList?.length && (await Promise.all(t.authorizationList.map(authorityOf))).every(a => a === t.from.toLowerCase());
+const reqOf = async (t: T, tag: string, unsigned = false): Promise<SimulationRequest> => {
   const stateOverrides = await delegations(t, tag);
-  return { chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), gas: BigInt(t.gas), gasPrice: BigInt(t.gasPrice), accessList: t.accessList, ...(stateOverrides && { stateOverrides }),
-    ...(t.authorizationList?.length && { authorizationList: t.authorizationList }) };
+  const auths = unsigned ? { unsignedAuthorizations: t.authorizationList!.map(a => ({ address: a.address.toLowerCase(), chainId: Number(a.chainId) })) }
+    : t.authorizationList?.length ? { authorizationList: t.authorizationList } : {};
+  return { chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), gas: BigInt(t.gas), gasPrice: BigInt(t.gasPrice), accessList: t.accessList, ...(stateOverrides && { stateOverrides }), ...auths };
 };
 const net = (transfers: { asset: string; from: string; to: string; raw: bigint }[], who: string) => {
   const m = new Map<string, bigint>();
@@ -98,7 +105,9 @@ for (const b of blocks) {
     const approvals = logs.approvals.filter(a => a.owner === from && !(a.kind === 'erc721' && /^0x0{40}$/.test(a.spender))).map(a => `${a.kind}:${a.token}:${a.spender}`);
     const row: Record<string, unknown> = { hash: t.hash, block: n, index, to: t.to, selector: t.input.slice(0, 10), receipt: r.status === '0x1' ? 'success' : 'reverted', receiptGas: (BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0)).toString() };
     const before = await Promise.all(b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type)).map(x => reqOf(x, parent)));
-    const target = await reqOf(t, parent);
+    const unsigned = UNSIGNED && await selfSigned(t);
+    if (UNSIGNED && !unsigned) { taken--; continue; }
+    const target = await reqOf(t, parent, unsigned);
     row.type = t.type;
     for (const [name, sim] of simulators) {
       const t0 = Date.now();

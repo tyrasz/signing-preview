@@ -154,7 +154,9 @@ export async function probeSimulate(post: RpcPost, reqs: SimulationRequest[], de
   const source = `eth_call with a state-override probe @ chain ${chainId}${block === 'latest' ? '' : ` block ${block}`} (the RPC has no eth_simulateV1)`;
   const touched = new Map<number, SimulatedApproval>(); // approval reads changed so far, by read index
   return reqs.map((req, i): SimulationResult => {
-    const before = snapshots[i], after = snapshots[i + 1], target = req.to!.toLowerCase();
+    const before = snapshots[i], after = snapshots[i + 1];
+    // A call to the account itself moved the tokens elsewhere (the zero address stands for "unknown").
+    const target = req.to!.toLowerCase() === account ? '0x0000000000000000000000000000000000000000' : req.to!.toLowerCase();
     const o = outcomes[i];
     const gasUsed = o.gasUsed + intrinsicGas(req.data);
     if (!o.ok) {

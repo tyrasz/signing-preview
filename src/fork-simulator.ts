@@ -10,15 +10,18 @@
 // Amounts come from the state, not the logs: the account's balance of each token its Transfer logs mention (and of
 // the native coin) is read before and after each call, so fee-on-transfer and rebasing tokens come out exact.
 // Approvals come from Approval logs and are read back from the token after each call.
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { createEVM, EVMError, type EVM } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, unpadBytes, type Address } from '@ethereumjs/util';
 import { keccak256 } from 'viem';
+import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
-import { approvalKey, decodeRevert, decodeState, namedApproval, parseLogs, stateCall } from './simulation.ts';
+import { approvalKey, decodeRevert, decodeState, ELSEWHERE, namedApproval, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -67,6 +70,13 @@ export interface ForkSimulatorOptions {
    */
   header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint } | undefined;
   profiles?: Record<number, ChainProfile>;
+  /**
+   * A file to keep the caches shared by all simulations in (contract code and the last value seen of each slot), so
+   * a restarted server's first previews are as fast as before it stopped. Loaded when the simulator is created,
+   * saved a few seconds after simulations. The values in it are only guesses, so a stale file costs rounds, never
+   * accuracy.
+   */
+  cacheFile?: string;
   /** Called after each speculative round with what it still needed (for tuning). */
   onRound?: (round: number, misses: { accounts: string[]; storage: string[]; calls: string[] }, grew: boolean) => void;
 }
@@ -81,7 +91,8 @@ const GAS = 30_000_000n;
 const PROXY_SLOTS = ['0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50', '0x7050c9e0f4ca769c69bd3a8ef740bc37934f8e2c036e5a723fd8ee048ed3f8c3'];
 /**
  * Contract code by chain and address, shared by all simulations: once deployed, code can't change (Cancun removed
- * self-destruct redeployment). Only non-empty code is kept, since an empty address can still be deployed to.
+ * self-destruct redeployment). Only non-empty code is kept, since an empty address can still be deployed to, and not
+ * EIP-7702 delegations, which their account can change.
  */
 const CODE_CACHE = new Map<string, Uint8Array>();
 const CODE_CACHE_MAX = 4000;
@@ -97,6 +108,10 @@ class Guesses<V> {
   private map = new Map<string, V>();
   private max: number;
   constructor(max: number) { this.max = max; }
+  get size() { return this.map.size; }
+  clear() { this.map.clear(); }
+  /** Most recently set first. */
+  recent(): [string, V][] { return [...this.map].reverse(); }
   get(k: string) { return this.map.get(k); }
   set(k: string, v: V) {
     this.map.delete(k);
@@ -107,6 +122,60 @@ class Guesses<V> {
 const GUESS_ACCOUNTS = new Guesses<{ balance: bigint; nonce: bigint; hasCode: boolean }>(20_000);
 const GUESS_STORAGE = new Guesses<Uint8Array>(200_000);
 const GUESS_CALLS = new Guesses<{ ok: boolean; data: Uint8Array }>(20_000);
+
+/** What the cache file holds, most recent first, within these limits (about 25 MB). */
+const SAVED = { accounts: 20_000, storage: 100_000, calls: 10_000, codeHexChars: 16_000_000 };
+interface CacheFile {
+  version: 1;
+  code: [string, string][];
+  accounts: [string, string, string, boolean][];
+  storage: [string, string][];
+  calls: [string, boolean, string][];
+}
+
+/** Loads a cache file written by saveForkCache into the shared caches. Returns the number of values loaded (0 when there is no file). */
+export function loadForkCache(file: string): number {
+  let c: CacheFile;
+  try { c = JSON.parse(readFileSync(file, 'utf8')); } catch { return 0; }
+  if (c?.version !== 1) return 0;
+  // Oldest first, so the most recent end up most recent again.
+  for (const [k, v] of c.code) if (CODE_CACHE.size < CODE_CACHE_MAX) CODE_CACHE.set(k, hexToBytes(v as Hex));
+  for (const [k, b, n, hasCode] of [...c.accounts].reverse()) GUESS_ACCOUNTS.set(k, { balance: BigInt(b), nonce: BigInt(n), hasCode });
+  for (const [k, v] of [...c.storage].reverse()) GUESS_STORAGE.set(k, hexToBytes(v as Hex));
+  for (const [k, ok, v] of [...c.calls].reverse()) GUESS_CALLS.set(k, { ok, data: hexToBytes(v as Hex) });
+  return c.code.length + c.accounts.length + c.storage.length + c.calls.length;
+}
+
+/** Empties the caches shared by all simulations (code and last values seen). */
+export function clearForkCaches(): void {
+  CODE_CACHE.clear();
+  GUESS_ACCOUNTS.clear();
+  GUESS_STORAGE.clear();
+  GUESS_CALLS.clear();
+}
+
+/** Writes the shared caches to `file` (atomically: a temporary file, then a rename). */
+export function saveForkCache(file: string): void {
+  const accounts = GUESS_ACCOUNTS.recent().slice(0, SAVED.accounts);
+  // The code of recently seen contracts: without it, their guesses can't be used.
+  const code: [string, string][] = [];
+  let chars = 0;
+  for (const [k, a] of accounts) {
+    const c = a.hasCode && CODE_CACHE.get(k);
+    if (!c || chars + c.length * 2 > SAVED.codeHexChars) continue;
+    code.push([k, bytesToHex(c)]);
+    chars += c.length * 2;
+  }
+  const out: CacheFile = { version: 1, code,
+    accounts: accounts.map(([k, a]) => [k, `0x${a.balance.toString(16)}`, `0x${a.nonce.toString(16)}`, a.hasCode]),
+    storage: GUESS_STORAGE.recent().slice(0, SAVED.storage).map(([k, v]) => [k, bytesToHex(v)]),
+    calls: GUESS_CALLS.recent().slice(0, SAVED.calls).map(([k, v]) => [k, v.ok, bytesToHex(v.data)]) };
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(out));
+  renameSync(tmp, file);
+}
+
 const ZERO = '0x0000000000000000000000000000000000000000';
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
@@ -144,7 +213,7 @@ class StateSource {
       jobs.push({ method: 'eth_getTransactionCount', params: [a, this.block], done: r => { acc.nonce = BigInt(r as string); } });
       if (!cached) jobs.push({ method: 'eth_getCode', params: [a, this.block], done: r => {
         acc.code = hexToBytes(r as Hex);
-        if (acc.code.length && CODE_CACHE.size < CODE_CACHE_MAX) CODE_CACHE.set(`${this.chainId}:${a}`, acc.code);
+        if (acc.code.length && !isDelegation(acc.code) && CODE_CACHE.size < CODE_CACHE_MAX) CODE_CACHE.set(`${this.chainId}:${a}`, acc.code);
       } });
       // Most contracts are proxies: their implementation is the next thing a call reads.
       for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`) && !m.storage.has(`${a}_${slot}`)) {
@@ -275,9 +344,31 @@ class LazyState extends SimpleStateManager {
   }
 }
 
+const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
+
+/** An EIP-7702 authorization: signed (its authority recovered, null if the signature can't be read), or for the sender, to be signed by the wallet (no nonce to check). */
+interface Authorization { authority: string | null; address: string; chainId: bigint; nonce?: bigint }
+
+async function authorizationsOf(req: SimulationRequest): Promise<Authorization[]> {
+  const out: Authorization[] = [];
+  for (const a of req.authorizationList ?? []) {
+    let authority: string | null = null;
+    try {
+      authority = (await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase();
+    } catch { /* the chain skips it */ }
+    out.push({ authority, address: hexOf(a.address), chainId: BigInt(a.chainId), nonce: BigInt(a.nonce) });
+  }
+  for (const a of req.unsignedAuthorizations ?? []) out.push({ authority: hexOf(req.from), address: hexOf(a.address), chainId: BigInt(a.chainId) });
+  return out;
+}
+
+/** Authorizations a transaction carries: each costs 25,000 gas whether or not it applies. */
+const authorizationCount = (req: SimulationRequest) => (req.authorizationList?.length ?? 0) + (req.unsignedAuthorizations?.length ?? 0);
+
 /**
- * The gas a transaction with this call would use: the 21,000 base and calldata, the execution, less the refund
- * (at most a fifth of the total), and from Prague on, at least EIP-7623's calldata floor.
+ * The gas a transaction with this call would use: the 21,000 base, calldata, access list and EIP-7702
+ * authorizations, the execution, less the refund (at most a fifth of the total), and from Prague on, at least
+ * EIP-7623's calldata floor.
  */
 function transactionGas(req: SimulationRequest, execution: bigint, refund: bigint, prague: boolean): bigint {
   const data = req.data, creation = !req.to;
@@ -285,7 +376,7 @@ function transactionGas(req: SimulationRequest, execution: bigint, refund: bigin
   for (let i = 2; i < data.length; i += 2) if (data.slice(i, i + 2) === '00') zero++; else nonzero++;
   const words = creation ? (BigInt(data.length - 2) / 2n + 31n) / 32n : 0n;
   const listed = (req.accessList ?? []).reduce((g, e) => g + 2400n + 1900n * BigInt(e.storageKeys.length), 0n);
-  const intrinsic = 21_000n + 4n * zero + 16n * nonzero + (creation ? 32_000n + 2n * words : 0n) + listed;
+  const intrinsic = 21_000n + 4n * zero + 16n * nonzero + (creation ? 32_000n + 2n * words : 0n) + listed + 25_000n * BigInt(authorizationCount(req));
   const used = intrinsic + execution;
   const net = used - (refund < used / 5n ? refund : used / 5n);
   const floor = 21_000n + 10n * (zero + 4n * nonzero);
@@ -304,11 +395,29 @@ export class ForkSimulator implements Simulator {
   last?: { rounds: number; requests: number; ms: number };
   /** Tokens that simulations still running have seen in their Transfer logs so far, by request (see discovered()). */
   private seen = new Map<string, Set<string>>();
+  /** Values loaded from the cache file when the simulator was created. */
+  readonly loaded: number = 0;
+  private saveTimer?: ReturnType<typeof setTimeout>;
 
   constructor(urls: Record<number, string>, options: ForkSimulatorOptions = {}) {
     this.urls = urls;
     this.opts = { fetchImpl: options.fetchImpl ?? fetch, batchSize: options.batchSize ?? 20, concurrency: options.concurrency ?? 4, maxRounds: options.maxRounds ?? 24,
-      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, profiles: { ...CHAIN_PROFILES, ...options.profiles } };
+      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', profiles: { ...CHAIN_PROFILES, ...options.profiles } };
+    if (this.opts.cacheFile) this.loaded = loadForkCache(this.opts.cacheFile);
+  }
+
+  /** Saves the shared caches to the cache file now (they are also saved a few seconds after each simulation). */
+  persist(): void {
+    if (!this.opts.cacheFile) return;
+    clearTimeout(this.saveTimer);
+    this.saveTimer = undefined;
+    try { saveForkCache(this.opts.cacheFile); } catch { /* a cache, not a record */ }
+  }
+
+  private schedulePersist() {
+    if (!this.opts.cacheFile || this.saveTimer) return;
+    this.saveTimer = setTimeout(() => this.persist(), 5000);
+    this.saveTimer.unref?.();
   }
 
   /**
@@ -336,7 +445,11 @@ export class ForkSimulator implements Simulator {
     const started = Date.now(), deadline = started + this.opts.timeoutMs;
     const tag = this.opts.block?.(chainId) ?? 'latest';
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
-    for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) if (o.code !== undefined) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
+    // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
+    // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.
+    const auths = await Promise.all(reqs.map(authorizationsOf));
+    const authorities = new Set(auths.flat().map(a => a.authority));
+    for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) if (o.code !== undefined && !authorities.has(hexOf(a))) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
     // The senders and targets are certain to be read: fetch them before the first run.
     const first = newMisses();
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.to) first.accounts.add(hexOf(r.to)); }
@@ -357,10 +470,11 @@ export class ForkSimulator implements Simulator {
     const key = requestKey(reqs);
     this.seen.set(key, new Set());
     try {
-      return await this.rounds(reqs, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
+      return await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
     } finally {
       // Kept briefly, for a caller that gave up waiting and wants what was seen.
       setTimeout(() => this.seen.delete(key), 30_000).unref?.();
+      this.schedulePersist();
     }
   }
 
@@ -372,13 +486,13 @@ export class ForkSimulator implements Simulator {
     return [...(this.seen.get(requestKey(reqs)) ?? [])];
   }
 
-  private async rounds(reqs: SimulationRequest[], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
+  private async rounds(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
     profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string): Promise<SimulationResult[]> {
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
       let run: Awaited<ReturnType<ForkSimulator['run']>>;
       try {
-        run = await this.run(reqs, source, misses, common, block, profile, tokens, approvals, chainId);
+        run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId);
       } catch (e) {
         if (e instanceof ForkTimeout || !misses || !missCount(misses)) throw e;
         run = undefined as never; // a speculative run broke on made-up values: fetch what it asked for and retry
@@ -407,7 +521,7 @@ export class ForkSimulator implements Simulator {
   }
 
   /** One run of the calls, in order, on a fresh state over `source`. */
-  private async run(reqs: SimulationRequest[], source: StateSource, misses: Misses | null, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
+  private async run(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, misses: Misses | null, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
     profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number) {
     const state = new LazyState(source, misses, { common });
     const forwarded = (profile.forwardedPrecompiles ?? []).map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
@@ -442,7 +556,7 @@ export class ForkSimulator implements Simulator {
     const seenTokens = new Set<string>(), seenApprovals: SimulatedApproval[] = [];
     const touched = new Map<string, SimulatedApproval>(watchedApprovals);
     const source_ = `local EVM over chain ${chainId} state (the RPC has no eth_simulateV1)`;
-    for (const req of reqs) {
+    for (const [i, req] of reqs.entries()) {
       const from = hexOf(req.from), target = req.to ? hexOf(req.to) : ZERO;
       const watch = [...tokens];
       const before = new Map<string, bigint | undefined>();
@@ -458,11 +572,17 @@ export class ForkSimulator implements Simulator {
       state.originalStorageCache.clear();
       for (const a of [from, target, block.header.coinbase.toString(), ...evm.precompiles.keys()]) evm.journal.addAlwaysWarmAddress(a);
       for (const e of req.accessList ?? []) { evm.journal.addAlwaysWarmAddress(e.address); for (const k of e.storageKeys) evm.journal.addAlwaysWarmSlot(e.address, k); }
+      // The sender's nonce goes up first, then the EIP-7702 authorizations apply (and stay, whatever the call does).
+      const sender = createAddressFromString(from);
+      const senderAccount = (await state.getAccount(sender)) ?? new Account();
+      senderAccount.nonce++;
+      await state.putAccount(sender, senderAccount);
+      const authRefund = await this.authorize(state, evm, auths[i], chainId);
       const gasLimit = req.gas ? req.gas - transactionGas({ ...req, data: req.data }, 0n, 0n, false) : GAS;
-      const res = await evm.runCall({ caller: createAddressFromString(from), origin: createAddressFromString(from), ...(req.to && { to: createAddressFromString(req.to) }),
+      const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block });
       const ex = res.execResult;
-      const gasUsed = transactionGas(req, ex.executionGasUsed, ex.gasRefund ?? 0n, profile.hardfork !== 'cancun');
+      const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + authRefund, profile.hardfork !== 'cancun');
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
         results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data });
@@ -480,9 +600,11 @@ export class ForkSimulator implements Simulator {
       if (named && !(await view(named.kind === 'permit2' ? named.emitter : named.token, stateCall(named)))) named = undefined;
       if (named && !parsed.approvals.some(a => approvalKey(a) === approvalKey(named!))) { parsed.approvals.push(named); seenApprovals.push(named); touched.set(approvalKey(named), named); }
       const transfers: SimulatedTransfer[] = [];
+      // A call to the account itself (an EIP-7702 account running its own batch) moved the tokens elsewhere.
+      const other = target === from ? ELSEWHERE : target;
       const add = (asset: string, delta: bigint) => {
-        if (delta < 0n) transfers.push({ asset, from, to: target, raw: -delta });
-        else if (delta > 0n) transfers.push({ asset, from: target, to: from, raw: delta });
+        if (delta < 0n) transfers.push({ asset, from, to: other, raw: -delta });
+        else if (delta > 0n) transfers.push({ asset, from: other, to: from, raw: delta });
       };
       add('native', (await native(from)) - nativeBefore);
       const logNet = new Map<string, bigint>();
@@ -507,6 +629,31 @@ export class ForkSimulator implements Simulator {
       results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), basis: 'fork', returnData: bytesToHex(ex.returnValue) });
     }
     return { results, tokens: [...seenTokens], approvals: seenApprovals };
+  }
+
+  /**
+   * Applies EIP-7702 authorizations as the chain does at the start of a transaction: each one for this chain (or
+   * every chain) whose authority has no code or a delegation, and whose nonce matches the authority's (checked for
+   * signed ones only), sets the authority's code and bumps its nonce. Returns the refund they earn: 12,500 for each
+   * whose authority already existed.
+   */
+  private async authorize(state: LazyState, evm: EVM, list: Authorization[], chainId: number): Promise<bigint> {
+    let refund = 0n;
+    for (const a of list) {
+      if (!a.authority || (a.chainId !== 0n && a.chainId !== BigInt(chainId))) continue;
+      const who = createAddressFromString(a.authority);
+      evm.journal.addAlwaysWarmAddress(a.authority);
+      const code = await state.getCode(who);
+      if (code.length && !isDelegation(code)) continue;
+      const account = await state.getAccount(who);
+      if (a.nonce !== undefined && (account?.nonce ?? 0n) !== a.nonce) continue;
+      if (account) refund += 12_500n;
+      const next = account ?? new Account();
+      next.nonce++;
+      await state.putAccount(who, next);
+      await state.putCode(who, a.address === ZERO ? new Uint8Array(0) : hexToBytes(`0xef0100${a.address.slice(2)}`));
+    }
+    return refund;
   }
 }
 
