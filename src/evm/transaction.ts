@@ -5,6 +5,7 @@ import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './eff
 import { type Adapter, type Decoded, type Tx } from './common.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
+import { textCalldataAdapter } from './text.ts';
 import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
@@ -27,6 +28,7 @@ export const ADAPTERS: Adapter[] = [
   erc20Adapter,
   universalRouterAdapter,
   abiAdapter,
+  textCalldataAdapter,
   unknownCallAdapter,
 ];
 
