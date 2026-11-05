@@ -1,8 +1,9 @@
-import { attentionOf, formatUnits, PreviewBuilder, sameAddress } from '../format.ts';
+import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS, chainName } from '../chains.ts';
 import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationResult, SimulationSummary } from '../types.ts';
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
-import { type Adapter, type Decoded, type Tx } from './common.ts';
+import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
+import { delegationEffects } from './eip7702.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
@@ -47,6 +48,35 @@ function quantity(value: unknown, field: string): bigint {
   throw new RequestError(`${field} must be a hex or decimal quantity`);
 }
 
+/** EIP-7702 `authorizationList` entries ({ address | contractAddress, chainId, nonce, r?, s?, yParity? | v? }). */
+function authorizationList(raw: unknown): AuthorizationRequest[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw)) throw new RequestError('"authorizationList" must be an array');
+  return raw.map((entry, i) => {
+    const field = `authorizationList[${i}]`;
+    if (!entry || typeof entry !== 'object') throw new RequestError(`${field} must be an object`);
+    const a = entry as Record<string, unknown>;
+    const address = a.address ?? a.contractAddress;
+    if (typeof address !== 'string' || !ADDRESS.test(address)) throw new RequestError(`${field}.address must be an address`);
+    const out: AuthorizationRequest = { address: address.toLowerCase() };
+    if (a.chainId !== undefined) out.chainId = Number(quantity(a.chainId, `${field}.chainId`));
+    if (a.nonce !== undefined) out.nonce = quantity(a.nonce, `${field}.nonce`);
+    if (a.r !== undefined || a.s !== undefined) {
+      const word = (v: unknown, k: string) => {
+        if (typeof v !== 'string' || !/^0x[0-9a-fA-F]{1,64}$/.test(v)) throw new RequestError(`${field}.${k} must be a 32-byte hex value`);
+        return `0x${v.slice(2).padStart(64, '0')}` as `0x${string}`;
+      };
+      // Without the parity the signer can't be recovered, and guessing could attribute your own delegation to someone else.
+      if (a.yParity === undefined && a.v === undefined) throw new RequestError(`${field} is signed but has no yParity`);
+      const parity = Number(quantity(a.yParity ?? a.v, `${field}.yParity`));
+      const yParity = parity >= 27 ? parity - 27 : parity;
+      if (yParity !== 0 && yParity !== 1) throw new RequestError(`${field}.yParity must be 0 or 1`);
+      out.signature = { r: word(a.r, 'r'), s: word(a.s, 's'), yParity };
+    }
+    return out;
+  });
+}
+
 /** Normalises one eth_sendTransaction / wallet_sendCalls call object. */
 export function normalizeTransaction(raw: unknown, context: PreviewContext, fallbackFrom?: string, fallbackChainId?: number): Tx {
   if (!raw || typeof raw !== 'object') throw new RequestError('Transaction must be an object');
@@ -59,7 +89,8 @@ export function normalizeTransaction(raw: unknown, context: PreviewContext, fall
   if (typeof data !== 'string' || !HEX.test(data)) throw new RequestError('"data" must be hex bytes');
   const chainId = t.chainId !== undefined ? Number(quantity(t.chainId, 'chainId')) : fallbackChainId ?? context.chainId;
   if (!chainId) throw new RequestError('Chain ID is unknown: include chainId in the transaction or the preview context');
-  return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value') };
+  const authorizations = authorizationList(t.authorizationList);
+  return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value'), ...(authorizations?.length && { authorizations }) };
 }
 
 /**
@@ -85,10 +116,29 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     b.detail('Native value attached', `${formatUnits(tx.value, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? ''}`.trim(), tx.value.toString());
   }
 
+  // EIP-7702: the authorization list can hand the account to a contract, whatever the call itself does.
+  let { title, summary } = d;
+  const delegation = await delegationEffects(tx, deps, b);
+  if (delegation) {
+    const own = delegation.ownDelegate, nothingElse = tx.value === 0n && tx.data === '0x';
+    if (own && nothingElse) {
+      title = `Delegate your account to ${own.name ?? shortAddress(own.address)} (EIP-7702)`;
+      summary = `Sets your account's code to delegate to ${own.address}${own.name ? ` (${own.name})` : ''}: that contract's code will run as your account.`;
+    } else if (delegation.ownRevoke && nothingElse) {
+      title = "Remove your account's EIP-7702 delegation";
+      summary = 'Clears the code your account delegates to, so it becomes a plain account again.';
+    } else {
+      summary = `${summary.replace(/\.$/, '')}. It also ${delegation.clause}.`;
+    }
+  }
+
   let assetChanges = d.assetChanges;
   let approvals: ApprovalChange[] = [];
   let simulation: SimulationSummary | undefined;
   let outcome = preset;
+  // Simulating without the delegation would run the call against the account's old code, so it would show nothing
+  // about what the delegate does.
+  if (!outcome && delegation && deps.simulator) outcome = { skipped: 'This transaction carries an EIP-7702 authorization list, which the simulator does not apply, so it was not simulated.' };
   if (!outcome && deps.simulator) {
     try {
       outcome = { result: await deps.simulator.simulate(simulationRequest(tx)) };
@@ -123,7 +173,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   return {
     schema: 'signing-preview/1', method, kind: 'transaction',
     network: { kind: 'evm', chainId: tx.chainId, name: chainName(tx.chainId) },
-    title: d.title, summary: d.summary, details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings: b.warnings, attention: attentionOf(b.warnings),
+    title, summary, details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings: b.warnings, attention: attentionOf(b.warnings),
     decoding: { status: d.status, decoder: d.decoder, notes: b.notes },
     ...(simulation && { simulation }),
   };

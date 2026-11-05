@@ -10,6 +10,18 @@ export interface Tx {
   to: string | null;
   data: `0x${string}`;
   value: bigint;
+  /** EIP-7702 authorization list (type-4 transactions). */
+  authorizations?: AuthorizationRequest[];
+}
+
+/** One EIP-7702 authorization, as requested: unsigned (the wallet signs it for the sender) or already signed. */
+export interface AuthorizationRequest {
+  /** The contract the account will delegate to; the zero address clears a delegation. */
+  address: string;
+  /** 0 means valid on every chain; undefined leaves it to the wallet (this chain). */
+  chainId?: number;
+  nonce?: bigint;
+  signature?: { r: `0x${string}`; s: `0x${string}`; yParity: number };
 }
 
 export interface Decoded {

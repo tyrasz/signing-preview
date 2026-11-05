@@ -357,7 +357,7 @@
         "required": [
           "method"
         ],
-        "description": "An EIP-1193 request, exactly as a dApp sends it. Params by method:\n- `eth_sendTransaction`, `eth_signTransaction`: `[transaction]` (`from`, `to`, `data`, `value`, `chainId`; hex quantities)\n- `wallet_sendCalls`: `[{ version, chainId, from, atomicRequired?, calls: [{ to, data, value }] }]`\n- `eth_signTypedData_v4`, `eth_signTypedData_v3`: `[address, typedData]` (typed data as a JSON string or object)\n- `personal_sign`: `[message, address]`; `eth_sign`: `[address, message]`",
+        "description": "An EIP-1193 request, exactly as a dApp sends it. Params by method:\n- `eth_sendTransaction`, `eth_signTransaction`: `[transaction]` (`from`, `to`, `data`, `value`, `chainId`; hex quantities; EIP-7702 `authorizationList` entries `{ address, chainId, nonce, r?, s?, yParity? }`)\n- `wallet_sendCalls`: `[{ version, chainId, from, atomicRequired?, calls: [{ to, data, value }] }]`\n- `eth_signTypedData_v4`, `eth_signTypedData_v3`: `[address, typedData]` (typed data as a JSON string or object)\n- `personal_sign`: `[message, address]`; `eth_sign`: `[address, message]`",
         "properties": {
           "method": {
             "type": "string",

@@ -264,6 +264,8 @@ export function buildSamples(now = Date.now()): Sample[] {
       }) },
     { id: 'eth-send', group: 'Ethereum', label: 'Send 0.25 ETH (simulated)', chainId: 1,
       request: tx(1, BOB, '0x', 250_000_000_000_000_000n) },
+    { id: 'eth-7702-delegate', group: 'Ethereum', label: 'EIP-7702: hand your account to an unknown contract', chainId: 1,
+      request: { method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: '0x', value: '0x0', chainId: '0x1', authorizationList: [{ address: '0xbad0000000000000000000000000000000007702', chainId: '0x1', nonce: '0x0' }] }] } },
     { id: 'eth-unknown-swap', group: 'Ethereum', label: 'Unknown router call (simulated swap)', chainId: 1,
       request: tx(1, ROUTER, '0x3593564c00000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000') },
     { id: 'eth-uniswap-swap', group: 'Ethereum', label: 'Uniswap: swap 1 ETH for USDC (Universal Router)', chainId: 1,

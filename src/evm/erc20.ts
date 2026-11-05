@@ -36,7 +36,8 @@ export const nativeAdapter: Adapter = async (tx) => {
   if (tx.data !== '0x') return null;
   const amount = nativeAmount(tx.chainId, tx.value);
   const b = new PreviewBuilder().detail('Recipient', tx.to).detail('Amount', amount, tx.value.toString());
-  if (sameAddress(tx.to, tx.from)) b.warn('info', 'self_transfer', 'The recipient is the sender; only the network fee is spent.');
+  // A type-4 transaction to yourself is how EIP-7702 delegations are sent; its effect is the authorization list.
+  if (sameAddress(tx.to, tx.from) && !tx.authorizations?.length) b.warn('info', 'self_transfer', 'The recipient is the sender; only the network fee is spent.');
   return decoded({
     title: `Send ${amount}`,
     summary: `Sends ${amount} to ${shortAddress(tx.to)}.`,
