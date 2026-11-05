@@ -82,6 +82,10 @@ async function send(request, chainId, context = {}) {
 }
 
 async function init() {
+  // The server says whether previews come from mock data or live chains (SIGNING_PREVIEW_MODE=live).
+  fetch('/demo/config.json').then(r => r.json()).then(c => {
+    if (c.data === 'live') $('data-note').textContent = 'Previews use live chain data: real balances, prices, contracts and simulations. The wallet itself is a mock and signs nothing; the sample requests use mock accounts unless ?account=0x… is set.';
+  }).catch(() => {});
   samples = await (await fetch('/v1/samples')).json();
   const groups = [...new Set(samples.map(s => s.group))];
   $('samples').innerHTML = groups.map(g => `<div class="group"><h3>${esc(g)}</h3>${samples.filter(s => s.group === g).map(s => `<button class="sample" data-id="${esc(s.id)}">${esc(s.label)}</button>`).join('')}</div>`).join('');

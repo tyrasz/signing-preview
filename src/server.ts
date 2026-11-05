@@ -36,6 +36,8 @@ export interface ServerOptions {
   samples?: () => unknown;
   /** Serve the demo page and browser bundles. */
   serveDemo?: boolean;
+  /** What the demo page says its previews are made from (served at /demo/config.json). Default "mock". */
+  demoData?: 'mock' | 'live';
 }
 
 export function createPreviewServer(options: ServerOptions) {
@@ -52,6 +54,7 @@ export function createPreviewServer(options: ServerOptions) {
       if (req.method === 'GET' && url.pathname === '/v1/openapi.json') return json(res, 200, openApiDocument());
       if (req.method === 'POST' && url.pathname === '/v1/preview') return await handlePreview(req, res, options.deps);
       if (req.method === 'GET' && url.pathname === '/v1/samples' && options.samples) return json(res, 200, options.samples());
+      if (req.method === 'GET' && options.serveDemo && url.pathname === '/demo/config.json') return json(res, 200, { data: options.demoData ?? 'mock' });
       if (req.method === 'GET' && options.serveDemo) return await serveStatic(url.pathname, res);
       return json(res, 404, { error: { code: 'NOT_FOUND', message: 'Not found' } });
     } catch (error) {

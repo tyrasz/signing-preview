@@ -14,5 +14,5 @@ const deps: Dependencies = mode === 'live' ? liveDependencies(process.env, { war
   : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() }, rpc: mockHyperEvmRpc() };
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? '127.0.0.1';
-createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true })
+createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true, demoData: mode })
   .listen(port, host, () => console.log(`signing-preview (${mode} data) on http://${host}:${port}  ·  POST /v1/preview  ·  GET /v1/openapi.json`));

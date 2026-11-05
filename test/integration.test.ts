@@ -32,6 +32,19 @@ test('HTTP API previews requests, allows any origin and rejects bad input', asyn
   });
 });
 
+test('The demo page is told whether its previews use mock or live data', async () => {
+  for (const demoData of [undefined, 'live'] as const) {
+    const server = createPreviewServer({ deps: mockDeps(), serveDemo: true, demoData });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/demo/config.json`);
+      assert.deepEqual(await res.json(), { data: demoData ?? 'mock' });
+    } finally { server.close(); }
+  }
+  // Without the demo, there is no config either.
+  await withServer(async url => assert.equal((await fetch(`${url}/demo/config.json`)).status, 404));
+});
+
 test('Interceptor previews signing requests, forwards approvals, rejects with 4001, passes others through', async () => {
   await withServer(async url => {
     const calls: string[] = [];
