@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { encodeFunctionData, parseAbi, toHex, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
 import type { AbiResolver, Dependencies, SimulationRequest, Simulator } from '../src/types.ts';
@@ -13,7 +14,8 @@ import { codes, detail, NOW } from './helpers.ts';
 
 const DELEGATE = '0x63c0c19a282a1b52b07dd5a65b58948a07dae32b';
 const ZERO = '0x0000000000000000000000000000000000000000';
-const abis: AbiResolver = { resolve: async (_c, a) => a.toLowerCase() === DELEGATE ? { abi: [], name: 'EIP7702StatelessDeleGator', source: 'test', verified: true } : null };
+const EXECUTE = parseAbi(['function execute((address target, uint256 value, bytes callData)[] calls)']);
+const abis: AbiResolver = { resolve: async (_c, a) => a.toLowerCase() === DELEGATE ? { abi: EXECUTE, name: 'EIP7702StatelessDeleGator', source: 'sourcify', verified: true } : null };
 const deps: Dependencies = { tokens: new StaticTokenRegistry() };
 const send = (tx: Record<string, unknown>, d: Dependencies = deps) =>
   previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, chainId: '0x1', ...tx }] }, { now: NOW }, d);
@@ -30,6 +32,18 @@ test('An unsigned authorization asks the wallet to delegate your account: danger
   assert.equal(q.title, 'Send 1 USDC');
   assert.match(q.summary, /It also delegates your account to 0x63c0…e32b \(EIP-7702\)\.$/);
   assert.match(q.warnings.find(w => w.code === 'eip7702_delegation')!.message, /on every EVM chain/);
+});
+
+test('A call to your own account in the transaction that delegates it is decoded against the new delegate', async () => {
+  const data = encodeFunctionData({ abi: EXECUTE, args: [[{ target: BOB, value: 0n, callData: '0x' }]] });
+  const p = await send({ to: ALICE, data, authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x5' }] }, { ...deps, abis });
+  assert.equal(p.title, 'Call execute on your account (EIP7702StatelessDeleGator)');
+  assert.equal(p.decoding.status, 'full');
+  assert.match(detail(p, 'ABI source')!, /the code your account delegates to in this transaction/);
+  assert.ok(codes(p).includes('eip7702_delegation'));
+  // Without the delegation, the account has no code to decode against.
+  const plain = await send({ to: ALICE, data }, { ...deps, abis });
+  assert.notEqual(plain.decoding.status, 'full');
 });
 
 test('Signed authorizations: yours is danger, another account’s is information; revocations and other chains are noted', async () => {
@@ -77,12 +91,23 @@ test('A transaction with an authorization list is simulated with the delegation 
   await assert.rejects(send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: 1, nonce: 0, r: '0x01', s: '0x02' }] }), /is signed but has no yParity/);
 });
 
-test('An unsigned authorization adds its gas to what eth_simulateV1 measured with the override', async () => {
-  const fetchImpl = (async () => new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] }] }] }))) as unknown as typeof fetch;
+test('For the gas of an unsigned authorization, eth_simulateV1 gets one signed by a stand-in account set up the same way', async () => {
+  let sent: { params: [{ blockStateCalls: { calls: { authorizationList?: { address: string; chainId: string; nonce: string; r: Hex; s: Hex; yParity: string }[] }[]; stateOverrides?: Record<string, Record<string, string>> }[] }] } | undefined;
+  const fetchImpl = (async (_u: string, init: RequestInit) => {
+    sent ??= JSON.parse(String(init.body));
+    return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0x8fd0', returnData: '0x', logs: [] }] }] }));
+  }) as typeof fetch;
   const { RpcSimulator } = await import('../src/simulation.ts');
-  const p = await send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x1' }] }, { ...deps, simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
-  // 21,000 + 25,000, less the 12,500 refund capped at a fifth (9,200), as the chain charges.
-  assert.equal(p.simulation?.gasUsed, '36800');
+  const p = await send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x1' }, { address: DELEGATE, chainId: '0x2105' }] }, { ...deps, simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
+  // The node's gas is the answer: it charged and refunded the stand-ins as the chain will the wallet's own.
+  assert.equal(p.simulation?.gasUsed, '36816');
+  const block = sent!.params[0].blockStateCalls[0];
+  const [mine, elsewhere] = block.calls[0].authorizationList!;
+  const standIn = (await recoverAuthorizationAddress({ authorization: { address: mine.address as Hex, chainId: Number(mine.chainId), nonce: Number(mine.nonce) }, signature: { r: mine.r, s: mine.s, yParity: Number(mine.yParity) } })).toLowerCase();
+  assert.notEqual(standIn, ALICE.toLowerCase());
+  assert.deepEqual([mine.chainId, mine.nonce, elsewhere.chainId], ['0x1', '0x0', '0x2105'], 'one applies here, one is for Base');
+  assert.deepEqual(block.stateOverrides?.[standIn], { balance: '0x1', nonce: '0x0', code: '0x' });
+  assert.equal(block.stateOverrides?.[ALICE.toLowerCase()]?.code, `0xef0100${DELEGATE.slice(2)}`);
 });
 
 test('Signed authorizations go to eth_simulateV1 as they are, and their authorities get no code override', async () => {

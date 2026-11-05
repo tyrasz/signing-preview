@@ -1,4 +1,5 @@
-import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, parseAbi, type Hex } from 'viem';
+import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, keccak256, parseAbi, stringToBytes, type Hex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
@@ -44,21 +45,28 @@ const overridesOf = (reqs: SimulationRequest[]) => {
   return Object.keys(all).length ? all : undefined;
 };
 
-/** A request's own gas limit, gas price, access list and signed authorizations, as eth_simulateV1 call fields. */
-const simulationFields = (req: SimulationRequest) => ({
-  ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
-  ...(req.gasPrice !== undefined && { gasPrice: '0x' + req.gasPrice.toString(16) }),
-  ...(req.accessList && { accessList: req.accessList }),
-  ...(req.authorizationList?.length && { authorizationList: req.authorizationList }),
-});
+/**
+ * A request's own gas limit, gas price, access list and signed authorizations, as eth_simulateV1 call fields, with
+ * stand-ins for the authorizations the wallet has yet to sign (see standIns).
+ */
+const simulationFields = async (req: SimulationRequest) => {
+  const authorizationList = [...(req.authorizationList ?? []), ...await standIns(req)];
+  return {
+    ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
+    ...(req.gasPrice !== undefined && { gasPrice: '0x' + req.gasPrice.toString(16) }),
+    ...(req.accessList && { accessList: req.accessList }),
+    ...(authorizationList.length && { authorizationList }),
+  };
+};
 
 /**
  * The code overrides eth_simulateV1 needs: those of signed authorizations it applies natively are left out, so an
  * authority's account isn't made to exist beforehand (its refund depends on that).
  */
 async function simulateV1Overrides(reqs: SimulationRequest[]) {
-  const all = overridesOf(reqs);
-  if (!all) return undefined;
+  const all: Record<string, { code?: string; balance?: string; nonce?: string }> = overridesOf(reqs) ?? {};
+  // The stand-in for unsigned authorizations: an existing account, without code, at nonce 0.
+  if (reqs.some(r => r.unsignedAuthorizations?.length)) all[STAND_IN.address.toLowerCase()] = { balance: '0x1', nonce: '0x0', code: '0x' };
   for (const r of reqs) for (const a of r.authorizationList ?? []) {
     try {
       const authority = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } });
@@ -68,19 +76,27 @@ async function simulateV1Overrides(reqs: SimulationRequest[]) {
   return Object.keys(all).length ? all : undefined;
 }
 
+/** A throwaway account standing in for the sender in the gas of authorizations not signed yet (see standIns). */
+const STAND_IN = privateKeyToAccount(keccak256(stringToBytes('signing-preview: EIP-7702 gas stand-in')));
+type AuthorizationJson = NonNullable<SimulationRequest['authorizationList']>[number];
+
 /**
- * The gas of a call whose EIP-7702 authorizations the wallet has yet to sign, from what a simulator measured with
- * them applied as code overrides (which cost nothing): plus 25,000 for each, less a refund of 12,500 for each that
- * applies (the sender's account exists), within the refund cap of a fifth of the gas. Exact when the call itself
- * earns no refund; otherwise the cap can make it slightly high.
+ * eth_simulateV1 can't apply an authorization nobody has signed yet: the code override stands in for its effect, and
+ * for its gas, an authorization signed by a throwaway account set up the same way (it exists, its nonce matches) goes
+ * in the call's list. The node charges 25,000 for it and refunds 12,500 within the refund cap, exactly as the chain
+ * will for the wallet's own. One for another chain is signed for that chain, so it costs the same and doesn't apply.
  */
-export function withUnsignedAuthorizationGas(req: SimulationRequest, gasUsed: bigint): bigint {
-  const list = req.unsignedAuthorizations ?? [];
-  if (!list.length) return gasUsed;
-  const used = gasUsed + 25_000n * BigInt(list.length);
-  const refund = 12_500n * BigInt(list.filter(a => a.chainId === 0 || a.chainId === req.chainId).length);
-  return used - (refund < used / 5n ? refund : used / 5n);
+async function standIns(req: SimulationRequest): Promise<AuthorizationJson[]> {
+  let nonce = 0;
+  const out: AuthorizationJson[] = [];
+  for (const a of req.unsignedAuthorizations ?? []) {
+    const applies = a.chainId === 0 || a.chainId === req.chainId;
+    const signed = await STAND_IN.signAuthorization({ address: ZERO_ADDRESS, chainId: applies ? req.chainId : a.chainId, nonce: applies ? nonce++ : 0 });
+    out.push({ address: ZERO_ADDRESS, chainId: `0x${signed.chainId.toString(16)}`, nonce: `0x${signed.nonce.toString(16)}`, r: signed.r, s: signed.s, yParity: `0x${signed.yParity!.toString(16)}` });
+  }
+  return out;
 }
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 /** Thrown by simulateBatch on chains whose RPC can't run calls in sequence (no eth_simulateV1 or state overrides). */
 export class BatchSimulationUnsupported extends Error {
@@ -138,7 +154,7 @@ export class RpcSimulator implements Simulator {
     const url = this.urls[chainId];
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
-    const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...simulationFields(req) }));
+    const calls = await Promise.all(reqs.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
     const stateOverrides = await simulateV1Overrides(reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(chainId).overrides && { blockOverrides: this.at(chainId).overrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
@@ -148,8 +164,8 @@ export class RpcSimulator implements Simulator {
     const results = body.result?.[0]?.calls;
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const source = `eth_simulateV1 @ chain ${chainId}`;
-    const parsed: SimulationResult[] = results.map((result, i) => {
-      const gasUsed = withUnsignedAuthorizationGas(reqs[i], BigInt(result.gasUsed));
+    const parsed: SimulationResult[] = results.map(result => {
+      const gasUsed = BigInt(result.gasUsed);
       return result.status !== '0x1'
         ? { status: 'reverted', source, gasUsed, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] }
         : { status: 'success', source, gasUsed, ...parseLogs(result.logs ?? []) };
@@ -260,8 +276,9 @@ export class RpcSimulator implements Simulator {
     const balances: { owner: string; token: string; index: number }[][] = [balanceReads()];
     const reads: { call: number; approval: SimulatedApproval; index: number }[] = [];
     const callIndex: number[] = [];
+    const fields = await Promise.all(reqs.map(simulationFields));
     reqs.forEach((req, i) => {
-      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...simulationFields(req) });
+      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...fields[i] });
       callIndex.push(calls.length - 1);
       for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: READER, to: a.emitter, data: stateCall(a) }); }
       balances.push(balanceReads());

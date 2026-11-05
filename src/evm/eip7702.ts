@@ -5,7 +5,7 @@
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { type PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
-import type { Dependencies } from '../types.ts';
+import type { AbiResolver, ContractAbi, Dependencies } from '../types.ts';
 import type { AuthorizationRequest, Tx } from './common.ts';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -31,6 +31,33 @@ async function authorityOf(tx: Tx, a: AuthorizationRequest): Promise<string | nu
   } catch {
     return null;
   }
+}
+
+/**
+ * The contract the sender's account will delegate to once this transaction's authorizations apply: an address, null
+ * when they clear its delegation, undefined when they don't touch it. The last one for the account wins, as on-chain.
+ */
+export async function ownDelegateAfter(tx: Tx): Promise<string | null | undefined> {
+  let out: string | null | undefined;
+  for (const a of tx.authorizations ?? []) {
+    if (a.chainId !== undefined && a.chainId !== 0 && a.chainId !== tx.chainId) continue;
+    if (!sameAddress((await authorityOf(tx, a)) ?? ZERO, tx.from)) continue;
+    out = sameAddress(a.address, ZERO) ? null : a.address.toLowerCase();
+  }
+  return out;
+}
+
+/**
+ * ABIs as they will be once the sender's account delegates to `delegate` in this transaction: the account's own
+ * address resolves to the delegate's ABI, so a call to it in the same transaction is decoded against its new code.
+ */
+export function delegatedAbis(base: AbiResolver, account: string, delegate: string): AbiResolver {
+  const mine = (a: string) => sameAddress(a, account);
+  const label = (c: ContractAbi | null) => c && { ...c, name: `your account (${c.name ?? shortAddress(delegate)})`, source: `${c.source}, the code your account delegates to in this transaction` };
+  return {
+    resolve: async (chainId, a) => mine(a) ? label(await base.resolve(chainId, delegate)) : base.resolve(chainId, a),
+    ...(base.resolveCall && { resolveCall: async (chainId: number, a: string, selector: string) => mine(a) ? label(await base.resolveCall!(chainId, delegate, selector)) : base.resolveCall!(chainId, a, selector) }),
+  };
 }
 
 export interface DelegationEffects {

@@ -3,7 +3,7 @@ import { CHAINS, chainName } from '../chains.ts';
 import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
-import { delegationEffects, SUPPORTS_7702 } from './eip7702.ts';
+import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
@@ -101,7 +101,9 @@ export type PresetSimulation = { result: SimulationResult | null } | { error: st
 
 /** Runs the decoders; the generic unknown-call decoder always answers, so this always resolves. */
 export async function decodeTransaction(tx: Tx, deps: Dependencies, context: PreviewContext): Promise<Decoded> {
-  const env = { deps, context };
+  // A call to your own account in the transaction that delegates it runs the new delegate's code: decode against that.
+  const delegate = tx.to && sameAddress(tx.to, tx.from) && deps.abis ? await ownDelegateAfter(tx) : undefined;
+  const env = { deps: delegate ? { ...deps, abis: delegatedAbis(deps.abis!, tx.from, delegate) } : deps, context };
   for (const adapter of ADAPTERS) {
     const result = await adapter(tx, env);
     if (result) return result;

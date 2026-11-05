@@ -137,7 +137,8 @@ function json(res: ServerResponse, status: number, body: unknown) {
 /**
  * Dependencies for live mode. RPC URLs enable simulation, on-chain token metadata and proxy detection; ABIs come
  * from Sourcify (plus Etherscan when ETHERSCAN_API_KEY is set); TOKEN_LIST_FILE adds a tokenlists.org-format list.
- * Set SIGNING_PREVIEW_OFFLINE_LOOKUPS=1 to skip the public ABI and signature services.
+ * Set SIGNING_PREVIEW_OFFLINE_LOOKUPS=1 to skip the public ABI and signature services. SIGNING_PREVIEW_FORK_CACHE names a
+ * file that keeps the HyperEVM simulator's caches across restarts.
  */
 export function liveDependencies(env = process.env, options: { warmUp?: boolean } = {}): Dependencies {
   const rpcs: Record<number, string> = {};
@@ -145,8 +146,9 @@ export function liveDependencies(env = process.env, options: { warmUp?: boolean 
   if (env.ARBITRUM_RPC_URL) rpcs[42161] = env.ARBITRUM_RPC_URL;
   if (env.HYPEREVM_RPC_URL) rpcs[999] = env.HYPEREVM_RPC_URL;
   const rpc = new JsonRpcClient(rpcs);
-  const fork = new ForkSimulator(rpcs);
-  if (options.warmUp && rpcs[999]) setTimeout(() => warmHyperEvm(fork, rpc).catch(() => { /* only warming */ }), 0).unref?.();
+  const cacheFile = env.SIGNING_PREVIEW_FORK_CACHE && env.SIGNING_PREVIEW_FORK_CACHE !== 'off' ? env.SIGNING_PREVIEW_FORK_CACHE : undefined;
+  const fork = new ForkSimulator(rpcs, { cacheFile });
+  if (options.warmUp && rpcs[999]) setTimeout(() => warmHyperEvm(rpcs, fork, rpc).catch(() => { /* only warming */ }), 0).unref?.();
   const tokenSources: TokenRegistry[] = [new StaticTokenRegistry()];
   if (env.TOKEN_LIST_FILE) tokenSources.push(new TokenListRegistry(JSON.parse(readFileSync(env.TOKEN_LIST_FILE, 'utf8'))));
   tokenSources.push(new OnchainTokenRegistry(rpc));
@@ -164,9 +166,10 @@ export function liveDependencies(env = process.env, options: { warmUp?: boolean 
 
 /**
  * Background simulations of HyperEVM's main protocol paths (a Kinetiq stake; HyperLend's reserves and their oracle
- * prices), so their first real previews get the fork simulator's full answer within its budget.
+ * prices), so their first real previews get the fork simulator's full answer within its budget. Without a cache
+ * from an earlier run, recent traffic is replayed too (see warmFromTraffic).
  */
-async function warmHyperEvm(fork: ForkSimulator, rpc: JsonRpcClient): Promise<void> {
+export async function warmHyperEvm(rpcs: Record<number, string>, fork: ForkSimulator, rpc: JsonRpcClient, { traffic = !fork.loaded } = {}): Promise<void> {
   const view = (to: string, data: string) => [{ chainId: 999, from: '0x0000000000000000000000000000000000000000', to, data, value: 0n }];
   const word = (a: string) => a.slice(2).toLowerCase().padStart(64, '0');
   const batches: SimulationRequest[][] = [
@@ -180,4 +183,33 @@ async function warmHyperEvm(fork: ForkSimulator, rpc: JsonRpcClient): Promise<vo
   // One batch: the calls share one fetch of each slot and contract, keeping a public RPC's rate limit in mind.
   batches[0].push(...reserves.flatMap(r => [...view(pool, `0x35ea6a75${word(r)}`), ...view(oracle, `0xb3596f07${word(r)}`)])); // getReserveData, getAssetPrice
   await fork.warm(batches);
+  if (traffic) await warmFromTraffic(rpcs, rpc, 999);
+  fork.persist();
+}
+
+/**
+ * Replays one recent transaction to each of the contracts most used by different accounts on `chainId` (routers,
+ * tokens, vaults: not one bot's own contract), so the shared caches hold what users' transactions read. With two
+ * requests in flight at a time, to stay within a public RPC's rate limit.
+ */
+export async function warmFromTraffic(rpcs: Record<number, string>, rpc: JsonRpcClient, chainId: number, { blocks = 60, targets = 12 } = {}): Promise<number> {
+  type T = { from: string; to: string | null; input: string; value: string };
+  const head = Number(await rpc.call(chainId, 'eth_blockNumber', []));
+  const senders = new Map<string, Set<string>>(), sample = new Map<string, T>();
+  for (let n = head; n > head - blocks; n--) {
+    const b = await rpc.call(chainId, 'eth_getBlockByNumber', [`0x${n.toString(16)}`, true]) as { transactions?: T[] } | null;
+    for (const t of b?.transactions ?? []) {
+      if (!t.to || t.input === '0x') continue;
+      const to = t.to.toLowerCase();
+      (senders.get(to) ?? senders.set(to, new Set()).get(to)!).add(t.from.toLowerCase());
+      if (!sample.has(to)) sample.set(to, t);
+    }
+  }
+  const busiest = [...senders].filter(([, s]) => s.size >= 2).sort((a, b) => b[1].size - a[1].size).slice(0, targets).map(([to]) => to);
+  const gentle = new ForkSimulator(rpcs, { concurrency: 2 });
+  for (const to of busiest) {
+    const t = sample.get(to)!;
+    await gentle.warm([[{ chainId, from: t.from.toLowerCase(), to, data: t.input, value: BigInt(t.value) }]]);
+  }
+  return busiest.length;
 }

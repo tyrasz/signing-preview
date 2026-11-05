@@ -6,7 +6,7 @@ import { encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, serialize
 import { privateKeyToAccount, sign } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { PERMIT2, StaticTokenRegistry } from '../src/chains.ts';
-import { RpcSimulator, withUnsignedAuthorizationGas } from '../src/simulation.ts';
+import { RpcSimulator } from '../src/simulation.ts';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -158,10 +158,9 @@ test('EIP-7702 authorizations are applied as the chain does: validity, nonces, p
   // The account called itself, so the other side is unknown: not the account, which would cancel the change out.
   assert.deepEqual(mine.transfers.filter(t => t.asset === usdc).map(t => [t.from, t.to, t.raw]), [[USER, '0x0000000000000000000000000000000000000000', 5_000_000n]]);
   assert.equal(mine.gasUsed, override.gasUsed! + 12_500n);
-  // The wallet's own, unsigned: the same gas, and RpcSimulator's estimate from the override's gas agrees.
+  // The wallet's own, unsigned: the same gas.
   const unsigned = { ...base, unsignedAuthorizations: [{ address: executor, chainId: 1 }], stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } };
   assert.equal((await sim.simulate(unsigned))!.gasUsed, mine.gasUsed);
-  assert.equal(withUnsignedAuthorizationGas(unsigned, override.gasUsed!), mine.gasUsed);
   // A stale nonce: the chain skips the authorization (and the override standing in for it), so the call reaches an
   // account without code and does nothing; the 25,000 is still paid.
   const [stale] = (await sim.simulateBatch([{ ...base, authorizationList: [await signed(KEY, 0)], stateOverrides: { [USER]: { code: `0xef0100${executor.slice(2)}` } } }]))!;
