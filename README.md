@@ -158,10 +158,12 @@ const deps = liveDependencies({ ARBITRUM_RPC_URL, HYPEREVM_RPC_URL });
 | Ethereum / Arbitrum / HyperEVM | ERC-20 transfer/approve/transferFrom, `setApprovalForAll`, WETH, Permit2 `approve`, native sends, contract creation | Amounts with the token's symbol and decimals. Warns on unlimited approvals, zero-value transfers and transfers to the token contract itself. |
 | Off-chain approvals | ERC-2612 / DAI `Permit`, Permit2 `PermitSingle/Batch/TransferFrom` | Spender, amount and expiry; flags unlimited or long-lived permissions and owner mismatches. |
 | Messages | `personal_sign`, SIWE, `eth_sign` | Readable text; SIWE domain vs. requesting origin (phishing); `eth_sign` is always danger. |
+| **EIP-7702** account delegation | `authorizationList` in `eth_sendTransaction` (type-4), unsigned or signed | Which account is delegated to which contract (named when its source is verified), on which chain (`chainId` 0 = every chain). **Danger** when your own account would run another contract's code; information for authorizations signed by other accounts (a sponsor relaying them) and for revocations. The simulator doesn't apply authorizations, so such transactions aren't simulated. "Delegate your account to X" when nothing else happens. |
 | Batches | `wallet_sendCalls` (EIP-5792) | Each call previewed, with warnings merged. The calls are simulated **in order in one block**, so "approve, then swap" isn't shown as failing, and balance changes are netted across the batch. **Danger** when a call in an all-or-nothing (`atomicRequired`) batch would fail, since then none take effect; **caution** for a non-atomic batch, where the other calls may still go through. A custom simulator without `simulateBatch` simulates only the first call and says why. |
-| Uniswap **Universal Router** | `execute(commands, inputs[, deadline])` on the official routers (current router with Uniswap v4, and v1.2) on Ethereum and Arbitrum | One headline for the trade ("Swap 1 ETH for at least 3,150 USDC"), summing split routes and following chained hops through wrap/unwrap, then every command as a step: v2/v3/v4 swaps with fee tiers, Permit2 permits and transfers, wrap/unwrap, sweep, pay, fee portions, balance checks, sub-plans, v3/v4 position-manager calls, and v1.2's NFT-marketplace purchases. **Caution** when output goes to another address, when the minimum received is 0 (no slippage protection), when the deadline has passed, or for a Permit2 allowance to an address other than the router; **danger** for a fee portion of 10% or more. Command IDs differ between router versions (0x10 is a Seaport purchase on v1.2 and a v4 swap now), so only known router addresses are decoded. |
+| Uniswap **Universal Router** | `execute(commands, inputs[, deadline])` and `executeSigned` on Uniswap's official routers: 2.1.1, 2.1.2 and 2.2.0 (current), 2.0 (Uniswap v4) and 1.2, on Ethereum, Arbitrum and HyperEVM | One headline for the trade ("Swap 1 ETH for at least 3,150 USDC"), summing split routes and following chained hops through wrap/unwrap, then every command as a step: v2/v3/v4 swaps with fee tiers and per-hop minimum prices, Permit2 permits and transfers, wrap/unwrap, sweep, pay, fee portions, balance checks, sub-plans, v3/v4 position-manager calls, **Across bridging** ("…, then bridge to Base"), and v1.2's NFT-marketplace purchases. `executeSigned` shows who signed the route. **Caution** when output goes to another address (on this chain or the bridge's destination), when nothing limits slippage (minimum received 0 and no per-hop prices), when the deadline has passed, or for a Permit2 allowance to an address other than the router; **danger** for a fee portion of 10% or more. Command tables differ between releases (0x10 is a Seaport purchase on 1.2 and a v4 swap now; 2.1 adds fields to every swap), so only known router addresses are decoded, each with its release's table. The original 1.0 router isn't decoded. |
 | Any other contract | calldata to a contract with a verified ABI (Sourcify, Etherscan or your own), including through proxies | Contract name, function and named arguments. Addresses are labelled ("you", token symbols) and amounts are shown in the right token's units. **Caution** for ownership, upgrade and role changes. See [Contract and token lookups](#contract-and-token-lookups). |
 | | no verified ABI, but a known selector | The function from the built-in list or a signature database, marked **unverified** (`partial`). The match must re-encode to exactly the signed calldata, and the most trusted source decides when several fit (see below). |
+| Plain-text calldata | data that is entirely printable UTF-8: `data:` URI inscriptions (Ethscriptions and similar), on-chain messages | The text, or for a JSON inscription its protocol operation ("Inscription: edmt emt-batch-transfer enat"), noting that an off-chain indexer decides its effect. Invisible and text-reordering characters are removed and flagged. Full when the recipient has no code; **caution** when it's a contract (it receives the text as input) or can't be checked. |
 | Anything else | unknown calldata | `opaque`, with the selector shown. Simulated balance changes are added when a simulator is configured. |
 | Simulated effects (any transaction) | `eth_simulateV1` logs and state | Balance changes for native, ERC-20, **ERC-721 and ERC-1155** (e.g. "+1 BAYC #42"). **Permissions left in place**: ERC-20 and Permit2 allowances, single-NFT approvals and `setApprovalForAll`, read back from the tokens after the simulated transaction. One set *along the way* by another call (a router writing a Permit2 allowance, a smart account's `execute`) is flagged: unlimited allowances and single NFTs with **caution**, all-NFT approvals with **danger**. |
 
@@ -310,6 +312,42 @@ Results are cached: tokens and ABIs for 10 minutes, signatures for an hour. A ne
 - **Not verified live yet:** Etherscan, which needs an API key.
 - There is no threat-intelligence feed. Warnings are rule-based observations, and `attention: 'none'` doesn't mean "safe".
 
+## Coverage of real traffic
+
+`npm run coverage` previews every transaction in blocks sampled evenly across the last 24 hours, as if each were an `eth_sendTransaction` request, and reports how much is readable, what crashed, and what is left. Pass 1 uses only the built-in decoders and lists; pass 2 adds what `liveDependencies()` would look up (Sourcify for the busiest unreadable contracts, OpenChain for their selectors). It needs the three RPCs, `sourcify.dev` and `api.openchain.xyz`.
+
+```bash
+npm run coverage -- --hours 24 --eth 300 --arb 1500 --hyperevm 1500 --out report.json
+```
+
+Run on 2026-11-05 (pass 2 figures; "readable" is full + partial):
+
+| | Ethereum | Arbitrum One | HyperEVM |
+|---|---|---|---|
+| Sample | 300 of 7,179 blocks: 81,367 txs | 1,500 of 304,223 blocks: 6,231 txs (1,506 ArbOS system txs excluded) | 1,500 of 87,840 blocks: 13,293 txs |
+| Full / partial / opaque | 71.8% / 18.8% / 9.4% | 39.7% / 14.1% / 46.2% | 52.0% / 12.2% / 35.8% |
+| Readable without lookups (pass 1) | 73.6% | 27.6% | 12.7% |
+| Readable, standard ABI-encoded calldata only | 95.4% | 78.2% | 80.1% |
+| Readable, occasional senders only | 94.9% | 76.6% | 78.4% |
+| Share of the opaque rest sent by automated senders | 70.3% | 82.5% | 92.4% |
+| Crashes | 0 | 0 | 0 |
+
+"Automated" means the sender appears in 3 or more of the sampled blocks, which are minutes apart: bots, relayers and exchanges sending around the clock. What stays opaque is mostly:
+
+- **Packed calldata** (Ethereum 3,889, Arbitrum 1,668, HyperEVM 2,461 txs): any length other than selector + 32-byte words, a custom encoding no ABI describes, used by trading bots.
+- **Vanity selectors** (230 / 283 / 183): ABI-shaped, but with selectors mined to start with zero bytes to save gas, also bots.
+- **ABI-shaped calls to contracts with no published source** (3,500 / 928 / 2,119), and whose selectors aren't in a signature database. Two such contracts (`0x278d…f8d2`, `0x93c3…dd17`) are among the busiest on all three chains.
+
+The first run found and fixed 26 crashes (a "never expires" Permit2 approval and struct-item multicalls, now in `test/mainnet-regressions.test.ts`). It also showed that the busiest unreadable contract on Ethereum was Uniswap's current Universal Router 2.1.2, and that the busiest unreadable "contract" was an account with no code receiving text inscriptions. Both are decoded now.
+
+Not covered, whatever the sample says:
+
+- **ERC-4337 UserOperations.** The UserOperations inside a bundler's `handleOps` call aren't previewed one by one, and a smart account's signature over a UserOperation hash isn't an EIP-1193 transaction.
+- **The call part of a self-delegating EIP-7702 transaction.** The delegation is decoded and flagged, but a call to your own address is decoded against the account's current code, not the new delegate's.
+- **Universal Router 1.0** (an older, NFT-era command table). Other DEX routers are shown through their verified ABI (function and arguments), without a swap headline.
+- **Simulation on HyperEVM**: its RPC has no `eth_simulateV1`, so calls are checked with `eth_call` and balance changes come from the decoded request.
+- **Sample size**: about 4% of Ethereum's blocks, 0.5% of Arbitrum's and 1.7% of HyperEVM's in the day.
+
 ## HyperCore coverage
 
 Checked against `@nktkas/hyperliquid` 0.33.3 (every exchange action) and `hyperliquid-python-sdk` 0.24.0:
@@ -442,7 +480,7 @@ Actions are pinned to commit SHAs (with the version in a comment), and workflows
 
 ```
 src/preview.ts            entry point: routes EIP-1193 methods
-src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, Uniswap Universal Router, any verified ABI)
+src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, Uniswap Universal Router, any verified ABI, plain text)
 src/evm/effects.ts        simulated balance changes (fungible and NFT) and approvals left in place
 src/evm/kinetiq.ts        Kinetiq staking; src/evm/hyperlend.ts HyperLend, gateway and credit delegation
 src/evm/onchain.ts        cached read-only contract calls for decoders; src/errors.ts known custom errors

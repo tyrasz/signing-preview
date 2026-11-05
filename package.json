@@ -63,7 +63,8 @@
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "verify:live": "NODE_USE_ENV_PROXY=1 node scripts/verify-live.ts",
-    "check:package": "node scripts/check-package.ts"
+    "check:package": "node scripts/check-package.ts",
+    "coverage": "NODE_USE_ENV_PROXY=1 node scripts/coverage.ts"
   },
   "dependencies": {
     "@msgpack/msgpack": "3.1.3",
