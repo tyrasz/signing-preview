@@ -99,12 +99,7 @@ export class RpcSimulator implements Simulator {
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
     const calls = reqs.map(req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...simulationFields(req) }));
-    const res = await this.fetchImpl(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls, ...(this.at(chainId).overrides && { blockOverrides: this.at(chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], traceTransfers: true, validation: false }, this.at(chainId).tag] }),
-    });
-    if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-    const body = await res.json() as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(chainId).overrides && { blockOverrides: this.at(chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], traceTransfers: true, validation: false }, this.at(chainId).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
       return this.withoutSimulateV1(url, chainId, reqs);
@@ -123,7 +118,7 @@ export class RpcSimulator implements Simulator {
   private async post(url: string, method: string, params: unknown[]): Promise<{ result?: unknown; error?: { code?: number; message?: string; data?: Hex } }> {
     for (let attempt = 0; ; attempt++) {
       const res = await this.fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(20_000), body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
-      if ((res.status === 429 || res.status >= 500) && attempt < 2) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
+      if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise(r => setTimeout(r, 500 * 2 ** attempt)); continue; }
       if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
       return await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
     }
@@ -190,10 +185,14 @@ export class RpcSimulator implements Simulator {
     const owners = [...new Set(reqs.map(r => r.from.toLowerCase()))];
     const touched = new Map<string, SimulatedApproval>();
     const after: SimulatedApproval[][] = [];
-    for (const r of parsed) {
+    const unconfirmed = new Set<SimulatedApproval>(); // named approvals: kept only if the state read confirms them
+    parsed.forEach((r, i) => {
+      // A call that sets a permission by name is listed even if its token emits no Approval event.
+      const named = r.status === 'success' ? namedApproval(reqs[i], reqs[i].from.toLowerCase(), r.approvals ?? []) : undefined;
+      if (named && !(r.approvals ?? []).some(a => approvalKey(a) === approvalKey(named))) { (r.approvals ??= []).push(named); unconfirmed.add(named); }
       for (const a of r.approvals ?? []) if (owners.includes(a.owner)) touched.set(approvalKey(a), a);
       after.push([...touched.values()].slice(0, 24));
-    }
+    });
     // Tokens: from the senders' Transfer logs, then the ones the calls name, then the chain's well-known ones.
     const skip = (a: string) => owners.includes(a) || /^0x0{40}$/.test(a) || BigInt(a) < 0x10000n || a === NATIVE_PSEUDO_TOKEN;
     const nftCollections = new Set(parsed.flatMap(r => (r.nftTransfers ?? []).map(t => t.collection)));
@@ -214,11 +213,7 @@ export class RpcSimulator implements Simulator {
       for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: READER, to: a.emitter, data: stateCall(a) }); }
       balances.push(balanceReads());
     });
-    const res = await this.fetchImpl(url, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls, ...(this.at(reqs[0].chainId).overrides && { blockOverrides: this.at(reqs[0].chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], validation: false }, this.at(reqs[0].chainId).tag] }),
-    });
-    const body = await res.json() as { result?: { calls: RawCallResult[] }[] };
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(this.at(reqs[0].chainId).overrides && { blockOverrides: this.at(reqs[0].chainId).overrides }), ...(overridesOf(reqs) && { stateOverrides: overridesOf(reqs) }) }], validation: false }, this.at(reqs[0].chainId).tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls;
     if (!out || out.length !== calls.length) return;
     // The re-run must have gone the same way, or its reads describe a different execution.
@@ -227,8 +222,9 @@ export class RpcSimulator implements Simulator {
       const r = out[index];
       if (r.status !== '0x1') continue; // non-standard token: keep the event value
       const state = decodeState(approval, r.returnData);
-      if (state) (parsed[call].approvalState ??= []).push(state);
+      if (state) { (parsed[call].approvalState ??= []).push(state); unconfirmed.delete(approval); }
     }
+    for (const p of parsed) if (p.approvals) p.approvals = p.approvals.filter(a => !unconfirmed.has(a));
     const word = (r: RawCallResult) => r.status === '0x1' && r.returnData.length >= 66 ? BigInt(r.returnData.slice(0, 66)) : undefined;
     const isNft = new Set(tokens.filter((_, j) => word(out[nftChecks[j]]) === 1n));
     parsed.forEach((p, i) => {
@@ -246,6 +242,20 @@ export class RpcSimulator implements Simulator {
       p.balancesRead = true;
     });
   }
+}
+
+/** The permission an approve / increaseAllowance / setApprovalForAll / Permit2 approve call sets, by its arguments. */
+export function namedApproval(req: SimulationRequest, from: string, logged: SimulatedApproval[] = []): SimulatedApproval | undefined {
+  if (!req.to) return undefined;
+  // ERC-721 approve(address,uint256) shares ERC-20's selector: an NFT approval in the logs settles which it was.
+  if (logged.some(a => (a.kind === 'erc721' || a.kind === 'operator') && a.token === req.to!.toLowerCase())) return undefined;
+  const sel = req.data.slice(0, 10), arg = (n: number) => `0x${req.data.slice(10 + 64 * n + 24, 10 + 64 * (n + 1))}`, num = (n: number) => BigInt(`0x${req.data.slice(10 + 64 * n, 10 + 64 * (n + 1)) || '0'}`);
+  const to = req.to.toLowerCase();
+  if (req.data.length < 10 + 64 * 2) return undefined;
+  if (sel === '0x095ea7b3' || sel === '0x39509351') return { kind: 'erc20', emitter: to, token: to, owner: from, spender: arg(0), amount: num(1) };
+  if (sel === '0xa22cb465') return { kind: 'operator', emitter: to, token: to, owner: from, spender: arg(0), approved: num(1) !== 0n };
+  if (sel === '0x87517c45' && to === PERMIT2 && req.data.length >= 10 + 64 * 4) return { kind: 'permit2', emitter: to, token: arg(0), owner: from, spender: arg(1), amount: num(2), expiration: Number(num(3)) };
+  return undefined;
 }
 
 /** One key per permission: an allowance per token and spender, one NFT, or an operator per collection. */

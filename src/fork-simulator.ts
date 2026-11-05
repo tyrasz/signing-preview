@@ -18,7 +18,7 @@ import { keccak256 } from 'viem';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
-import { approvalKey, decodeRevert, decodeState, parseLogs, stateCall } from './simulation.ts';
+import { approvalKey, decodeRevert, decodeState, namedApproval, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -291,18 +291,6 @@ function transactionGas(req: SimulationRequest, execution: bigint, refund: bigin
   return prague && floor > net ? floor : net;
 }
 
-/** The permission an approve / increaseAllowance / setApprovalForAll / Permit2 approve call sets, by its arguments. */
-function namedApproval(req: SimulationRequest, from: string): SimulatedApproval | undefined {
-  if (!req.to) return undefined;
-  const sel = req.data.slice(0, 10), arg = (n: number) => `0x${req.data.slice(10 + 64 * n + 24, 10 + 64 * (n + 1))}`, num = (n: number) => BigInt(`0x${req.data.slice(10 + 64 * n, 10 + 64 * (n + 1)) || '0'}`);
-  const to = hexOf(req.to);
-  if (req.data.length < 10 + 64 * 2) return undefined;
-  if (sel === '0x095ea7b3' || sel === '0x39509351') return { kind: 'erc20', emitter: to, token: to, owner: from, spender: arg(0), amount: num(1) };
-  if (sel === '0xa22cb465') return { kind: 'operator', emitter: to, token: to, owner: from, spender: arg(0), approved: num(1) !== 0n };
-  if (sel === '0x87517c45' && to === PERMIT2 && req.data.length >= 10 + 64 * 4) return { kind: 'permit2', emitter: to, token: arg(0), owner: from, spender: arg(1), amount: num(2), expiration: Number(num(3)) };
-  return undefined;
-}
-
 const word = (b: Uint8Array) => b.length >= 32 ? BigInt(bytesToHex(b.slice(0, 32))) : undefined;
 const hexOf = (a: string) => a.toLowerCase();
 
@@ -450,8 +438,10 @@ export class ForkSimulator implements Simulator {
       for (const a of parsed.approvals) if (a.owner === from) { seenApprovals.push(a); touched.set(approvalKey(a), a); }
       // A call that sets a permission by name is listed even if its token emits no Approval event (non-compliant
       // tokens exist); its state is read back below like the rest.
-      const named = namedApproval(req, from);
-      if (named && !parsed.approvals.some(a => approvalKey(a) === approvalKey(named))) { parsed.approvals.push(named); seenApprovals.push(named); touched.set(approvalKey(named), named); }
+      let named = namedApproval(req, from, parsed.approvals);
+      // Kept only if the token answers for it (an NFT contract's approve shares ERC-20's selector).
+      if (named && !(await view(named.kind === 'permit2' ? named.emitter : named.token, stateCall(named)))) named = undefined;
+      if (named && !parsed.approvals.some(a => approvalKey(a) === approvalKey(named!))) { parsed.approvals.push(named); seenApprovals.push(named); touched.set(approvalKey(named), named); }
       const transfers: SimulatedTransfer[] = [];
       const add = (asset: string, delta: bigint) => {
         if (delta < 0n) transfers.push({ asset, from, to: target, raw: -delta });

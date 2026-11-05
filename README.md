@@ -351,6 +351,10 @@ Every difference is listed. The public RPC keeps about 128 blocks of state, so o
 npm run accuracy -- --blocks 20 --per-block 3 --max-index 6
 ```
 
+```bash
+npm run accuracy -- --chain 42161 --blocks 15 --per-block 2 --max-index 12 --simulators eth_simulateV1
+```
+
 Run on 2026-11-05:
 
 | | Transactions | Outcome | Token movements | Native change | Approvals | Gas exact |
@@ -358,9 +362,11 @@ Run on 2026-11-05:
 | `eth_simulateV1` | 47 | 100% | 11/11 | 100% | 2/2 | 100% |
 | `ForkSimulator` | 47 | 100% | 11/11 | 100% | 2/2 | 46/47 |
 | `eth_simulateV1`, EIP-7702 transactions only (`--only-type 0x4`) | 21 | 100% | 3/3 | 100% | 5/5 | 0/21 |
+| `eth_simulateV1` on Arbitrum One (`--chain 42161`) | 21 | 100% | 6/6 | 100% | 1/1 | 100% (L2 part) |
 
 - A separate run of 71 transactions gave the same result for `ForkSimulator`: 71/71 outcomes, 22/22 token movements and 71/71 gas. Its one gas difference here is 19,900 (one storage write priced as warm) in a transaction whose outcome and balances are exact.
 - For EIP-7702 transactions, gas leaves out what processing the authorizations costs: 25,000 each, less 12,500 for an account that already exists, with refunds capped at a fifth of the total. The differences are exactly that.
+- On Arbitrum, ArbOS's own transactions are skipped and gas is compared without the receipt's L1 data part; the fork simulator, which doesn't model ArbOS, isn't used there. Arbitrum's public RPC keeps about 30 seconds of state and rate-limits hard, so runs are short (two of 23 transactions were rate-limited in that run; the simulator now retries).
 - What a replay can't show: anything that happens between the preview and inclusion. A price, balance or nonce that moves in between moves the result too.
 
 ## Coverage of real traffic

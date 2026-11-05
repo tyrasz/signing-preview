@@ -39,6 +39,7 @@ await chain.exec(weth, call('mint', [USER, 2n * E]));
 await chain.setBalance(weth, 2n * E);
 await chain.exec(shares, call('mintShares', [USER, 300_000_000n])); // worth 1,000 stUSD
 await chain.setBalance(USER, 10n * E);
+await chain.exec(nft, encodeFunctionData({ abi: parseAbi(['function mint(address,uint256)']), functionName: 'mint', args: [USER as Hex, 7n] }));
 
 // The precompile at 0x…0800 is forwarded to the chain, as HyperEVM's HyperCore reads are.
 const profiles = { 999: { ...CHAIN_PROFILES[999], forwardedPrecompiles: [PRECOMPILE] } };
@@ -83,6 +84,10 @@ test('Batches run in order with approvals read back; signatures, NFTs and EOA-on
   assert.deepEqual(changes(await send(eoaOnly, call('claim'))), [['in', '1', 'USDC', 'simulated_state']]);
   const approve = await send(usdc, call('approve', [BOB, MAX]));
   assert.deepEqual(approve.approvals?.map(a => [a.spender, a.allowance, a.direct]), [[BOB, 'unlimited', true]]);
+  // approve(address,uint256) on an NFT is a token approval, not an ERC-20 allowance of "7".
+  const nftApprove = await send(nft, call('approve', [BOB, 7n]));
+  assert.equal(nftApprove.simulation?.status, 'success');
+  assert.ok(!(nftApprove.approvals ?? []).some(a => a.kind === 'erc20'), JSON.stringify(nftApprove.approvals));
 });
 
 test('Failures: revert reasons, insufficient funds; a chain precompile is answered by the chain', async () => {

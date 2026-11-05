@@ -1,4 +1,4 @@
-// npm run accuracy -- [--blocks 30] [--per-block 3] [--max-index 8] [--only-type 0x4] [--simulators eth_simulateV1,fork] [--out report.json]
+// npm run accuracy -- [--chain 1|42161] [--blocks 30] [--per-block 3] [--max-index 8] [--only-type 0x4] [--simulators eth_simulateV1,fork] [--out report.json]
 //
 // How accurate simulation is, measured against what actually happened. Recent Ethereum transactions from one-off
 // senders are replayed at their exact pre-state: on top of the parent block, after the earlier transactions of their
@@ -7,7 +7,9 @@
 //   - ForkSimulator: a local EVM over the chain's state (what HyperEVM, which has no eth_simulateV1, uses).
 // and is compared with the receipt: outcome, every token movement of the sender, the native coin change (balance
 // before and after the block, net of the fee), approvals by the sender, and gas. Any difference is listed.
-// The public Ethereum RPC keeps about 128 blocks of state, so only the latest blocks can be replayed.
+// Public RPCs keep only recent state (Ethereum about 128 blocks, ~25 minutes; Arbitrum about 30 seconds), so only
+// the latest blocks can be replayed. On Arbitrum, ArbOS's own transactions are skipped and gas is compared without
+// the L1 data part of the receipt (gasUsedForL1); the fork simulator doesn't model ArbOS, so it runs on Ethereum only.
 import { writeFileSync } from 'node:fs';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
@@ -16,19 +18,21 @@ import type { SimulationRequest, SimulationResult, Simulator } from '../src/type
 import { recoverAuthorizationAddress } from 'viem/utils';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
-const URL_ = process.env.ETHEREUM_RPC_URL ?? 'https://ethereum-rpc.publicnode.com';
+const CHAIN = Number(arg('chain', '1'));
+const URL_ = CHAIN === 42161 ? process.env.ARBITRUM_RPC_URL ?? 'https://arb1.arbitrum.io/rpc' : process.env.ETHEREUM_RPC_URL ?? 'https://ethereum-rpc.publicnode.com';
+const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : new Set<string>();
 const BLOCKS = Number(arg('blocks', '30')), PER_BLOCK = Number(arg('per-block', '3')), MAX_INDEX = Number(arg('max-index', '8'));
 const ONLY_TYPE = arg('only-type', ''), SIMULATORS = arg('simulators', 'eth_simulateV1,fork').split(',');
-const rpc = new JsonRpcClient({ 1: URL_ }, { timeoutMs: 20_000, retries: 4, retryDelayMs: 400 });
+const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 20_000, retries: CHAIN === 42161 ? 8 : 4, retryDelayMs: CHAIN === 42161 ? 1000 : 400 });
 type Hex = `0x${string}`;
 type Auth = { address: Hex; chainId: Hex; nonce: Hex; r: Hex; s: Hex; yParity: Hex };
 type T = { hash: string; from: string; to: string | null; input: Hex; value: string; transactionIndex: string; type: string; gas: string; gasPrice: string; accessList?: { address: string; storageKeys: string[] }[]; authorizationList?: Auth[] };
 type B = { number: Hex; timestamp: Hex; miner: string; mixHash: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: T[] };
-type R = { transactionHash: string; status: string; gasUsed: string; effectiveGasPrice: string; logs: { address: string; topics: string[]; data: string }[] };
+type R = { transactionHash: string; status: string; gasUsed: string; gasUsedForL1?: string; effectiveGasPrice: string; logs: { address: string; topics: string[]; data: string }[] };
 
-const head = Number(await rpc.call(1, 'eth_blockNumber', []));
+const head = Number(await rpc.call(CHAIN, 'eth_blockNumber', []));
 const blocks: B[] = [];
-for (let i = 0; i < BLOCKS; i++) blocks.push(await rpc.call(1, 'eth_getBlockByNumber', ['0x' + (head - 1 - i).toString(16), true]) as B);
+for (let i = 0; i < BLOCKS; i++) blocks.push(await rpc.call(CHAIN, 'eth_getBlockByNumber', ['0x' + (head - 1 - i).toString(16), true]) as B);
 const txsBySender = new Map<string, number>();
 for (const b of blocks) for (const t of b.transactions) txsBySender.set(t.from.toLowerCase(), (txsBySender.get(t.from.toLowerCase()) ?? 0) + 1);
 /**
@@ -40,10 +44,10 @@ async function delegations(t: T, tag: string): Promise<Record<string, { code: st
   if (!t.authorizationList?.length) return undefined;
   const out: Record<string, { code: string }> = {};
   for (const a of t.authorizationList) {
-    if (![0, 1].includes(Number(a.chainId))) continue;
+    if (![0, CHAIN].includes(Number(a.chainId))) continue;
     let authority: string;
     try { authority = (await recoverAuthorizationAddress({ authorization: { address: a.address, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r, s: a.s, yParity: Number(a.yParity) } })).toLowerCase(); } catch { continue; }
-    const nonce = BigInt(String(await rpc.call(1, 'eth_getTransactionCount', [authority, tag]))) + (authority === t.from.toLowerCase() ? 1n : 0n);
+    const nonce = BigInt(String(await rpc.call(CHAIN, 'eth_getTransactionCount', [authority, tag]))) + (authority === t.from.toLowerCase() ? 1n : 0n);
     if (BigInt(a.nonce) !== nonce) continue;
     out[authority] = { code: /^0x0{40}$/.test(a.address) ? '0x' : `0xef0100${a.address.slice(2).toLowerCase()}` };
   }
@@ -51,7 +55,7 @@ async function delegations(t: T, tag: string): Promise<Record<string, { code: st
 }
 const reqOf = async (t: T, tag: string): Promise<SimulationRequest> => {
   const stateOverrides = await delegations(t, tag);
-  return { chainId: 1, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), gas: BigInt(t.gas), gasPrice: BigInt(t.gasPrice), accessList: t.accessList, ...(stateOverrides && { stateOverrides }) };
+  return { chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), gas: BigInt(t.gas), gasPrice: BigInt(t.gasPrice), accessList: t.accessList, ...(stateOverrides && { stateOverrides }) };
 };
 const net = (transfers: { asset: string; from: string; to: string; raw: bigint }[], who: string) => {
   const m = new Map<string, bigint>();
@@ -62,28 +66,28 @@ const net = (transfers: { asset: string; from: string; to: string; raw: bigint }
 const rows: Record<string, unknown>[] = [];
 for (const b of blocks) {
   const n = Number(b.number), parent = '0x' + (n - 1).toString(16);
-  const receipts = await rpc.call(1, 'eth_getBlockReceipts', [b.number]) as R[];
+  const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
   const simulators = ([
-    ['eth_simulateV1', new RpcSimulator({ 1: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time: b.timestamp, feeRecipient: b.miner, prevRandao: b.mixHash, baseFeePerGas: b.baseFeePerGas, gasLimit: b.gasLimit } }) })],
-    ['fork', new ForkSimulator({ 1: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000 })],
-  ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name));
+    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time: b.timestamp, feeRecipient: b.miner, prevRandao: b.mixHash, baseFeePerGas: b.baseFeePerGas, gasLimit: b.gasLimit } }) })],
+    ['fork', new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000 })],
+  ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name) && !(CHAIN === 42161 && name === 'fork'));
   let taken = 0;
   for (const t of b.transactions) {
     const from = t.from.toLowerCase(), index = Number(t.transactionIndex);
-    if (taken >= PER_BLOCK || !t.to || index > MAX_INDEX || txsBySender.get(from)! > 1 || t.type === '0x3' || (ONLY_TYPE && t.type !== ONLY_TYPE)) continue;
+    if (taken >= PER_BLOCK || !t.to || index > MAX_INDEX || txsBySender.get(from)! > 1 || t.type === '0x3' || SYSTEM.has(t.type) || (ONLY_TYPE && t.type !== ONLY_TYPE)) continue;
     // Senders without code (EOAs; for type-4 transactions the code can be a delegation, which is what they set).
-    const code = String(await rpc.call(1, 'eth_getCode', [from, parent]));
+    const code = String(await rpc.call(CHAIN, 'eth_getCode', [from, parent]));
     if (code !== '0x' && !code.startsWith('0xef0100')) continue;
     taken++;
     const r = receipts.find(x => x.transactionHash === t.hash)!;
     const logs = parseLogs(r.logs);
     const tokens = net(logs.transfers, from);
     // Native: the sender's balance across the block, plus the fee it paid (it sent nothing else in this block).
-    const bal = async (tag: string) => BigInt(String(await rpc.call(1, 'eth_getBalance', [from, tag])));
+    const bal = async (tag: string) => BigInt(String(await rpc.call(CHAIN, 'eth_getBalance', [from, tag])));
     const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice);
     const approvals = logs.approvals.filter(a => a.owner === from && !(a.kind === 'erc721' && /^0x0{40}$/.test(a.spender))).map(a => `${a.kind}:${a.token}:${a.spender}`);
-    const row: Record<string, unknown> = { hash: t.hash, block: n, index, to: t.to, selector: t.input.slice(0, 10), receipt: r.status === '0x1' ? 'success' : 'reverted', receiptGas: BigInt(r.gasUsed).toString() };
-    const before = await Promise.all(b.transactions.slice(0, index).map(x => reqOf(x, parent)));
+    const row: Record<string, unknown> = { hash: t.hash, block: n, index, to: t.to, selector: t.input.slice(0, 10), receipt: r.status === '0x1' ? 'success' : 'reverted', receiptGas: (BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0)).toString() };
+    const before = await Promise.all(b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type)).map(x => reqOf(x, parent)));
     const target = await reqOf(t, parent);
     row.type = t.type;
     for (const [name, sim] of simulators) {
@@ -113,7 +117,7 @@ for (const b of blocks) {
 const out = arg('out', '');
 if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
 const pct = (a: number, b: number) => b ? `${(100 * a / b).toFixed(1)}%` : '-';
-console.log(`${rows.length} Ethereum transactions from one-off senders (blocks ${Number(blocks.at(-1)!.number)}-${Number(blocks[0].number)}), replayed at their exact pre-state:`);
+console.log(`${rows.length} ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'} transactions from one-off senders (blocks ${Number(blocks.at(-1)!.number)}-${Number(blocks[0].number)}), replayed at their exact pre-state:`);
 for (const name of SIMULATORS) {
   const rs = rows.map(r => r[name] as Record<string, any>), ok = rs.filter(r => !r.error);
   const sum = (k: string) => ok.reduce((s, r) => s + r[k], 0);
