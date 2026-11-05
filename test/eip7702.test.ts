@@ -75,3 +75,20 @@ test('A transaction with an authorization list is simulated with the delegation 
   await assert.rejects(send({ to: ALICE, authorizationList: [{ address: '0x1234' }] }), /authorizationList\[0\]\.address must be an address/);
   await assert.rejects(send({ to: ALICE, authorizationList: [{ address: DELEGATE, chainId: 1, nonce: 0, r: '0x01', s: '0x02' }] }), /is signed but has no yParity/);
 });
+
+test('Signed authorizations go to eth_simulateV1 as they are, and their authorities get no code override', async () => {
+  const me = privateKeyToAccount('0x7777777777777777777777777777777777777777777777777777777777777777');
+  const a = await me.signAuthorization({ address: DELEGATE as Hex, chainId: 1, nonce: 3 });
+  let sent: { params: [{ blockStateCalls: { calls: { authorizationList?: unknown[] }[]; stateOverrides?: Record<string, unknown> }[] }] } | undefined;
+  const fetchImpl = (async (_u: string, init: RequestInit) => {
+    sent ??= JSON.parse(String(init.body));
+    return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] }] }] }));
+  }) as typeof fetch;
+  const { RpcSimulator } = await import('../src/simulation.ts');
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: me.address, to: me.address, chainId: '0x1', authorizationList: [{ address: a.address, chainId: toHex(a.chainId), nonce: toHex(a.nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) }] }] },
+    { now: NOW }, { ...deps, simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
+  assert.equal(p.simulation?.status, 'success');
+  const block = sent!.params[0].blockStateCalls[0];
+  assert.equal(block.calls[0].authorizationList?.length, 1);
+  assert.equal(block.stateOverrides?.[me.address.toLowerCase()], undefined, 'the node applies it; no override');
+});
