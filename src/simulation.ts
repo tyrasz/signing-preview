@@ -194,17 +194,23 @@ export class RpcSimulator implements Simulator {
   }
 
   private async withoutSimulateV1(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
-    if (this.fork?.covers(chainId)) {
-      const forked = this.fork.simulateBatch(reqs);
-      forked.catch(() => { /* a late failure only means the probe's answer stood */ });
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const first = await Promise.race([forked.then(r => ({ r }), () => null), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), this.forkBudgetMs); })]);
-      clearTimeout(timer);
-      if (first?.r) return first.r;
-      // The probe answers; the tokens the fork run has seen so far are worth reading too.
-      const hints = this.fork.discovered?.(reqs) ?? [];
-      if (hints.length) reqs = reqs.map(r => ({ ...r, watch: [...new Set([...(r.watch ?? []), ...hints])] }));
-    }
+    if (!this.fork?.covers(chainId)) return this.probeOrCall(url, chainId, reqs);
+    const forked = this.fork.simulateBatch(reqs);
+    forked.catch(() => { /* a late failure only means the probe's answer stood */ });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const first = await Promise.race([forked.then(r => ({ r }), () => null), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), this.forkBudgetMs); })]);
+    clearTimeout(timer);
+    if (first?.r) return first.r;
+    // The probe answers; the tokens the fork run has seen so far are worth reading too. If the fork run, which
+    // carries on, finishes while the probe is still out, its fuller answer is taken instead.
+    const hints = this.fork.discovered?.(reqs) ?? [];
+    const probed = this.probeOrCall(url, chainId, hints.length ? reqs.map(r => ({ ...r, watch: [...new Set([...(r.watch ?? []), ...hints])] })) : reqs);
+    probed.catch(() => { /* the fork's answer may still come */ });
+    return Promise.race([probed, forked.then(r => r ?? probed, () => probed)]);
+  }
+
+  /** The probe's answer, or eth_call's where the probe can't run. */
+  private async probeOrCall(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
     // The probe takes over the sender's code, so it can't also apply code overrides (EIP-7702 delegations).
     const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase()) && !overridesOf(reqs);
     if (probeable && !this.noProbe.has(chainId)) {

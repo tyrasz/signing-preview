@@ -123,16 +123,15 @@ test('Speculative rounds converge, guesses from earlier simulations cut them, an
   const [slow] = (await fork({ maxRounds: 0 }).simulateBatch([{ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n }]))!;
   assert.deepEqual(slow.transfers.map(t => [t.asset, t.raw]), [[usdc, 1n]]);
   await assert.rejects(fork({ timeoutMs: 1 }).simulate(req), ForkTimeout);
-  // A slow chain: past the budget, RpcSimulator answers with the probe.
-  chain.delayMs = 120;
-  try {
-    const sim = new RpcSimulator({ 999: URL_ }, { fetchImpl: chain.fetchImpl, fork: fork({ timeoutMs: 5000 }), forkBudgetMs: 150 });
-    const p = await sim.simulate({ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 2n]), value: 0n });
-    assert.equal(p?.basis, 'state');
-    assert.match(p!.source, /state-override probe/);
-  } finally {
-    chain.delayMs = 0;
-  }
+  // Past the budget, RpcSimulator asks the probe, and takes whichever of the two answers first: the probe when the
+  // fork run is slow to fetch state, the fork's fuller answer when it finishes while the probe is still out.
+  const delayed = (ms: number) => (async (u: string, init: RequestInit) => { await new Promise(r => setTimeout(r, ms)); return chain.fetchImpl(u, init); }) as typeof fetch;
+  const transferReq = { chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 2n]), value: 0n };
+  const probeWins = await new RpcSimulator({ 999: URL_ }, { fetchImpl: chain.fetchImpl, fork: fork({ fetchImpl: delayed(400), timeoutMs: 5000 }), forkBudgetMs: 50 }).simulate(transferReq);
+  assert.equal(probeWins?.basis, 'state');
+  assert.match(probeWins!.source, /state-override probe/);
+  const forkWins = await new RpcSimulator({ 999: URL_ }, { fetchImpl: delayed(1500), fork: fork(), forkBudgetMs: 1 }).simulate(transferReq);
+  assert.equal(forkWins?.basis, 'fork');
 });
 
 test('EIP-7702: an account delegated to a smart-account contract runs its code (chain 1, Osaka rules)', async () => {
