@@ -215,8 +215,9 @@ class StateSource {
         acc.code = hexToBytes(r as Hex);
         if (acc.code.length && !isDelegation(acc.code) && CODE_CACHE.size < CODE_CACHE_MAX) CODE_CACHE.set(`${this.chainId}:${a}`, acc.code);
       } });
-      // Most contracts are proxies: their implementation is the next thing a call reads.
-      for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`) && !m.storage.has(`${a}_${slot}`)) {
+      // Most contracts are proxies: their implementation is the next thing a call reads. Only for an account not seen
+      // before: one seen before is known to have no code, or its slots are guessed and fetched only if read.
+      if (!GUESS_ACCOUNTS.get(`${this.chainId}:${a}`)) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`) && !m.storage.has(`${a}_${slot}`)) {
         jobs.push({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: r => { this.setStorage(`${a}_${slot}`, unpadBytes(hexToBytes(r as Hex))); } });
       }
     }
@@ -497,7 +498,7 @@ export class ForkSimulator implements Simulator {
         if (e instanceof ForkTimeout || !misses || !missCount(misses)) throw e;
         run = undefined as never; // a speculative run broke on made-up values: fetch what it asked for and retry
       }
-      const grew = !!run && (run.tokens.some(t => !tokens.has(t)) || run.approvals.some(a => !approvals.has(approvalKey(a))));
+      const grew = !!run && run.rerun;
       if (misses) this.opts.onRound?.(round, { accounts: [...misses.accounts], storage: [...misses.storage], calls: [...misses.calls] }, grew);
       if (run && (!misses || (!missCount(misses) && !grew))) {
         this.last = { rounds: round, requests: source.requests, ms: Date.now() - started };
@@ -540,11 +541,20 @@ export class ForkSimulator implements Simulator {
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: forwarded });
-    const view = async (to: string, data: Hex) => {
-      const r = await evm.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 1_000_000n, isStatic: true, block });
+    const viewOn = async (on: EVM, to: string, data: Hex) => {
+      const r = await on.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 1_000_000n, isStatic: true, block });
       return r.execResult.exceptionError ? undefined : r.execResult.returnValue;
     };
+    const view = (to: string, data: Hex) => viewOn(evm, to, data);
     const balanceOf = async (token: string, owner: string) => { const r = await view(token, `0x70a08231${owner.slice(2).padStart(64, '0')}` as Hex); return r ? word(r) : undefined; };
+    // The state before the first call is the chain's own: a token its logs reveal can be read there afterwards, on a
+    // second EVM, instead of running everything again with the token watched from the start.
+    let pre: EVM | undefined;
+    const balanceBefore = async (token: string, owner: string) => {
+      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: forwarded });
+      const r = await viewOn(pre, token, `0x70a08231${owner.slice(2).padStart(64, '0')}` as Hex);
+      return r ? word(r) : undefined;
+    };
     const native = async (a: string) => (await state.getAccount(createAddressFromString(a)))?.balance ?? 0n;
     const nft = new Map<string, boolean>();
     const isNft = async (t: string) => {
@@ -554,6 +564,8 @@ export class ForkSimulator implements Simulator {
 
     const results: SimulationResult[] = [];
     const seenTokens = new Set<string>(), seenApprovals: SimulatedApproval[] = [];
+    // A token or approval first seen in a later call of a batch must be read around the calls before it too.
+    let rerun = false;
     const touched = new Map<string, SimulatedApproval>(watchedApprovals);
     const source_ = `local EVM over chain ${chainId} state (the RPC has no eth_simulateV1)`;
     for (const [i, req] of reqs.entries()) {
@@ -591,8 +603,15 @@ export class ForkSimulator implements Simulator {
       const logs = (ex.logs ?? []).map(([address, topics, data]) => ({ address: bytesToHex(address), topics: topics.map(t => bytesToHex(t)), data: bytesToHex(data) }));
       const parsed = parseLogs(logs);
       // Tokens whose Transfer logs involve the account: read its balance of each, before and after.
-      for (const l of logs) if (l.topics[0] === TRANSFER && l.topics.length === 3 && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from)) seenTokens.add(hexOf(l.address));
-      for (const a of parsed.approvals) if (a.owner === from) { seenApprovals.push(a); touched.set(approvalKey(a), a); }
+      for (const l of logs) if (l.topics[0] === TRANSFER && l.topics.length === 3 && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from)) {
+        const t = hexOf(l.address);
+        seenTokens.add(t);
+        if (i > 0 && !tokens.has(t)) rerun = true;
+      }
+      for (const a of parsed.approvals) if (a.owner === from) {
+        if (i > 0 && !watchedApprovals.has(approvalKey(a))) rerun = true;
+        seenApprovals.push(a); touched.set(approvalKey(a), a);
+      }
       // A call that sets a permission by name is listed even if its token emits no Approval event (non-compliant
       // tokens exist); its state is read back below like the rest.
       let named = namedApproval(req, from, parsed.approvals);
@@ -616,7 +635,9 @@ export class ForkSimulator implements Simulator {
       const nftLogs = new Set(logs.filter(l => l.topics[0] === TRANSFER && l.topics.length === 4).map(l => hexOf(l.address)));
       for (const t of new Set([...watch, ...logNet.keys()])) {
         if (t === 'native' || nftLogs.has(t) || await isNft(t)) continue;
-        const b = before.get(t), a = before.has(t) ? await balanceOf(t, from) : undefined;
+        // A token first seen in the first call's logs is read on the state before it (see balanceBefore).
+        const b = before.has(t) ? before.get(t) : i === 0 ? await balanceBefore(t, from) : undefined;
+        const a = before.has(t) || i === 0 ? await balanceOf(t, from) : undefined;
         // The balance read wins; a token whose balanceOf can't be read keeps its log amounts.
         add(t, b !== undefined && a !== undefined ? a - b : (logNet.get(t) ?? 0n));
       }
@@ -628,7 +649,7 @@ export class ForkSimulator implements Simulator {
       }
       results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue) });
     }
-    return { results, tokens: [...seenTokens], approvals: seenApprovals };
+    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun };
   }
 
   /**
