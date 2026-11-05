@@ -169,9 +169,19 @@ export const abiAdapter: Adapter = async (tx, env) => {
 
   // Batched calls to the same contract (e.g. Uniswap routers' multicall(bytes[])).
   if (call.fn.name === 'multicall') {
-    const inner = call.args.find(a => Array.isArray(a)) as Hex[] | undefined;
-    for (const [i, data] of (inner ?? []).slice(0, 10).entries()) {
-      const c = (contract ? decodeStrict(contract.abi, data) : null);
+    // multicall(bytes[]) holds calldata directly; other variants hold structs such as (address target, bytes callData).
+    const inner = call.args.find(a => Array.isArray(a)) as unknown[] | undefined;
+    const bytesOf = (item: unknown): Hex | null => {
+      if (typeof item === 'string') return /^0x[0-9a-fA-F]*$/.test(item) ? item as Hex : null;
+      if (!item || typeof item !== 'object') return null;
+      // The struct's bytes field: the longest hex value that isn't an address.
+      const hex = Object.values(item as Record<string, unknown>).filter((v): v is Hex => typeof v === 'string' && /^0x[0-9a-fA-F]*$/.test(v) && v.length !== 42);
+      return hex.sort((x, y) => y.length - x.length)[0] ?? null;
+    };
+    for (const [i, item] of (inner ?? []).slice(0, 10).entries()) {
+      const data = bytesOf(item);
+      if (!data) continue;
+      const c = contract && data.length >= 10 ? decodeStrict(contract.abi, data) : null;
       b.detail(`Batched call ${i + 1}`, c ? describeCall(c) : `${data.slice(0, 10)} (not decoded)`);
     }
   }

@@ -1,5 +1,5 @@
 import { decodeFunctionData, parseAbi } from 'viem';
-import { formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
+import { formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress, formatTimestamp } from '../format.ts';
 import { PERMIT2 } from '../chains.ts';
 import { decoded, nativeAmount, selectorOf, tokenAmount, tokenInfo, tokenSourceWarnings, type Adapter } from './common.ts';
 
@@ -56,7 +56,7 @@ export const erc20Adapter: Adapter = async (tx, env) => {
       .detail('Token', info ? info.symbol : token, token)
       .detail('Spender', spender)
       .detail('Amount', isUnlimited(amount) ? 'Unlimited' : tokenAmount(amount, info, token), amount.toString())
-      .detail('Expires', new Date(Number(expiration) * 1000).toISOString());
+      .detail('Expires', formatTimestamp(Number(expiration) * 1000), expiration.toString());
     tokenSourceWarnings(b, tx.chainId, info);
     if (isUnlimited(amount)) b.warn('caution', 'unlimited_approval', `${shortAddress(spender)} can move any amount of this token through Permit2 until the approval expires or is revoked.`);
     return decoded({ title: `Permit2: allow ${shortAddress(spender)} to spend ${info?.symbol ?? 'a token'}`, summary: 'Sets a Permit2 allowance for another address.', decoder: 'permit2_approve', status: info ? 'full' : 'partial', b });

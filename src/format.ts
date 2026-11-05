@@ -73,7 +73,13 @@ export function sameAddress(a: string | undefined | null, b: string | undefined 
   return !!a && !!b && a.toLowerCase() === b.toLowerCase();
 }
 
+/**
+ * ISO time. Values past year 9999 (e.g. Permit2's 2^48-1 or max-uint "never expires") would make Date throw, so they
+ * read as "never"; negative or non-numeric values are shown as they are.
+ */
 export function formatTimestamp(ms: number): string {
+  if (!Number.isFinite(ms) || ms > 253_402_300_799_000) return 'never (no real expiry date)';
+  if (ms < 0) return `invalid time (${ms / 1000})`;
   return new Date(ms).toISOString().replace('.000Z', 'Z');
 }
 
