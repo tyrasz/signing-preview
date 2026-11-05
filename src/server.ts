@@ -8,6 +8,7 @@ import { RequestError } from './evm/transaction.ts';
 import { StaticTokenRegistry } from './chains.ts';
 import { HttpHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
 import { RpcSimulator } from './simulation.ts';
+import { ForkSimulator } from './fork-simulator.ts';
 import type { Dependencies, PreviewContext, TokenRegistry } from './types.ts';
 import { JsonRpcClient } from './rpc.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry, TokenListRegistry } from './tokens.ts';
@@ -150,6 +151,6 @@ export function liveDependencies(env = process.env): Dependencies {
     abis: new ContractAbiResolver({ sources: abiSources, rpc }),
     signatures: new ChainedSignatures(online ? [new OpenChainSignatures(), new FourByteSignatures()] : []),
     hyperliquid: { mainnet: new HttpHyperliquidInfo(INFO_URLS.mainnet), testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
-    ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs) }),
+    ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs, { fork: new ForkSimulator(rpcs) }) }),
   };
 }

@@ -166,14 +166,14 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     } else if (sim.limited) {
       b.note(sim.note ?? "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
     } else {
-      const basis = sim.basis === 'state' ? 'simulated_state' as const : 'simulated_events' as const;
+      const basis = sim.basis === 'state' || sim.basis === 'fork' ? 'simulated_state' as const : 'simulated_events' as const;
       const simulated = [...await netChanges(sim.transfers, tx, deps, b, basis), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b, basis)];
       if (simulated.length || !assetChanges.length) assetChanges = simulated;
       approvals = await approvalChanges((sim.approvals ?? []).map(approval => ({ approval, callTo: tx.to })), tx, deps, sim.approvalState);
       // Approvals the decoded request already shows (e.g. a router's Permit2 permit step) are not hidden.
       for (const a of approvals) if (d.declaredApprovals?.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender))) a.direct = true;
       approvalWarnings(b, approvals, context.now);
-      b.note(sim.basis === 'state' ? stateBasisNote(sim) : 'Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.');
+      b.note(simulationNote(sim));
     }
   }
   return {
@@ -191,6 +191,13 @@ export function simulationRequest(tx: Tx, d?: Decoded): SimulationRequest {
   for (const c of d?.assetChanges ?? []) if (/^0x[0-9a-fA-F]{40}$/.test(c.asset ?? '')) watch.add(c.asset!.toLowerCase());
   for (const a of d?.declaredApprovals ?? []) { watch.add(a.token.toLowerCase()); watch.add(a.spender.toLowerCase()); }
   return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }) };
+}
+
+/** How the simulated balance changes were found, for the preview's notes. */
+export function simulationNote(sim: Pick<SimulationResult, 'basis' | 'tokensRead'>): string {
+  if (sim.basis === 'state') return stateBasisNote(sim);
+  if (sim.basis === 'fork') return "Simulated in a local EVM over this chain's latest state (its RPC has no eth_simulateV1), in the next block. Balance changes were read from the state before and after, for every token the transaction's events touch; the final result can differ if state changes before inclusion.";
+  return 'Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.';
 }
 
 /** For results measured from balances (SimulationProbe) rather than logs. */

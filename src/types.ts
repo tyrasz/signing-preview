@@ -159,6 +159,10 @@ export interface SimulationRequest {
    * HyperLend hToken a supply mints). Only simulators that read state rather than logs need them.
    */
   watch?: string[];
+  /** The transaction's gas limit, gas price and EIP-2930 access list, when the request sets them (contracts can read gasleft() and tx.gasprice). */
+  gas?: bigint;
+  gasPrice?: bigint;
+  accessList?: { address: string; storageKeys: string[] }[];
 }
 
 export interface SimulatedTransfer {
@@ -216,14 +220,17 @@ export interface SimulationResult {
    */
   limited?: boolean;
   /**
-   * How transfers and approvals were found: from the simulated logs (default), or from balances and permissions read
-   * before and after the call ('state', see SimulationProbe), which only covers the tokens that were read.
+   * How transfers and approvals were found: from the simulated logs (default); from balances and permissions read
+   * before and after the call ('state', see SimulationProbe), which only covers the tokens that were read; or from a
+   * local EVM over the chain's state ('fork', see ForkSimulator): tokens from its logs, amounts from balances.
    */
-  basis?: 'logs' | 'state';
+  basis?: 'logs' | 'state' | 'fork';
   /** basis 'state': how many tokens' balances were read. */
   tokensRead?: number;
   /** A caveat to show with the preview. */
   note?: string;
+  /** What the call returned (or its revert data), when the simulator reports it. */
+  returnData?: string;
 }
 
 export interface Simulator {

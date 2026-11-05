@@ -6,15 +6,17 @@ pragma solidity 0.8.37;
 interface IERC1271 { function isValidSignature(bytes32, bytes calldata) external view returns (bytes4); }
 interface IERC721Receiver { function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4); }
 
-/// ERC-20 that is also WETH-like (deposit / withdraw native).
+/// ERC-20 that is also WETH-like (deposit / withdraw native). It emits Transfer but, like some real tokens, no
+/// Approval event, so simulators must read allowances rather than rely on events.
 contract Token {
+    event Transfer(address indexed from, address indexed to, uint256 value);
     string public symbol;
     uint8 public decimals;
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
     constructor(string memory s, uint8 d) { symbol = s; decimals = d; }
-    function mint(address to, uint256 v) external { balanceOf[to] += v; }
+    function mint(address to, uint256 v) external { balanceOf[to] += v; emit Transfer(address(0), to, v); }
     function transfer(address to, uint256 v) external returns (bool) { _move(msg.sender, to, v); return true; }
     function approve(address spender, uint256 v) external returns (bool) { allowance[msg.sender][spender] = v; return true; }
     function transferFrom(address from, address to, uint256 v) external returns (bool) {
@@ -25,14 +27,14 @@ contract Token {
     }
     function deposit() external payable { balanceOf[msg.sender] += msg.value; }
     function withdraw(uint256 v) external { require(balanceOf[msg.sender] >= v, "balance"); balanceOf[msg.sender] -= v; payable(msg.sender).transfer(v); }
-    function _move(address from, address to, uint256 v) internal { require(balanceOf[from] >= v, "balance"); balanceOf[from] -= v; balanceOf[to] += v; }
+    function _move(address from, address to, uint256 v) internal { require(balanceOf[from] >= v, "balance"); balanceOf[from] -= v; balanceOf[to] += v; emit Transfer(from, to, v); }
 }
 
 /// Pulls an asset and credits shares in itself (the target is the share token, so it's named by the call).
 contract Vault is Token {
     Token public immutable asset;
     constructor(Token a) Token("vUSD", 6) { asset = a; }
-    function deposit(uint256 amount) external { asset.transferFrom(msg.sender, address(this), amount); balanceOf[msg.sender] += amount; }
+    function deposit(uint256 amount) external { asset.transferFrom(msg.sender, address(this), amount); balanceOf[msg.sender] += amount; emit Transfer(address(0), msg.sender, amount); }
 }
 
 /// Aave-like: supply mints a receipt token the calldata doesn't mention.
@@ -44,6 +46,7 @@ contract Pool {
 }
 
 contract NFT {
+    event Transfer(address indexed from, address indexed to, uint256 indexed id);
     mapping(uint256 => address) public ownerOf;
     mapping(uint256 => address) public getApproved;
     mapping(address => mapping(address => bool)) public isApprovedForAll;
@@ -57,6 +60,7 @@ contract NFT {
         require(ownerOf[id] == address(0), "sold");
         ownerOf[id] = msg.sender;
         balanceOf[msg.sender]++;
+        emit Transfer(address(0), msg.sender, id);
         if (msg.sender.code.length > 0) require(IERC721Receiver(msg.sender).onERC721Received(msg.sender, address(0), id, "") == 0x150b7a02, "receiver");
     }
     function safeTransferFrom(address from, address to, uint256 id) external {
@@ -65,6 +69,7 @@ contract NFT {
         balanceOf[from]--;
         balanceOf[to]++;
         getApproved[id] = address(0);
+        emit Transfer(from, to, id);
     }
     function approve(address spender, uint256 id) external { require(ownerOf[id] == msg.sender, "owner"); getApproved[id] = spender; }
     function setApprovalForAll(address operator, bool approved) external { isApprovedForAll[msg.sender][operator] = approved; }
@@ -72,6 +77,7 @@ contract NFT {
 
 /// Permit2's allowance layout and signature rule: ecrecover for accounts without code, ERC-1271 for the rest.
 contract Permit2Like {
+    event Permit(address indexed owner, address indexed token, address indexed spender, uint160 amount, uint48 expiration, uint48 nonce);
     struct Allowance { uint160 amount; uint48 expiration; uint48 nonce; }
     mapping(address => mapping(address => mapping(address => Allowance))) public allowance;
 
@@ -83,7 +89,9 @@ contract Permit2Like {
         } else {
             require(IERC1271(owner).isValidSignature(h, sig) == 0x1626ba7e, "1271");
         }
-        allowance[owner][token][spender] = Allowance(amount, expiration, allowance[owner][token][spender].nonce + 1);
+        uint48 nonce = allowance[owner][token][spender].nonce;
+        allowance[owner][token][spender] = Allowance(amount, expiration, nonce + 1);
+        emit Permit(owner, token, spender, amount, expiration, nonce);
     }
 }
 
@@ -104,4 +112,31 @@ contract EoaOnly {
 
 contract Reverter {
     function fail() external pure { revert("nope"); }
+}
+
+/// Balances are shares × 10/3, as with share-based tokens: the Transfer event states the amount asked for, but the
+/// balance moves by what the shares are worth (101 asked → 30 shares → 100 moved).
+contract SharesToken {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    mapping(address => uint256) public shares;
+    function decimals() external pure returns (uint8) { return 6; }
+    function symbol() external pure returns (string memory) { return "stUSD"; }
+    function balanceOf(address a) external view returns (uint256) { return shares[a] * 10 / 3; }
+    function mintShares(address to, uint256 s) external { shares[to] += s; }
+    function transfer(address to, uint256 amount) external returns (bool) {
+        uint256 s = amount * 3 / 10;
+        shares[msg.sender] -= s;
+        shares[to] += s;
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+}
+
+/// Reads a chain-specific precompile at 0x…0800 (HyperEVM's HyperCore reads live there).
+contract CoreReader {
+    function read(uint32 x) external view returns (uint256) {
+        (bool ok, bytes memory r) = address(0x0000000000000000000000000000000000000800).staticcall(abi.encode(x));
+        require(ok && r.length == 32, "precompile");
+        return abi.decode(r, (uint256));
+    }
 }

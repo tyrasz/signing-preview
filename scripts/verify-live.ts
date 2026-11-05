@@ -16,8 +16,9 @@
 //     with what the receipt and balance changes show was paid and received.
 //  9. Kinetiq and HyperLend on HyperEVM: identities, facets and typehashes, and the decoders' predictions (rate,
 //     minimum, precision, health factor) against eth_call results on the live contracts.
-// 10. HyperEVM simulation (SimulationProbe through eth_call state overrides): a Kinetiq stake against Kinetiq's own
-//     quote, a USDC transfer and an approve + HyperLend supply batch, from real holders found in recent blocks.
+// 10. HyperEVM simulation, with both the fork simulator (a local EVM over fetched state) and SimulationProbe (eth_call
+//     state overrides): a Kinetiq stake against Kinetiq's own quote, a USDC transfer and an approve + HyperLend
+//     supply batch, from real holders found in recent blocks.
 // Exits non-zero if the chain and the previewer disagree. Needs network access to arb1.arbitrum.io,
 // ethereum-rpc.publicnode.com (or ETHEREUM_RPC_URL), rpc.hyperliquid.xyz and api.hyperliquid.xyz, plus
 // sourcify.dev, api.openchain.xyz and www.4byte.directory for step 6 (behind a proxy, run with
@@ -31,6 +32,7 @@ import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource
 import type { RpcClient } from '../src/rpc.ts';
 import { abiAdapter } from '../src/evm/abi-adapter.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { ForkSimulator } from '../src/fork-simulator.ts';
 import { UNIVERSAL_ROUTERS } from '../src/evm/universal-router.ts';
 import { KINETIQ } from '../src/evm/kinetiq.ts';
 import { HYPERLEND } from '../src/evm/hyperlend.ts';
@@ -530,7 +532,7 @@ console.log('\n9. Kinetiq and HyperLend on HyperEVM');
   } else console.log('skip HyperLend withdraw check: no recent borrower with supplied collateral found');
 }
 
-console.log('\n10. HyperEVM simulation with the state-override probe (the RPC has no eth_simulateV1)');
+console.log('\n10. HyperEVM simulation: the fork simulator and the state-override probe (the RPC has no eth_simulateV1)');
 {
   const tokens = new ChainedTokenRegistry([new StaticTokenRegistry(), new OnchainTokenRegistry(live)]);
   const deps = { tokens, rpc: live, simulator: new RpcSimulator({ 999: urls[999] }) };
@@ -552,26 +554,37 @@ console.log('\n10. HyperEVM simulation with the state-override probe (the RPC ha
       if ((await readAt(hl, H.usdc, 'function balanceOf(address) view returns (uint256)', [to]) as bigint) >= 2_000_000n && await eoa(to)) usdcHolder = to;
     }
   }
-  if (hypeHolder) {
-    const accountant = String(await readAt(hl, k.stakingManager as Address, 'function stakingAccountant() view returns (address)'));
-    const quote = await readAt(hl, accountant as Address, 'function HYPEToKHYPE(uint256) view returns (uint256)', [10n * E]) as bigint;
-    const p = await send(hypeHolder, k.stakingManager, '0x3a4b66f1', 10n * E);
-    const kIn = p.assetChanges.find(c => c.asset === k.kHYPE && c.direction === 'in');
-    check(p.simulation?.status === 'success' && p.assetChanges.some(c => c.asset === 'native' && c.direction === 'out' && c.raw === (10n * E).toString() && c.basis === 'simulated_state') && kIn?.raw === quote.toString(),
-      'probe: Kinetiq stake 10 HYPE'.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE`);
-  } else console.log('skip probe stake: no recent EOA sender holding 12 HYPE');
-  if (usdcHolder) {
-    const t = await send(usdcHolder, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] }));
-    check(t.simulation?.status === 'success' && moved(t) === 'out 1 USDC (simulated_state)', 'probe: USDC transfer of 1'.padEnd(34), moved(t));
-    const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: usdcHolder, atomicRequired: true, calls: [
-      { to: H.usdc, data: encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [m.pool as Address, 1_000_000n] }) },
-      { to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function supply(address,uint256,address,uint16)']), functionName: 'supply', args: [H.usdc, 1_000_000n, usdcHolder as Address, 0] }) },
-    ] }] }, {}, deps);
-    const hIn = batch.assetChanges.find(c => c.direction === 'in');
-    // The hUSDC isn't in the calldata: HyperLend's decoder watches it. Aave-style scaled balances round by a unit or two.
-    check(batch.simulation?.status === 'success' && batch.assetChanges.some(c => c.direction === 'out' && c.raw === '1000000') && !!hIn && Math.abs(Number(hIn.raw) - 1_000_000) <= 2,
-      'probe: approve + HyperLend supply'.padEnd(34), `${batch.simulation?.status}: ${moved(batch)}`);
-  } else console.log('skip probe USDC checks: no recent EOA holding 2 USDC');
+  // Both HyperEVM simulators: the fork simulator (every log; a long budget here so it is what answers) and the probe.
+  const simulators = [
+    ['fork', new RpcSimulator({ 999: urls[999] }, { fork: new ForkSimulator({ 999: urls[999] }, { timeoutMs: 60_000 }), forkBudgetMs: 60_000 }), /local EVM/],
+    ['probe', new RpcSimulator({ 999: urls[999] }), /state-override probe/],
+  ] as const;
+  for (const [name, simulator, sourcePattern] of simulators) {
+    const d = { ...deps, simulator };
+    const sendWith = (from: string, to: string, data: Hex, value = 0n) => previewRequest({ method: 'eth_sendTransaction', params: [{ from, to, data, value: toHex(value), chainId: '0x3e7' }] }, {}, d);
+    const by = (p: Awaited<ReturnType<typeof send>>) => sourcePattern.test(p.simulation?.source ?? '') ? '' : ` (simulated by ${p.simulation?.source})`;
+    if (hypeHolder) {
+      const accountant = String(await readAt(hl, k.stakingManager as Address, 'function stakingAccountant() view returns (address)'));
+      const quote = await readAt(hl, accountant as Address, 'function HYPEToKHYPE(uint256) view returns (uint256)', [10n * E]) as bigint;
+      const p = await sendWith(hypeHolder, k.stakingManager, '0x3a4b66f1', 10n * E);
+      const kIn = p.assetChanges.find(c => c.asset === k.kHYPE && c.direction === 'in');
+      check(!by(p) && p.simulation?.status === 'success' && p.assetChanges.some(c => c.asset === 'native' && c.direction === 'out' && c.raw === (10n * E).toString() && c.basis === 'simulated_state') && kIn?.raw === quote.toString(),
+        `${name}: Kinetiq stake 10 HYPE`.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE${by(p)}`);
+    } else console.log('skip stake: no recent EOA sender holding 12 HYPE');
+    if (usdcHolder) {
+      const t = await sendWith(usdcHolder, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] }));
+      check(!by(t) && t.simulation?.status === 'success' && moved(t) === 'out 1 USDC (simulated_state)', `${name}: USDC transfer of 1`.padEnd(34), moved(t) + by(t));
+      const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: usdcHolder, atomicRequired: true, calls: [
+        { to: H.usdc, data: encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [m.pool as Address, 1_000_000n] }) },
+        { to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function supply(address,uint256,address,uint16)']), functionName: 'supply', args: [H.usdc, 1_000_000n, usdcHolder as Address, 0] }) },
+      ] }] }, {}, d);
+      const hIn = batch.assetChanges.find(c => c.direction === 'in');
+      // The hUSDC isn't in the calldata: the fork simulator sees its mint event, the probe has HyperLend's decoder
+      // watch it. Aave-style scaled balances round by a unit or two.
+      check(sourcePattern.test(batch.simulation?.source ?? '') && batch.simulation?.status === 'success' && batch.assetChanges.some(c => c.direction === 'out' && c.raw === '1000000') && !!hIn && Math.abs(Number(hIn.raw) - 1_000_000) <= 2,
+        `${name}: approve + HyperLend supply`.padEnd(34), `${batch.simulation?.status}: ${moved(batch)}`);
+    } else console.log('skip USDC checks: no recent EOA holding 2 USDC');
+  }
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

@@ -32,16 +32,31 @@ export class BatchSimulationUnsupported extends Error {
  * state override runs the calls from the sender and reads balances and permissions around each one (see
  * simulation-probe.ts). Only if the RPC ignores state overrides too is a single call merely checked with eth_call.
  */
+/** A simulator that can stand in on chains without eth_simulateV1, e.g. ForkSimulator ('signing-preview/fork'). */
+export interface FallbackSimulator extends Simulator {
+  covers(chainId: number): boolean;
+  simulateBatch(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
+}
+
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
   private fetchImpl: typeof fetch;
+  private fork?: FallbackSimulator;
+  private forkBudgetMs: number;
   /** Chains whose RPC answered "method not found" for eth_simulateV1 (e.g. HyperEVM's public RPC). */
   private noSimulate = new Set<number>();
   /** ...and that also ignore eth_call state overrides: only success or failure can be checked. */
   private noProbe = new Set<number>();
-  constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch } = {}) {
+  /**
+   * `fork`: on chains without eth_simulateV1, simulate with this first (ForkSimulator gives every log there). If it
+   * hasn't finished within `forkBudgetMs` (default 3,500), the probe answers instead, while the fork run carries on
+   * in the background, warming its caches for the next preview.
+   */
+  constructor(urls: Record<number, string>, options: { fetchImpl?: typeof fetch; fork?: FallbackSimulator; forkBudgetMs?: number } = {}) {
     this.urls = urls;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.fork = options.fork;
+    this.forkBudgetMs = options.forkBudgetMs ?? 3500;
   }
   async simulate(req: SimulationRequest): Promise<SimulationResult | null> {
     return (await this.simulateBatch([req]))?.[0] ?? null;
@@ -85,6 +100,14 @@ export class RpcSimulator implements Simulator {
   }
 
   private async withoutSimulateV1(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
+    if (this.fork?.covers(chainId)) {
+      const forked = this.fork.simulateBatch(reqs);
+      forked.catch(() => { /* a late failure only means the probe's answer stood */ });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const first = await Promise.race([forked.then(r => ({ r }), () => null), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), this.forkBudgetMs); })]);
+      clearTimeout(timer);
+      if (first?.r) return first.r;
+    }
     const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase());
     if (probeable && !this.noProbe.has(chainId)) {
       try {
@@ -161,14 +184,15 @@ export class RpcSimulator implements Simulator {
 /** One key per permission: an allowance per token and spender, one NFT, or an operator per collection. */
 export const approvalKey = (a: SimulatedApproval) => a.kind === 'erc721' ? `erc721:${a.token}:${a.tokenId}` : `${a.kind}:${a.token}:${a.spender}`;
 
-function stateCall(a: SimulatedApproval): Hex {
+/** The view call that reads a permission's current state (allowance, Permit2 allowance, isApprovedForAll, getApproved). */
+export function stateCall(a: SimulatedApproval): Hex {
   if (a.kind === 'erc20') return ('0xdd62ed3e' + encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [a.owner as Hex, a.spender as Hex]).slice(2)) as Hex; // allowance(owner,spender)
   if (a.kind === 'permit2') return ('0x927da105' + encodeAbiParameters([{ type: 'address' }, { type: 'address' }, { type: 'address' }], [a.owner as Hex, a.token as Hex, a.spender as Hex]).slice(2)) as Hex; // Permit2 allowance(owner,token,spender)
   if (a.kind === 'operator') return ('0xe985e9c5' + encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [a.owner as Hex, a.spender as Hex]).slice(2)) as Hex; // isApprovedForAll(owner,operator)
   return ('0x081812fc' + encodeAbiParameters([{ type: 'uint256' }], [a.tokenId ?? 0n]).slice(2)) as Hex; // getApproved(tokenId)
 }
 
-function decodeState(a: SimulatedApproval, data: Hex): SimulatedApproval | null {
+export function decodeState(a: SimulatedApproval, data: Hex): SimulatedApproval | null {
   try {
     if (a.kind === 'erc20') return { ...a, amount: decodeAbiParameters([{ type: 'uint256' }], data)[0] };
     if (a.kind === 'permit2') { const [amount, expiration] = decodeAbiParameters([{ type: 'uint160' }, { type: 'uint48' }, { type: 'uint48' }], data); return { ...a, amount, expiration }; }

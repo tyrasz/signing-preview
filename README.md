@@ -236,19 +236,29 @@ Public endpoints can rate-limit or change without notice; use your own provider 
 
 ## Contract and token lookups
 
-**HyperEVM simulation.** The public RPC (`rpc.hyperliquid.xyz/evm`) has no `eth_simulateV1`, `debug_traceCall` or `trace_call`, and serves only the latest state. It does have `eth_call` with state overrides. `RpcSimulator` notices the missing method once and simulates with **`SimulationProbe`** (`contracts/SimulationProbe.sol`) instead:
-- One `eth_call` sets the probe as the code of the sending account and runs the transaction (or a whole batch, in order) through it, from that account. The target sees the real sender as `msg.sender` and `tx.origin`.
-- Around each call the probe reads the native balance, ERC-20 balances, allowances, Permit2 allowances, `isApprovedForAll`, and NFT ownership and approvals by token ID. The differences become the same balance changes and approvals that `eth_simulateV1`'s logs give, with basis `simulated_state`. Native HYPE received through an internal call (unwrapping WHYPE) shows too, which logs alone don't.
+**HyperEVM simulation.** The public RPC (`rpc.hyperliquid.xyz/evm`) has no `eth_simulateV1`, `debug_traceCall`, `trace_call`, `eth_createAccessList` or `eth_getProof`, and serves only the latest state. It does have the plain state reads and `eth_call` with state overrides. `RpcSimulator` notices the missing method once and, in live mode, simulates with **`ForkSimulator`** (`signing-preview/fork`), falling back to **`SimulationProbe`**.
+
+`ForkSimulator` runs the transaction in a local EVM (`@ethereumjs/evm`, Cancun rules as HyperEVM uses) over HyperEVM's state, fetched on demand with `eth_getBalance`, `eth_getCode`, `eth_getTransactionCount` and `eth_getStorageAt`, as Foundry's fork mode does:
+- It produces every log, so every token, NFT and approval the transaction touches is seen, with no token list. Amounts are read from the state before and after each call, so fee-on-transfer and share-based tokens come out exact; tokens the calls name are read too, which catches WETH-style wrappers that emit `Deposit` instead of `Transfer`. Approvals are read back from the tokens.
+- HyperCore's read precompiles (`0x…0800` onward) are answered by the chain itself through `eth_call`. Revert data, gas (with refunds and warm/cold access as in a real transaction) and batches in order are exact.
+- Fetching one value per round trip would be far too slow, so each run is speculative: unknown values read as the last value seen (shared across simulations) or zero, and everything the run needed is fetched in parallel JSON-RPC batches (20 per request, HyperEVM's limit) before it runs again. Only a run that used fresh values throughout is accepted. A long chain of dependent reads, such as Kinetiq's diamond router, takes about 10 s the first time and about 1 s once its values have been seen.
+- It runs in the next block (latest + 1 s), so interest and time-based values are one second further on than a plain `eth_call` shows.
+- If it hasn't finished within 3.5 s (`forkBudgetMs`), the probe answers instead, and the fork run carries on in the background so the next preview is fast.
+
+`SimulationProbe` (`contracts/SimulationProbe.sol`) is the fallback: one `eth_call` sets the probe as the code of the sending account and runs the transaction (or a whole batch, in order) through it, from that account.
+- Around each call the probe reads the native balance, ERC-20 balances, allowances, Permit2 allowances, `isApprovedForAll`, and NFT ownership and approvals by token ID. The differences become balance changes and approvals with basis `simulated_state`.
 - Without logs, only what is read is seen: the tokens the calls name (their targets, the addresses in their calldata, nested calldata and packed Uniswap paths), HyperEVM's built-in tokens, and tokens decoders name (HyperLend's hTokens and debt tokens). The preview says how many tokens were read.
 - With code at the account, contracts may treat it differently. The probe answers ERC-1271 `isValidSignature` the way the account's key would (`ecrecover`), and accepts NFTs as an account without code does. A contract that refuses senders with code makes the probe fail; a plain `eth_call` then confirms the call works, and the preview says its balance changes couldn't be measured.
-- Calls run at the latest block's timestamp, so a result that depends on the exact time can differ slightly.
 - An RPC that also ignores state overrides falls back to `eth_call` alone: success or failure and the revert reason, for single calls only.
 - `src/probe-code.ts` holds the compiled bytecode; `npm run build:probe` rebuilds it with the pinned solc, and a test checks it matches the source.
 
 How it was checked:
+- `ForkSimulator` on Ethereum, whose RPC still has the exact state before recent blocks: 71 transactions replayed after the earlier transactions of their block, with the real block header. All 71 outcomes match the receipts, all 22 of the senders' token movements are exact, and gas matches to the unit in all 71.
+- `ForkSimulator` on HyperEVM: view calls through it return the same bytes as HyperEVM's own `eth_call`, including HyperCore precompile reads (token and perp info, spot balances, oracle prices), Kinetiq's exchange rate and HyperLend's account data across all its reserves (with the same timestamp).
 - On Ethereum, whose RPC still has the exact state before recent blocks, 240 transactions from one-off senders were simulated at their parent block with the shipped code and compared with their receipts. 237 succeeded as on-chain (the other 3 depended on an earlier transaction in the same block). 231 of the 235 token movements were found, 230 with the exact amount, and no movement was reported that didn't happen. 8 of the 10 approvals were found; the other two were granted and spent in the same transaction. In an earlier run of the same comparison, the probe and `eth_simulateV1` agreed on 232 of 233 outcomes; the other depended on the block time.
-- On HyperEVM, live (`npm run verify:live`, step 10): a Kinetiq stake of 10 HYPE matches Kinetiq's own `HYPEToKHYPE` quote to the wei, a USDC transfer moves exactly 1 USDC, and approve + HyperLend supply in one batch gives −1 USDC and +0.999999 hUSDC (Aave-style balances round). Before that, 8 constructed flows matched independently computed values, including a WHYPE unwrap, a CoreDepositWallet deposit, HYPE to HyperCore and a below-minimum stake.
+- On HyperEVM, live (`npm run verify:live`, step 10, with each simulator): a Kinetiq stake of 10 HYPE matches Kinetiq's own `HYPEToKHYPE` quote to the wei, a USDC transfer moves exactly 1 USDC, and approve + HyperLend supply in one batch gives −1 USDC and +0.999999 hUSDC (Aave-style balances round). Before that, 8 constructed flows matched independently computed values, including a WHYPE unwrap, a CoreDepositWallet deposit, HYPE to HyperCore and a below-minimum stake.
 - On real HyperEVM traffic (2,796 transactions from 300 blocks over the last two hours, 2026-11-05), compared with their receipts: in every transaction whose replay still succeeds (273 that moved the sender's tokens, 26 of them from occasional senders), the preview shows all of the sender's token movements, against 90.8% (62.1% for occasional senders) with the `eth_call` check alone. The RPC only has the state after these transactions, so many replays fail (a balance already spent, a nonce already used); a preview before signing doesn't have that problem.
+- `test/fork-simulator.test.ts` runs `ForkSimulator` against contracts in an in-process EVM behind a HyperEVM-shaped node (`test/evm-chain.ts`): exact share-token amounts, batches, approvals without events, Permit2 signatures, NFTs, an EOA-only contract, a forwarded precompile, reverts, round convergence and the fallback to the probe.
 - `test/simulation-probe.test.ts` runs the real bytecode in an in-process EVM (`@ethereumjs/evm`) behind a fake HyperEVM-like RPC: transfers, unwrapping, direct and along-the-way approvals (including a forged Permit2 signature), batches, NFTs, reverts, insufficient funds and a contract that refuses senders with code.
 
 **HyperEVM decoding.**
@@ -359,7 +369,7 @@ Not covered, whatever the sample says:
 - **ERC-4337 UserOperations.** The UserOperations inside a bundler's `handleOps` call aren't previewed one by one, and a smart account's signature over a UserOperation hash isn't an EIP-1193 transaction.
 - **The call part of a self-delegating EIP-7702 transaction.** The delegation is decoded and flagged, but a call to your own address is decoded against the account's current code, not the new delegate's.
 - **Universal Router 1.0** (an older, NFT-era command table). Other DEX routers are shown through their verified ABI (function and arguments), without a swap headline.
-- **Simulation on HyperEVM** reads balances instead of logs (see [HyperEVM simulation](#contract-and-token-lookups)), so a token the transaction doesn't name, and no decoder adds, can be missing; and its RPC serves only the latest state.
+- **Simulation on HyperEVM** runs in a local EVM over the chain's state (see [HyperEVM simulation](#contract-and-token-lookups)). When that takes longer than its budget (a first preview of a deep contract), the probe answers, and it reads balances rather than logs, so a token the transaction doesn't name, and no decoder adds, can be missing.
 - **Sample size**: about 4% of Ethereum's blocks, 0.5% of Arbitrum's and 1.7% of HyperEVM's in the day.
 
 ## HyperCore coverage
@@ -502,7 +512,7 @@ src/abi.ts                ABI sources (Sourcify, Etherscan, static), proxy detec
 src/rpc.ts                JSON-RPC client and the lookup cache
 src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2, generic
 src/hyperliquid/          /info client, asset resolution, L1 action hash
-src/simulation.ts         eth_simulateV1 simulator + mock; src/simulation-probe.ts the eth_call + state-override simulator
+src/simulation.ts         eth_simulateV1 simulator + mock; src/fork-simulator.ts local EVM over fetched state; src/simulation-probe.ts the eth_call + state-override simulator
 contracts/                SimulationProbe.sol (compiled into src/probe-code.ts by npm run build:probe)
 src/interceptor.ts        dependency-free EIP-1193 wrapper
 src/server.ts             HTTP API + demo server (src/cli.ts starts it: npm start / npx signing-preview)
