@@ -289,6 +289,10 @@ export interface HyperliquidInfo {
   spotClearinghouseState?(user: string): Promise<{ balances: SpotBalance[] }>;
   /** Account mode: collateral is shared across spot/perps/DEXes for unifiedAccount and portfolioMargin. */
   userAbstraction?(user: string): Promise<'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>;
+  /** HYPE staking balances (decimal strings). */
+  delegatorSummary?(user: string): Promise<{ delegated: string; undelegated: string; totalPendingWithdrawal: string; nPendingWithdrawals: number }>;
+  /** HYPE delegations by validator, each locked until a time (ms). */
+  delegations?(user: string): Promise<{ validator: string; amount: string; lockedUntilTimestamp: number }[]>;
 }
 
 /** A contract ABI found for an address. */

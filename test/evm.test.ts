@@ -44,6 +44,34 @@ test('CoreWriter borrow/lend and account-mode actions', async () => {
   assert.equal(unknown.decoding.status, 'opaque');
 });
 
+test('CoreWriter actions are checked against the HyperCore account: HyperCore rejects what the account can’t cover', async () => {
+  const abi = parseAbi(['function sendRawAction(bytes data)']);
+  const { encodeAbiParameters, parseAbiParameters } = await import('viem');
+  const raw = (id: number, params: string, values: unknown[]) => encodeFunctionData({ abi, functionName: 'sendRawAction', args: [('0x01' + id.toString(16).padStart(6, '0') + encodeAbiParameters(parseAbiParameters(params), values as never).slice(2)) as `0x${string}`] });
+  const send = (data: string, from = ALICE) => previewRequest({ method: 'eth_sendTransaction', params: [{ from, to: '0x3333333333333333333333333333333333333333', data, chainId: '0x3e7' }] }, { now: NOW }, mockDeps());
+  const short = async (data: string, code = 'insufficient_balance') => codes(await send(data)).includes(code);
+  const V = '0x000000000056f99d36b6f2e0c51fd41496bbacb8';
+  // ALICE: 1,000 USDC free in spot (200 held by orders), 5 HYPE in spot, 3,200 USDC withdrawable from perps,
+  // 3 HYPE undelegated, 10 delegated to V (locked for another day).
+  assert.equal(await short(raw(6, 'address, uint64, uint64', [BOB, 150n, 4_00000000n])), false, 'send 4 of 5 HYPE');
+  const send6 = await send(raw(6, 'address, uint64, uint64', [BOB, 150n, 6_00000000n]));
+  assert.match(send6.warnings.find(w => w.code === 'insufficient_balance')!.message, /needs 6 HYPE, but 0xa11c…0001 has only 5 free in HyperCore spot, so HyperCore will reject it/);
+  assert.equal(await short(raw(7, 'uint64, bool', [1_000_000000n, true])), false, '1,000 USDC spot → perps');
+  assert.equal(await short(raw(7, 'uint64, bool', [1_001_000000n, true])), true, '1,001 USDC: 200 are held by orders');
+  assert.equal(await short(raw(7, 'uint64, bool', [3_500_000000n, false])), true, 'perps → spot beyond the withdrawable 3,200');
+  assert.equal(await short(raw(2, 'address, bool, uint64', [BOB, true, 3_000_000000n])), false, 'vault deposit within the withdrawable');
+  assert.equal(await short(raw(4, 'uint64', [6_00000000n])), true, 'stake 6 HYPE with 5 in spot');
+  assert.equal(await short(raw(5, 'uint64', [2_00000000n])), false, 'unstake 2 of 3 undelegated');
+  assert.equal(await short(raw(3, 'address, uint64, bool', [V, 4_00000000n, false])), true, 'delegate 4 with 3 undelegated');
+  assert.equal(await short(raw(3, 'address, uint64, bool', [V, 20_00000000n, true])), true, 'undelegate 20 of 10');
+  assert.equal(await short(raw(3, 'address, uint64, bool', [V, 5_00000000n, true]), 'stake_locked'), true, 'locked for a day');
+  assert.equal(await short(raw(15, 'uint8, uint64, uint64', [0, 150n, 6_00000000n])), true, 'supply 6 HYPE to lending');
+  // A perp order beyond the account's margin: 10,000 HYPE at 39.5 at 10x needs ~$39,500 of the $3,200 available.
+  assert.equal(await short(raw(1, 'uint32, bool, uint64, uint64, bool, uint8, uint128', [3, true, 3_950_000_000n, 1_000_000_000_000n, false, 2, 0n]), 'insufficient_margin'), true);
+  // A shared-collateral account's USDC isn't checked per balance.
+  assert.ok(!codes(await send(raw(7, 'uint64, bool', [1_000_000_000000n, true]), BOB)).includes('insufficient_balance'));
+});
+
 test('ERC-20 unlimited approval and Permit2 signatures', async () => {
   const approve = await sample('eth-approve-unlimited');
   assert.ok(codes(approve).includes('unlimited_approval'));

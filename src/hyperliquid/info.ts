@@ -49,6 +49,8 @@ export class HttpHyperliquidInfo implements HyperliquidInfo {
   outcomeMeta() { return this.post<OutcomeMeta>({ type: 'outcomeMeta' }, true); }
   spotClearinghouseState(user: string) { return this.post<{ balances: SpotBalance[] }>({ type: 'spotClearinghouseState', user }, false); }
   userAbstraction(user: string) { return this.post<'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>({ type: 'userAbstraction', user }, false); }
+  delegatorSummary(user: string) { return this.post<{ delegated: string; undelegated: string; totalPendingWithdrawal: string; nPendingWithdrawals: number }>({ type: 'delegatorSummary', user }, false); }
+  delegations(user: string) { return this.post<{ validator: string; amount: string; lockedUntilTimestamp: number }[]>({ type: 'delegations', user }, false); }
 }
 
 /** Fixed in-memory data, for tests and demos. */
@@ -64,6 +66,8 @@ export interface StaticInfoData {
   outcomeMeta?: OutcomeMeta;
   spotBalances?: Record<string, SpotBalance[]>;
   abstraction?: Record<string, 'unifiedAccount' | 'portfolioMargin' | 'disabled' | 'default'>;
+  /** Staking, by user. */
+  staking?: Record<string, { undelegated: string; delegations: { validator: string; amount: string; lockedUntilTimestamp: number }[] }>;
 }
 
 export class StaticHyperliquidInfo implements HyperliquidInfo {
@@ -88,4 +92,10 @@ export class StaticHyperliquidInfo implements HyperliquidInfo {
   async outcomeMeta() { return this.data.outcomeMeta ?? { outcomes: [], questions: [] }; }
   async spotClearinghouseState(user: string) { return { balances: this.data.spotBalances?.[user.toLowerCase()] ?? [] }; }
   async userAbstraction(user: string) { return this.data.abstraction?.[user.toLowerCase()] ?? 'default'; }
+  async delegatorSummary(user: string) {
+    const st = this.data.staking?.[user.toLowerCase()];
+    const delegated = (st?.delegations ?? []).reduce((t, d) => t + Number(d.amount), 0);
+    return { delegated: String(delegated), undelegated: st?.undelegated ?? '0.0', totalPendingWithdrawal: '0.0', nPendingWithdrawals: 0 };
+  }
+  async delegations(user: string) { return this.data.staking?.[user.toLowerCase()]?.delegations ?? []; }
 }

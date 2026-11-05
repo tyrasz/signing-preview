@@ -99,9 +99,11 @@ for (const b of blocks) {
       return actual.get(a)!;
     };
     for (const a of logged.keys()) await actualOf(a);
-    // Native: the sender's balance across the block, plus the fee it paid (it sent nothing else in this block).
+    // Native: the sender's balance across the block, plus the fee it paid (it sent nothing else in this block), less
+    // what other transactions of the block paid it directly (a bot funded just before it acts, say).
     const bal = async (tag: string) => BigInt(String(await rpc.call(CHAIN, 'eth_getBalance', [from, tag])));
-    const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice);
+    const paidIn = b.transactions.filter(x => x.hash !== t.hash && x.to?.toLowerCase() === from && receipts.find(y => y.transactionHash === x.hash)?.status === '0x1').reduce((sum, x) => sum + BigInt(x.value), 0n);
+    const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice) - paidIn;
     const approvals = logs.approvals.filter(a => a.owner === from && !(a.kind === 'erc721' && /^0x0{40}$/.test(a.spender))).map(a => `${a.kind}:${a.token}:${a.spender}`);
     const row: Record<string, unknown> = { hash: t.hash, block: n, index, to: t.to, selector: t.input.slice(0, 10), receipt: r.status === '0x1' ? 'success' : 'reverted', receiptGas: (BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0)).toString() };
     const before = await Promise.all(b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type)).map(x => reqOf(x, parent)));

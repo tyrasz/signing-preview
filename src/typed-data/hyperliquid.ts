@@ -4,6 +4,7 @@ import { l1ActionHash } from '../hyperliquid/action-hash.ts';
 import { describeOrder, findSpotToken, resolveAsset, TIF_LABELS, type ResolvedAsset } from '../hyperliquid/assets.ts';
 import type { HyperliquidInfo, Network, SpotToken } from '../types.ts';
 import { describeMoreL1 } from './hyperliquid-admin.ts';
+import { checkUsdcAvailable, fundsCheck } from '../hyperliquid/checks.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv } from './common.ts';
 
 const PREFIX = 'HyperliquidTransaction:';
@@ -49,26 +50,6 @@ function checkSystemAddressTransfer(b: PreviewBuilder, destination: string, name
   const systemIndex = parseSpotSystemAddress(destination);
   if (known && systemIndex !== null && known.index !== systemIndex) b.warn('danger', 'system_address_mismatch', `This system address belongs to token #${systemIndex}, not ${known.name} (#${known.index}). The transfer to HyperEVM will not work as intended.`);
   else if (known && !known.evmContract) b.warn('danger', 'no_evm_contract', `${known.name} is not linked to a HyperEVM contract, so it cannot be moved to HyperEVM.`);
-}
-
-/** Checks the USDC being withdrawn against the account (skipped for shared-collateral accounts). */
-async function checkUsdcAvailable(b: PreviewBuilder, info: HyperliquidInfo | undefined, account: string | null, source: 'perps' | 'spot', amount: number) {
-  if (!info || !account || !Number.isFinite(amount)) return;
-  let mode: string | undefined;
-  try { mode = await info.userAbstraction?.(account); } catch { mode = undefined; }
-  if (mode === 'unifiedAccount' || mode === 'portfolioMargin') { b.note('The balance was not checked because this account shares collateral across spot and perps.'); return; }
-  let have: number;
-  try {
-    if (source === 'spot') {
-      if (!info.spotClearinghouseState) return;
-      const bal = (await info.spotClearinghouseState(account)).balances.find(x => x.token === 0);
-      have = bal ? Number(bal.total) - Number(bal.hold) : 0;
-    } else {
-      have = Number((await info.clearinghouseState(account)).withdrawable);
-    }
-  } catch { return; }
-  b.detail(`Withdrawable USDC (${source})`, formatDecimalString(String(have)));
-  if (amount > have) b.warn('caution', 'insufficient_balance', `This needs ${formatDecimalString(String(amount))} USDC but only ${formatDecimalString(String(have))} is withdrawable from your ${source} balance, so Hyperliquid will reject it.`);
 }
 
 const usdc = (raw: bigint) => `${formatUnits(raw, 6)} USDC`;
@@ -512,46 +493,3 @@ async function describeL1Action(action: Wire, b: PreviewBuilder, info: Hyperliqu
   return { title: `Hyperliquid action: ${type}`, summary: 'An unrecognised Hyperliquid L1 action.', status: 'partial' };
 }
 
-/** Checks the order against the account: margin for perps (per DEX), balances for spot. */
-async function fundsCheck(b: PreviewBuilder, info: HyperliquidInfo | undefined, account: string | null, asset: ResolvedAsset, spec: { isBuy: boolean; price: string; size: string; reduceOnly: boolean }) {
-  const price = Number(spec.price), size = Number(spec.size), notional = price * size;
-  if (!info || !account || spec.reduceOnly || !Number.isFinite(notional)) return;
-  if (asset.kind === 'spot' && asset.base && asset.quote && info.spotClearinghouseState) {
-    let balances;
-    try { balances = (await info.spotClearinghouseState(account)).balances; } catch { return; }
-    const free = (token: number) => { const x = balances.find(bal => bal.token === token); return x ? Number(x.total) - Number(x.hold) : 0; };
-    const [token, need] = spec.isBuy ? [asset.quote, notional] : [asset.base, size];
-    const have = free(token.index);
-    b.detail(`Available ${token.name}`, formatDecimalString(String(have)));
-    if (have < need) b.warn('caution', 'insufficient_balance', `This order needs ${formatDecimalString(String(need))} ${token.name} but only ${formatDecimalString(String(have))} is available in spot. It may be rejected.`);
-    return;
-  }
-  if (asset.kind !== 'perp' || !asset.midKey) return;
-  let mode: string | undefined;
-  try { mode = await info.userAbstraction?.(account); } catch { mode = undefined; }
-  if (mode === 'unifiedAccount' || mode === 'portfolioMargin') {
-    b.detail('Account mode', mode === 'unifiedAccount' ? 'Unified account (collateral shared)' : 'Portfolio margin (collateral shared)');
-    b.note('Margin was not checked per market because this account shares collateral across spot, perps and DEXes.');
-    return;
-  }
-  let state;
-  try { state = await info.clearinghouseState(account, asset.dex); } catch { return; }
-  const withdrawable = Number(state.withdrawable);
-  const where = asset.dex ? ` on ${asset.dexFullName ?? asset.dex}` : '';
-  b.detail(`Account value${where}`, formatUsd(Number(state.marginSummary.accountValue))).detail(`Available margin${where}`, formatUsd(withdrawable));
-  const coin = asset.midKey;
-  const position = state.assetPositions.find(p => p.position.coin === coin)?.position;
-  const leverage = position?.leverage.value ?? asset.maxLeverage;
-  if (position) {
-    b.detail(`Current ${coin} position`, `${formatDecimalString(position.szi)} @ ${formatDecimalString(position.entryPx ?? '?')} (${position.leverage.value}× ${position.leverage.type})`);
-    if (position.liquidationPx) b.detail(`Current ${coin} liquidation price`, formatDecimalString(position.liquidationPx));
-  }
-  if (!leverage) return;
-  const required = notional / leverage;
-  b.detail(position ? 'Margin required (approx.)' : 'Margin required at max leverage (approx.)', `${formatUsd(required)} at ${leverage}×`);
-  if (required > withdrawable) {
-    const msg = `This order needs about ${formatUsd(required)} of margin at ${leverage}×${position ? '' : ' (the maximum)'}, but only ${formatUsd(withdrawable)} is available${where}. It may be rejected.`;
-    // HIP-3 DEX accounts can be funded via DEX abstraction, which this check does not see.
-    b.warn(asset.dex ? 'info' : 'caution', 'insufficient_margin', asset.dex ? `${msg} (If DEX abstraction is on, collateral may come from your main account.)` : msg);
-  }
-}

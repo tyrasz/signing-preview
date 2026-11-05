@@ -65,6 +65,8 @@ export function mockHyperliquidInfo(): StaticHyperliquidInfo {
     },
     spotBalances: { [ALICE]: [{ coin: 'USDC', token: 0, total: '1200', hold: '200' }, { coin: 'HYPE', token: 150, total: '5', hold: '0' }] },
     abstraction: { [BOB]: 'unifiedAccount' },
+    // 3 HYPE undelegated; 10 delegated to a validator, locked until 2026-11-03 (a day after the tests' clock).
+    staking: { [ALICE]: { undelegated: '3.0', delegations: [{ validator: '0x000000000056f99d36b6f2e0c51fd41496bbacb8', amount: '10.0', lockedUntilTimestamp: Date.UTC(2026, 10, 3, 12, 0, 0) }] } },
     clearinghouse: {
       [`xyz:${ALICE}`]: { marginSummary: { accountValue: '100', totalNtlPos: '0', totalMarginUsed: '0' }, withdrawable: '100', assetPositions: [] },
       [BOB]: { marginSummary: { accountValue: '10', totalNtlPos: '0', totalMarginUsed: '0' }, withdrawable: '10', assetPositions: [] },

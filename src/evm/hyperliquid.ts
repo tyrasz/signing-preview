@@ -2,6 +2,7 @@ import { decodeAbiParameters, decodeFunctionData, parseAbi, parseAbiParameters, 
 import { decimalString, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CCTP, HYPEREVM_MAINNET, HYPEREVM_TESTNET, HYPERLIQUID, parseSpotSystemAddress } from '../chains.ts';
 import { describeOrder, findSpotToken, resolveAsset } from '../hyperliquid/assets.ts';
+import { checkSpotAvailable, checkStaking, checkUsdcAvailable, fundsCheck } from '../hyperliquid/checks.ts';
 import { decoded, nativeAmount, tokenInfo, type Adapter, type AdapterEnv, type Decoded } from './common.ts';
 
 const TOKEN_ABI = parseAbi([
@@ -166,6 +167,9 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
   const info = env.deps.hyperliquid?.mainnet;
   const usd = (raw: bigint) => `${formatUnits(raw, 6)} USDC`;
   const hype = (raw: bigint) => `${formatUnits(raw, 8)} HYPE`;
+  // The checks below read the HyperCore account of the address calling CoreWriter (from) as it is now: HyperCore
+  // runs the action after this block, and rejects it if the account can't cover it.
+  const now = env.context.now ?? Date.now();
   switch (id) {
     case 1: {
       const [asset, isBuy, limitPx, sz, reduceOnly, tif, cloid] = f as [number, boolean, bigint, bigint, boolean, number, bigint];
@@ -173,22 +177,27 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
       const title = await describeOrder(b, info, resolved, { isBuy, price: decimalString(limitPx, 8), size: decimalString(sz, 8), reduceOnly, orderType: TIF[tif] ?? `unknown time-in-force ${tif}` });
       if (!TIF[tif]) b.warn('caution', 'unknown_tif', `Time-in-force code ${tif} is not recognised.`);
       if (cloid !== 0n) b.detail('Client order ID', '0x' + cloid.toString(16).padStart(32, '0'));
+      await fundsCheck(b, info, from, resolved, { isBuy, price: decimalString(limitPx, 8), size: decimalString(sz, 8), reduceOnly });
       return { title: `HyperCore order: ${title}`, summary: `Places a ${resolved.name} order on HyperCore from your HyperEVM contract/account ${shortAddress(from)}.`, status: resolved.kind === 'unknown' ? 'partial' : 'full' };
     }
     case 2: {
       const [vault, isDeposit, amount] = f as [string, boolean, bigint];
       b.detail('Vault', vault).detail('Amount', usd(amount), amount.toString());
+      if (isDeposit) await checkUsdcAvailable(b, info, from, 'perps', Number(decimalString(amount, 6)));
       return { title: `${isDeposit ? 'Deposit' : 'Withdraw'} ${usd(amount)} ${isDeposit ? 'into' : 'from'} vault ${shortAddress(vault)}`, summary: `Moves perp USDC ${isDeposit ? 'into' : 'out of'} a Hyperliquid vault.` };
     }
     case 3: {
       const [validator, amount, undelegate] = f as [string, bigint, boolean];
       b.detail('Validator', validator).detail('Amount', hype(amount), amount.toString());
+      await checkStaking(b, info, from, undelegate ? 'undelegate' : 'delegate', decimalString(amount, 8), validator, now);
       return { title: `${undelegate ? 'Undelegate' : 'Delegate'} ${hype(amount)} ${undelegate ? 'from' : 'to'} ${shortAddress(validator)}`, summary: 'Changes HYPE staking delegation on HyperCore.' };
     }
     case 4:
     case 5: {
       const [amount] = f as [bigint];
       b.detail('Amount', hype(amount), amount.toString());
+      if (id === 5) await checkStaking(b, info, from, 'withdraw', decimalString(amount, 8));
+      else { const token = await findSpotToken(info, { name: 'HYPE' }); if (token) await checkSpotAvailable(b, info, from, token, amount, 'This move to staking'); }
       return id === 4
         ? { title: `Move ${hype(amount)} from spot to staking`, summary: 'Transfers HYPE from your HyperCore spot balance into your staking balance.' }
         : { title: `Move ${hype(amount)} from staking to spot`, summary: 'Starts moving HYPE out of staking (subject to the unstaking queue).' };
@@ -199,11 +208,13 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
       const amountText = token ? `${formatUnits(amount, token.weiDecimals)} ${token.name}` : `${amount} base units of token #${tokenIndex}`;
       b.detail('Recipient (HyperCore)', destination).detail('Token', token?.name ?? `#${tokenIndex}`, tokenIndex.toString()).detail('Amount', amountText, amount.toString());
       if (!token) b.warn('caution', 'core_token_unknown', `HyperCore token #${tokenIndex} could not be looked up.`);
+      else await checkSpotAvailable(b, info, from, token, amount, 'This transfer');
       return { title: `Send ${amountText} on HyperCore to ${shortAddress(destination)}`, summary: 'Transfers a HyperCore spot token to another HyperCore account.', status: token ? 'full' : 'partial' };
     }
     case 7: {
       const [ntl, toPerp] = f as [bigint, boolean];
       b.detail('Amount', usd(ntl), ntl.toString()).detail('Direction', toPerp ? 'Spot → Perps' : 'Perps → Spot');
+      await checkUsdcAvailable(b, info, from, toPerp ? 'spot' : 'perps', Number(decimalString(ntl, 6)));
       return { title: `Move ${usd(ntl)} ${toPerp ? 'from spot to perps' : 'from perps to spot'}`, summary: 'Moves USDC between your HyperCore spot and perps balances.' };
     }
     case 8: {
@@ -245,6 +256,9 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
       const fromSub = !/^0x0{40}$/.test(subAccount);
       b.detail('Recipient', destination).detail('From sub-account', fromSub ? subAccount : 'none (main account)')
         .detail('From', dexName(sourceDex), String(sourceDex)).detail('To', dexName(destinationDex), String(destinationDex)).detail('Amount', amountText, amount.toString());
+      // From the account's own balances (a sub-account's aren't read here): spot, or USDC on the main perps DEX.
+      if (!fromSub && token && sourceDex === SPOT_DEX) await checkSpotAvailable(b, info, from, token, amount, 'This transfer');
+      else if (!fromSub && token?.index === 0 && sourceDex === 0) await checkUsdcAvailable(b, info, from, 'perps', Number(decimalString(amount, token.weiDecimals)));
       if (sameAddress(destination, from) && !fromSub) return { title: `Move ${amountText} from ${dexName(sourceDex)} to ${dexName(destinationDex)}`, summary: 'Moves an asset between your own HyperCore balances.', status: token ? 'full' : 'partial' };
       return { title: `Send ${amountText} to ${shortAddress(destination)}`, summary: 'Transfers an asset between HyperCore accounts or DEXes.', status: token ? 'full' : 'partial' };
     }
@@ -256,6 +270,7 @@ async function describeCoreWriterAction(id: number, f: readonly unknown[], from:
       const verb = op === 0 ? 'Supply' : op === 1 ? 'Withdraw' : `Borrow/lend operation ${op}`;
       b.detail('Operation', verb, String(op)).detail('Amount', amountText, amount.toString());
       if (op !== 0 && op !== 1) b.warn('caution', 'unknown_borrow_lend_op', `Borrow/lend operation ${op} is not recognised.`);
+      if (op === 0 && token) await checkSpotAvailable(b, info, from, token, amount, 'This supply');
       return { title: `${verb} ${amountText} ${op === 0 ? 'to' : 'from'} HyperCore lending`, summary: 'Changes your HyperCore lending position.', status: token && (op === 0 || op === 1) ? 'full' : 'partial' };
     }
     case 16: {
