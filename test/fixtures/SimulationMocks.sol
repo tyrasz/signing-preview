@@ -157,3 +157,14 @@ contract Hop {
     constructor(Hop n, uint256 v) { next = n; value = v; }
     function total() external view returns (uint256) { return value + (address(next) == address(0) ? 0 : next.total()); }
 }
+
+/// HyperEVM's CoreWriter: emits each action for HyperCore to pick up after the block.
+contract CoreWriterLike {
+    event RawAction(address indexed user, bytes data);
+    function sendRawAction(bytes calldata data) external { emit RawAction(msg.sender, data); }
+}
+
+/// A contract that sends HyperCore actions for its own HyperCore account, as vaults and strategies do.
+contract CoreSender {
+    function act(bytes calldata data) external { CoreWriterLike(0x3333333333333333333333333333333333333333).sendRawAction(data); }
+}

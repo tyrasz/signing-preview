@@ -626,7 +626,7 @@ export class ForkSimulator implements Simulator {
         const s = r && decodeState(ap, bytesToHex(r) as Hex);
         if (s) approvalState.push(s);
       }
-      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), basis: 'fork', returnData: bytesToHex(ex.returnValue) });
+      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue) });
     }
     return { results, tokens: [...seenTokens], approvals: seenApprovals };
   }

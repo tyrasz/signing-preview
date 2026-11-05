@@ -227,6 +227,8 @@ export interface SimulationResult {
    * USDC, OpenZeppelin 5 tokens and Permit2 lower an allowance without an event when it is spent.
    */
   approvalState?: SimulatedApproval[];
+  /** HyperCore actions the calls sent through HyperEVM's CoreWriter (its RawAction events): who sent each, and its encoded action. */
+  coreActions?: { user: string; data: string }[];
   /**
    * Only success or failure is known (the RPC has no eth_simulateV1, so the call was checked with eth_call):
    * no transfers, approvals or gas.

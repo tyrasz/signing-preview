@@ -1,5 +1,5 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import { CHAINS, chainName } from '../chains.ts';
+import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
 import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
@@ -11,7 +11,7 @@ import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
 import { cctpAdapter, cctpExtensionAdapter } from './cctp.ts';
-import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreSystemTransferAdapter } from './hyperliquid.ts';
+import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreSystemTransferAdapter, simulatedCoreActions } from './hyperliquid.ts';
 
 /** Order matters: specific routes before generic ERC-20 shapes. */
 export const ADAPTERS: Adapter[] = [
@@ -187,6 +187,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       // Approvals the decoded request already shows (e.g. a router's Permit2 permit step) are not hidden.
       for (const a of approvals) if (d.declaredApprovals?.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender))) a.direct = true;
       approvalWarnings(b, approvals, context.now);
+      if (sim.coreActions?.length && !sameAddress(tx.to ?? '', HYPERLIQUID.coreWriter)) await simulatedCoreActions(sim.coreActions, tx.from, b, { deps, context });
       b.note(simulationNote(sim));
     }
   }

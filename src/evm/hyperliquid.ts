@@ -146,22 +146,49 @@ export const coreWriterAdapter: Adapter = async (tx, env) => {
     b.warn('caution', 'corewriter_unknown_function', 'Unrecognised CoreWriter function.');
     return decoded({ title: 'Send an unknown action to HyperCore', summary: 'The CoreWriter call could not be decoded.', decoder: 'corewriter', status: 'opaque', b });
   }
+  const result = await describeCoreAction(raw, tx.from, b, env);
+  return decoded({ ...result, decoder: 'corewriter', b });
+};
+
+/**
+ * Describes one encoded CoreWriter action (version byte, 3-byte action ID, ABI-encoded fields) sent by `user`, into
+ * `b`, with checks against `user`'s HyperCore account.
+ */
+export async function describeCoreAction(raw: Hex, user: string, b: PreviewBuilder, env: AdapterEnv): Promise<Pick<Decoded, 'title' | 'summary' | 'status'>> {
   const version = Number.parseInt(raw.slice(2, 4), 16);
   const id = Number.parseInt(raw.slice(4, 10), 16);
   const spec = CORE_ACTIONS[id];
   b.detail('Action', spec ? spec.name : `unknown (id ${id})`, String(id));
   if (version !== 1 || !spec) {
     b.warn('caution', 'corewriter_unknown_action', `CoreWriter action version ${version}, id ${id} is not recognised.`);
-    return decoded({ title: 'Send an unknown action to HyperCore', summary: `Submits CoreWriter action ${id}, which is not decoded.`, decoder: 'corewriter', status: 'opaque', b });
+    return { title: 'Send an unknown action to HyperCore', summary: `Submits CoreWriter action ${id}, which is not decoded.`, status: 'opaque' };
   }
   let fields: readonly unknown[];
   try { fields = decodeAbiParameters(parseAbiParameters(spec.params), ('0x' + raw.slice(10)) as Hex); } catch {
     b.warn('danger', 'corewriter_malformed', `The ${spec.name} payload does not match its expected layout; HyperCore will probably reject it.`);
-    return decoded({ title: `Send a malformed ${spec.name} to HyperCore`, summary: 'The action payload could not be decoded.', decoder: 'corewriter', status: 'partial', b });
+    return { title: `Send a malformed ${spec.name} to HyperCore`, summary: 'The action payload could not be decoded.', status: 'partial' };
   }
-  const result = await describeCoreWriterAction(id, fields, tx.from, b, env);
-  return decoded({ ...result, decoder: 'corewriter', status: result.status ?? 'full', b });
-};
+  const result = await describeCoreWriterAction(id, fields, user, b, env);
+  return { ...result, status: result.status ?? 'full' };
+}
+
+/**
+ * HyperCore actions a transaction sends through CoreWriter from inside other contracts, as its simulation's logs show
+ * (a vault or router calling CoreWriter; an EIP-7702 account running a batch): each is listed with the checks
+ * against the HyperCore account it runs on, which is the sending contract's own unless it is your account.
+ */
+export async function simulatedCoreActions(actions: { user: string; data: string }[], from: string, b: PreviewBuilder, env: AdapterEnv): Promise<void> {
+  for (const [i, a] of actions.slice(0, 10).entries()) {
+    const sub = new PreviewBuilder();
+    const r = await describeCoreAction(a.data as Hex, a.user, sub, env);
+    const n = actions.length > 1 ? ` ${i + 1}` : '';
+    b.detail(`HyperCore action${n}`, `${r.title}${sameAddress(a.user, from) ? '' : ` (sent by ${shortAddress(a.user)}, for its own HyperCore account)`}`, a.data);
+    for (const w of sub.warnings) if (w.severity !== 'info') b.warn(w.severity, w.code, `HyperCore action${n}: ${w.message}`);
+  }
+  if (actions.length > 10) b.detail('More HyperCore actions', String(actions.length - 10));
+  const one = actions.length === 1;
+  b.warn('info', 'corewriter_async', `This transaction sends ${one ? 'a HyperCore action' : `${actions.length} HyperCore actions`} through CoreWriter. HyperCore runs ${one ? 'it' : 'them'} after the HyperEVM block; if ${one ? 'it fails' : 'one fails'}, the EVM transaction still succeeds and gas is spent.`);
+}
 
 async function describeCoreWriterAction(id: number, f: readonly unknown[], from: string, b: PreviewBuilder, env: AdapterEnv): Promise<Pick<Decoded, 'title' | 'summary'> & { status?: Decoded['status'] }> {
   const info = env.deps.hyperliquid?.mainnet;

@@ -15,6 +15,9 @@ const TRANSFER_BATCH_TOPIC = '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d
 const PERMIT2_APPROVAL_TOPIC = '0xda9fa7c1b00402c17d0161b249b1ab8bbec047c5a52207b9c112deffd817036b'; // Approval(owner,token,spender,uint160,uint48)
 const PERMIT2_PERMIT_TOPIC = '0xc6a377bfc4eb120024a8ac08eef205be16b817020812c73223e81d1bdb9708ec'; // Permit(owner,token,spender,uint160,uint48,uint48)
 const PERMIT2_LOCKDOWN_TOPIC = '0x89b1add15eff56b3dfe299ad94e01f2b52fbcb80ae1a3baea6ae8c04cb2b98a4'; // Lockdown(owner,token,spender)
+/** HyperEVM's CoreWriter emits RawAction(msg.sender, data) for each HyperCore action sent through it. */
+const CORE_WRITER = '0x3333333333333333333333333333333333333333';
+const RAW_ACTION_TOPIC = '0x8c7f585fb295f7eb1e6aeb8fba61b23a4fe60beda405f0045073b185c74412e3'; // RawAction(address,bytes)
 /** eth_simulateV1 with traceTransfers reports native transfers as ERC-20 logs from this address. */
 const NATIVE_PSEUDO_TOKEN = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
@@ -364,8 +367,8 @@ export function parseTransfers(logs: Log[]): SimulatedTransfer[] {
  * Reads transfers and approvals from simulated logs. The emitting contract is taken from the log itself, so a
  * contract can't fake events for another token; Permit2 events are only read from the canonical Permit2.
  */
-export function parseLogs(logs: Log[]): { transfers: SimulatedTransfer[]; nftTransfers: SimulatedNftTransfer[]; approvals: SimulatedApproval[] } {
-  const transfers: SimulatedTransfer[] = [], nftTransfers: SimulatedNftTransfer[] = [], approvals: SimulatedApproval[] = [];
+export function parseLogs(logs: Log[]): { transfers: SimulatedTransfer[]; nftTransfers: SimulatedNftTransfer[]; approvals: SimulatedApproval[]; coreActions?: { user: string; data: string }[] } {
+  const transfers: SimulatedTransfer[] = [], nftTransfers: SimulatedNftTransfer[] = [], approvals: SimulatedApproval[] = [], coreActions: { user: string; data: string }[] = [];
   for (const log of logs) {
     const address = log.address.toLowerCase();
     const [topic0, t1, t2, t3] = log.topics.map(t => t.toLowerCase());
@@ -390,9 +393,11 @@ export function parseLogs(logs: Log[]): { transfers: SimulatedTransfer[]; nftTra
       const base = { kind: 'permit2' as const, emitter: address, owner: topicAddress(t1), token: topicAddress(t2), spender: topicAddress(t3) };
       if (topic0 === PERMIT2_LOCKDOWN_TOPIC) approvals.push({ ...base, amount: 0n });
       else if (isWords(log.data, topic0 === PERMIT2_PERMIT_TOPIC ? 3 : 2)) approvals.push({ ...base, amount: BigInt('0x' + log.data.slice(2, 66)), expiration: Number(BigInt('0x' + log.data.slice(66, 130))) });
+    } else if (address === CORE_WRITER && topic0 === RAW_ACTION_TOPIC && n === 2) {
+      try { coreActions.push({ user: topicAddress(t1), data: decodeAbiParameters([{ type: 'bytes' }], log.data as Hex)[0] }); } catch { /* malformed */ }
     }
   }
-  return { transfers, nftTransfers, approvals };
+  return { transfers, nftTransfers, approvals, ...(coreActions.length && { coreActions }) };
 }
 
 const ERRORS = parseAbi(['error Error(string message)', 'error Panic(uint256 code)']);

@@ -219,6 +219,19 @@ test('A cache file keeps what simulations have seen across restarts: the first p
   assert.equal(fork({ cacheFile: file }).loaded, 0);
 });
 
+test('HyperCore actions a contract sends through CoreWriter are listed, checked against the account they run on', async () => {
+  await chain.putCode('0x3333333333333333333333333333333333333333', `0x${compiled('CoreWriterLike').evm.deployedBytecode.object}`);
+  const sender = await chain.deploy('CoreSender');
+  // Spot send (action 6): 6 HYPE to BOB, from the contract's HyperCore account, which holds none.
+  const action = `0x01000006${encodeAbiParameters([{ type: 'address' }, { type: 'uint64' }, { type: 'uint64' }], [BOB, 150n, 6_00000000n]).slice(2)}` as Hex;
+  const data = encodeFunctionData({ abi: parseAbi(['function act(bytes)']), functionName: 'act', args: [action] });
+  const { mockHyperliquidInfo } = await import('../mocks/data.ts');
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: USER, to: sender, data, chainId: '0x3e7' }] }, { now: NOW }, { ...deps, hyperliquid: { mainnet: mockHyperliquidInfo() } });
+  assert.equal(p.details.find(d => d.label === 'HyperCore action')?.value, `Send 6 HYPE on HyperCore to 0xb0b0…0002 (sent by ${sender.slice(0, 6)}…${sender.slice(-4)}, for its own HyperCore account)`);
+  assert.match(p.warnings.find(w => w.code === 'insufficient_balance')!.message, /^HyperCore action: This transfer needs 6 HYPE, but .* has only 0 free in HyperCore spot/);
+  assert.ok(codes(p).includes('corewriter_async'));
+});
+
 test('When the fork simulator runs out of budget, the probe reads the tokens it had already seen', async () => {
   const hUsdc = await chain.deploy('Token', 'string,uint8', ['hUSDC', 6]);
   const pool = await chain.deploy('Pool', 'address,address', [usdc, hUsdc]);
