@@ -47,3 +47,15 @@ test('Single calls (packed ERC-7579, execute(address,uint256,bytes)), executeBat
   const other = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: BOB, data: encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [USDC, 0n, transfer] }), chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
   assert.notEqual(other.decoding.decoder, 'smart_account');
 });
+
+test('A batch sent to your own account does nothing when the account has no code; a delegation in the same transaction counts', async () => {
+  const batch = encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [USDC, 0n, transfer] });
+  const rpc = { has: () => true, call: async (_c: number, method: string) => method === 'eth_getCode' ? '0x' : null };
+  const plain = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: batch, chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), rpc });
+  assert.ok(codes(plain).includes('smart_account_no_code'));
+  assert.notEqual(plain.title, 'Send 1 USDC');
+  const upgrading = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: batch, chainId: '0x1', authorizationList: [{ address: '0x63c0c19a282a1b52b07dd5a65b58948a07dae32b', chainId: '0x1' }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), rpc });
+  assert.equal(upgrading.title, 'Send 1 USDC');
+  const delegated = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: batch, chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), rpc: { ...rpc, call: async () => '0xef010063c0c19a282a1b52b07dd5a65b58948a07dae32b' } });
+  assert.equal(delegated.title, 'Send 1 USDC');
+});

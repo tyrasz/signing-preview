@@ -11,6 +11,7 @@ import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../forma
 import { CHAINS } from '../chains.ts';
 import { decoded, type Adapter, type Decoded } from './common.ts';
 import { decodeTransaction } from './transaction.ts';
+import { ownDelegateAfter } from './eip7702.ts';
 
 const ABI = parseAbi([
   'function execute(bytes32 mode, bytes executionData)',
@@ -62,6 +63,17 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   if (!parsed || !parsed.calls.length) return null;
 
   const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', parsed.standard);
+  // Only code at the account runs the calls: a delegation set in this transaction, or one (or a contract) already there.
+  const delegate = await ownDelegateAfter(tx);
+  if (delegate === null) return null; // cleared in this transaction: a plain account again
+  if (delegate === undefined && env.deps.rpc?.has(tx.chainId)) {
+    let code: unknown;
+    try { code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, 'latest']); } catch { code = undefined; }
+    if (code === '0x') {
+      b.warn('caution', 'smart_account_no_code', 'Your account has no code (no EIP-7702 delegation), so this call to it runs nothing: the calls it lists would not happen.');
+      return decoded({ title: `Call your own account (${tx.data.slice(0, 10)})`, summary: 'A call to your own account, which has no code to run it.', decoder: 'smart_account', status: 'partial', b });
+    }
+  }
   const native = CHAINS[tx.chainId]?.nativeSymbol ?? 'native';
   const inner: Decoded[] = [];
   for (const [i, c] of parsed.calls.slice(0, MAX_CALLS).entries()) {
