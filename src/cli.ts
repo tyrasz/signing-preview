@@ -9,7 +9,8 @@ import type { Dependencies } from './types.ts';
 
 const mode = process.env.SIGNING_PREVIEW_MODE === 'live' ? 'live' : 'mock';
 const { buildSamples, mockHyperEvmRpc, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
-const deps: Dependencies = mode === 'live' ? liveDependencies()
+// Live mode warms the HyperEVM simulator's caches in the background, so first previews there are fast.
+const deps: Dependencies = mode === 'live' ? liveDependencies(process.env, { warmUp: true })
   : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() }, rpc: mockHyperEvmRpc() };
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? '127.0.0.1';

@@ -9,7 +9,9 @@ import { StaticTokenRegistry } from './chains.ts';
 import { HttpHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
 import { RpcSimulator } from './simulation.ts';
 import { ForkSimulator } from './fork-simulator.ts';
-import type { Dependencies, PreviewContext, TokenRegistry } from './types.ts';
+import type { Dependencies, PreviewContext, SimulationRequest, TokenRegistry } from './types.ts';
+import { KINETIQ } from './evm/kinetiq.ts';
+import { HYPERLEND } from './evm/hyperlend.ts';
 import { JsonRpcClient } from './rpc.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry, TokenListRegistry } from './tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource, type AbiSource } from './abi.ts';
@@ -134,12 +136,14 @@ function json(res: ServerResponse, status: number, body: unknown) {
  * from Sourcify (plus Etherscan when ETHERSCAN_API_KEY is set); TOKEN_LIST_FILE adds a tokenlists.org-format list.
  * Set SIGNING_PREVIEW_OFFLINE_LOOKUPS=1 to skip the public ABI and signature services.
  */
-export function liveDependencies(env = process.env): Dependencies {
+export function liveDependencies(env = process.env, options: { warmUp?: boolean } = {}): Dependencies {
   const rpcs: Record<number, string> = {};
   if (env.ETHEREUM_RPC_URL) rpcs[1] = env.ETHEREUM_RPC_URL;
   if (env.ARBITRUM_RPC_URL) rpcs[42161] = env.ARBITRUM_RPC_URL;
   if (env.HYPEREVM_RPC_URL) rpcs[999] = env.HYPEREVM_RPC_URL;
   const rpc = new JsonRpcClient(rpcs);
+  const fork = new ForkSimulator(rpcs);
+  if (options.warmUp && rpcs[999]) setTimeout(() => warmHyperEvm(fork, rpc).catch(() => { /* only warming */ }), 0).unref?.();
   const tokenSources: TokenRegistry[] = [new StaticTokenRegistry()];
   if (env.TOKEN_LIST_FILE) tokenSources.push(new TokenListRegistry(JSON.parse(readFileSync(env.TOKEN_LIST_FILE, 'utf8'))));
   tokenSources.push(new OnchainTokenRegistry(rpc));
@@ -151,6 +155,26 @@ export function liveDependencies(env = process.env): Dependencies {
     abis: new ContractAbiResolver({ sources: abiSources, rpc }),
     signatures: new ChainedSignatures(online ? [new OpenChainSignatures(), new FourByteSignatures()] : []),
     hyperliquid: { mainnet: new HttpHyperliquidInfo(INFO_URLS.mainnet), testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
-    ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs, { fork: new ForkSimulator(rpcs) }) }),
+    ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs, { fork }) }),
   };
+}
+
+/**
+ * Background simulations of HyperEVM's main protocol paths (a Kinetiq stake; HyperLend's reserves and their oracle
+ * prices), so their first real previews get the fork simulator's full answer within its budget.
+ */
+async function warmHyperEvm(fork: ForkSimulator, rpc: JsonRpcClient): Promise<void> {
+  const view = (to: string, data: string) => [{ chainId: 999, from: '0x0000000000000000000000000000000000000000', to, data, value: 0n }];
+  const word = (a: string) => a.slice(2).toLowerCase().padStart(64, '0');
+  const batches: SimulationRequest[][] = [
+    // From WHYPE's own address: it holds plenty of HYPE.
+    [{ chainId: 999, from: '0x5555555555555555555555555555555555555555', to: KINETIQ[999].stakingManager, data: '0x3a4b66f1', value: 10n ** 19n }],
+  ];
+  const pool = HYPERLEND[999].pool;
+  const list = String(await rpc.call(999, 'eth_call', [{ to: pool, data: '0xd1946dbc' }, 'latest']));
+  const reserves = list.length > 130 ? Array.from({ length: Number(BigInt('0x' + list.slice(66, 130))) }, (_, i) => '0x' + list.slice(130 + 64 * i + 24, 130 + 64 * (i + 1))) : [];
+  const oracle = '0x' + String(await rpc.call(999, 'eth_call', [{ to: HYPERLEND[999].addressesProvider, data: '0xfca513a8' }, 'latest'])).slice(26);
+  // One batch: the calls share one fetch of each slot and contract, keeping a public RPC's rate limit in mind.
+  batches[0].push(...reserves.flatMap(r => [...view(pool, `0x35ea6a75${word(r)}`), ...view(oracle, `0xb3596f07${word(r)}`)])); // getReserveData, getAssetPrice
+  await fork.warm(batches);
 }

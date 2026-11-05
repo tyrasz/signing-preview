@@ -136,3 +136,24 @@ test('EIP-7702: an account delegated to a smart-account contract runs its code (
   assert.equal(delegated.status, 'success');
   assert.deepEqual(delegated.transfers.filter(t => t.asset === usdc).map(t => [t.from, t.raw]), [[USER, 5_000_000n]]);
 });
+
+test('When the fork simulator runs out of budget, the probe reads the tokens it had already seen', async () => {
+  const hUsdc = await chain.deploy('Token', 'string,uint8', ['hUSDC', 6]);
+  const pool = await chain.deploy('Pool', 'address,address', [usdc, hUsdc]);
+  const reqs = [
+    { chainId: 999, from: USER, to: usdc, data: call('approve', [pool, 3_000_000n]), value: 0n },
+    { chainId: 999, from: USER, to: pool, data: encodeFunctionData({ abi: parseAbi(['function supply(uint256)']), functionName: 'supply', args: [3_000_000n] }), value: 0n },
+  ];
+  // A real run reports what it saw: the receipt token minted to the account, which the calldata never names.
+  const real = fork();
+  await real.simulateBatch(reqs);
+  assert.ok(real.discovered(reqs).includes(hUsdc));
+  // A fork run that doesn't finish in time: the probe answers, reading the token the fork had seen.
+  const stuck = { covers: () => true, simulate: async () => null, simulateBatch: () => new Promise<never>(() => {}), discovered: () => [hUsdc] };
+  const out = (await new RpcSimulator({ 999: URL_ }, { fetchImpl: chain.fetchImpl, fork: stuck, forkBudgetMs: 50 }).simulateBatch(reqs))!;
+  assert.equal(out[1].basis, 'state');
+  assert.deepEqual(out[1].transfers.filter(t => t.asset === hUsdc).map(t => t.raw), [3_000_000n]);
+  // Without the hint the probe can't know about it.
+  const blind = (await new RpcSimulator({ 999: URL_ }, { fetchImpl: chain.fetchImpl, fork: { ...stuck, discovered: () => [] }, forkBudgetMs: 50 }).simulateBatch(reqs))!;
+  assert.deepEqual(blind[1].transfers.filter(t => t.asset === hUsdc), []);
+});

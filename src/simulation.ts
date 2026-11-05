@@ -62,6 +62,8 @@ export class BatchSimulationUnsupported extends Error {
 export interface FallbackSimulator extends Simulator {
   covers(chainId: number): boolean;
   simulateBatch(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
+  /** Tokens a simulation still running has seen so far: passed on to the probe if it has to answer instead. */
+  discovered?(requests: SimulationRequest[]): string[];
 }
 
 export class RpcSimulator implements Simulator {
@@ -132,6 +134,9 @@ export class RpcSimulator implements Simulator {
       const first = await Promise.race([forked.then(r => ({ r }), () => null), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), this.forkBudgetMs); })]);
       clearTimeout(timer);
       if (first?.r) return first.r;
+      // The probe answers; the tokens the fork run has seen so far are worth reading too.
+      const hints = this.fork.discovered?.(reqs) ?? [];
+      if (hints.length) reqs = reqs.map(r => ({ ...r, watch: [...new Set([...(r.watch ?? []), ...hints])] }));
     }
     // The probe takes over the sender's code, so it can't also apply code overrides (EIP-7702 delegations).
     const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase()) && !overridesOf(reqs);

@@ -200,7 +200,8 @@ class StateSource {
       // Rate limits, and load-balanced nodes a block behind ("invalid block height") are worth retrying.
       const transient = /rate limit|invalid block height|header not found|unknown block/i;
       const limited = res.status === 429 || (!Array.isArray(body) && transient.test(JSON.stringify(body ?? '')));
-      if ((limited || res.status >= 500) && attempt < 5) { await new Promise(r => setTimeout(r, 300 * 2 ** attempt)); continue; }
+      // Public RPCs rate-limit per IP: back off (up to 4 s between tries), within the simulation's deadline.
+      if ((limited || res.status >= 500) && attempt < 8) { await new Promise(r => setTimeout(r, Math.min(4000, 300 * 2 ** attempt))); continue; }
       if (!Array.isArray(body)) throw new Error(`state fetch failed: HTTP ${res.status} ${JSON.stringify(body ?? '').slice(0, 160)}`);
       const byId = new Map((body as { id: number; result?: unknown; error?: { code?: number; message?: string; data?: Hex } }[]).map(r => [r.id, r]));
       const retry = batch.filter((_, i) => transient.test(byId.get(i)?.error?.message ?? ''));
@@ -212,9 +213,9 @@ class StateSource {
         j.done(r.result, r.error);
       });
       if (!retry.length) return;
-      if (attempt >= 5) throw new Error('state fetch: rate limited');
+      if (attempt >= 8) throw new Error('state fetch: rate limited');
       batch = retry;
-      await new Promise(r => setTimeout(r, 300 * 2 ** attempt));
+      await new Promise(r => setTimeout(r, Math.min(4000, 300 * 2 ** attempt)));
     }
   }
 }
@@ -291,6 +292,8 @@ function transactionGas(req: SimulationRequest, execution: bigint, refund: bigin
   return prague && floor > net ? floor : net;
 }
 
+const requestKey = (reqs: SimulationRequest[]) => reqs.map(r => `${r.chainId}:${r.from}:${r.to}:${r.value}:${r.data}`).join('|').toLowerCase();
+
 const word = (b: Uint8Array) => b.length >= 32 ? BigInt(bytesToHex(b.slice(0, 32))) : undefined;
 const hexOf = (a: string) => a.toLowerCase();
 
@@ -299,11 +302,22 @@ export class ForkSimulator implements Simulator {
   private opts: Required<Omit<ForkSimulatorOptions, 'profiles' | 'block' | 'header' | 'onRound'>> & Pick<ForkSimulatorOptions, 'block' | 'header' | 'onRound'> & { profiles: Record<number, ChainProfile> };
   /** Counters from the last simulation, for tuning and tests. */
   last?: { rounds: number; requests: number; ms: number };
+  /** Tokens that simulations still running have seen in their Transfer logs so far, by request (see discovered()). */
+  private seen = new Map<string, Set<string>>();
 
   constructor(urls: Record<number, string>, options: ForkSimulatorOptions = {}) {
     this.urls = urls;
     this.opts = { fetchImpl: options.fetchImpl ?? fetch, batchSize: options.batchSize ?? 20, concurrency: options.concurrency ?? 4, maxRounds: options.maxRounds ?? 24,
       timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, profiles: { ...CHAIN_PROFILES, ...options.profiles } };
+  }
+
+  /**
+   * Runs `batches` only to fill the caches shared by all simulations (code, and the last value seen of each slot),
+   * so the first real previews of these contracts take a round or two instead of one per dependent read. Failures are
+   * ignored. Resolves when done.
+   */
+  async warm(batches: SimulationRequest[][]): Promise<void> {
+    for (const b of batches) { try { await this.simulateBatch(b); } catch { /* only warming */ } }
   }
 
   /** Whether this simulator can run calls on `chainId` (an RPC URL and a known EVM profile). */
@@ -340,6 +354,26 @@ export class ForkSimulator implements Simulator {
       ...builtinTokens(chainId).map(t => hexOf(t.address)),
     ].filter(a => !skip(a)));
     const approvals = new Map<string, SimulatedApproval>();
+    const key = requestKey(reqs);
+    this.seen.set(key, new Set());
+    try {
+      return await this.rounds(reqs, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
+    } finally {
+      // Kept briefly, for a caller that gave up waiting and wants what was seen.
+      setTimeout(() => this.seen.delete(key), 30_000).unref?.();
+    }
+  }
+
+  /**
+   * Tokens the speculative runs of a simulation still in progress (or just finished) have seen in Transfer logs
+   * involving the account. A caller that stops waiting can hand these to a cheaper simulator, such as the probe.
+   */
+  discovered(reqs: SimulationRequest[]): string[] {
+    return [...(this.seen.get(requestKey(reqs)) ?? [])];
+  }
+
+  private async rounds(reqs: SimulationRequest[], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
+    profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string): Promise<SimulationResult[]> {
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
       let run: Awaited<ReturnType<ForkSimulator['run']>>;
@@ -355,7 +389,10 @@ export class ForkSimulator implements Simulator {
         this.last = { rounds: round, requests: source.requests, ms: Date.now() - started };
         return run.results;
       }
-      if (run) { for (const t of run.tokens) tokens.add(t); for (const a of run.approvals) approvals.set(approvalKey(a), a); }
+      if (run) {
+        for (const t of run.tokens) { tokens.add(t); this.seen.get(key)?.add(t); }
+        for (const a of run.approvals) approvals.set(approvalKey(a), a);
+      }
       if (Date.now() > deadline) throw new ForkTimeout(`the simulation needed more than ${this.opts.timeoutMs} ms`);
       if (misses && missCount(misses)) await source.fetch(misses);
     }
