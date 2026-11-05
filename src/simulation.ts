@@ -116,13 +116,19 @@ export class RpcSimulator implements Simulator {
     return parsed;
   }
 
-  /** One JSON-RPC request, retried briefly when the node rate-limits (HyperEVM's public RPC does). */
+  /**
+   * One JSON-RPC request, retried when the node rate-limits: HTTP 429 or 5xx, or a rate-limit error inside an HTTP
+   * 200 (Arbitrum's and HyperEVM's public RPCs do both). A rate limit is never mistaken for an answer.
+   */
   private async post(url: string, method: string, params: unknown[]): Promise<{ result?: unknown; error?: { code?: number; message?: string; data?: Hex } }> {
     for (let attempt = 0; ; attempt++) {
       const res = await this.fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(20_000), body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
-      if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise(r => setTimeout(r, 500 * 2 ** attempt)); continue; }
+      const retry = () => attempt < 4 && new Promise(r => setTimeout(r, 500 * 2 ** attempt)).then(() => true);
+      if ((res.status === 429 || res.status >= 500) && await retry()) continue;
       if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
-      return await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
+      const body = await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
+      if (body.error && (body.error.code === -32005 || body.error.code === 429 || /rate limit|too many requests/i.test(body.error.message ?? '')) && await retry()) continue;
+      return body;
     }
   }
 

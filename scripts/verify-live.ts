@@ -196,7 +196,8 @@ console.log('\n# EIP-5792 batch on Arbitrum One: approve + CCTP deposit, via Rpc
   const bad = p.warnings.filter(w => ['simulation_reverted', 'batch_will_fail', 'simulation_unavailable'].includes(w.code)).map(w => w.code);
   check(p.simulation?.status === 'success' && !bad.length, 'in order, the batch succeeds'.padEnd(34), `${p.simulation?.status}, gas ${p.simulation?.gasUsed}${bad.length ? ', ' + bad.join(', ') : ''} | "${p.title}"`);
   const changes = p.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} (${c.basis})`).join(', ');
-  check(changes === 'out 10 USDC (simulated_events)', 'batch balance change'.padEnd(34), changes);
+  // Read from the state before and after the batch, not taken from the Transfer logs.
+  check(changes === 'out 10 USDC (simulated_state)', 'batch balance change'.padEnd(34), changes);
   // USDC lowers the allowance without an Approval event when it is spent: the state read must say none is left.
   const left = (p.approvals ?? []).map(a => `${a.symbol} ${a.allowance} (${a.basis})`).join(', ');
   check(left === 'USDC none (simulated_state)', 'allowance left after the batch'.padEnd(34), left || 'no approvals');
