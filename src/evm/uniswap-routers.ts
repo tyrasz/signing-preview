@@ -1,7 +1,7 @@
 // Uniswap's routers before the Universal Router, still used directly and by many dApps: V2 Router02, V3 SwapRouter
 // and SwapRouter02 (V3 and V2 swaps, multicall with unwrap/sweep). Only Uniswap's own deployments get a headline: a
 // lookalike contract with the same function names could do anything.
-import { decodeFunctionData, parseAbi, type Hex } from 'viem';
+import { decodeFunctionData, parseAbi, toFunctionSelector, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import { decoded, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
@@ -101,6 +101,31 @@ export const uniswapRoutersAdapter: Adapter = async (tx, env) => {
   if (!r || !r.chains.includes(tx.chainId)) return null;
   const parsed = swapsOf(r.kind, tx.data);
   if (!parsed || !parsed.swaps.length) return null;
+  return describe(tx, env, r, parsed);
+};
+
+/**
+ * Other contracts called with Uniswap's router functions: forks (HyperEVM's main DEXes are), or anything with the same
+ * function names. With a verified ABI that has the function, the headline is given under the contract's name;
+ * without one, it is marked partial and cautioned, since only the contract's code decides what the call does.
+ */
+export const uniswapForkAdapter: Adapter = async (tx, env) => {
+  if (!tx.to || ROUTERS[tx.to.toLowerCase()] || tx.data.length < 10) return null;
+  for (const kind of ['v3-02', 'v3', 'v2'] as const) {
+    const parsed = swapsOf(kind, tx.data);
+    if (!parsed?.swaps.length) continue;
+    let contract = null;
+    try { contract = env.deps.abis ? await env.deps.abis.resolve(tx.chainId, tx.to) : null; } catch { contract = null; }
+    const selector = tx.data.slice(0, 10);
+    const verified = !!contract?.verified && (contract.abi as { type?: string; name?: string; inputs?: unknown[] }[]).some(f => { try { return f.type === 'function' && toFunctionSelector(f as never) === selector; } catch { return false; } });
+    const name = verified ? contract!.name ?? shortAddress(tx.to) : `a Uniswap-style router (${shortAddress(tx.to)})`;
+    const d = await describe(tx, env, { name, kind }, parsed, !verified);
+    return d;
+  }
+  return null;
+};
+
+async function describe(tx: Parameters<Adapter>[0], env: AdapterEnv, r: { name: string; kind: 'v2' | 'v3' | 'v3-02' }, parsed: NonNullable<ReturnType<typeof swapsOf>>, unverified = false) {
   const weth = wrappedNative(tx.chainId) ?? '';
   const first = parsed.swaps[0], last = parsed.swaps[parsed.swaps.length - 1];
   // ETH in: value sent with a WETH input; ETH out: the ETH-out V2 functions, or an unwrap after the swap.
@@ -111,7 +136,7 @@ export const uniswapRoutersAdapter: Adapter = async (tx, env) => {
   const sumOut = parsed.swaps.filter(s => sameAddress(s.tokenOut, last.tokenOut)).reduce((t, s) => t + s.amountOut, 0n);
   const sent = await amountOf(env, tx.chainId, first.tokenIn, ethIn && first.exactIn ? (sumIn || tx.value) : sumIn, ethIn);
   const got = await amountOf(env, tx.chainId, last.tokenOut, sumOut, ethOut);
-  const b = new PreviewBuilder().detail('Contract', `${r.name} (${tx.to})`, tx.to!);
+  const b = new PreviewBuilder().detail('Contract', r.name.includes(tx.to!.slice(0, 6)) ? tx.to! : `${r.name} (${tx.to})`, tx.to!);
   const exactIn = first.exactIn;
   b.detail(exactIn ? 'You send' : 'You send at most', sent).detail(exactIn ? 'You receive at least' : 'You receive', got);
   if (parsed.swaps.some(s => s.fees)) b.detail('Pool fees', parsed.swaps.flatMap(s => s.fees ?? []).map(f => `${f / 10_000}%`).join(', '));
@@ -129,6 +154,8 @@ export const uniswapRoutersAdapter: Adapter = async (tx, env) => {
     if (when) b.detail('Deadline', when);
     if (env.context.now !== undefined && Number(deadline) * 1000 < env.context.now) b.warn('info', 'deadline_passed', 'The deadline has passed, so the swap would revert.');
   }
-  const title = exactIn ? `Swap ${sent} for at least ${got} on Uniswap` : `Buy ${got} for at most ${sent} on Uniswap`;
-  return decoded({ title, summary: `${exactIn ? 'Swaps' : 'Buys'} through ${r.name}${parsed.swaps.length > 1 ? ` in ${parsed.swaps.length} swaps` : ''}: ${exactIn ? `${sent} for at least ${got}` : `${got} for at most ${sent}`}.`, decoder: 'uniswap_router', status: 'full', b });
-};
+  const where = ROUTERS[tx.to!.toLowerCase()] ? 'Uniswap' : r.name;
+  if (unverified) b.warn('caution', 'unverified_signature', `${shortAddress(tx.to!)} isn't one of Uniswap's own routers and has no verified source here: the call was recognised by its shape (a Uniswap-style swap), but only the contract's code decides what it does. Rely on the simulated balance changes.`);
+  const title = exactIn ? `Swap ${sent} for at least ${got} on ${where}` : `Buy ${got} for at most ${sent} on ${where}`;
+  return decoded({ title, summary: `${exactIn ? 'Swaps' : 'Buys'} through ${r.name}${parsed.swaps.length > 1 ? ` in ${parsed.swaps.length} swaps` : ''}: ${exactIn ? `${sent} for at least ${got}` : `${got} for at most ${sent}`}.`, decoder: unverified ? 'uniswap_style_router' : 'uniswap_router', status: unverified ? 'partial' : 'full', b });
+}

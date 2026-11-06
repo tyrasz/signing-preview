@@ -14,7 +14,7 @@ import { safeExecAdapter } from './safe.ts';
 import { seaDropAdapter } from './seadrop.ts';
 import { lifiAdapter } from './lifi.ts';
 import { aggregatorAdapters } from './aggregators.ts';
-import { uniswapRoutersAdapter } from './uniswap-routers.ts';
+import { uniswapForkAdapter, uniswapRoutersAdapter } from './uniswap-routers.ts';
 import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
@@ -31,6 +31,7 @@ export const ADAPTERS: Adapter[] = [
   lifiAdapter,
   ...aggregatorAdapters,
   uniswapRoutersAdapter,
+  uniswapForkAdapter,
   coreDepositWalletAdapter,
   hyperCoreSystemTransferAdapter,
   nativeAdapter,

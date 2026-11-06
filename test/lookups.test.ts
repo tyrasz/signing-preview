@@ -144,23 +144,34 @@ test('Signature-database decoding is marked unverified, and must reproduce the c
   const swap = parseAbi(['function swapExactTokensForTokens(uint256,uint256,address[],address,uint256)']);
   const data = encodeFunctionData({ abi: swap, functionName: 'swapExactTokensForTokens', args: [1_000_000n, 990_000n, ['0xaf88d065e77c8cC2239327C5EDb3A432268e5831', '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'], ALICE, 1_800_000_000n] });
   const deps: Dependencies = { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]) }; // built-in list, no network
-  // A router that isn't Uniswap's own (SushiSwap's, same ABI): Uniswap's routers have their own decoder.
-  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506', data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
+  // The generic decoder (here called directly: a Uniswap-shaped call gets a swap headline first, below).
+  const SUSHI = '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506';
+  const generic = async (d: `0x${string}`) => (await abiAdapter({ chainId: 42161, from: ALICE.toLowerCase(), to: SUSHI.toLowerCase(), data: d, value: 0n }, { deps, context: { now: NOW } }))!;
+  const field = (r: Awaited<ReturnType<typeof generic>>, label: string) => r.b.details.find(x => x.label === label)?.value;
+  const p = await generic(data);
   assert.equal(p.title.toLowerCase(), 'call swapexacttokensfortokens on 0x1b02…7506');
-  assert.equal(p.decoding.status, 'partial');
-  assert.ok(codes(p).includes('unverified_signature'));
-  assert.match(detail(p, 'path[0]')!, /^USDC/);
-  assert.equal(detail(p, 'amountIn'), '1 USDC', 'amountIn is in path[0]');
-  assert.equal(detail(p, 'amountOutMin'), '0.00000000000099 WETH', 'amountOutMin is in the last path token');
-  assert.equal(detail(p, 'to'), `${ALICE} (you)`);
+  assert.equal(p.status, 'partial');
+  assert.ok(p.b.warnings.some(w => w.code === 'unverified_signature'));
+  assert.match(field(p, 'path[0]')!, /^USDC/);
+  assert.equal(field(p, 'amountIn'), '1 USDC', 'amountIn is in path[0]');
+  assert.equal(field(p, 'amountOutMin'), '0.00000000000099 WETH', 'amountOutMin is in the last path token');
+  assert.equal(field(p, 'to'), `${ALICE.toLowerCase()} (you)`);
 
-  // Uniswap V3 SwapRouter02: amountIn pairs with tokenIn, amountOutMinimum with tokenOut.
+  // Uniswap V3 SwapRouter02 shape: amountIn pairs with tokenIn, amountOutMinimum with tokenOut.
   const v3 = parseAbi(['struct P { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }', 'function exactInputSingle(P params)']);
   const v3data = encodeFunctionData({ abi: v3, functionName: 'exactInputSingle', args: [{ tokenIn: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', tokenOut: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', fee: 500, recipient: ALICE, amountIn: 10n ** 18n, amountOutMinimum: 3_500_000_000n, sqrtPriceLimitX96: 0n }] });
-  const q = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506', data: v3data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
-  assert.equal(detail(q, 'params.amountIn'), '1 WETH');
-  assert.equal(detail(q, 'params.amountOutMinimum'), '3,500 USDC');
-  assert.equal(detail(q, 'params.fee'), '500');
+  const q = await generic(v3data);
+  assert.equal(field(q, 'params.amountIn'), '1 WETH');
+  assert.equal(field(q, 'params.amountOutMinimum'), '3,500 USDC');
+  assert.equal(field(q, 'params.fee'), '500');
+
+  // The full preview of the same calls: a swap headline, partial and cautioned (not a known router, no verified source).
+  const fork = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SUSHI, data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
+  assert.equal(fork.title, 'Swap 1 USDC for at least 0.00000000000099 WETH on a Uniswap-style router (0x1b02…7506)');
+  assert.equal(fork.decoding.status, 'partial');
+  assert.ok(codes(fork).includes('unverified_signature'));
+  const fork3 = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SUSHI, data: v3data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
+  assert.equal(fork3.title, 'Swap 1 WETH for at least 3,500 USDC on a Uniswap-style router (0x1b02…7506)');
 
   // A database returning the built-in function again, without parameter names, is the same function, not a collision.
   const dup = new ChainedSignatures([{ lookup: async () => ['swapExactTokensForTokens(uint256,uint256,address[],address,uint256)'] }]);
