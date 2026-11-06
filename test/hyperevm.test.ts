@@ -274,3 +274,11 @@ test('Demo samples: Kinetiq stake and unstake, HyperLend borrow and credit deleg
   assert.equal(delegation.title.toLowerCase(), 'let 0x5bad…0005 borrow unlimited usdc in your name on hyperlend');
   assert.equal(delegation.attention, 'danger');
 });
+
+test('Kinetiq-run deployments on the same staking code: asxnHYPE stakes read like kHYPE, under its own symbol', async () => {
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x0c5d890Cf52973aE4A7b10fA7EE18e146d13D87B', data: '0x3a4b66f1', value: toHex(10n * E), chainId: toHex(999) }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  assert.equal(p.title, 'Stake 10 HYPE for asxnHYPE');
+  assert.equal(p.decoding.decoder, 'kinetiq_stake');
+  assert.match(detail(p, 'Protocol')!, /^ASXN liquid staking/);
+  assert.deepEqual(p.assetChanges.map(c => [c.direction, c.symbol]), [['out', 'HYPE']]);
+});

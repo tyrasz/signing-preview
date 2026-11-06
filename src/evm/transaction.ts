@@ -15,6 +15,7 @@ import { seaDropAdapter } from './seadrop.ts';
 import { lifiAdapter } from './lifi.ts';
 import { relayAdapter } from './relay.ts';
 import { binanceWalletAdapter } from './binance-wallet.ts';
+import { hyperlendIsolatedAdapter } from './hyperlend-isolated.ts';
 import { orbitInboxAdapter } from './orbit-inbox.ts';
 import { aggregatorAdapters } from './aggregators.ts';
 import { uniswapForkAdapter, uniswapRoutersAdapter } from './uniswap-routers.ts';
@@ -34,6 +35,7 @@ export const ADAPTERS: Adapter[] = [
   lifiAdapter,
   relayAdapter,
   binanceWalletAdapter,
+  hyperlendIsolatedAdapter,
   orbitInboxAdapter,
   ...aggregatorAdapters,
   uniswapRoutersAdapter,

@@ -16,6 +16,17 @@ export const KINETIQ: Record<number, { stakingManager: string; kHYPE: string }> 
   999: { stakingManager: '0x393d0b87ed38fc779fd9611144ae649ba6082109', kHYPE: '0xfd739d4e423301ce9385c1fb8850539d657c296d' },
 };
 
+/**
+ * Liquid-staking tokens run on Kinetiq's staking code, by StakingManager: kHYPE, and the institutional deployments
+ * whose StakingManager and StakingAccountant run the same implementation as kHYPE's (same code hashes, and
+ * tokenAddress() returns the listed token; kinetiq.xyz/docs/contracts-and-audits, 2026-11-06). Others listed there
+ * (kmHYPE, flowHYPE, HiHYPE, hylqHYPE) run different, unpublished code and aren't decoded.
+ */
+export const KINETIQ_LSTS: Record<string, { chainId: number; token: string; symbol: string; name: string }> = {
+  '0x393d0b87ed38fc779fd9611144ae649ba6082109': { chainId: 999, token: '0xfd739d4e423301ce9385c1fb8850539d657c296d', symbol: 'kHYPE', name: 'Kinetiq liquid staking' },
+  '0x0c5d890cf52973ae4a7b10fa7ee18e146d13d87b': { chainId: 999, token: '0x8599f2efa5064c666b920e71381b5aabc7bb27f6', symbol: 'asxnHYPE', name: 'ASXN liquid staking (asxnHYPE, on Kinetiq)' },
+};
+
 const ABI = parseAbi([
   'function stake() payable',
   'function stake(address validator) payable',
@@ -36,21 +47,22 @@ const pct = (bps: bigint) => `${Number(bps) / 100}%`;
 interface Request { hypeAmount: bigint; kHYPEAmount: bigint; kHYPEFee: bigint; bufferUsed: bigint; timestamp: bigint }
 
 export const kinetiqAdapter: Adapter = async (tx, env) => {
-  const k = KINETIQ[tx.chainId];
-  if (!k || tx.to !== k.stakingManager) return null;
+  const k = tx.to ? KINETIQ_LSTS[tx.to.toLowerCase()] : undefined;
+  if (!k || k.chainId !== tx.chainId) return null;
+  const S = k.symbol, manager = tx.to!.toLowerCase();
   let call;
   try { call = decodeFunctionData({ abi: ABI, data: tx.data }); } catch { return null; }
   const b = new PreviewBuilder();
-  const sm = (sig: string, args: readonly unknown[] = []) => read(env, tx.chainId, k.stakingManager, sig, args);
+  const sm = (sig: string, args: readonly unknown[] = []) => read(env, tx.chainId, manager, sig, args);
   const toHype = async (kHype: bigint) => {
     const accountant = await sm('function stakingAccountant() view returns (address)') as string | undefined;
     return accountant ? await read<bigint>(env, tx.chainId, accountant, 'function kHYPEToHYPE(uint256) view returns (uint256)', [kHype]) : undefined;
   };
   const willFail = (code: string, message: string) => b.warn('caution', code, `This will fail: ${message}`);
-  b.detail('Protocol', `Kinetiq liquid staking (StakingManager ${tx.to})`, tx.to!);
+  b.detail('Protocol', `${k.name} (StakingManager ${tx.to})`, tx.to!);
   const changes: AssetChange[] = [];
-  const change = (direction: 'in' | 'out', raw: bigint, symbol: 'HYPE' | 'kHYPE') =>
-    changes.push({ direction, account: tx.from, amount: fmt(raw), symbol, raw: raw.toString(), asset: symbol === 'HYPE' ? 'native' : k.kHYPE, basis: 'requested' });
+  const change = (direction: 'in' | 'out', raw: bigint, what: 'HYPE' | 'lst') =>
+    changes.push({ direction, account: tx.from, amount: fmt(raw), symbol: what === 'HYPE' ? 'HYPE' : S, raw: raw.toString(), asset: what === 'HYPE' ? 'native' : k.token, basis: 'requested' });
 
   switch (call.functionName) {
     case 'stake': {
@@ -59,9 +71,9 @@ export const kinetiqAdapter: Adapter = async (tx, env) => {
       const accountant = await sm('function stakingAccountant() view returns (address)') as string | undefined;
       const kOut = accountant ? await read<bigint>(env, tx.chainId, accountant, 'function HYPEToKHYPE(uint256) view returns (uint256)', [value]) : undefined;
       b.detail('You stake', `${fmt(value)} HYPE`, value.toString());
-      if (kOut !== undefined) b.detail('You receive (at the current rate)', `${fmt(kOut)} kHYPE`, kOut.toString());
+      if (kOut !== undefined) b.detail('You receive (at the current rate)', `${fmt(kOut)} ${S}`, kOut.toString());
       const oneK = await toHype(10n ** 18n);
-      if (oneK) b.detail('Rate', `1 kHYPE = ${fmt(oneK)} HYPE`);
+      if (oneK) b.detail('Rate', `1 ${S} = ${fmt(oneK)} HYPE`);
       if (validator) b.detail('Validator', validator);
       // Checks from StakingFacet._stakeInternal / _distributeStake, with live parameters.
       const min = await sm('function minStakeAmount() view returns (uint256)') as bigint | undefined;
@@ -72,11 +84,11 @@ export const kinetiqAdapter: Adapter = async (tx, env) => {
       if (value % HYPE_STEP !== 0n) willFail('kinetiq_amount_precision', 'the HYPE amount must be a multiple of 0.00000001 HYPE (HyperCore keeps 8 decimals).');
       if (await sm('function stakingPaused() view returns (bool)') === true) willFail('kinetiq_paused', 'staking is paused.');
       if (await sm('function whitelistEnabled() view returns (bool)') === true) b.warn('info', 'kinetiq_whitelist', 'Kinetiq staking is limited to whitelisted addresses right now.');
-      b.note('kHYPE grows in HYPE value as staking rewards accrue. To get HYPE back, queue a withdrawal (about 7 days) or unstake instantly for a fee.');
+      b.note(`${S} grows in HYPE value as staking rewards accrue. To get HYPE back, queue a withdrawal (about 7 days) or unstake instantly for a fee.`);
       change('out', value, 'HYPE');
-      if (kOut !== undefined) change('in', kOut, 'kHYPE');
-      return decoded({ title: `Stake ${short(value)} HYPE${kOut !== undefined ? ` for ≈ ${short(kOut)} kHYPE` : ' for kHYPE'}`,
-        summary: `Stakes ${fmt(value)} HYPE with Kinetiq${validator ? ` through validator ${shortAddress(validator)}` : ''} and mints kHYPE to you.`, decoder: 'kinetiq_stake', status: 'full', b, assetChanges: changes });
+      if (kOut !== undefined) change('in', kOut, 'lst');
+      return decoded({ title: `Stake ${short(value)} HYPE${kOut !== undefined ? ` for ≈ ${short(kOut)} ${S}` : ` for ${S}`}`,
+        summary: `Stakes ${fmt(value)} HYPE with Kinetiq${validator ? ` through validator ${shortAddress(validator)}` : ''} and mints ${S} to you.`, decoder: 'kinetiq_stake', status: 'full', b, assetChanges: changes });
     }
     case 'queueWithdrawal': {
       const amount = call.args[0];
@@ -85,19 +97,19 @@ export const kinetiqAdapter: Adapter = async (tx, env) => {
       const hype = await toHype(amount - (fee ?? 0n));
       const delay = await sm('function withdrawalDelay() view returns (uint256)') as bigint | undefined;
       const quick = await sm('function quickWithdrawalDelay() view returns (uint256)') as bigint | undefined;
-      b.detail('You unstake', `${fmt(amount)} kHYPE`, amount.toString());
-      if (fee !== undefined) b.detail('Unstake fee', `${pct(feeRate!)} (${fmt(fee)} kHYPE)`);
+      b.detail('You unstake', `${fmt(amount)} ${S}`, amount.toString());
+      if (fee !== undefined) b.detail('Unstake fee', `${pct(feeRate!)} (${fmt(fee)} ${S})`);
       if (hype !== undefined) b.detail('HYPE to claim (at the current rate)', `${fmt(hype)} HYPE`, hype.toString());
       if (delay !== undefined) b.detail('Claimable after', `${delayText(delay)}${quick ? ` (${delayText(quick)} if Kinetiq's buffer covers the whole amount)` : ''}`);
       const id = await sm('function nextWithdrawalId(address) view returns (uint256)', [tx.from]) as bigint | undefined;
       if (id !== undefined) b.detail('Withdrawal ID', `${id} (claim it with confirmWithdrawal)`);
       if (await sm('function withdrawalPaused() view returns (bool)') === true) willFail('kinetiq_paused', 'withdrawals are paused.');
       const min = await sm('function minWithdrawalAmount() view returns (uint256)') as bigint | undefined;
-      if (amount === 0n || (min && amount < min)) willFail('kinetiq_below_minimum', `the minimum is ${fmt(min ?? 1n)} kHYPE.`);
-      b.note('Your kHYPE leaves your wallet now; the HYPE is sent when you claim after the delay. Kinetiq needs a kHYPE allowance for the amount.');
-      change('out', amount, 'kHYPE');
-      return decoded({ title: `Unstake ${short(amount)} kHYPE${hype !== undefined ? `: ≈ ${short(hype)} HYPE` : ''}${delay !== undefined ? ` claimable in ${delayText(delay)}` : ''}`,
-        summary: `Queues a Kinetiq withdrawal of ${fmt(amount)} kHYPE. The HYPE can be claimed after the unstaking delay.`, decoder: 'kinetiq_queue_withdrawal', status: 'full', b, assetChanges: changes });
+      if (amount === 0n || (min && amount < min)) willFail('kinetiq_below_minimum', `the minimum is ${fmt(min ?? 1n)} ${S}.`);
+      b.note(`Your ${S} leaves your wallet now; the HYPE is sent when you claim after the delay. Kinetiq needs a ${S} allowance for the amount.`);
+      change('out', amount, 'lst');
+      return decoded({ title: `Unstake ${short(amount)} ${S}${hype !== undefined ? `: ≈ ${short(hype)} HYPE` : ''}${delay !== undefined ? ` claimable in ${delayText(delay)}` : ''}`,
+        summary: `Queues a Kinetiq withdrawal of ${fmt(amount)} ${S}. The HYPE can be claimed after the unstaking delay.`, decoder: 'kinetiq_queue_withdrawal', status: 'full', b, assetChanges: changes });
     }
     case 'confirmWithdrawal':
     case 'batchConfirmWithdrawals': {
@@ -130,28 +142,28 @@ export const kinetiqAdapter: Adapter = async (tx, env) => {
       const [amount, minOut] = call.args;
       const pool = await sm('function instantUnstakePool() view returns (address)') as string | undefined;
       const quote = pool && !/^0x0{40}$/.test(pool) ? await read<readonly [bigint, bigint, bigint, boolean]>(env, tx.chainId, pool, 'function previewInstantUnstake(uint256) view returns (uint256 hypeAmount, uint256 kHYPEFee, uint256 feeRateBps, bool bufferSufficient)', [amount]) : undefined;
-      b.detail('You unstake', `${fmt(amount)} kHYPE`, amount.toString());
+      b.detail('You unstake', `${fmt(amount)} ${S}`, amount.toString());
       b.detail('Minimum HYPE out', minOut === 0n ? 'none' : `${fmt(minOut)} HYPE`, minOut.toString());
       if (quote) {
         const [hype, fee, rate, enough] = quote;
-        b.detail('You receive (Kinetiq quote)', `${fmt(hype)} HYPE`, hype.toString()).detail('Instant-unstake fee', `${pct(rate)} (${fmt(fee)} kHYPE)`);
+        b.detail('You receive (Kinetiq quote)', `${fmt(hype)} HYPE`, hype.toString()).detail('Instant-unstake fee', `${pct(rate)} (${fmt(fee)} ${S})`);
         if (!enough) willFail('kinetiq_buffer_too_small', "Kinetiq's instant-unstake buffer doesn't hold enough HYPE for this amount right now.");
         if (hype < minOut) willFail('kinetiq_below_min_out', `the quote (${fmt(hype)} HYPE) is below your minimum (${fmt(minOut)} HYPE).`);
         const queueFee = await sm('function unstakeFeeRate() view returns (uint256)') as bigint | undefined;
         if (queueFee !== undefined && queueFee < rate) b.warn('info', 'kinetiq_queue_cheaper', `Queuing a withdrawal instead costs ${pct(queueFee)} and takes about 7 days.`);
-        change('out', amount, 'kHYPE');
+        change('out', amount, 'lst');
         change('in', hype, 'HYPE');
-      } else change('out', amount, 'kHYPE');
+      } else change('out', amount, 'lst');
       if (minOut === 0n) b.warn('caution', 'no_slippage_protection', 'No minimum amount of HYPE is set, so you accept whatever the rate and fee are when the transaction runs.');
-      return decoded({ title: `Instant unstake ${short(amount)} kHYPE${quote ? ` for ≈ ${short(quote[0])} HYPE (${pct(quote[2])} fee)` : ''}`,
-        summary: `Swaps ${fmt(amount)} kHYPE back to HYPE immediately through Kinetiq's instant-unstake buffer, for a fee.`, decoder: 'kinetiq_instant_unstake', status: 'full', b, assetChanges: changes });
+      return decoded({ title: `Instant unstake ${short(amount)} ${S}${quote ? ` for ≈ ${short(quote[0])} HYPE (${pct(quote[2])} fee)` : ''}`,
+        summary: `Swaps ${fmt(amount)} ${S} back to HYPE immediately through Kinetiq's instant-unstake buffer, for a fee.`, decoder: 'kinetiq_instant_unstake', status: 'full', b, assetChanges: changes });
     }
     case 'redelegate': {
       const [fromValidator, toValidator, amount] = call.args;
       const zero = (a: string) => /^0x0{40}$/.test(a);
-      b.detail('Stake', `${fmt(amount)} kHYPE worth`).detail('From validator', zero(fromValidator) ? 'Kinetiq default' : fromValidator).detail('To validator', zero(toValidator) ? 'Kinetiq default' : toValidator);
-      return decoded({ title: `Move the stake behind ${short(amount)} kHYPE to ${zero(toValidator) ? "Kinetiq's default validator" : `validator ${shortAddress(toValidator)}`}`,
-        summary: 'Redelegates the HYPE backing your kHYPE to another validator. Your kHYPE stays in your wallet.', decoder: 'kinetiq_redelegate', status: 'full', b });
+      b.detail('Stake', `${fmt(amount)} ${S} worth`).detail('From validator', zero(fromValidator) ? 'Kinetiq default' : fromValidator).detail('To validator', zero(toValidator) ? 'Kinetiq default' : toValidator);
+      return decoded({ title: `Move the stake behind ${short(amount)} ${S} to ${zero(toValidator) ? "Kinetiq's default validator" : `validator ${shortAddress(toValidator)}`}`,
+        summary: `Redelegates the HYPE backing your ${S} to another validator. Your ${S} stays in your wallet.`, decoder: 'kinetiq_redelegate', status: 'full', b });
     }
   }
   return null;
