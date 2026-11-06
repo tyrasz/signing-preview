@@ -269,3 +269,22 @@ test('Router 2.1: executeSigned shows who signed the route; HyperEVM routes wrap
   assert.equal(detail(hype, 'Step 1'), 'Wrap all the HYPE sent into WHYPE, for the router, for a later step');
   assert.match(detail(hype, 'Contract')!, /^Uniswap Universal Router v2\.2\.0/);
 });
+
+test('Router 1.0: its own command table (0x1f mask, NFT-era purchases naming the NFT and buyer, 0x0e a placeholder)', async () => {
+  const UR_V10_ETH = '0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B', BAYC = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
+  const swap = await send(UR_V10_ETH, exec([0x0b, 0x00], [pair(ROUTER_SELF, CONTRACT_BALANCE), swapIn(MSG_SENDER, CONTRACT_BALANCE, 3_000_000_000n, v3path('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', 500, ETH_USDC), false)]), 10n ** 18n, '0x1');
+  assert.equal(swap.title, 'Swap 1 ETH for at least 3,000 USDC');
+  assert.match(detail(swap, 'Contract')!, /^Uniswap Universal Router v1\.0/);
+  // LOOKS_RARE_721: (value, data, recipient, token, id); the NFT goes to the recipient.
+  const buy = encodeAbiParameters(parseAbiParameters('uint256, bytes, address, address, uint256'), [10n ** 18n, '0x1234', MSG_SENDER, BAYC, 42n]);
+  const nft = await send(UR_V10_ETH, exec([0x11], [buy]), 10n ** 18n, '0x1');
+  assert.match(detail(nft, 'Step 1')!, /^Buy NFT #42 of .+ on LooksRare, paying 1 ETH, for you$/);
+  const gift = await send(UR_V10_ETH, exec([0x18], [encodeAbiParameters(parseAbiParameters('uint256, bytes, address, address, uint256'), [10n ** 18n, '0x', BOB, BAYC, 7n])]), 10n ** 18n, '0x1');
+  assert.ok(codes(gift).includes('output_to_other'));
+  // 0x0e is a balance check on 1.2 and later, but a placeholder (which reverts) on 1.0.
+  const placeholder = await send(UR_V10_ETH, exec([0x0e], [triple(ALICE, ETH_USDC, 1n)]), 0n, '0x1');
+  assert.equal(detail(placeholder, 'Step 1'), 'Unknown command 0x0e');
+  // 1.0 masks commands with 0x1f: 0x21 (a sub-plan on 1.2) is 0x01 there, a v3 exact-output swap.
+  const masked = await send(UR_V10_ETH, exec([0x21], [swapIn(MSG_SENDER, 1_000_000n, 10n ** 18n, v3path(ETH_USDC, 500, '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'), true)]), 0n, '0x1');
+  assert.match(detail(masked, 'Step 1')!, /^Swap at most/);
+});

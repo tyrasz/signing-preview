@@ -4,6 +4,7 @@
 // tables are in use: 2.1.x/2.2.0 (2.0 plus per-hop minimum prices on every swap, PAY_PORTION_FULL_PRECISION, Across
 // bridging and executeSigned), 2.0 (adds Uniswap v4) and 1.2, whose commands 0x10-0x1e are NFT marketplaces instead.
 // The original 1.0 router (mask 0x1f, older NFT markets) is not decoded.
+import { collectionLabel } from './effects.ts';
 import { decodeAbiParameters, decodeFunctionData, hexToBytes, parseAbi, parseAbiParameters, recoverTypedDataAddress, type Hex } from 'viem';
 import { compactUnits, formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { builtinTokens, CHAINS } from '../chains.ts';
@@ -11,7 +12,7 @@ import type { AssetChange, TokenInfo } from '../types.ts';
 import { decoded, selectorOf, tokenInfo, tokenSourceWarnings, type Adapter, type AdapterEnv, type Decoded, type Tx } from './common.ts';
 
 /** The command table: 'v2.1' covers releases 2.1.1, 2.1.2 and 2.2.0, whose Commands.sol and Dispatcher.sol match. */
-type Version = 'v2.1' | 'v2' | 'v1.2';
+type Version = 'v2.1' | 'v2' | 'v1.2' | 'v1.0';
 /**
  * Official deployments (github.com/Uniswap/universal-router deploy-addresses), each verified on Sourcify as
  * UniversalRouter. `release` is shown to the user.
@@ -21,11 +22,14 @@ export const UNIVERSAL_ROUTERS: Record<string, { chainId: number; version: Versi
   '0x4c82d1fbfe28c977cbb58d8c7ff8fcf9f70a2cca': { chainId: 1, version: 'v2.1', release: '2.1.1' },
   '0x66a9893cc07d91d95644aedd05d03f95e1dba8af': { chainId: 1, version: 'v2', release: '2.0' },
   '0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad': { chainId: 1, version: 'v1.2', release: '1.2' },
+  // The original release (Nov 2022), with its NFT-era command table; little used since 1.2.
+  '0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b': { chainId: 1, version: 'v1.0', release: '1.0' },
   '0x2d01411773c8c24805306e89a41f7855c3c4fe65': { chainId: 42161, version: 'v2.1', release: '2.1.2' },
   '0x8b844f885672f333bc0042cb669255f93a4c1e6b': { chainId: 42161, version: 'v2.1', release: '2.1.1' },
   '0xa51afafe0263b40edaef0df8781ea9aa03e381a3': { chainId: 42161, version: 'v2', release: '2.0' },
   '0x5e325eda8064b456f4781070c0738d849c824258': { chainId: 42161, version: 'v1.2', release: '1.2' },
   '0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4': { chainId: 42161, version: 'v1.2', release: '1.2' }, // the build without Uniswap v2
+  '0x4c60051384bd2d3c01bfc845cf5f4b44bcbe9de5': { chainId: 42161, version: 'v1.0', release: '1.0' },
   '0x9afe3c497e19501db228f28cdbdd29bc98f65dba': { chainId: 999, version: 'v2.1', release: '2.2.0' },
   '0xed270a1bcdc63cf1356d695e7f40961d4819d6bf': { chainId: 999, version: 'v2.1', release: '2.1.2' },
 };
@@ -41,7 +45,7 @@ const MSG_SENDER = '0x0000000000000000000000000000000000000001';
 const ADDRESS_THIS = '0x0000000000000000000000000000000000000002';
 const NATIVE = '0x0000000000000000000000000000000000000000'; // ETH in sweep/transfer and v4 currencies
 const ALLOW_REVERT = 0x80;
-const commandId = (c: Ctx, byte: number) => byte & (c.version === 'v2.1' ? 0x7f : 0x3f);
+const commandId = (c: Ctx, byte: number) => byte & (c.version === 'v2.1' ? 0x7f : c.version === 'v1.0' ? 0x1f : 0x3f);
 
 const P = {
   swap: parseAbiParameters('address recipient, uint256 amount, uint256 limit, bytes path, bool payerIsUser'),
@@ -288,7 +292,8 @@ async function command(c: Ctx, byte: number, input: Hex, depth: number) {
       if (toOther(c, recipient)) c.outputs.push({ recipient, what: (await token(c, NATIVE)).symbol });
       break;
     }
-    case 0x0e: { // BALANCE_CHECK_ERC20
+    case 0x0e: { // BALANCE_CHECK_ERC20 (a placeholder on 1.0, which reverts)
+      if (c.version === 'v1.0') return unknownCommand(c, id);
       const [owner, tok, min] = decodeAbiParameters(P.balanceCheck, input);
       c.steps.push(`Check that ${who(c, owner)} hold${who(c, owner) === 'you' ? '' : 's'} at least ${await amount(c, tok, min)}`);
       break;
@@ -313,6 +318,7 @@ async function command(c: Ctx, byte: number, input: Hex, depth: number) {
     }
     default:
       if (c.version === 'v1.2') await v1Command(c, id, input);
+      else if (c.version === 'v1.0') await v10Command(c, id, input);
       else await v2Command(c, id, input);
   }
   if (byte & ALLOW_REVERT) for (let i = start; i < c.steps.length; i++) c.steps[i] += ' (allowed to fail)';
@@ -417,6 +423,53 @@ async function v1Command(c: Ctx, id: number, input: Hex) {
     return;
   }
   unknownCommand(c, id);
+}
+
+/** 1.0's marketplaces (Seaport was 1.1 then; LooksRare v1). */
+const V10_MARKETS: Record<number, string> = { 0x10: 'Seaport', 0x11: 'LooksRare', 0x12: 'NFTX', 0x14: 'LooksRare', 0x18: 'X2Y2', 0x19: 'Sudoswap', 0x1a: 'NFT20', 0x1b: 'X2Y2', 0x1c: 'Foundation' };
+
+/**
+ * Universal Router 1.0 commands 0x10-0x1f (contracts/base/Dispatcher.sol of the verified 1.0 router). LooksRare,
+ * X2Y2 and Foundation purchases name the NFT and who gets it: (value, data, recipient, token, id[, amount]).
+ */
+async function v10Command(c: Ctx, id: number, input: Hex) {
+  const eth = (await token(c, NATIVE)).symbol;
+  const nft = async (tok: string, tokenId: bigint) => `#${tokenId} of ${(await collectionLabel(c.env.deps, c.tx.chainId, tok)).label}`;
+  if (id === 0x13) return v1Command(c, id, input); // CRYPTOPUNKS: the same input as 1.2
+  if (id === 0x11 || id === 0x18 || id === 0x1c) { // LOOKS_RARE_721, X2Y2_721, FOUNDATION
+    const [value, , recipient, tok, tokenId] = decodeAbiParameters(parseAbiParameters('uint256 value, bytes data, address recipient, address token, uint256 id'), input);
+    c.steps.push(`Buy NFT ${await nft(tok, tokenId)} on ${V10_MARKETS[id]}, paying ${formatUnits(value, 18)} ${eth}, for ${who(c, recipient)}`);
+    if (toOther(c, recipient)) c.outputs.push({ recipient, what: `NFT #${tokenId}` });
+    return;
+  }
+  if (id === 0x14 || id === 0x1b) { // LOOKS_RARE_1155, X2Y2_1155
+    const [value, , recipient, tok, tokenId, n] = decodeAbiParameters(parseAbiParameters('uint256 value, bytes data, address recipient, address token, uint256 id, uint256 amount'), input);
+    c.steps.push(`Buy ${n} × NFT ${await nft(tok, tokenId)} on ${V10_MARKETS[id]}, paying ${formatUnits(value, 18)} ${eth}, for ${who(c, recipient)}`);
+    if (toOther(c, recipient)) c.outputs.push({ recipient, what: `NFT #${tokenId}` });
+    return;
+  }
+  if (id === 0x10 || id === 0x12 || id === 0x19 || id === 0x1a) { // SEAPORT, NFTX, SUDOSWAP, NFT20: (value, data)
+    const [value] = decodeAbiParameters(P.valueData, input);
+    c.steps.push(`Buy NFTs on ${V10_MARKETS[id]}, paying ${formatUnits(value, 18)} ${eth} (the order details are not decoded)`);
+    return;
+  }
+  if (id === 0x15) { // OWNER_CHECK_721
+    const [owner, tok, tokenId] = decodeAbiParameters(parseAbiParameters('address owner, address token, uint256 id'), input);
+    c.steps.push(`Check that ${who(c, owner)} own${who(c, owner) === 'you' ? '' : 's'} NFT ${await nft(tok, tokenId)}`);
+    return;
+  }
+  if (id === 0x16) { // OWNER_CHECK_1155
+    const [owner, tok, tokenId, min] = decodeAbiParameters(parseAbiParameters('address owner, address token, uint256 id, uint256 minBalance'), input);
+    c.steps.push(`Check that ${who(c, owner)} hold${who(c, owner) === 'you' ? '' : 's'} at least ${min} of NFT ${await nft(tok, tokenId)}`);
+    return;
+  }
+  if (id === 0x17 || id === 0x1d) { // SWEEP_ERC721, SWEEP_ERC1155
+    const [tok, recipient, tokenId] = decodeAbiParameters(parseAbiParameters('address token, address recipient, uint256 id'), input.slice(0, 2 + 64 * 3) as Hex);
+    c.steps.push(`Send NFT ${await nft(tok, tokenId)} from the router to ${who(c, recipient)}`);
+    if (toOther(c, recipient)) c.outputs.push({ recipient, what: `NFT #${tokenId}` });
+    return;
+  }
+  unknownCommand(c, id); // 0x1e, 0x1f: placeholders, which revert
 }
 
 const POSITION_MANAGER = parseAbi([
