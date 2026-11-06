@@ -272,6 +272,23 @@ export function buildSamples(now = Date.now()): Sample[] {
         { id: 'eth-seaport-drainer', group: 'Ethereum' as const, label: 'Seaport: a drainer-style order (your NFTs for nothing)', chainId: 1, request: order([nft(4242), nft(4243)], [eth('1', BOB)]) },
       ];
     })(),
+    ...(() => {
+      // Safe owner signatures: a payout batch through MultiSendCallOnly, and a delegatecall to an unknown contract (the Bybit pattern).
+      const SAFE = '0x5afe00000000000000000000000000000000cafe', Z = '0x0000000000000000000000000000000000000000';
+      const safeTx = (to: string, data: Hex, operation: number) => typed({
+        domain: { chainId: 1, verifyingContract: SAFE },
+        types: { EIP712Domain: [{ name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+          SafeTx: [{ name: 'to', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }, { name: 'operation', type: 'uint8' }, { name: 'safeTxGas', type: 'uint256' }, { name: 'baseGas', type: 'uint256' },
+            { name: 'gasPrice', type: 'uint256' }, { name: 'gasToken', type: 'address' }, { name: 'refundReceiver', type: 'address' }, { name: 'nonce', type: 'uint256' }] },
+        primaryType: 'SafeTx', message: { to, value: '0', data, operation, safeTxGas: '0', baseGas: '0', gasPrice: '0', gasToken: Z, refundReceiver: Z, nonce: '12' } });
+      const pay = (to: string, raw: bigint) => encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [to as Hex, raw] });
+      const packed = (calls: [string, Hex][]) => '0x' + calls.map(([to, data]) => '00' + to.slice(2) + '0'.repeat(64) + ((data.length - 2) / 2).toString(16).padStart(64, '0') + data.slice(2)).join('');
+      const multiSend = encodeFunctionData({ abi: parseAbi(['function multiSend(bytes transactions)']), args: [packed([[ETH_USDC, pay(BOB, 2_500_000_000n)], [ETH_USDC, pay(SPENDER, 1_200_000_000n)]]) as Hex] });
+      return [
+        { id: 'eth-safe-batch', group: 'Ethereum' as const, label: 'Safe: owner signature for a 2-payment batch', chainId: 1, request: safeTx('0x9641d764fc13c8B624c04430C7356C1C7C8102e2', multiSend, 1) },
+        { id: 'eth-safe-delegatecall', group: 'Ethereum' as const, label: 'Safe: a delegatecall to an unknown contract (the Bybit pattern)', chainId: 1, request: safeTx('0x96221423681a6d52e184d440a8efcebb105c7242', '0xa9059cbb000000000000000000000000bdd077f651ebe7f7b3ce16fe5f2b025be29695160000000000000000000000000000000000000000000000000000000000000000', 1) },
+      ];
+    })(),
     { id: 'eth-userop', group: 'Ethereum', label: 'ERC-4337 UserOperation: approve + transfer from a smart account', chainId: 1,
       request: typed({
         domain: { name: 'ERC4337', version: '1', chainId: 1, verifyingContract: '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108' },

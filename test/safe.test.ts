@@ -37,6 +37,7 @@ test('A delegatecall to anything but Safe’s libraries is danger (the Bybit pat
   const bybit = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: '0xa9059cbb', operation: 1 });
   assert.equal(bybit.attention, 'danger');
   assert.match(bybit.warnings.find(w => w.code === 'safe_delegatecall')!.message, /Bybit/);
+  assert.equal(bybit.title, 'Safe transaction: Let 0x9622…7242 run its code as the Safe (delegatecall)');
   const batch = await sign({ to: MULTISEND_CALL_ONLY, operation: 1, data: multiSend([[0, USDC, 0n, transfer], [0, SAFE, 0n, encodeFunctionData({ abi: ABI, functionName: 'addOwnerWithThreshold', args: [BOB, 2n] })]]) });
   assert.equal(batch.title, 'Safe transaction: Run 2 calls from the Safe');
   assert.equal(detail(batch, 'Call 1'), 'Send 1,000 USDC (0xa0b8…eb48)');

@@ -155,6 +155,10 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   }
   const statuses = decoded.map(d => d.status);
   const status = statuses.includes('opaque') ? 'partial' : statuses.includes('partial') ? 'partial' : 'full';
-  const title = calls.length === 1 ? titles[0] : `Run ${calls.length} calls from the Safe`;
+  // A delegatecall to an unknown contract is titled for what it is: whatever its calldata looks like (in the Bybit
+  // theft it looked like a plain transfer), the contract's own code runs as the Safe.
+  const rogue = t.operation === 1 && !lib;
+  if (rogue) b.detail('Its calldata reads as', titles[0]);
+  const title = rogue ? `Let ${shortAddress(t.to.toLowerCase())} run its code as the Safe (delegatecall)` : calls.length === 1 ? titles[0] : `Run ${calls.length} calls from the Safe`;
   return { title, summary: `The Safe ${shortAddress(safe)} ${calls.length === 1 ? (t.operation === 1 ? 'delegatecalls' : 'makes this call') : `runs ${calls.length} calls${label ? ` through ${label}` : ''}`}: ${titles.slice(0, 3).join('; ')}${calls.length > 3 ? '; …' : ''}.`, status, assetChanges };
 }
