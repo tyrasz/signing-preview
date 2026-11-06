@@ -77,3 +77,52 @@ test('A bulk listing: every order in the tree, padding left out', async () => {
   assert.equal(sneaky.attention, 'danger');
   assert.match(sneaky.warnings.find(w => w.code === 'seaport_nothing_in_return')!.message, /^Order 2: /);
 });
+
+// Transactions to Seaport, from the side of whoever sends them.
+import { encodeFunctionData, parseAbi, type Hex } from 'viem';
+const TX_ABI = parseAbi([
+  'struct OfferItem { uint8 itemType; address token; uint256 identifierOrCriteria; uint256 startAmount; uint256 endAmount; }',
+  'struct ConsiderationItem { uint8 itemType; address token; uint256 identifierOrCriteria; uint256 startAmount; uint256 endAmount; address recipient; }',
+  'struct OrderParameters { address offerer; address zone; OfferItem[] offer; ConsiderationItem[] consideration; uint8 orderType; uint256 startTime; uint256 endTime; bytes32 zoneHash; uint256 salt; bytes32 conduitKey; uint256 totalOriginalConsiderationItems; }',
+  'struct Order { OrderParameters parameters; bytes signature; }',
+  'struct AdditionalRecipient { uint256 amount; address recipient; }',
+  'struct BasicOrderParameters { address considerationToken; uint256 considerationIdentifier; uint256 considerationAmount; address offerer; address zone; address offerToken; uint256 offerIdentifier; uint256 offerAmount; uint8 basicOrderType; uint256 startTime; uint256 endTime; bytes32 zoneHash; uint256 salt; bytes32 offererConduitKey; bytes32 fulfillerConduitKey; uint256 totalOriginalAdditionalRecipients; AdditionalRecipient[] additionalRecipients; bytes signature; }',
+  'struct Fulfillment { FulfillmentComponent[] offerComponents; FulfillmentComponent[] considerationComponents; }',
+  'struct FulfillmentComponent { uint256 orderIndex; uint256 itemIndex; }',
+  'function fulfillBasicOrder_efficient_6GL6yc(BasicOrderParameters parameters) payable returns (bool)',
+  'function matchOrders(Order[] orders, Fulfillment[] fulfillments) payable returns (bytes)',
+  'function validate(Order[] orders) returns (bool)',
+  'function incrementCounter() returns (uint256)',
+]);
+const send = (data: Hex, value = 0n) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: BOB, to: SEAPORT, data, value: `0x${value.toString(16)}`, chainId: '0x1' }] }, { now: NOW }, deps);
+const basic = (basicOrderType: number, o: Record<string, unknown>) => encodeFunctionData({ abi: TX_ABI, functionName: 'fulfillBasicOrder_efficient_6GL6yc', args: [{
+  considerationToken: ZERO, considerationIdentifier: 0n, considerationAmount: 0n, offerer: ALICE, zone: ZERO, offerToken: APES, offerIdentifier: 42n, offerAmount: 1n, basicOrderType, startTime: BigInt(start), endTime: BigInt(start + month),
+  zoneHash: `0x${'00'.repeat(32)}`, salt: 1n, offererConduitKey: CONDUIT_KEY, fulfillerConduitKey: CONDUIT_KEY, totalOriginalAdditionalRecipients: 1n, additionalRecipients: [], signature: '0x', ...o,
+} as never] });
+const params = (offerer: string, offer: unknown[], consideration: unknown[]) => ({ offerer, zone: ZERO, offer, consideration, orderType: 0, startTime: BigInt(start), endTime: BigInt(start + month), zoneHash: `0x${'00'.repeat(32)}` as Hex, salt: 1n, conduitKey: CONDUIT_KEY as Hex, totalOriginalConsiderationItems: BigInt(consideration.length) });
+const item = (itemType: number, token: string, id: bigint, amount: bigint, recipient?: string) => ({ itemType, token, identifierOrCriteria: id, startAmount: amount, endAmount: amount, ...(recipient && { recipient }) });
+
+test('Buying a listing, and selling into an offer, with fees counted', async () => {
+  const buy = await send(basic(0, { considerationAmount: 9_750_000_000_000_000_000n, additionalRecipients: [{ amount: 250_000_000_000_000_000n, recipient: FEE }] }), 10n * E);
+  assert.equal(buy.title, 'Buy BAYC #42 for 10 ETH');
+  assert.equal(detail(buy, 'Net'), '-10 ETH');
+  // Route 4 (ERC721_TO_ERC20): ALICE offers 5 WETH for BAYC #42; the fees (0.125 WETH) come out of the offer.
+  const sell = await send(basic(16, { considerationToken: APES, considerationIdentifier: 42n, considerationAmount: 1n, offerToken: WETH, offerIdentifier: 0n, offerAmount: 5n * E, additionalRecipients: [{ amount: 125_000_000_000_000_000n, recipient: FEE }] }));
+  assert.equal(sell.title, 'Sell BAYC #42 for 4.875 WETH');
+});
+
+test('A matched buy is judged as a whole; validating a give-away order and cancelling everything are flagged', async () => {
+  // OpenSea's matched buy: BOB's own order offers 2 ETH and asks nothing; the listing sends BAYC #42 to BOB.
+  const listing = params(ALICE, [item(2, APES, 42n, 1n)], [item(0, ZERO, 0n, 2n * E, ALICE)]);
+  const counter = params(BOB, [item(0, ZERO, 0n, 2n * E)], [item(2, APES, 42n, 1n, BOB)]);
+  const m = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'matchOrders', args: [[{ parameters: listing, signature: '0x' }, { parameters: counter, signature: '0x' }] as never, []] }), 2n * E);
+  assert.equal(m.title, 'Buy BAYC #42 for 2 ETH');
+  assert.ok(!codes(m).includes('seaport_nothing_in_return'));
+  // Validating an order that gives BOB's NFT to someone else for nothing: as binding as signing it.
+  const giveaway = params(BOB, [item(2, APES, 7n, 1n)], [item(0, ZERO, 0n, 1n, ALICE)]);
+  const v = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'validate', args: [[{ parameters: giveaway, signature: '0x' }] as never] }));
+  assert.equal(v.attention, 'danger');
+  assert.ok(codes(v).includes('seaport_validate'));
+  const all = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'incrementCounter' }));
+  assert.equal(all.title, 'Cancel all your Seaport orders');
+});

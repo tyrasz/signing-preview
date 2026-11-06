@@ -129,3 +129,67 @@ export function orderTerms(o: SeaportOrder, b: PreviewBuilder, now: number, n = 
   const conduit = KNOWN_CONDUITS[o.conduitKey.toLowerCase()];
   if (!/^0x0{64}$/.test(o.conduitKey)) b.detail(`${p}Conduit`, conduit ?? o.conduitKey);
 }
+
+/**
+ * One order from the side of whoever fills it (`fulfiller`): they receive the offer items and provide the
+ * consideration items, so per token the net is what the offer gives less what the consideration takes.
+ */
+export async function describeFill(o: SeaportOrder, fulfiller: string, env: Env, b: PreviewBuilder, n = ''): Promise<{ title: string }> {
+  const p = n ? `${n}: ` : '';
+  const gets = await Promise.all(o.offer.map(i => itemLabel(i, env)));
+  const pays = await Promise.all(o.consideration.map(i => itemLabel(i, env)));
+  b.detail(`${p}Seller`, sameAddress(o.offerer, fulfiller) ? `you (${o.offerer})` : o.offerer, o.offerer);
+  b.detail(`${p}You get`, gets.join(', ') || 'nothing');
+  for (const [k, i] of o.consideration.entries()) {
+    const who = sameAddress(i.recipient ?? '', o.offerer) ? 'the seller' : KNOWN_RECIPIENTS[(i.recipient ?? '').toLowerCase()] ?? shortAddress(i.recipient ?? ZERO);
+    b.detail(`${p}You provide`, `${pays[k]} to ${who}`, i.recipient);
+  }
+  const received = sums(o.offer), paid = sums(o.consideration);
+  const net: string[] = [];
+  for (const token of new Set([...received.keys(), ...paid.keys()])) {
+    const d = await decimalsOf(token, env);
+    const v = (received.get(token) ?? 0n) - (paid.get(token) ?? 0n);
+    if (v === 0n || d === undefined) continue;
+    let sym = token === 'native' ? CHAINS[env.chainId]?.nativeSymbol ?? 'native' : shortAddress(token);
+    if (token !== 'native') { try { sym = (await env.deps.tokens?.get(env.chainId, token))?.symbol ?? sym; } catch { /* keep the address */ } }
+    net.push(`${v < 0n ? '-' : '+'}${formatUnits(v < 0n ? -v : v, d)} ${sym}`);
+  }
+  if (net.length) b.detail(`${p}Net`, net.join(', '));
+  const nftIn = o.offer.filter(isNft), nftOut = o.consideration.filter(isNft);
+  const nftLabels = async (xs: SeaportItem[]) => (await Promise.all(xs.map(i => itemLabel(i, env)))).join(', ');
+  const fungible = (sign: string) => net.filter(x => x.startsWith(sign)).map(x => x.slice(1)).join(' and ');
+  const title = nftIn.length && !nftOut.length ? `Buy ${await nftLabels(nftIn)}${fungible('-') ? ` for ${fungible('-')}` : ''}`
+    : nftOut.length && !nftIn.length ? `Sell ${await nftLabels(nftOut)}${fungible('+') ? ` for ${fungible('+')}` : ''}`
+      : `Fill a Seaport order: get ${gets.join(', ') || 'nothing'}`;
+  return { title };
+}
+
+/**
+ * Orders matched against each other in one transaction (matchOrders), from `user`'s side: what they give is their
+ * own orders' offers, what they get is every consideration item addressed to them, whichever order it is in. (A
+ * buyer's own counter-order gives the payment and gets nothing itself: the NFT comes from the listing it matches.)
+ */
+export async function describeMatch(orders: SeaportOrder[], user: string, env: Env, b: PreviewBuilder): Promise<{ title: string }> {
+  const mine = orders.filter(o => sameAddress(o.offerer, user));
+  const give = mine.flatMap(o => o.offer);
+  const get = orders.flatMap(o => o.consideration.filter(i => sameAddress(i.recipient ?? '', user)));
+  const gives = await Promise.all(give.map(i => itemLabel(i, env))), gets = await Promise.all(get.map(i => itemLabel(i, env)));
+  b.detail('You give', gives.join(', ') || 'nothing').detail('You get', gets.join(', ') || 'nothing');
+  for (const [i, o] of orders.entries()) if (!sameAddress(o.offerer, user)) b.detail(`Order ${i + 1}`, `from ${shortAddress(o.offerer)}: offers ${(await Promise.all(o.offer.map(x => itemLabel(x, env)))).join(', ') || 'nothing'}`, o.offerer);
+  if (give.length && !get.length) b.warn('danger', 'seaport_nothing_in_return', `This gives away ${gives.join(', ')}, and nothing in the matched orders comes to you.`);
+  const nftIn = get.filter(isNft), nftOut = give.filter(isNft);
+  const fungibleGive = gives.filter((_, k) => isFungible(give[k])), fungibleGet = gets.filter((_, k) => isFungible(get[k]));
+  const title = nftIn.length && !nftOut.length ? `Buy ${gets.filter((_, k) => isNft(get[k])).join(', ')}${fungibleGive.length ? ` for ${fungibleGive.join(' and ')}` : ''}`
+    : nftOut.length && !nftIn.length ? `Sell ${gives.filter((_, k) => isNft(give[k])).join(', ')}${fungibleGet.length ? ` for ${fungibleGet.join(' and ')}` : ''}`
+      : `Match ${orders.length} Seaport orders`;
+  return { title };
+}
+
+/** Applies criteria resolvers: an item offered as "any token" of a collection becomes the token actually chosen. */
+export function resolveCriteria(orders: SeaportOrder[], resolvers: readonly { orderIndex: bigint; side: number; index: bigint; identifier: bigint }[]): void {
+  for (const r of resolvers) {
+    const o = orders[Number(r.orderIndex)];
+    const item = o && (r.side === 0 ? o.offer : o.consideration)[Number(r.index)];
+    if (item && item.itemType >= 4) { item.itemType -= 2; item.identifierOrCriteria = r.identifier; }
+  }
+}

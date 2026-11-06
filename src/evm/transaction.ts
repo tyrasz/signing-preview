@@ -9,6 +9,7 @@ import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
 import { smartAccountAdapter } from './smart-account.ts';
 import { entryPointAdapter } from './entry-point.ts';
+import { seaportTxAdapter } from './seaport.ts';
 import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
@@ -19,6 +20,7 @@ import { bridge2Adapter, coreDepositWalletAdapter, coreWriterAdapter, hyperCoreS
 export const ADAPTERS: Adapter[] = [
   smartAccountAdapter,
   entryPointAdapter,
+  seaportTxAdapter,
   coreDepositWalletAdapter,
   hyperCoreSystemTransferAdapter,
   nativeAdapter,
