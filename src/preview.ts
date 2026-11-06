@@ -9,10 +9,11 @@ import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
 import { eip3009Adapter } from './typed-data/eip3009.ts';
 import { userOperationAdapter } from './typed-data/user-operation.ts';
+import { seaportAdapter } from './typed-data/seaport.ts';
 import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts';
 import { previewMessage } from './message.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, permitAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, seaportAdapter, permitAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'] as const;

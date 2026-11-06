@@ -34,7 +34,7 @@ export async function netChanges(transfers: SimulatedTransfer[], account: Accoun
 
 const shortId = (id: bigint) => { const s = id.toString(); return s.length > 12 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s; };
 
-async function collectionLabel(deps: Dependencies, chainId: number, address: string): Promise<{ label: string; named: boolean }> {
+export async function collectionLabel(deps: Dependencies, chainId: number, address: string): Promise<{ label: string; named: boolean }> {
   try {
     const c = await deps.tokens?.collection?.(chainId, address);
     const name = c?.symbol || c?.name;
