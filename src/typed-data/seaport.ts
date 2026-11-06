@@ -4,7 +4,47 @@ import { PreviewBuilder } from '../format.ts';
 import { chainName } from '../chains.ts';
 import { describeOrder, orderTerms, SEAPORTS, type SeaportItem, type SeaportOrder } from '../seaport.ts';
 import type { AssetChange } from '../types.ts';
-import { big, domainChainId, str, type TypedAdapter } from './common.ts';
+import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
+import { callWords, canMoveNow, pad } from './exposure.ts';
+import { collectionLabel } from '../evm/effects.ts';
+import { shortAddress } from '../format.ts';
+
+const CONDUIT_CONTROLLER = '0x00000000f9490004c11cef243f5400493c00ad63';
+const asAddress = (w: bigint | undefined) => w === undefined ? undefined : `0x${w.toString(16).padStart(40, '0')}`;
+
+/**
+ * Whether the order could be filled now: Seaport moves the offer with the approvals the offerer has given its
+ * operator (Seaport itself, or the conduit the order names), so each offered item is checked for ownership and that
+ * approval; the order's counter must be Seaport's current one for the offerer (incrementCounter cancels all older).
+ */
+async function fillableNow(o: SeaportOrder, seaport: string, chainId: number, env: TypedEnv, b: PreviewBuilder, p: string): Promise<void> {
+  if (!env.deps.rpc?.has(chainId)) return;
+  const counter = (await callWords(env, chainId, seaport, `0xf07ec373${pad(o.offerer)}`))?.[0];
+  if (counter !== undefined && o.counter !== undefined && o.counter !== counter) b.warn('info', 'seaport_counter_stale', `${p}This order is signed with counter ${o.counter}, but your Seaport counter is ${counter}: ${o.counter < counter ? 'it was cancelled (incrementCounter), so it' : 'it'} can't be filled.`);
+  const operator = /^0x0{64}$/.test(o.conduitKey) ? seaport : asAddress((await callWords(env, chainId, CONDUIT_CONTROLLER, `0x6e9bfd9f${pad(o.conduitKey)}`))?.[0]);
+  if (!operator || /^0x0{40}$/.test(operator)) return;
+  const name = operator === seaport ? 'Seaport' : "the order's conduit";
+  for (const [i, it] of o.offer.slice(0, 6).entries()) {
+    const label = `${p}${o.offer.length > 1 ? `Item ${i + 1}: ` : ''}can transfer now`;
+    if (it.itemType === 1) {
+      let info;
+      try { info = await env.deps.tokens?.get(chainId, it.token); } catch { info = undefined; }
+      await canMoveNow(env, b, chainId, o.offerer, it.token, info ?? undefined, it.startAmount, { address: operator, name }, label);
+      continue;
+    }
+    if (it.itemType < 2) continue;
+    const approved = (await callWords(env, chainId, it.token, `0xe985e9c5${pad(o.offerer)}${pad(operator)}`))?.[0];
+    const collection = (await collectionLabel(env.deps, chainId, it.token)).label;
+    if (it.itemType === 4 || it.itemType === 5) { if (approved !== undefined) b.detail(label, approved ? `any ${collection} you own: ${name} is approved for the collection` : `nothing yet: ${name} isn't approved for ${collection}`); continue; }
+    const id = it.identifierOrCriteria;
+    let owns: boolean | undefined;
+    if (it.itemType === 2) { const owner = asAddress((await callWords(env, chainId, it.token, `0x6352211e${pad(id)}`))?.[0]); owns = owner === undefined ? undefined : owner === o.offerer; }
+    else { const held = (await callWords(env, chainId, it.token, `0x00fdd58e${pad(o.offerer)}${pad(id)}`))?.[0]; owns = held === undefined ? undefined : held >= it.startAmount; }
+    const single = it.itemType === 2 && !approved ? asAddress((await callWords(env, chainId, it.token, `0x081812fc${pad(id)}`))?.[0]) === operator : false;
+    if (owns === undefined || approved === undefined) continue;
+    b.detail(label, !owns ? `no: you don't ${it.itemType === 2 ? 'own' : 'hold enough of'} ${collection} #${id}` : approved || single ? `${collection} #${id} (you own it, and ${name} is approved)` : `not yet: ${name} isn't approved for ${collection}, so the order can't be filled until you approve it`);
+  }
+}
 
 const MAX_ORDERS = 20;
 
@@ -53,6 +93,7 @@ export const seaportAdapter: TypedAdapter = async (data, env) => {
     const n = bulk ? `Order ${i + 1}` : '';
     const s = await describeOrder(o, env.signer, env2, b, n);
     orderTerms(o, b, env.now, n);
+    if (i < 5) { try { await fillableNow(o, contract, chainId, env, b, n ? `${n}: ` : ''); } catch { /* not checked */ } }
     summaries.push(s);
     assetChanges.push(...s.assetChanges);
   }

@@ -44,3 +44,13 @@ export async function canMoveNow(env: TypedEnv, b: PreviewBuilder, chainId: numb
   b.detail(label, `${fmt(amount)} (${why})`, amount.toString());
   return { amount, balance, limitedBy };
 }
+
+/** One eth_call's 32-byte words, or undefined without an RPC (or on failure). */
+export async function callWords(env: TypedEnv, chainId: number, to: string, data: string): Promise<bigint[] | undefined> {
+  if (!env.deps.rpc?.has(chainId)) return undefined;
+  try {
+    const r = String(await env.deps.rpc.call(chainId, 'eth_call', [{ to, data }, 'latest']));
+    return /^0x([0-9a-f]{64})+$/i.test(r) ? (r.slice(2).match(/.{64}/g) ?? []).map(x => BigInt(`0x${x}`)) : undefined;
+  } catch { return undefined; }
+}
+export const pad = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');

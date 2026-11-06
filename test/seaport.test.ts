@@ -140,3 +140,23 @@ test('SeaDrop mints: the collection, quantity and price, overpaying the drop, an
   assert.ok(codes(await mint(ZERO, 10n ** 17n)).includes('mint_overpay'));
   assert.ok(codes(await mint(BOB, 2n * 10n ** 16n)).includes('recipient_not_sender'));
 });
+
+test('Whether a listing can be filled now: the NFT owned, the conduit approved, and the counter current', async () => {
+  const CONDUIT = '0x1e0049783f008a0085193e00003d00cd54003c71', word = (v: bigint | string) => (typeof v === 'bigint' ? v.toString(16) : v.slice(2)).padStart(64, '0');
+  const chain = (approved: boolean, counter: bigint) => ({ ...deps, rpc: { has: () => true, call: async (_c: number, _m: string, params: unknown[]) => {
+    const { data } = params[0] as { data: string };
+    const sel = data.slice(0, 10);
+    if (sel === '0xf07ec373') return `0x${word(counter)}`; // Seaport.getCounter
+    if (sel === '0x6e9bfd9f') return `0x${word(CONDUIT)}${word(1n)}`; // ConduitController.getConduit
+    if (sel === '0xe985e9c5') return `0x${word(approved ? 1n : 0n)}`; // isApprovedForAll
+    if (sel === '0x6352211e') return `0x${word(BigInt(`0x${data.slice(10)}`) === 42n ? ALICE.toLowerCase() : BOB.toLowerCase())}`; // ownerOf
+    if (sel === '0x081812fc') return `0x${word(0n)}`;
+    return '0x';
+  } } });
+  const listing = (id: number) => components([nft(id)], [eth(10n * E, ALICE)], { conduitKey: CONDUIT_KEY, counter: '3' });
+  const at = (message: unknown, d: Dependencies) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify({ domain: { name: 'Seaport', version: '1.6', chainId: 1, verifyingContract: SEAPORT }, types: TYPES, primaryType: 'OrderComponents', message })] }, { now: NOW }, d);
+  assert.equal(detail(await at(listing(42), chain(true, 3n)), 'can transfer now'), "BAYC #42 (you own it, and the order's conduit is approved)");
+  assert.match(detail(await at(listing(42), chain(false, 3n)), 'can transfer now')!, /^not yet: the order's conduit isn't approved for BAYC/);
+  assert.equal(detail(await at(listing(43), chain(true, 3n)), 'can transfer now'), "no: you don't own BAYC #43");
+  assert.ok(codes(await at(listing(42), chain(true, 4n))).includes('seaport_counter_stale'));
+});
