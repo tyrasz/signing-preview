@@ -12,6 +12,8 @@ export interface Tx {
   value: bigint;
   /** EIP-7702 authorization list (type-4 transactions). */
   authorizations?: AuthorizationRequest[];
+  /** The sender's code will be in place when this runs though the chain shows none yet (a UserOperation that deploys its account first). */
+  codeInPlace?: boolean;
 }
 
 /** One EIP-7702 authorization, as requested: unsigned (the wallet signs it for the sender) or already signed. */

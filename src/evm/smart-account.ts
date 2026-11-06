@@ -66,7 +66,7 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   // Only code at the account runs the calls: a delegation set in this transaction, or one (or a contract) already there.
   const delegate = await ownDelegateAfter(tx);
   if (delegate === null) return null; // cleared in this transaction: a plain account again
-  if (delegate === undefined && env.deps.rpc?.has(tx.chainId)) {
+  if (delegate === undefined && !tx.codeInPlace && env.deps.rpc?.has(tx.chainId)) {
     let code: unknown;
     try { code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, 'latest']); } catch { code = undefined; }
     if (code === '0x') {
