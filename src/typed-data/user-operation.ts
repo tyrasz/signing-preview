@@ -7,7 +7,7 @@ import { CHAINS, chainName } from '../chains.ts';
 import { decodeTransaction, simulationNote } from '../evm/transaction.ts';
 import { netChanges } from '../evm/effects.ts';
 import type { AssetChange } from '../types.ts';
-import { big, domainChainId, str, type TypedAdapter } from './common.ts';
+import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
 
 /** EntryPoints that sign UserOperations as EIP-712 typed data, at the same address on every chain (checked on Ethereum, Arbitrum One and HyperEVM). */
 export const ENTRY_POINTS: Record<string, string> = {
@@ -25,6 +25,39 @@ const halves = (v: unknown): [bigint, bigint] | null => {
   if (!h || h.length !== 66) return null;
   return [BigInt(`0x${h.slice(2, 34)}`), BigInt(`0x${h.slice(34)}`)];
 };
+
+/** The paymaster in paymasterAndData, and (from EntryPoint v0.7 on) the gas it may use: verification and post-op limits after its address. */
+export function paymasterOf(paymasterAndData: string, packedGas: boolean): { paymaster: string | null; paymasterGas: bigint } {
+  const paymaster = paymasterAndData.length >= 42 ? `0x${paymasterAndData.slice(2, 42)}`.toLowerCase() : null;
+  const paymasterGas = packedGas && paymasterAndData.length >= 106 ? BigInt(`0x${paymasterAndData.slice(42, 74)}`) + BigInt(`0x${paymasterAndData.slice(74, 106)}`) : 0n;
+  return { paymaster, paymasterGas };
+}
+
+export interface OpGas { verification: bigint; call: bigint; preVerification: bigint; maxFee: bigint; maxPriority: bigint; paymaster: string | null; paymasterGas: bigint; /** EntryPoint v0.6, which reserves verification gas three times over when a paymaster is set. */ v06?: boolean }
+
+/** Gas limits, fees and the most the operation can cost the account (or its paymaster), at the highest fee it allows. */
+export function gasDetails(b: PreviewBuilder, g: OpGas, chainId: number | null): void {
+  const native = chainId !== null ? CHAINS[chainId] : undefined;
+  const gas = g.v06 ? g.call + g.verification * (g.paymaster ? 3n : 1n) + g.preVerification : g.verification + g.call + g.preVerification + g.paymasterGas;
+  b.detail('Gas limits', `verification ${g.verification}, call ${g.call}, pre-verification ${g.preVerification}${g.paymaster && !g.v06 ? `, paymaster ${g.paymasterGas}` : ''}`);
+  b.detail('Maximum fee', `${formatUnits(g.maxFee, 9)} gwei (priority ${formatUnits(g.maxPriority, 9)} gwei)`);
+  const cost = `${formatUnits(gas * g.maxFee, native?.nativeDecimals ?? 18)} ${native?.nativeSymbol ?? 'native'}`;
+  b.detail(g.paymaster ? 'Gas paid by' : 'Maximum gas cost', g.paymaster ? `paymaster ${g.paymaster} (at most ${cost})` : `${cost}, from the account`, g.paymaster ?? undefined);
+  if (g.paymaster) b.warn('info', 'userop_paymaster', `A paymaster (${shortAddress(g.paymaster)}) pays the gas. It may charge for it in tokens, through the calls below or by its own rules.`);
+}
+
+/**
+ * The EntryPoint's own nonce for this key (getNonce): an operation whose nonce is behind it has already run (or
+ * another with the same nonce has), so it can't; one ahead of it waits for the operations before it.
+ */
+export async function nonceCheck(b: PreviewBuilder, env: { deps: TypedEnv['deps'] }, chainId: number | null, entryPoint: string, sender: string, nonce: bigint | null): Promise<void> {
+  if (chainId === null || nonce === null || !env.deps.rpc?.has(chainId)) return;
+  const key = nonce >> 64n, seq = nonce & ((1n << 64n) - 1n);
+  let current: bigint;
+  try { current = BigInt(String(await env.deps.rpc.call(chainId, 'eth_call', [{ to: entryPoint, data: `0x35567e1a${sender.slice(2).padStart(64, '0')}${key.toString(16).padStart(64, '0')}` }, 'latest']))) & ((1n << 64n) - 1n); } catch { return; }
+  if (seq < current) b.warn('info', 'userop_nonce_used', `The account's nonce${key ? ` for key ${key}` : ''} is already ${current}: an operation with nonce ${seq} has run, so this one can't.`);
+  else if (seq > current) b.note(`${seq - current} other operation${seq - current === 1n ? '' : 's'} of this account must run before this one (its nonce${key ? ` for key ${key}` : ''} is at ${current}).`);
+}
 
 export const userOperationAdapter: TypedAdapter = async (data, env) => {
   if (data.primaryType !== 'PackedUserOperation' || str(data.domain.name) !== 'ERC4337') return null;
@@ -46,6 +79,7 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   if (!ENTRY_POINTS[entryPoint]) b.warn('caution', 'unknown_entrypoint', `${shortAddress(entryPoint)} is not a known ERC-4337 EntryPoint (v0.8 or v0.9). Only sign UserOperations for the EntryPoint your wallet uses.`);
   if (!mine && env.signer) b.warn('info', 'userop_owner_signature', `You sign as an owner of the smart account ${shortAddress(sender)}: the operation runs from that account, not from ${shortAddress(env.signer)}.`);
   if (nonce !== null) b.detail('Nonce', `${nonce & ((1n << 64n) - 1n)} (key ${nonce >> 64n})`, nonce.toString());
+  if (ENTRY_POINTS[entryPoint]) await nonceCheck(b, env, chainId, entryPoint, sender, nonce);
 
   // How the account comes to have code: already there, its EIP-7702 delegation, or deployed by a factory first.
   // The EntryPoint hashes an EIP-7702 account's initCode with its delegate in place of the 0x7702 marker, so SDKs
@@ -69,17 +103,8 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   }
 
   // Gas: the most the operation can cost the account (or its paymaster), at the highest fee it allows.
-  const native = chainId !== null ? CHAINS[chainId] : undefined;
-  const paymaster = paymasterAndData.length >= 42 ? `0x${paymasterAndData.slice(2, 42)}` : null;
-  const paymasterGas = paymasterAndData.length >= 106 ? BigInt(`0x${paymasterAndData.slice(42, 74)}`) + BigInt(`0x${paymasterAndData.slice(74, 106)}`) : 0n;
-  if (limits && fees && preVerificationGas !== null) {
-    const gas = limits[0] + limits[1] + preVerificationGas + paymasterGas;
-    b.detail('Gas limits', `verification ${limits[0]}, call ${limits[1]}, pre-verification ${preVerificationGas}${paymaster ? `, paymaster ${paymasterGas}` : ''}`);
-    b.detail('Maximum fee', `${formatUnits(fees[1], 9)} gwei (priority ${formatUnits(fees[0], 9)} gwei)`);
-    const cost = `${formatUnits(gas * fees[1], native?.nativeDecimals ?? 18)} ${native?.nativeSymbol ?? 'native'}`;
-    b.detail(paymaster ? 'Gas paid by' : 'Maximum gas cost', paymaster ? `paymaster ${paymaster} (at most ${cost})` : `${cost}, from the account`, paymaster ?? undefined);
-  }
-  if (paymaster) b.warn('info', 'userop_paymaster', `A paymaster (${shortAddress(paymaster)}) pays the gas. It may charge for it in tokens, through the calls below or by its own rules.`);
+  const pm = paymasterOf(paymasterAndData, true);
+  if (limits && fees && preVerificationGas !== null) gasDetails(b, { verification: limits[0], call: limits[1], preVerification: preVerificationGas, maxPriority: fees[0], maxFee: fees[1], ...pm }, chainId);
 
   b.note('This is an off-chain signature; it costs no gas now. Any bundler holding it can submit the operation, which then runs its calls from the account.');
   if (!callData || callData === '0x' || chainId === null) {

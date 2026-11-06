@@ -123,6 +123,9 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     b.warn('danger', 'safe_delegatecall', `This is a delegatecall: ${t.to}'s code would run as the Safe itself, able to change its owners, move everything in it or replace its code. It is not one of Safe's own libraries. A delegatecall like this is how the Bybit Safe was drained in 2025: don't sign it unless you know exactly what that contract does.`);
     calls = [{ operation: 1, to: t.to, value: t.value, data: t.data }];
   } else {
+    // MultiSend must be delegatecalled to run its batch as the Safe. MultiSendCallOnly, called plainly, still runs
+    // it, but as itself: the calls can't move the Safe's funds or act in its name. (MultiSend itself reverts.)
+    if (lib?.kind === 'multisend' || lib?.kind === 'multisend_call_only') b.warn('caution', 'safe_multisend_call', `This calls ${lib.name} directly instead of delegatecalling it, so its batch ${lib.kind === 'multisend' ? 'is rejected' : 'runs from the MultiSend contract, not from the Safe: the calls can\'t move the Safe\'s funds or act in its name'}. Wallets send batches as a delegatecall; this one is probably built wrongly.`);
     calls = [{ operation: 0, to: t.to, value: t.value, data: t.data }];
   }
 
