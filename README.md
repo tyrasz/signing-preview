@@ -193,6 +193,17 @@ A dApp or integrator that holds the action can pass it as `context.hyperliquid =
 
 Smart accounts for EntryPoint v0.6 and v0.7 (SimpleAccount, LightAccount, Kernel, Biconomy and most others) have their owner sign the operation's bare hash: `personal_sign` of `getUserOpHash`, 32 bytes that say nothing. The wallet or SDK building the operation holds it, so it can pass it as `context.userOperation = { entryPoint, chainId?, operation }` (to the HTTP API, or from the interceptor's per-request `context` option), in the form bundlers' RPC carries it (v0.6 fields; v0.7 fields unpacked as `factory`/`paymaster…`, or packed). The previewer hashes it as that EntryPoint does and decodes it **only if** the hash equals the message being signed: "Sign a UserOperation: Send 15 USDC", read the same way as a v0.8 operation (calls, setup, gas, paymaster, simulation as the account). A different hash is a **danger** mismatch. The hashing was checked against the EntryPoints' own `getUserOpHash` on 30 recent v0.7 operations on Ethereum and 26 v0.6 ones on Arbitrum, all equal. For the 15 of those accounts with an `owner()`, the real signature was a `personal_sign` of exactly that hash by the owner.
 
+### Can the transaction be included, and what does it cost
+
+Simulation runs the call; the network also checks the transaction itself before including it, and `eth_simulateV1` runs with validation off. With an RPC for the chain, each `eth_sendTransaction` / `eth_signTransaction` preview reads the account's nonces, balance and the latest base fee, and adds:
+- **Nonce**: **danger** when the request's nonce is already used by a mined transaction; **caution** when it belongs to a pending one (it replaces it, a speed-up or cancel); information when it leaves a gap, or when the account has pending transactions the preview doesn't include.
+- **Fee cap**: **caution** when `maxFeePerGas` (or `gasPrice`) is below the current base fee, so the transaction waits.
+- **Funds for gas**: **danger** when the balance doesn't cover the value plus gas limit × fee cap, which the network rejects; caution when it may not cover the estimated fee.
+- **Network fee**: "≈ 0.000055 ETH (50,000 gas at 1.1 gwei); at most 0.00012 ETH": the simulated gas at the current base fee plus the tip (the request's, or `eth_maxPriorityFeePerGas`), capped at the fee cap. On Arbitrum One it is the base fee (no tip) on the L2 gas plus the gas ArbOS charges for the data posted to Ethereum, from NodeInterface's `gasEstimateL1Component` (zero at the moment: it matched `gasUsedForL1` in 20 of 20 recent receipts).
+- **Gas limit**: the request's own limit is passed to the simulator, so a limit too low shows as running out of gas, and the call is run again without it to say how much it needs ("out of gas: the gas limit (30,000) is below the 62,044 gas this call needs"). A node's "insufficient funds" or "intrinsic gas too low" is reported as the failure it is rather than as a simulator error.
+
+**Pending transactions.** A preview runs on the latest state, but the wallet's own transactions that aren't mined yet run first. Pass them as `context.pendingTransactions` (oldest first; `{ to, data, value }`) and the transaction is simulated after them, in order, in one block: a WETH transfer that fails on its own (no WETH yet) succeeds after a pending wrap, live on Ethereum. A pending transaction expected to fail is a caution.
+
 ## Preview JSON
 
 ```ts

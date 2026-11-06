@@ -4,6 +4,7 @@ import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationR
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
+import { transactionChecks } from './tx-checks.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
@@ -117,7 +118,11 @@ export function normalizeTransaction(raw: unknown, context: PreviewContext, fall
   const chainId = t.chainId !== undefined ? Number(quantity(t.chainId, 'chainId')) : fallbackChainId ?? context.chainId;
   if (!chainId) throw new RequestError('Chain ID is unknown: include chainId in the transaction or the preview context');
   const authorizations = authorizationList(t.authorizationList);
-  return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value'), ...(authorizations?.length && { authorizations }) };
+  // Optional fields the wallet may already have filled in: kept only when present.
+  const optional = (field: string) => t[field] === undefined || t[field] === null || t[field] === '' ? undefined : quantity(t[field], field);
+  const fees = { gas: optional('gas') ?? optional('gasLimit'), gasPrice: optional('gasPrice'), maxFeePerGas: optional('maxFeePerGas'), maxPriorityFeePerGas: optional('maxPriorityFeePerGas'), nonce: optional('nonce') };
+  return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value'), ...(authorizations?.length && { authorizations }),
+    ...Object.fromEntries(Object.entries(fees).filter(([, v]) => v !== undefined)) };
 }
 
 /**
@@ -187,7 +192,18 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         if (unsigned.length) request.unsignedAuthorizations = unsigned.map(a => ({ address: a.address, chainId: a.chainId ?? tx.chainId }));
         b.note('Simulated with the EIP-7702 authorizations applied: the delegated accounts run their new code.');
       }
-      outcome = { result: await deps.simulator.simulate(request) };
+      const pending = pendingRequests(tx, context);
+      if (pending.length && deps.simulator.simulateBatch) {
+        // On top of the wallet's pending transactions, in order: this one is the last call of the batch.
+        const results = await deps.simulator.simulateBatch([...pending, request]);
+        const failed = results ? results.slice(0, -1).findIndex(r => r.status === 'reverted') : -1;
+        if (failed !== -1) b.warn('caution', 'pending_transaction_fails', `Your pending transaction #${failed + 1} is expected to fail${results![failed].revertReason ? ` (${results![failed].revertReason})` : ''}, so this one was simulated after a failed transaction.`);
+        b.note(`Simulated after your ${pending.length} pending transaction${pending.length === 1 ? '' : 's'}, in order, as they will run before it.`);
+        outcome = { result: results ? results[results.length - 1] : null };
+      } else {
+        if (pending.length) b.note("Your pending transactions couldn't be simulated before this one on this chain, so the simulation runs on the latest state without them.");
+        outcome = { result: await deps.simulator.simulate(request) };
+      }
     } catch (error) {
       outcome = { error: error instanceof Error ? error.message : String(error) };
     }
@@ -200,7 +216,14 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     b.warn('info', 'simulation_unavailable', 'The transaction could not be simulated, so balance changes are based on the decoded request only.');
   } else if (outcome?.result) {
     // A null result means this simulator does not cover the call: show the decoded request only.
-    const sim = outcome.result;
+    let sim = outcome.result;
+    // A revert under the request's own gas limit: run it again without the limit to see whether the limit is why.
+    if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length) {
+      try {
+        const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined });
+        if (unlimited?.status === 'success') sim = { ...sim, revertReason: `out of gas: the gas limit (${tx.gas.toLocaleString('en-US')}) is below the ${unlimited.gasUsed !== undefined ? `${unlimited.gasUsed.toLocaleString('en-US')} gas` : 'gas'} this call needs` };
+      } catch { /* keep the first answer */ }
+    }
     simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }) };
     if (sim.status === 'reverted') {
       b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
@@ -218,6 +241,11 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       b.note(simulationNote(sim));
     }
   }
+  // What the network checks before including it, and the fee. A batch call's fee belongs to the whole batch.
+  if (method !== 'wallet_sendCalls') {
+    const gasUsed = outcome && 'result' in outcome && outcome.result ? outcome.result.gasUsed : undefined;
+    try { await transactionChecks(tx, gasUsed, deps, context, b); } catch { /* no checks */ }
+  }
   return {
     schema: 'signing-preview/1', method, kind: 'transaction',
     network: { kind: 'evm', chainId: tx.chainId, name: chainName(tx.chainId) },
@@ -232,7 +260,16 @@ export function simulationRequest(tx: Tx, d?: Decoded): SimulationRequest {
   const watch = new Set<string>(d?.watch ?? []);
   for (const c of d?.assetChanges ?? []) if (/^0x[0-9a-fA-F]{40}$/.test(c.asset ?? '')) watch.add(c.asset!.toLowerCase());
   for (const a of d?.declaredApprovals ?? []) { watch.add(a.token.toLowerCase()); watch.add(a.spender.toLowerCase()); }
-  return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }) };
+  // The request's gas limit, so a limit too low for the call shows as running out of gas.
+  return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }), ...(tx.gas !== undefined && { gas: tx.gas }) };
+}
+
+/** The wallet's own transactions still waiting to be mined, as simulation requests run before this one. */
+export function pendingRequests(tx: Tx, context: PreviewContext): SimulationRequest[] {
+  return (context.pendingTransactions ?? []).filter(p => p && typeof p === 'object').map(p => ({
+    chainId: tx.chainId, from: tx.from, to: typeof p.to === 'string' && ADDRESS.test(p.to) ? p.to.toLowerCase() : null,
+    data: (typeof p.data === 'string' && HEX.test(p.data) ? p.data.toLowerCase() : '0x') as `0x${string}`, value: quantity(p.value, 'pendingTransactions[].value'),
+  }));
 }
 
 /** How the simulated balance changes were found, for the preview's notes. */

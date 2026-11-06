@@ -14,6 +14,12 @@ export interface Tx {
   authorizations?: AuthorizationRequest[];
   /** The sender's code will be in place when this runs though the chain shows none yet (a UserOperation that deploys its account first). */
   codeInPlace?: boolean;
+  /** The request's own gas limit, fees and nonce, when it sets them (wallets usually fill them in). */
+  gas?: bigint;
+  gasPrice?: bigint;
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
+  nonce?: bigint;
 }
 
 /** One EIP-7702 authorization, as requested: unsigned (the wallet signs it for the sender) or already signed. */

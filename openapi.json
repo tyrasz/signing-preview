@@ -470,6 +470,36 @@
                 "type": "object"
               }
             }
+          },
+          "pendingTransactions": {
+            "type": "array",
+            "maxItems": 16,
+            "description": "The account's transactions the wallet has sent that aren't mined yet, oldest first. The transaction being previewed is simulated after them, in order, as it will run.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "to": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^0x[0-9a-fA-F]{40}$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "data": {
+                  "type": "string",
+                  "pattern": "^0x([0-9a-fA-F]{2})*$"
+                },
+                "value": {
+                  "type": "string",
+                  "description": "Hex or decimal wei."
+                }
+              }
+            }
           }
         }
       },

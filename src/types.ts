@@ -137,6 +137,11 @@ export interface PreviewContext {
     chainId?: number;
     operation: Record<string, unknown>;
   };
+  /**
+   * The account's transactions the wallet has sent and that aren't mined yet, oldest first. The transaction being
+   * previewed is simulated after them, as it will run, instead of on the latest state alone.
+   */
+  pendingTransactions?: { to: string | null; data?: string; value?: string }[];
   /** Current time in ms; injectable for tests. */
   now?: number;
 }

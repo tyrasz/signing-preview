@@ -96,6 +96,12 @@ function sanitizeContext(raw: unknown): PreviewContext {
       expiresAfter: typeof hl.expiresAfter === 'number' ? hl.expiresAfter : null,
     };
   }
+  if (Array.isArray(c.pendingTransactions)) {
+    out.pendingTransactions = c.pendingTransactions.slice(0, 16).filter(t => t && typeof t === 'object').map(t => {
+      const r = t as Record<string, unknown>;
+      return { to: typeof r.to === 'string' && /^0x[0-9a-fA-F]{40}$/.test(r.to) ? r.to : null, ...(typeof r.data === 'string' && { data: r.data }), ...(typeof r.value === 'string' && { value: r.value }) };
+    });
+  }
   const uo = c.userOperation as Record<string, unknown> | undefined;
   if (uo && typeof uo === 'object' && typeof uo.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(uo.entryPoint) && uo.operation && typeof uo.operation === 'object' && !Array.isArray(uo.operation)) {
     out.userOperation = { entryPoint: uo.entryPoint, operation: uo.operation as Record<string, unknown>, ...(typeof uo.chainId === 'number' && Number.isSafeInteger(uo.chainId) && { chainId: uo.chainId }) };

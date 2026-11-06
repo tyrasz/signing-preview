@@ -165,8 +165,11 @@ export class RpcSimulator implements Simulator {
       return this.withoutSimulateV1(url, chainId, reqs);
     }
     const results = body.result?.[0]?.calls;
-    if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const source = `eth_simulateV1 @ chain ${chainId}`;
+    // Errors that are the answer for a single transaction: the network would reject it the same way.
+    const rejected = body.error?.message && reqs.length === 1 ? rejection(body.error.message) : null;
+    if (rejected) return [{ status: 'reverted', source, revertReason: rejected, transfers: [], limited: true }];
+    if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const parsed: SimulationResult[] = results.map(result => {
       const gasUsed = BigInt(result.gasUsed);
       return result.status !== '0x1'
@@ -363,6 +366,13 @@ type Log = { address: string; topics: string[]; data: string };
 const topicAddress = (t: string) => '0x' + t.slice(26).toLowerCase();
 const isWords = (data: string, n: number) => new RegExp(`^0x[0-9a-fA-F]{${64 * n}}$`).test(data);
 const isEmpty = (data: string) => data === '0x' || data === '';
+
+/** A node's refusal that says why the transaction can't run at all, worded for the preview; null for other errors. */
+export function rejection(message: string): string | null {
+  if (/insufficient funds/i.test(message)) return "insufficient funds: the account can't cover the value it sends";
+  if (/intrinsic gas too low/i.test(message)) return 'out of gas: the gas limit is below the minimum any transaction with this calldata needs';
+  return null;
+}
 
 /** Fungible transfers only (ERC-20 and, with traceTransfers, native). */
 export function parseTransfers(logs: Log[]): SimulatedTransfer[] {
