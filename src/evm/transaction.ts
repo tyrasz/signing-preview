@@ -12,6 +12,7 @@ import { entryPointAdapter } from './entry-point.ts';
 import { seaportTxAdapter } from './seaport.ts';
 import { safeExecAdapter } from './safe.ts';
 import { aggregatorAdapters } from './aggregators.ts';
+import { uniswapRoutersAdapter } from './uniswap-routers.ts';
 import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
@@ -25,6 +26,7 @@ export const ADAPTERS: Adapter[] = [
   seaportTxAdapter,
   safeExecAdapter,
   ...aggregatorAdapters,
+  uniswapRoutersAdapter,
   coreDepositWalletAdapter,
   hyperCoreSystemTransferAdapter,
   nativeAdapter,

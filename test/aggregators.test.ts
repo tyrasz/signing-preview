@@ -64,3 +64,28 @@ test('OKX DEX router: the request it carries, and pool-only swaps with the outpu
   assert.equal((await unx(0n)).title, 'Swap 100 USDC for at least 0.03 WETH on OKX DEX');
   assert.equal((await unx(1n << 254n)).title, 'Swap 100 USDC for at least 0.03 ETH on OKX DEX');
 });
+
+test('Uniswap V2 Router02, V3 SwapRouter and SwapRouter02: swaps, ETH in and out, exact output, and a recipient elsewhere', async () => {
+  const A = parseAbi([
+    'function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable',
+    'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) payable',
+    'function unwrapWETH9(uint256 amountMinimum, address recipient) payable',
+    'function multicall(uint256 deadline, bytes[] data) payable',
+    'function exactOutput((bytes path, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum) params) payable',
+  ]);
+  const v2 = await send('0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D', encodeFunctionData({ abi: A, functionName: 'swapExactETHForTokens', args: [990_000_000n, [WETH, USDC], ALICE, 2_000_000_000n] }), 10n ** 18n / 3n);
+  assert.equal(v2.title, 'Swap 0.333333333333333333 ETH for at least 990 USDC on Uniswap');
+  // SwapRouter02: USDC → WETH to the router (placeholder 2), then unwrapped to the sender.
+  const single = encodeFunctionData({ abi: A, functionName: 'exactInputSingle', args: [{ tokenIn: USDC, tokenOut: WETH, fee: 500, recipient: '0x0000000000000000000000000000000000000002', amountIn: 100_000_000n, amountOutMinimum: 3n * 10n ** 16n, sqrtPriceLimitX96: 0n }] });
+  const unwrap = (to: string) => encodeFunctionData({ abi: A, functionName: 'unwrapWETH9', args: [3n * 10n ** 16n, to as Hex] });
+  const r02 = (to: string) => send('0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45', encodeFunctionData({ abi: A, functionName: 'multicall', args: [2_000_000_000n, [single, unwrap(to)]] }));
+  const toMe = await r02(ALICE);
+  assert.equal(toMe.title, 'Swap 100 USDC for at least 0.03 ETH on Uniswap');
+  assert.equal(detail(toMe, 'Pool fees'), '0.05%');
+  assert.ok(!codes(toMe).includes('recipient_not_sender'));
+  assert.ok(codes(await r02(BOB)).includes('recipient_not_sender'));
+  // V3 SwapRouter exactOutput: the path runs from the output token back to the input.
+  const path = `0x${WETH.slice(2)}0001f4${USDC.slice(2)}` as Hex;
+  const out = await send('0xE592427A0AEce92De3Edee1F18E0157C05861564', encodeFunctionData({ abi: A, functionName: 'exactOutput', args: [{ path, recipient: ALICE, deadline: 2_000_000_000n, amountOut: 10n ** 17n, amountInMaximum: 400_000_000n }] }));
+  assert.equal(out.title, 'Buy 0.1 WETH for at most 400 USDC on Uniswap');
+});

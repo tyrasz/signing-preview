@@ -112,7 +112,7 @@ function who(c: Ctx, recipient: string): string {
 const toOther = (c: Ctx, recipient: string) => who(c, recipient) === recipient;
 
 /** v3 paths are packed: token (20 bytes), then fee (3 bytes) + token per hop. */
-function v3Path(path: Hex): { tokens: string[]; fees: number[] } | null {
+export function v3Path(path: Hex): { tokens: string[]; fees: number[] } | null {
   const hex = path.slice(2);
   if (hex.length < 86 || (hex.length - 40) % 46 !== 0) return null;
   const tokens = ['0x' + hex.slice(0, 40)], fees: number[] = [];
@@ -448,7 +448,7 @@ async function commands(c: Ctx, cmds: Hex, inputs: readonly Hex[], depth: number
 }
 
 /** The chain's wrapped native token (WETH, or WHYPE on HyperEVM), which WRAP_ETH / UNWRAP_WETH use. */
-const wrappedNative = (chainId: number) => builtinTokens(chainId).find(t => t.symbol === `W${CHAINS[chainId]?.nativeSymbol ?? 'ETH'}`)?.address;
+export const wrappedNative = (chainId: number) => builtinTokens(chainId).find(t => t.symbol === `W${CHAINS[chainId]?.nativeSymbol ?? 'ETH'}`)?.address;
 
 /** Collapses the legs into one headline trade when they form a split route or a chain of hops. */
 async function headline(c: Ctx): Promise<{ title: string; summary: string; changes: AssetChange[]; minOut?: bigint } | null> {

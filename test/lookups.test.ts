@@ -144,8 +144,9 @@ test('Signature-database decoding is marked unverified, and must reproduce the c
   const swap = parseAbi(['function swapExactTokensForTokens(uint256,uint256,address[],address,uint256)']);
   const data = encodeFunctionData({ abi: swap, functionName: 'swapExactTokensForTokens', args: [1_000_000n, 990_000n, ['0xaf88d065e77c8cC2239327C5EDb3A432268e5831', '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'], ALICE, 1_800_000_000n] });
   const deps: Dependencies = { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]) }; // built-in list, no network
-  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24', data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
-  assert.equal(p.title.toLowerCase(), 'call swapexacttokensfortokens on 0x4752…ad24');
+  // A router that isn't Uniswap's own (SushiSwap's, same ABI): Uniswap's routers have their own decoder.
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506', data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
+  assert.equal(p.title.toLowerCase(), 'call swapexacttokensfortokens on 0x1b02…7506');
   assert.equal(p.decoding.status, 'partial');
   assert.ok(codes(p).includes('unverified_signature'));
   assert.match(detail(p, 'path[0]')!, /^USDC/);
@@ -156,7 +157,7 @@ test('Signature-database decoding is marked unverified, and must reproduce the c
   // Uniswap V3 SwapRouter02: amountIn pairs with tokenIn, amountOutMinimum with tokenOut.
   const v3 = parseAbi(['struct P { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }', 'function exactInputSingle(P params)']);
   const v3data = encodeFunctionData({ abi: v3, functionName: 'exactInputSingle', args: [{ tokenIn: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', tokenOut: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', fee: 500, recipient: ALICE, amountIn: 10n ** 18n, amountOutMinimum: 3_500_000_000n, sqrtPriceLimitX96: 0n }] });
-  const q = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45', data: v3data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
+  const q = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506', data: v3data, chainId: '0xa4b1' }] }, { now: NOW }, deps);
   assert.equal(detail(q, 'params.amountIn'), '1 WETH');
   assert.equal(detail(q, 'params.amountOutMinimum'), '3,500 USDC');
   assert.equal(detail(q, 'params.fee'), '500');
