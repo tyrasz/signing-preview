@@ -559,13 +559,17 @@ Actions are pinned to commit SHAs (with the version in a comment), and workflows
 ```
 src/preview.ts            entry point: routes EIP-1193 methods
 src/evm/                  transaction decoders (Bridge2, CCTP, CoreWriter, system transfers, ERC-20, Uniswap Universal Router, any verified ABI, plain text)
+src/evm/aggregators.ts    1inch v6, OKX DEX, MetaMask Swaps/Bridge, Across deposits; src/evm/entry-point.ts ERC-4337 EntryPoints
+src/evm/smart-account.ts  smart-account batches (ERC-7579/7821 execute, executeBatch); src/evm/eip7702.ts delegations
+src/seaport.ts            Seaport orders (src/typed-data/seaport.ts signatures, src/evm/seaport.ts transactions)
+src/safe.ts               Safe multisig transactions (src/typed-data/safe.ts SafeTx/SafeMessage, src/evm/safe.ts execTransaction)
 src/evm/effects.ts        simulated balance changes (fungible and NFT) and approvals left in place
 src/evm/kinetiq.ts        Kinetiq staking; src/evm/hyperlend.ts HyperLend, gateway and credit delegation
 src/evm/onchain.ts        cached read-only contract calls for decoders; src/errors.ts known custom errors
 src/tokens.ts             token registries: token lists, on-chain metadata, impersonation check
 src/abi.ts                ABI sources (Sourcify, Etherscan, static), proxy detection, signature databases
 src/rpc.ts                JSON-RPC client and the lookup cache
-src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2, generic
+src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2 (and UniswapX witnesses), ERC-4337 UserOperations, CoW and 1inch orders, generic
 src/hyperliquid/          /info client, asset resolution, L1 action hash
 src/simulation.ts         eth_simulateV1 simulator + mock; src/fork-simulator.ts local EVM over fetched state; src/simulation-probe.ts the eth_call + state-override simulator
 contracts/                SimulationProbe.sol (compiled into src/probe-code.ts by npm run build:probe)
