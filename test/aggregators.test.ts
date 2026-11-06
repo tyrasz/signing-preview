@@ -109,3 +109,11 @@ test('LI.FI: any bridge facet read from its shared BridgeData, swaps first, a no
   assert.equal(swap.title, 'Swap 0.1 WETH for at least 290 USDC (LI.FI)');
   assert.ok(codes(swap).includes('recipient_not_sender'));
 });
+
+test('KyberSwap MetaAggregationRouterV2: the swap description, and a recipient elsewhere', async () => {
+  const A = parseAbi(['function swap((address callTarget, address approveTarget, bytes targetData, (address srcToken, address dstToken, address[] srcReceivers, uint256[] srcAmounts, address[] feeReceivers, uint256[] feeAmounts, address dstReceiver, uint256 amount, uint256 minReturnAmount, uint256 flags, bytes permit) desc, bytes clientData) execution) payable returns (uint256, uint256)']);
+  const kyber = (dstReceiver: string) => send('0x6131B5fae19EA4f9D964eAc0408E4408b66337b5', encodeFunctionData({ abi: A, functionName: 'swap', args: [{ callTarget: BOB, approveTarget: BOB, targetData: '0x', clientData: '0x',
+    desc: { srcToken: USDC, dstToken: USDT, srcReceivers: [], srcAmounts: [], feeReceivers: [], feeAmounts: [], dstReceiver: dstReceiver as Hex, amount: 640_000_000n, minReturnAmount: 639_000_000n, flags: 0n, permit: '0x' } }] }));
+  assert.equal((await kyber(ALICE)).title, 'Swap 640 USDC for at least 639 USDT on KyberSwap');
+  assert.ok(codes(await kyber(BOB)).includes('recipient_not_sender'));
+});

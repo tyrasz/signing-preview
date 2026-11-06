@@ -228,4 +228,30 @@ const okxAdapter: Adapter = async (tx, env) => {
   return decoded({ title: `Swap ${sent} for at least ${least} on OKX DEX`, summary: `Swaps ${sent} through OKX's DEX router, for at least ${least}.`, decoder: 'okx_dex', status: dst ? 'full' : 'partial', b });
 };
 
-export const aggregatorAdapters: Adapter[] = [oneInchAdapter, metaMaskAdapter, acrossAdapter, okxAdapter];
+// --- KyberSwap MetaAggregationRouterV2 (same address on Ethereum, Arbitrum One and HyperEVM; ABI verified on Sourcify) ---
+const KYBER = '0x6131b5fae19ea4f9d964eac0408e4408b66337b5';
+const KYBER_DESC = '(address srcToken, address dstToken, address[] srcReceivers, uint256[] srcAmounts, address[] feeReceivers, uint256[] feeAmounts, address dstReceiver, uint256 amount, uint256 minReturnAmount, uint256 flags, bytes permit) desc';
+const KYBER_ABI = parseAbi([
+  `function swap((address callTarget, address approveTarget, bytes targetData, ${KYBER_DESC}, bytes clientData) execution) payable returns (uint256, uint256)`,
+  `function swapSimpleMode(address caller, ${KYBER_DESC}, bytes executorData, bytes clientData) returns (uint256, uint256)`,
+]);
+
+const kyberAdapter: Adapter = async (tx, env) => {
+  if (!tx.to || tx.to.toLowerCase() !== KYBER) return null;
+  let call;
+  try { call = decodeFunctionData({ abi: KYBER_ABI, data: tx.data }); } catch { return null; }
+  const d = call.functionName === 'swap' ? call.args[0].desc : call.args[1];
+  const sent = await amountOf(env, tx.chainId, d.srcToken, d.amount);
+  const least = await amountOf(env, tx.chainId, d.dstToken, d.minReturnAmount);
+  const b = new PreviewBuilder().detail('Contract', `KyberSwap MetaAggregationRouterV2 (${KYBER})`, KYBER).detail('You send', sent).detail('You receive at least', least);
+  // Integrator fees, taken from the input or the output (in basis points or as amounts, by the flags).
+  if (d.feeReceivers.length) b.detail('Fees paid to', d.feeReceivers.map(r => shortAddress(r)).join(', '));
+  if (!/^0x0{40}$/.test(d.dstReceiver) && !sameAddress(d.dstReceiver, tx.from)) {
+    b.detail('Recipient', d.dstReceiver);
+    b.warn('caution', 'recipient_not_sender', `The tokens you buy go to ${shortAddress(d.dstReceiver)}, not to you.`);
+  }
+  if (d.minReturnAmount <= 1n) b.warn('caution', 'no_slippage_limit', 'Nothing limits the price: the minimum received is zero, so the swap would go through at any rate.');
+  return decoded({ title: `Swap ${sent} for at least ${least} on KyberSwap`, summary: `Swaps ${sent} through KyberSwap's aggregator, for at least ${least}.`, decoder: 'kyberswap', status: 'full', b });
+};
+
+export const aggregatorAdapters: Adapter[] = [oneInchAdapter, metaMaskAdapter, acrossAdapter, okxAdapter, kyberAdapter];
