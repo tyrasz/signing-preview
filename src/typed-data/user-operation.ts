@@ -81,14 +81,14 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   }
   if (paymaster) b.warn('info', 'userop_paymaster', `A paymaster (${shortAddress(paymaster)}) pays the gas. It may charge for it in tokens, through the calls below or by its own rules.`);
 
-  b.note("This is an off-chain signature; it costs no gas now. Any bundler holding it can submit the operation, which then runs the calls below from the account.");
+  b.note('This is an off-chain signature; it costs no gas now. Any bundler holding it can submit the operation, which then runs its calls from the account.');
   if (!callData || callData === '0x' || chainId === null) {
     return { title: `Sign a UserOperation for ${mine ? 'your account' : shortAddress(sender)}`, summary: 'Authorizes an ERC-4337 UserOperation that makes no calls.', decoder: 'erc4337_user_operation', status: 'partial', b, network };
   }
 
   // The calls: the callData is a call from the EntryPoint into the account, which runs it as the account's own.
   const inner = await decodeTransaction({ chainId, from: sender, to: sender, data: callData, value: 0n, ...(deploys && { codeInPlace: true }) }, env.deps, env.context);
-  for (const d of inner.b.details) b.details.push(d);
+  for (const d of inner.b.details) if (!b.details.some(x => x.label === d.label)) b.details.push(d);
   for (const w of inner.b.warnings) b.warnings.push(w);
   for (const n of inner.b.notes) b.note(n);
 
@@ -110,7 +110,7 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   }
   return {
     title: `Sign a UserOperation: ${inner.title}`,
-    summary: `Authorizes an ERC-4337 UserOperation from ${mine ? 'your account' : `account ${shortAddress(sender)}`}: ${inner.summary.replace(/\.$/, '')}.`,
+    summary: `Authorizes an ERC-4337 UserOperation from ${mine ? 'your account' : `account ${shortAddress(sender)}`}. ${inner.summary}`,
     decoder: 'erc4337_user_operation', status: inner.status, b, network, assetChanges,
   };
 };
