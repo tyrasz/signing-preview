@@ -10,6 +10,7 @@ import { textCalldataAdapter } from './text.ts';
 import { smartAccountAdapter } from './smart-account.ts';
 import { entryPointAdapter } from './entry-point.ts';
 import { seaportTxAdapter } from './seaport.ts';
+import { aggregatorAdapters } from './aggregators.ts';
 import { universalRouterAdapter } from './universal-router.ts';
 import { kinetiqAdapter } from './kinetiq.ts';
 import { creditDelegationAdapter, hyperlendGatewayAdapter, hyperlendPoolAdapter } from './hyperlend.ts';
@@ -21,6 +22,7 @@ export const ADAPTERS: Adapter[] = [
   smartAccountAdapter,
   entryPointAdapter,
   seaportTxAdapter,
+  ...aggregatorAdapters,
   coreDepositWalletAdapter,
   hyperCoreSystemTransferAdapter,
   nativeAdapter,

@@ -341,7 +341,7 @@ const CHAIN_NAMES: Record<string, string> = {
   690: 'Redstone', 999: 'HyperEVM', 1135: 'Lisk', 1868: 'Soneium', 8453: 'Base', 34443: 'Mode', 42161: 'Arbitrum One', 57073: 'Ink',
   59144: 'Linea', 81457: 'Blast', 534352: 'Scroll', 7777777: 'Zora', 34268394551451: 'Solana',
 };
-const chainLabel = (id: bigint) => CHAINS[Number(id)]?.name ?? CHAIN_NAMES[id.toString()] ?? `chain ${id}`;
+export const chainLabel = (id: bigint) => CHAINS[Number(id)]?.name ?? CHAIN_NAMES[id.toString()] ?? `chain ${id}`;
 
 /**
  * ACROSS_V4_DEPOSIT_V3: the router deposits its balance into the Across SpokePool. Unlike other commands, the
