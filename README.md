@@ -415,6 +415,7 @@ The first run found and fixed 26 crashes (a "never expires" Permit2 approval and
 
 Not covered, whatever the sample says:
 
+- **UserOperations for EntryPoint v0.6 and v0.7.** Their wallets sign the operation's hash as a bare 32-byte message (`personal_sign`), which says nothing about what the operation does. v0.8 and v0.9 operations are signed as typed data and decoded.
 - **Universal Router 1.0** (an older, NFT-era command table). Other DEX routers are shown through their verified ABI (function and arguments), without a swap headline.
 - **Simulation on HyperEVM** runs in a local EVM over the chain's state (see [HyperEVM simulation](#contract-and-token-lookups)). When that takes longer than its budget (a first preview of a deep contract), the probe answers, and it reads balances rather than logs, so a token the transaction doesn't name, and no decoder adds, can be missing.
 - **Sample size**: about 4% of Ethereum's blocks, 0.5% of Arbitrum's and 1.7% of HyperEVM's in the day.
