@@ -89,3 +89,23 @@ test('Uniswap V2 Router02, V3 SwapRouter and SwapRouter02: swaps, ETH in and out
   const out = await send('0xE592427A0AEce92De3Edee1F18E0157C05861564', encodeFunctionData({ abi: A, functionName: 'exactOutput', args: [{ path, recipient: ALICE, deadline: 2_000_000_000n, amountOut: 10n ** 17n, amountInMaximum: 400_000_000n }] }));
   assert.equal(out.title, 'Buy 0.1 WETH for at most 400 USDC on Uniswap');
 });
+
+test('LI.FI: any bridge facet read from its shared BridgeData, swaps first, a non-EVM destination, and same-chain swaps', async () => {
+  const LIFI = '0x1231DEB6f5749EF6cE6943a275A1D3E7486F4EaE';
+  const BD = '(bytes32 transactionId, string bridge, string integrator, address referrer, address sendingAssetId, address receiver, uint256 minAmount, uint256 destinationChainId, bool hasSourceSwaps, bool hasDestinationCall)';
+  const SD = '(address callTo, address approveTo, address sendingAssetId, address receivingAssetId, uint256 fromAmount, bytes callData, bool requiresDeposit)';
+  const A = parseAbi([`function startBridgeTokensViaAcrossV3(${BD} _bridgeData, (address receiverAddress, address refundAddress, address receivingAssetId, uint256 outputAmount, uint64 outputAmountPercent, address exclusiveRelayer, uint32 quoteTimestamp, uint32 fillDeadline, uint32 exclusivityDeadline, bytes message) _acrossData) payable`,
+    `function swapAndStartBridgeTokensViaRelay(${BD} _bridgeData, ${SD}[] _swapData, (bytes32 requestId, address nonEVMReceiver, bytes32 receivingAssetId, bytes signature) _relayData) payable`,
+    `function swapTokensMultipleV3ERC20ToERC20(bytes32 _transactionId, string _integrator, string _referrer, address _receiver, uint256 _minAmountOut, ${SD}[] _swapData)`]);
+  const bd = (o: Record<string, unknown>) => ({ transactionId: `0x${'11'.repeat(32)}` as Hex, bridge: 'across', integrator: 'jumper.exchange', referrer: '0x0000000000000000000000000000000000000000' as Hex, sendingAssetId: USDC as Hex, receiver: ALICE as Hex, minAmount: 250_000_000n, destinationChainId: 42161n, hasSourceSwaps: false, hasDestinationCall: false, ...o });
+  const across = await send(LIFI, encodeFunctionData({ abi: A, functionName: 'startBridgeTokensViaAcrossV3', args: [bd({}), { receiverAddress: ALICE as Hex, refundAddress: ALICE as Hex, receivingAssetId: USDC as Hex, outputAmount: 249_000_000n, outputAmountPercent: 0n, exclusiveRelayer: '0x0000000000000000000000000000000000000000', quoteTimestamp: 0, fillDeadline: 0, exclusivityDeadline: 0, message: '0x' }] }));
+  assert.equal(across.title, 'Bridge 250 USDC to Arbitrum One via across (LI.FI)');
+  assert.ok(codes(across).includes('bridge_same_address'));
+  const step = { callTo: BOB as Hex, approveTo: BOB as Hex, sendingAssetId: WETH as Hex, receivingAssetId: USDC as Hex, fromAmount: 10n ** 17n, callData: '0x' as Hex, requiresDeposit: true };
+  const solana = await send(LIFI, encodeFunctionData({ abi: A, functionName: 'swapAndStartBridgeTokensViaRelay', args: [bd({ bridge: 'relay', receiver: '0x11f111f111f111f111f111f111f111f111f111f1', destinationChainId: 1151111081099710n, hasSourceSwaps: true }), [step], { requestId: `0x${'22'.repeat(32)}`, nonEVMReceiver: BOB as Hex, receivingAssetId: `0x${'33'.repeat(32)}`, signature: '0x' }] }));
+  assert.equal(solana.title, 'Swap and bridge 0.1 WETH to Solana via relay (LI.FI)');
+  assert.ok(codes(solana).includes('bridge_non_evm'));
+  const swap = await send(LIFI, encodeFunctionData({ abi: A, functionName: 'swapTokensMultipleV3ERC20ToERC20', args: [`0x${'44'.repeat(32)}`, 'jumper.exchange', '', BOB, 290_000_000n, [step]] }));
+  assert.equal(swap.title, 'Swap 0.1 WETH for at least 290 USDC (LI.FI)');
+  assert.ok(codes(swap).includes('recipient_not_sender'));
+});

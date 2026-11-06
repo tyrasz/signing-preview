@@ -12,6 +12,7 @@ import { entryPointAdapter } from './entry-point.ts';
 import { seaportTxAdapter } from './seaport.ts';
 import { safeExecAdapter } from './safe.ts';
 import { seaDropAdapter } from './seadrop.ts';
+import { lifiAdapter } from './lifi.ts';
 import { aggregatorAdapters } from './aggregators.ts';
 import { uniswapRoutersAdapter } from './uniswap-routers.ts';
 import { universalRouterAdapter } from './universal-router.ts';
@@ -27,6 +28,7 @@ export const ADAPTERS: Adapter[] = [
   seaportTxAdapter,
   safeExecAdapter,
   seaDropAdapter,
+  lifiAdapter,
   ...aggregatorAdapters,
   uniswapRoutersAdapter,
   coreDepositWalletAdapter,
