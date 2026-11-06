@@ -166,8 +166,8 @@ const acrossAdapter: Adapter = async (tx, env) => {
     assetChanges: info ? [{ direction: 'out', account: tx.from, amount: formatUnits(inputAmount, info.decimals), symbol: info.symbol, raw: inputAmount.toString(), asset: nativeIn ? 'native' : inputToken, basis: 'requested', standard: nativeIn ? 'native' : 'erc20' }] : [] });
 };
 
-// --- OKX DEX router (Ethereum) ---
-const OKX: Record<string, number> = { '0x8feab81d36e7576107d5de0758c1b839be31b4f6': 1 };
+// --- OKX DEX router (Ethereum; Arbitrum One, identified by its selectors and checked against receipts) ---
+const OKX: Record<string, number> = { '0x8feab81d36e7576107d5de0758c1b839be31b4f6': 1, '0x09f94b5fc68e227c323a6fbae3bd98c97fd8c849': 42161 };
 const BASE_REQUEST = '(uint256 fromToken, address toToken, uint256 fromTokenAmount, uint256 minReturnAmount, uint256 deadLine) baseRequest';
 const ROUTER_PATH = '(address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[] paths';
 const OKX_ABI = parseAbi([
