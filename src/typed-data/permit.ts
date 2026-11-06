@@ -84,6 +84,8 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
       const permitted = (Array.isArray(m.permitted) ? m.permitted : [m.permitted]) as Record<string, unknown>[];
       for (const [i, p] of permitted.entries()) await addToken(str(p.token), big(p.amount), permitted.length > 1 ? `Token #${i + 1}` : 'Amount');
       deadline(b, env, 'Signature valid until', m.deadline);
+      const order = data.primaryType.includes('Witness') ? await uniswapXOrder(m.witness, env, chainId, spender, lines.join(', '), b) : null;
+      if (order) { offChainNote(); return result(order.title, order.summary, 'uniswapx_order', 'full'); }
       if (data.primaryType.includes('Witness')) b.warn('info', 'permit2_witness', 'The signature also commits to extra order data (a "witness"), typically a swap or intent order.');
       offChainNote();
       return result(`Permit2: let ${shortAddress(spender)} take ${lines.join(', ')}`, 'Signs a one-time Permit2 transfer; the spender can pull these tokens once.', 'permit2_transfer', data.primaryType.includes('Witness') ? 'partial' : 'full');
@@ -91,6 +93,37 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
   }
   return null;
 };
+
+/**
+ * A UniswapX order carried as a Permit2 witness (Dutch, V2/V3 Dutch, priority and limit orders all have an `info`
+ * with the reactor and swapper, and outputs of token, amount and recipient). The swapper gets the outputs addressed to
+ * it; others (an interface fee) are listed. Amounts are the least each output can decay to.
+ */
+async function uniswapXOrder(witness: unknown, env: TypedEnv, chainId: number | null, spender: string, input: string, b: PreviewBuilder): Promise<{ title: string; summary: string } | null> {
+  if (!witness || typeof witness !== 'object' || chainId === null) return null;
+  const w = witness as Record<string, unknown>;
+  const info = w.info as Record<string, unknown> | undefined;
+  const outputs = (Object.values(w).find(v => Array.isArray(v) && v.every(o => o && typeof o === 'object' && 'token' in o && 'recipient' in o)) ?? null) as Record<string, unknown>[] | null;
+  if (!info || !info.swapper || !outputs?.length) return null;
+  const swapper = str(info.swapper).toLowerCase(), reactor = str(info.reactor).toLowerCase();
+  const least = (o: Record<string, unknown>) => {
+    const vals = ['minAmount', 'endAmount', 'startAmount', 'amount'].map(k => big(o[k])).filter((v): v is bigint => v !== null);
+    return big(o.minAmount) ?? (vals.length ? vals.reduce((a, c) => (c < a ? c : a)) : null);
+  };
+  const mine: string[] = [];
+  b.detail('Swapper', swapper).detail('Reactor', reactor);
+  for (const o of outputs) {
+    const t = str(o.token), raw = least(o);
+    const text = amountText(raw, await token(env, chainId, t), t);
+    if (sameAddress(str(o.recipient), swapper)) mine.push(text);
+    else b.detail('Also paid out', `${text} to ${shortAddress(str(o.recipient))}`, str(o.recipient));
+  }
+  b.detail('You receive at least', mine.join(', ') || 'nothing');
+  if (!mine.length) b.warn('danger', 'order_for_nothing', `This order pays nothing to the swapper (${shortAddress(swapper)}): signing it gives away ${input}.`);
+  if (env.signer && !sameAddress(swapper, env.signer)) b.warn('caution', 'order_maker_mismatch', `The order's swapper is ${shortAddress(swapper)}, not ${shortAddress(env.signer)}, who is asked to sign it.`);
+  if (!sameAddress(reactor, spender)) b.warn('caution', 'reactor_mismatch', `The order names reactor ${shortAddress(reactor)}, but the permit lets ${shortAddress(spender)} take the tokens.`);
+  return { title: `Swap ${input} for at least ${mine.join(' and ') || 'nothing'} (UniswapX)`, summary: `Signs a UniswapX order: fillers can take up to ${input} and must pay you at least ${mine.join(' and ') || 'nothing'} before it expires.` };
+}
 
 /** Fallback for any EIP-712 message: list every field. */
 export const genericTypedDataAdapter: TypedAdapter = async (data: TypedData, env) => {

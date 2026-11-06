@@ -45,3 +45,30 @@ test('1inch limit orders: the price, and an order for nothing', async () => {
   assert.ok(codes(await sign(order({ takingAmount: '0' }))).includes('order_for_nothing'));
   assert.ok(codes(await sign(order({ maker: BOB }))).includes('order_maker_mismatch'));
 });
+
+test('UniswapX orders inside a Permit2 witness: what the swapper gets at least, fees, and an order that pays nothing', async () => {
+  const REACTOR = '0x00000011F84B9aa48e5f8aA8B9897600006289Be', PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+  const order = (outputs: unknown[], swapper = ALICE) => ({
+    domain: { name: 'Permit2', chainId: 1, verifyingContract: PERMIT2 },
+    types: {
+      EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+      PermitWitnessTransferFrom: [{ name: 'permitted', type: 'TokenPermissions' }, { name: 'spender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }, { name: 'witness', type: 'ExclusiveDutchOrder' }],
+      TokenPermissions: [{ name: 'token', type: 'address' }, { name: 'amount', type: 'uint256' }],
+      ExclusiveDutchOrder: [{ name: 'info', type: 'OrderInfo' }, { name: 'decayStartTime', type: 'uint256' }, { name: 'decayEndTime', type: 'uint256' }, { name: 'exclusiveFiller', type: 'address' }, { name: 'exclusivityOverrideBps', type: 'uint256' },
+        { name: 'inputToken', type: 'address' }, { name: 'inputStartAmount', type: 'uint256' }, { name: 'inputEndAmount', type: 'uint256' }, { name: 'outputs', type: 'DutchOutput[]' }],
+      OrderInfo: [{ name: 'reactor', type: 'address' }, { name: 'swapper', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'deadline', type: 'uint256' }, { name: 'additionalValidationContract', type: 'address' }, { name: 'additionalValidationData', type: 'bytes' }],
+      DutchOutput: [{ name: 'token', type: 'address' }, { name: 'startAmount', type: 'uint256' }, { name: 'endAmount', type: 'uint256' }, { name: 'recipient', type: 'address' }],
+    },
+    primaryType: 'PermitWitnessTransferFrom',
+    message: { permitted: { token: USDC, amount: '1000000000' }, spender: REACTOR, nonce: '1', deadline: String(Math.floor(NOW / 1000) + 600),
+      witness: { info: { reactor: REACTOR, swapper, nonce: '1', deadline: String(Math.floor(NOW / 1000) + 600), additionalValidationContract: ZERO, additionalValidationData: '0x' },
+        decayStartTime: '0', decayEndTime: '0', exclusiveFiller: ZERO, exclusivityOverrideBps: '0', inputToken: USDC, inputStartAmount: '1000000000', inputEndAmount: '1000000000', outputs } },
+  });
+  const p = await sign(order([{ token: WETH, startAmount: '300000000000000000', endAmount: '295000000000000000', recipient: ALICE }, { token: WETH, startAmount: '750000000000000', endAmount: '750000000000000', recipient: '0x000000fee13a103a10d593b9ae06b3e05f2e7e1c' }]));
+  assert.equal(p.title, 'Swap 1,000 USDC for at least 0.295 WETH (UniswapX)');
+  assert.equal(p.decoding.decoder, 'uniswapx_order');
+  assert.match(detail(p, 'Also paid out')!, /^0\.00075 WETH to 0x0000…7e1c$/);
+  assert.equal(p.attention, 'none');
+  const robbed = await sign(order([{ token: WETH, startAmount: '300000000000000000', endAmount: '300000000000000000', recipient: BOB }]));
+  assert.equal(robbed.attention, 'danger');
+});
