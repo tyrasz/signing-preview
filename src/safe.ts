@@ -12,8 +12,8 @@ import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
 import type { AssetChange } from './types.ts';
 
-/** Safe's libraries (safe-global/safe-deployments v1.3.0 canonical and EIP-155, v1.4.1), deployed on every chain here. */
-export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 'multisend_call_only' | 'sign_message' | 'create_call' }> = {
+/** Safe's libraries (safe-global/safe-deployments v1.3.0 canonical and EIP-155, v1.4.1, v1.5.0), deployed on every chain here. */
+export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 'multisend_call_only' | 'sign_message' | 'create_call' | 'migration' }> = {
   '0xa238cbeb142c10ef7ad8442c6d1f9e89e07e7761': { name: 'MultiSend 1.3.0', kind: 'multisend' },
   '0x998739bfdaadde7c933b942a68053933098f9eda': { name: 'MultiSend 1.3.0', kind: 'multisend' },
   '0x38869bf66a61cf6bdb996a6ae40d5853fd43b526': { name: 'MultiSend 1.4.1', kind: 'multisend' },
@@ -26,6 +26,14 @@ export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 
   '0x7cbb62eaa69f79e6873cd1ecb2392971036cfaa4': { name: 'CreateCall 1.3.0', kind: 'create_call' },
   '0xb19d6ffc2182150f8eb585b79d4abcd7c5640a9d': { name: 'CreateCall 1.3.0', kind: 'create_call' },
   '0x9b35af71d77eaf8d7e40252370304687390a1a52': { name: 'CreateCall 1.4.1', kind: 'create_call' },
+  '0x218543288004cd07832472d464648173c77d7eb7': { name: 'MultiSend 1.5.0', kind: 'multisend' },
+  '0xa83c336b20401af773b6219ba5027174338d1836': { name: 'MultiSendCallOnly 1.5.0', kind: 'multisend_call_only' },
+  '0x4ffef8222648872b3de295ba1e49110e61f5b5aa': { name: 'SignMessageLib 1.5.0', kind: 'sign_message' },
+  '0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4': { name: 'CreateCall 1.5.0', kind: 'create_call' },
+  // Official upgrades: these change the Safe's code, to an official Safe singleton.
+  '0x526643f69b81b008f46d95cd5ced5ec0edffdac6': { name: 'SafeMigration 1.4.1', kind: 'migration' },
+  '0xff83f6335d8930cbad1c0d439a841f01888d9f69': { name: 'SafeToL2Migration 1.4.1', kind: 'migration' },
+  '0x6439e7abd8bb915a5263094784c5cf561c4172ac': { name: 'SafeMigration 1.5.0', kind: 'migration' },
 };
 const ZERO = '0x0000000000000000000000000000000000000000';
 const MAX_CALLS = 20;
@@ -105,6 +113,9 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   } else if (t.operation === 1 && lib?.kind === 'sign_message') {
     b.warn('info', 'safe_sign_message', `This signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's.`);
     return { title: 'Sign a message as the Safe', summary: `Marks a message as signed by the Safe, through ${lib.name}.`, status: 'full', assetChanges: [] };
+  } else if (t.operation === 1 && lib?.kind === 'migration') {
+    b.warn('caution', 'safe_migration', `This upgrades the Safe's code through Safe's official ${lib.name} contract. Only sign it if you meant to upgrade the Safe.`);
+    return { title: `Upgrade the Safe (${lib.name})`, summary: `Moves the Safe to another official Safe version, through ${lib.name}.`, status: 'full', assetChanges: [] };
   } else if (t.operation === 1 && lib?.kind === 'create_call') {
     b.warn('info', 'safe_create_call', `This deploys a contract from the Safe (${lib.name}).`);
     return { title: 'Deploy a contract from the Safe', summary: `Deploys a contract with the Safe as its creator, through ${lib.name}.`, status: 'full', assetChanges: [] };

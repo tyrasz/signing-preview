@@ -73,3 +73,11 @@ test('A SafeMessage: a message signed in the Safe’s name, its text shown when 
   const hash = await msg(`0x${'ab'.repeat(32)}`);
   assert.equal(detail(hash, 'Message hash'), `0x${'ab'.repeat(32)}`);
 });
+
+test('Safe 1.5.0 libraries are known, and an official migration is a caution, not a danger', async () => {
+  const batch = await sign({ to: '0xA83c336B20401Af773B6219BA5027174338D1836', operation: 1, data: multiSend([[0, USDC, 0n, transfer]]) });
+  assert.ok(!codes(batch).includes('safe_delegatecall'));
+  const upgrade = await sign({ to: '0x6439e7ABD8Bb915A5263094784C5CF561c4172AC', operation: 1, data: '0xed007fc6' });
+  assert.equal(upgrade.title, 'Safe transaction: Upgrade the Safe (SafeMigration 1.5.0)');
+  assert.equal(upgrade.attention, 'caution');
+});
