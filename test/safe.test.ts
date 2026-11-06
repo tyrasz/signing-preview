@@ -63,3 +63,12 @@ test('execTransaction: the same reading of what the Safe does, whoever submits i
   assert.equal(p.title, 'Execute a Safe transaction: Send 1,000 USDC');
   assert.equal(detail(p, 'Owner signatures'), '2');
 });
+
+test('A SafeMessage: a message signed in the Safe’s name, its text shown when it is text', async () => {
+  const msg = (message: string) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify({ domain: { chainId: 1, verifyingContract: SAFE }, types: { EIP712Domain: [{ name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], SafeMessage: [{ name: 'message', type: 'bytes' }] }, primaryType: 'SafeMessage', message: { message } })] }, { now: NOW }, deps);
+  const text = await msg(`0x${Buffer.from('Sign in to app.example.com').toString('hex')}`);
+  assert.equal(text.title, 'Sign a message as the Safe 0x5afe…cafe');
+  assert.equal(detail(text, 'Message'), 'Sign in to app.example.com');
+  const hash = await msg(`0x${'ab'.repeat(32)}`);
+  assert.equal(detail(hash, 'Message hash'), `0x${'ab'.repeat(32)}`);
+});
