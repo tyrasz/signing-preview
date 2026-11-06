@@ -253,6 +253,26 @@ export function buildSamples(now = Date.now()): Sample[] {
 
     { id: 'eth-approve-unlimited', group: 'Ethereum', label: 'Unlimited USDC approval', chainId: 1,
       request: tx(1, ETH_USDC, encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [SPENDER, MAX] })) },
+    { id: 'eth-userop', group: 'Ethereum', label: 'ERC-4337 UserOperation: approve + transfer from a smart account', chainId: 1,
+      request: typed({
+        domain: { name: 'ERC4337', version: '1', chainId: 1, verifyingContract: '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108' },
+        types: {
+          EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+          PackedUserOperation: [{ name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' },
+            { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' }],
+        },
+        primaryType: 'PackedUserOperation',
+        // An EIP-7702 account (ALICE, delegated) running an ERC-7579 batch: approve a spender for 100 USDC, send 25 USDC to BOB.
+        message: {
+          sender: ALICE, nonce: '3', initCode: `0x7702${'00'.repeat(18)}`,
+          callData: encodeFunctionData({ abi: parseAbi(['function execute(bytes32,bytes)']), args: [pad('0x01', { dir: 'right', size: 32 }), encodeAbiParameters(parseAbiParameters('(address,uint256,bytes)[]'), [[
+            [ETH_USDC as Hex, 0n, encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [SPENDER, 100_000_000n] })],
+            [ETH_USDC as Hex, 0n, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [BOB, 25_000_000n] })],
+          ]])] }),
+          accountGasLimits: `0x${(120_000n).toString(16).padStart(32, '0')}${(180_000n).toString(16).padStart(32, '0')}`, preVerificationGas: '48000',
+          gasFees: `0x${(1_000_000_000n).toString(16).padStart(32, '0')}${(4_000_000_000n).toString(16).padStart(32, '0')}`, paymasterAndData: '0x',
+        },
+      }) },
     { id: 'eth-permit2', group: 'Ethereum', label: 'Permit2 signature (gasless approval)', chainId: 1,
       request: typed({
         domain: { name: 'Permit2', chainId: 1, verifyingContract: PERMIT2 },
