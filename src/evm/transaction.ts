@@ -16,6 +16,7 @@ import { lifiAdapter } from './lifi.ts';
 import { relayAdapter } from './relay.ts';
 import { binanceWalletAdapter } from './binance-wallet.ts';
 import { hyperlendIsolatedAdapter } from './hyperlend-isolated.ts';
+import { beaconDepositAdapter } from './beacon-deposit.ts';
 import { orbitInboxAdapter } from './orbit-inbox.ts';
 import { aggregatorAdapters } from './aggregators.ts';
 import { uniswapForkAdapter, uniswapRoutersAdapter } from './uniswap-routers.ts';
@@ -36,6 +37,7 @@ export const ADAPTERS: Adapter[] = [
   relayAdapter,
   binanceWalletAdapter,
   hyperlendIsolatedAdapter,
+  beaconDepositAdapter,
   orbitInboxAdapter,
   ...aggregatorAdapters,
   uniswapRoutersAdapter,
