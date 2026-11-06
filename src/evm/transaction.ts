@@ -13,6 +13,7 @@ import { seaportTxAdapter } from './seaport.ts';
 import { safeExecAdapter } from './safe.ts';
 import { seaDropAdapter } from './seadrop.ts';
 import { lifiAdapter } from './lifi.ts';
+import { relayAdapter } from './relay.ts';
 import { orbitInboxAdapter } from './orbit-inbox.ts';
 import { aggregatorAdapters } from './aggregators.ts';
 import { uniswapForkAdapter, uniswapRoutersAdapter } from './uniswap-routers.ts';
@@ -30,6 +31,7 @@ export const ADAPTERS: Adapter[] = [
   safeExecAdapter,
   seaDropAdapter,
   lifiAdapter,
+  relayAdapter,
   orbitInboxAdapter,
   ...aggregatorAdapters,
   uniswapRoutersAdapter,
