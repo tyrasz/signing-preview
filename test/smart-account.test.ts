@@ -72,3 +72,19 @@ test('An Arbitrum-style inbox message: the transaction it delivers to the child 
   assert.ok(!codes(mine).includes('inbox_relayed'));
   assert.ok(codes(await send(ALICE)).includes('inbox_relayed'));
 });
+
+test('The older parallel-array batches: executeBatch(address[],bytes[]) and executeBatch(address[],uint256[],bytes[])', async () => {
+  const abi = parseAbi(['function executeBatch(address[] dest, bytes[] func)', 'function executeBatch(address[] dest, uint256[] value, bytes[] func)']);
+  const usdcTransfer = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB, 1_000_000n] });
+  const usdc = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+  const run = (data: Hex) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data, chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  const two = await run(encodeFunctionData({ abi, functionName: 'executeBatch', args: [[usdc, usdc], [usdcTransfer, usdcTransfer]] }));
+  assert.equal(two.title, 'Run 2 calls from your account');
+  assert.equal(detail(two, 'Format'), 'executeBatch(address[],bytes[])');
+  const valued = await run(encodeFunctionData({ abi, functionName: 'executeBatch', args: [[usdc, BOB], [], [usdcTransfer, '0x']] }));
+  assert.equal(valued.title, 'Run 2 calls from your account');
+  assert.equal(detail(valued, 'Format'), 'executeBatch(address[],uint256[],bytes[])');
+  // Arrays of different lengths are rejected by the account: not read as a batch.
+  const bad = await run(encodeFunctionData({ abi, functionName: 'executeBatch', args: [[usdc, usdc], [usdcTransfer]] }));
+  assert.notEqual(bad.decoding.decoder, 'smart_account');
+});

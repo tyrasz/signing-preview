@@ -96,6 +96,10 @@ function sanitizeContext(raw: unknown): PreviewContext {
       expiresAfter: typeof hl.expiresAfter === 'number' ? hl.expiresAfter : null,
     };
   }
+  const uo = c.userOperation as Record<string, unknown> | undefined;
+  if (uo && typeof uo === 'object' && typeof uo.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(uo.entryPoint) && uo.operation && typeof uo.operation === 'object' && !Array.isArray(uo.operation)) {
+    out.userOperation = { entryPoint: uo.entryPoint, operation: uo.operation as Record<string, unknown>, ...(typeof uo.chainId === 'number' && Number.isSafeInteger(uo.chainId) && { chainId: uo.chainId }) };
+  }
   return out;
 }
 

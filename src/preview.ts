@@ -14,6 +14,7 @@ import { safeTxAdapter } from './typed-data/safe.ts';
 import { cowOrderAdapter, oneInchOrderAdapter } from './typed-data/orders.ts';
 import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts';
 import { previewMessage } from './message.ts';
+import { previewSignedOperation } from './userop-hash.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, genericTypedDataAdapter];
 
@@ -42,7 +43,7 @@ export async function previewRequest(request: SigningRequest, context: PreviewCo
       return previewTypedData(method, params, context, deps);
     case 'personal_sign':
     case 'eth_sign':
-      return previewMessage(method, params, context);
+      return await previewSignedOperation(method, params, context, deps) ?? previewMessage(method, params, context);
   }
   const b = new PreviewBuilder().warn('info', 'not_a_signing_request', `${method} is not a signing request, so there is nothing to preview.`);
   return { schema: 'signing-preview/1', method, kind: 'unsupported', network: null, title: method, summary: 'Not a signing request.', details: [], assetChanges: [], warnings: b.warnings, attention: 'info', decoding: { status: 'opaque', decoder: 'none', notes: [] } };

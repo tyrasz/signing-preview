@@ -65,21 +65,34 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   if (!FIELDS.every(f => names.includes(f))) return null;
   const m = data.message;
   const chainId = domainChainId(data);
-  const network = chainId !== null ? { kind: 'evm' as const, chainId, name: chainName(chainId) } : null;
   const entryPoint = str(data.domain.verifyingContract).toLowerCase();
   const sender = str(m.sender).toLowerCase();
   const callData = hex(m.callData), initCode = hex(m.initCode) ?? '0x', paymasterAndData = hex(m.paymasterAndData) ?? '0x';
   const nonce = big(m.nonce), preVerificationGas = big(m.preVerificationGas);
   const limits = halves(m.accountGasLimits), fees = halves(m.gasFees);
-  const b = new PreviewBuilder();
+  const pm = paymasterOf(paymasterAndData, true);
+  const gas = limits && fees && preVerificationGas !== null ? { verification: limits[0], call: limits[1], preVerification: preVerificationGas, maxPriority: fees[0], maxFee: fees[1], ...pm } : null;
+  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster }, env);
+};
+
+/** A UserOperation, whichever EntryPoint version and however it was signed. */
+export interface Operation {
+  chainId: number | null; entryPoint: string; entryPointName: string | null; sender: string; nonce: bigint | null;
+  initCode: Hex; callData: Hex | null; gas: OpGas | null; paymaster: string | null;
+}
+
+/** What a UserOperation does: its account, setup, gas, and its callData decoded and simulated as the account's own calls. */
+export async function describeOperation(u: Operation, env: TypedEnv, b = new PreviewBuilder()): Promise<NonNullable<Awaited<ReturnType<TypedAdapter>>>> {
+  const { chainId, entryPoint, sender, nonce, initCode, callData } = u;
+  const network = chainId !== null ? { kind: 'evm' as const, chainId, name: chainName(chainId) } : null;
   const mine = env.signer !== null && sameAddress(sender, env.signer);
 
   b.detail('Account', mine ? `your account (${sender})` : sender, sender);
-  b.detail('EntryPoint', ENTRY_POINTS[entryPoint] ? `${ENTRY_POINTS[entryPoint]} (${entryPoint})` : entryPoint, entryPoint);
-  if (!ENTRY_POINTS[entryPoint]) b.warn('caution', 'unknown_entrypoint', `${shortAddress(entryPoint)} is not a known ERC-4337 EntryPoint (v0.8 or v0.9). Only sign UserOperations for the EntryPoint your wallet uses.`);
+  b.detail('EntryPoint', u.entryPointName ? `${u.entryPointName} (${entryPoint})` : entryPoint, entryPoint);
+  if (!u.entryPointName) b.warn('caution', 'unknown_entrypoint', `${shortAddress(entryPoint)} is not a known ERC-4337 EntryPoint. Only sign UserOperations for the EntryPoint your wallet uses.`);
   if (!mine && env.signer) b.warn('info', 'userop_owner_signature', `You sign as an owner of the smart account ${shortAddress(sender)}: the operation runs from that account, not from ${shortAddress(env.signer)}.`);
   if (nonce !== null) b.detail('Nonce', `${nonce & ((1n << 64n) - 1n)} (key ${nonce >> 64n})`, nonce.toString());
-  if (ENTRY_POINTS[entryPoint]) await nonceCheck(b, env, chainId, entryPoint, sender, nonce);
+  if (u.entryPointName) await nonceCheck(b, env, chainId, entryPoint, sender, nonce);
 
   // How the account comes to have code: already there, its EIP-7702 delegation, or deployed by a factory first.
   // The EntryPoint hashes an EIP-7702 account's initCode with its delegate in place of the 0x7702 marker, so SDKs
@@ -103,8 +116,7 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   }
 
   // Gas: the most the operation can cost the account (or its paymaster), at the highest fee it allows.
-  const pm = paymasterOf(paymasterAndData, true);
-  if (limits && fees && preVerificationGas !== null) gasDetails(b, { verification: limits[0], call: limits[1], preVerification: preVerificationGas, maxPriority: fees[0], maxFee: fees[1], ...pm }, chainId);
+  if (u.gas) gasDetails(b, u.gas, chainId);
 
   b.note('This is an off-chain signature; it costs no gas now. Any bundler holding it can submit the operation, which then runs its calls from the account.');
   if (!callData || callData === '0x' || chainId === null) {
@@ -138,4 +150,4 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
     summary: `Authorizes an ERC-4337 UserOperation from ${mine ? 'your account' : `account ${shortAddress(sender)}`}. ${inner.summary}`,
     decoder: 'erc4337_user_operation', status: inner.status, b, network, assetChanges,
   };
-};
+}

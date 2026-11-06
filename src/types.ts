@@ -126,6 +126,17 @@ export interface PreviewContext {
     vaultAddress?: string | null;
     expiresAfter?: number | null;
   };
+  /**
+   * ERC-4337 operations for EntryPoint v0.6 and v0.7 are signed as their bare hash (personal_sign of
+   * getUserOpHash). To decode one, the caller supplies the operation, as bundlers' RPC carries it. It is hashed as
+   * the EntryPoint does and checked against the message being signed.
+   */
+  userOperation?: {
+    entryPoint: string;
+    /** Defaults to the context's chainId. */
+    chainId?: number;
+    operation: Record<string, unknown>;
+  };
   /** Current time in ms; injectable for tests. */
   now?: number;
 }

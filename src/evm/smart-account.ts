@@ -5,7 +5,8 @@
 // Formats: ERC-7579 and ERC-7821 execute(bytes32 mode, bytes executionData) (MetaMask's DeleGator, Safe's 7579
 // adapter, Ithaca/Porto, OpenZeppelin's accounts), and executeBatch((address,uint256,bytes)[]) /
 // execute(address,uint256,bytes) (Coinbase Smart Wallet, eth-infinitism's Simple7702Account and most ERC-4337
-// accounts).
+// accounts), and the older executeBatch(address[],bytes[]) (SimpleAccount for EntryPoint v0.6, Alchemy's
+// LightAccount) and executeBatch(address[],uint256[],bytes[]) (LightAccount).
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, parseAbi, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
@@ -17,6 +18,8 @@ const ABI = parseAbi([
   'function execute(bytes32 mode, bytes executionData)',
   'function executeBatch((address target, uint256 value, bytes data)[] calls)',
   'function execute(address target, uint256 value, bytes data)',
+  'function executeBatch(address[] dest, bytes[] func)',
+  'function executeBatch(address[] dest, uint256[] value, bytes[] func)',
 ]);
 const CALLS = [{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }] as const;
 const MAX_CALLS = 20;
@@ -53,7 +56,14 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   let parsed: { calls: Call[]; delegatecall: boolean; tryMode: boolean; standard: string } | null = null;
   try {
     const call = decodeFunctionData({ abi: ABI, data: tx.data });
-    if (call.functionName === 'executeBatch') parsed = { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: 'executeBatch' };
+    if (call.functionName === 'executeBatch' && call.args.length === 1) parsed = { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: 'executeBatch' };
+    else if (call.functionName === 'executeBatch') {
+      // Parallel arrays: targets, (values,) calldata. The account requires equal lengths (an empty value list means none).
+      const [dest, a, b] = call.args as unknown as [string[], readonly unknown[], readonly Hex[] | undefined];
+      const values = b ? a as readonly bigint[] : [], datas = (b ?? a) as readonly Hex[];
+      if (dest.length !== datas.length || (values.length && values.length !== dest.length)) return null;
+      parsed = { calls: dest.map((target, i) => ({ target, value: values[i] ?? 0n, data: datas[i] })), delegatecall: false, tryMode: false, standard: b ? 'executeBatch(address[],uint256[],bytes[])' : 'executeBatch(address[],bytes[])' };
+    }
     else if (call.args.length === 3) parsed = { calls: [{ target: call.args[0], value: call.args[1], data: call.args[2] }], delegatecall: false, tryMode: false, standard: 'execute(address,uint256,bytes)' };
     else {
       const p = erc7579Calls(call.args[0] as Hex, call.args[1] as Hex);

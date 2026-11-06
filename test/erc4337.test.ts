@@ -92,3 +92,50 @@ test('Transactions to an EntryPoint: a bundle of UserOperations, and gas deposit
   const deposit = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: EP8, value: '0x2386f26fc10000', data: encodeFunctionData({ abi: OP, functionName: 'depositTo', args: [ALICE as Hex] }), chainId: '0x1' }] }, { now: NOW }, deps);
   assert.equal(deposit.title, "Deposit 0.01 ETH for your account's ERC-4337 gas");
 });
+
+// EntryPoint v0.6 and v0.7: the account's owner signs the bare userOpHash (personal_sign). Two real operations (Ethereum
+// 0xee244eaa…, v0.7; Arbitrum 0x14efb41e…, v0.6), in the form bundlers' RPC carries them. Their hashes are the
+// EntryPoint's own getUserOpHash, and the owners' real signatures are personal_sign of exactly these hashes (checked on
+// 30 v0.7 and 26 v0.6 operations, 2026-11-06).
+const OP_V07 = { sender: '0xA59f653372D92A47F60370f38e4F3F68bf8E41AE', nonce: '0x63', callData: '0xb61d27f6000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000044a9059cbb00000000000000000000000093cbfd95254a3fdd5534fb3b80b89d29ba3bae750000000000000000000000000000000000000000000000000000000000e4e1c000000000000000000000000000000000000000000000000000000000',
+  preVerificationGas: '0xbb08', verificationGasLimit: '0x7302', callGasLimit: '0x7c6a', maxPriorityFeePerGas: '0x12c684c', maxFeePerGas: '0x8f78835', paymaster: '0x2cc0c7981d846b9f2a16276556f6e8cb52bfb633', paymasterVerificationGasLimit: '0x7302', paymasterPostOpGasLimit: '0x0',
+  paymasterData: '0x00000000000000006aed37c9997f588e83193ac91ff6670f71ba6f8964f6864d8ea1e281897fe9e8bff9f34f7ec975f53eee24f9bfba0e5d8a41f7e4ab6b6294907f241647c20f591470b8011c' };
+const HASH_V07 = '0x40131522ed86c88d97637947247c0bac60fee0fa64579b852dfe5f701c03f636', OWNER_V07 = '0x0ec3d2657eee1bef2939722dd78ff94f62562181';
+const OP_V06 = { sender: '0x078Bf499222bFcbbFB50EbB191270A9baC93ce44', nonce: '0x68eca936d5b5d0c1c82467f1ffb7fb29fee09af672fc7a0f0000000000000000', initCode: '0x',
+  callData: '0x18dfb3c7000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000002000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e5831000000000000000000000000af88d065e77c8cc2239327c5edb3a432268e583100000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000016000000000000000000000000000000000000000000000000000000000000000e4d505accf00000000000000000000000075ab498536b0324b374feb02b21a4c7f2e4d59e8000000000000000000000000078bf499222bfcbbfb50ebb191270a9bac93ce440000000000000000000000000000000000000000000000000000000005f5e100000000000000000000000000000000000000000000000000000000006aed794c000000000000000000000000000000000000000000000000000000000000001cc135bec867b30d8ef8d8c9dd8bac26b89756d22ab89b169b26a104893154c4c00f115e72384baa60803d14ad47f6abfd8cb3a372fad85ec5a8f96ffd7a2be0d700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006423b872dd00000000000000000000000075ab498536b0324b374feb02b21a4c7f2e4d59e80000000000000000000000009ccf8e76b5aa8ff516d0bbcf3467531ba4bc48330000000000000000000000000000000000000000000000000000000005f5e10000000000000000000000000000000000000000000000000000000000',
+  callGasLimit: '0x2b7a6', verificationGasLimit: '0x1491c', preVerificationGas: '0x0', maxFeePerGas: '0x0', maxPriorityFeePerGas: '0x0', paymasterAndData: '0x' };
+const HASH_V06 = '0x20e8bbeaf8ef88adec7ac7a1d775cbcb1497ca586f219f9e9d4bcf0ab279ff69', OWNER_V06 = '0x4850f18b6295bf28d9e48ace95587aa08083a58b';
+const EP7 = '0x0000000071727De22E5E9d8BAf0edAc6f37da032', EP6 = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789';
+const signHash = (hash: string, owner: string, entryPoint: string, operation: Record<string, unknown>, chainId: number, method = 'personal_sign') =>
+  previewRequest({ method, params: method === 'eth_sign' ? [owner, hash] : [hash, owner] }, { now: NOW, chainId, userOperation: { entryPoint, operation } }, deps);
+
+test('A v0.7 or v0.6 UserOperation signed as its hash: decoded from the supplied operation when it hashes to the message', async () => {
+  const v07 = await signHash(HASH_V07, OWNER_V07, EP7, OP_V07, 1);
+  assert.equal(v07.title, 'Sign a UserOperation: Send 15 USDC');
+  assert.equal(v07.decoding.decoder, 'erc4337_user_operation_hash');
+  assert.equal(detail(v07, 'UserOperation hash'), HASH_V07);
+  assert.equal(detail(v07, 'EntryPoint'), 'EntryPoint v0.7 (0x0000000071727de22e5e9d8baf0edac6f37da032)');
+  assert.match(String(detail(v07, 'Gas paid by')), /^paymaster 0x2cc0c7981d846b9f2a16276556f6e8cb52bfb633/);
+  assert.equal(v07.assetChanges[0]?.amount, '15');
+  // The same operation in the EntryPoint's packed form hashes the same.
+  const packedForm = { sender: OP_V07.sender, nonce: OP_V07.nonce, initCode: '0x', callData: OP_V07.callData, accountGasLimits: packed(0x7302n, 0x7c6an), preVerificationGas: OP_V07.preVerificationGas, gasFees: packed(0x12c684cn, 0x8f78835n),
+    paymasterAndData: concatHex([OP_V07.paymaster as Hex, numberToHex(0x7302n, { size: 16 }), numberToHex(0n, { size: 16 }), OP_V07.paymasterData as Hex]) };
+  assert.equal(detail(await signHash(HASH_V07, OWNER_V07, EP7, packedForm, 1), 'UserOperation hash'), HASH_V07);
+
+  const v06 = await signHash(HASH_V06, OWNER_V06, EP6, OP_V06, 42161);
+  assert.equal(v06.title, 'Sign a UserOperation: Run 2 calls from your account');
+  assert.equal(detail(v06, 'Format'), 'executeBatch(address[],bytes[])');
+  assert.equal(detail(v06, 'UserOperation hash'), HASH_V06);
+  assert.ok((await signHash(HASH_V06, OWNER_V06, EP6, OP_V06, 42161, 'eth_sign')).warnings.every(w => w.severity !== 'danger'));
+});
+
+test('A hash that isn’t the supplied operation’s is danger; an unknown EntryPoint or no operation leaves it a binary message', async () => {
+  const other = await signHash(HASH_V06, OWNER_V07, EP7, OP_V07, 1);
+  assert.equal(other.attention, 'danger');
+  assert.match(other.warnings.find(w => w.code === 'userop_hash_mismatch')!.message, new RegExp(HASH_V07));
+  assert.equal(other.title, 'Sign a binary message');
+  assert.equal((await signHash(HASH_V07, OWNER_V07, EP7, OP_V07, 42161)).attention, 'danger'); // hashed for another chain
+  assert.ok(codes(await signHash(HASH_V07, OWNER_V07, EP8, OP_V07, 1)).includes('userop_hash_mismatch'));
+  const plain = await previewRequest({ method: 'personal_sign', params: [HASH_V07, OWNER_V07] }, { now: NOW }, deps);
+  assert.equal(plain.decoding.decoder, 'personal_sign');
+});
