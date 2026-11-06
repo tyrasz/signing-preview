@@ -3,6 +3,24 @@ import { chainName, PERMIT2 } from '../chains.ts';
 import { tokenSourceWarnings } from '../evm/common.ts';
 import type { TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv, type TypedData } from './common.ts';
+import { canMoveNow } from './exposure.ts';
+
+/** One eth_call's 32-byte words, or undefined without an RPC (or on failure). */
+async function words(env: TypedEnv, chainId: number | null, to: string, data: string): Promise<bigint[] | undefined> {
+  if (chainId === null || !env.deps.rpc?.has(chainId)) return undefined;
+  try {
+    const r = String(await env.deps.rpc.call(chainId, 'eth_call', [{ to, data }, 'latest']));
+    return /^0x([0-9a-f]{64})+$/i.test(r) ? (r.slice(2).match(/.{64}/g) ?? []).map(w => BigInt(`0x${w}`)) : undefined;
+  } catch { return undefined; }
+}
+const w = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');
+
+/** A signature whose nonce isn't the next one can't be used (or only after the ones before it). */
+function nonceCheck(b: PreviewBuilder, signed: bigint | null, current: bigint | undefined, what: string) {
+  if (signed === null || current === undefined) return;
+  if (signed < current) b.warn('info', 'signature_nonce_used', `This ${what} uses nonce ${signed}, but the next is ${current}: it was already used or superseded, so it can't be used.`);
+  else if (signed > current) b.warn('info', 'signature_nonce_ahead', `This ${what} uses nonce ${signed}; it can only be used after the ${signed - current} before it (the next is ${current}).`);
+}
 
 async function token(env: TypedEnv, chainId: number | null, address: string): Promise<TokenInfo | undefined> {
   if (chainId === null) return undefined;
@@ -47,6 +65,9 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
     if (value !== null && isUnlimited(value)) b.warn('caution', 'unlimited_permit', `${shortAddress(spender)} will be able to move all of this token from your wallet.`);
     if (env.signer && !sameAddress(str(m.owner ?? m.holder), env.signer)) b.warn('danger', 'permit_owner_mismatch', 'The permit owner is not the signing account.');
     if (!info) b.warn('caution', 'unknown_token', 'The token is not in the known-token list; its name comes from the signing domain and is unverified.');
+    const owner = str(m.owner ?? m.holder);
+    if (value !== 0n) await canMoveNow(env, b, chainId, owner, tokenAddress, info, value);
+    nonceCheck(b, big(m.nonce), (await words(env, chainId, tokenAddress, `0x7ecebe00${w(owner)}`))?.[0], 'permit');
     offChainNote();
     return result(value === 0n ? `Revoke ${info?.symbol ?? 'token'} permission for ${shortAddress(spender)}` : `Allow ${shortAddress(spender)} to spend ${amountText(value, info, tokenAddress)}`,
       `Signs a gasless approval (permit) letting ${shortAddress(spender)} transfer your tokens.`, 'erc2612_permit', info ? 'full' : 'partial');
@@ -64,6 +85,8 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
     lines.push(text);
     b.detail(label, text, raw?.toString());
     if (raw !== null && isUnlimited(raw)) b.warn('caution', 'unlimited_permit', `${shortAddress(spender)} will be able to move all of your ${info?.symbol ?? 'tokens'} through Permit2.`);
+    // Permit2 pulls with its own ERC-20 allowance: that and the balance cap what the signature moves.
+    if (sameAddress(str(data.domain.verifyingContract), PERMIT2)) await canMoveNow(env, b, chainId, env.signer, address, info, raw, { address: PERMIT2, name: 'Permit2' }, label === 'Allowance' || label === 'Amount' ? 'Can move now' : `${label}: can move now`);
   };
   switch (data.primaryType) {
     case 'PermitSingle':
@@ -72,6 +95,8 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
       for (const [i, d] of details.entries()) {
         await addToken(str(d.token), big(d.amount), details.length > 1 ? `Token #${i + 1}` : 'Allowance');
         deadline(b, env, details.length > 1 ? `Token #${i + 1} allowance expires` : 'Allowance expires', d.expiration);
+        // Permit2's nonce for this owner, token and spender: allowance(owner, token, spender) = (amount, expiration, nonce).
+        if (env.signer && /^0x[0-9a-fA-F]{40}$/.test(str(d.token))) nonceCheck(b, big(d.nonce), (await words(env, chainId, PERMIT2, `0x927da105${w(env.signer)}${w(str(d.token))}${w(spender)}`))?.[2], 'Permit2 allowance');
       }
       deadline(b, env, 'Signature valid until', m.sigDeadline);
       offChainNote();
@@ -84,6 +109,12 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
       const permitted = (Array.isArray(m.permitted) ? m.permitted : [m.permitted]) as Record<string, unknown>[];
       for (const [i, p] of permitted.entries()) await addToken(str(p.token), big(p.amount), permitted.length > 1 ? `Token #${i + 1}` : 'Amount');
       deadline(b, env, 'Signature valid until', m.deadline);
+      // A one-time transfer's nonce is a bit in Permit2's nonceBitmap(owner, nonce >> 8): set means it was used.
+      const nonce = big(m.nonce);
+      if (env.signer && nonce !== null) {
+        const bitmap = (await words(env, chainId, PERMIT2, `0x4fe02b44${w(env.signer)}${w(nonce >> 8n)}`))?.[0];
+        if (bitmap !== undefined && (bitmap >> (nonce & 0xffn)) & 1n) b.warn('info', 'signature_nonce_used', `This Permit2 transfer's nonce (${nonce}) has already been used, so the signature can't be used.`);
+      }
       const order = data.primaryType.includes('Witness') ? await uniswapXOrder(m.witness, env, chainId, spender, lines.join(', '), b) : null;
       if (order) { offChainNote(); return result(order.title, order.summary, 'uniswapx_order', 'full'); }
       if (data.primaryType.includes('Witness')) b.warn('info', 'permit2_witness', 'The signature also commits to extra order data (a "witness"), typically a swap or intent order.');

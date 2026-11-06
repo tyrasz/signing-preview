@@ -5,6 +5,10 @@ import { formatTimestamp, formatUnits, PreviewBuilder, sameAddress, shortAddress
 import { chainName, CHAINS } from '../chains.ts';
 import type { AssetChange } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
+import { canMoveNow } from './exposure.ts';
+
+/** CoW's GPv2VaultRelayer, which pulls sell tokens (GPv2Settlement.vaultRelayer() on Ethereum and Arbitrum One). */
+const COW_VAULT_RELAYER = '0xc92e8bdf79f0507f65a392b0ab4667716bfe0110';
 
 const COW_SETTLEMENT = '0x9008d19f58aabd9ed0d60971565aa8510560ab41';
 const ONEINCH_V6 = '0x111111125421ca6dc452d289314280a0f8842a65';
@@ -57,6 +61,7 @@ export const cowOrderAdapter: TypedAdapter = async (data, env) => {
   if (validTo !== null) b.detail('Valid until', formatTimestamp(Number(validTo) * 1000));
   if (m.partiallyFillable === true) b.detail('Partial fills', 'allowed');
   priceChecks(b, owner, receiver, buyRaw, sell.text, 'CoW');
+  if (!NATIVE.includes(sellToken) && sell.decimals !== undefined) await canMoveNow(env, b, chainId, owner, sellToken, { address: sellToken, symbol: sell.symbol!, decimals: sell.decimals }, sellRaw + fee, { address: COW_VAULT_RELAYER, name: "CoW Protocol's vault relayer" });
   b.note('This is an off-chain signature; it costs no gas. CoW Protocol solvers can fill the order at these terms (or better) until it expires.');
   return {
     title: kind === 'buy' ? `Buy ${buy.text} for at most ${sell.text} (CoW Swap)` : `Sell ${sell.text} for at least ${buy.text} (CoW Swap)`,
@@ -83,6 +88,7 @@ export const oneInchOrderAdapter: TypedAdapter = async (data, env) => {
   if (contract !== ONEINCH_V6) b.warn('caution', 'unknown_settlement', `${contract} is not 1inch's Aggregation Router v6, though the request calls it that.`);
   if (env.signer && !sameAddress(maker, env.signer)) b.warn('caution', 'order_maker_mismatch', `The order's maker is ${shortAddress(maker)}, not ${shortAddress(env.signer)}, who is asked to sign it.`);
   priceChecks(b, maker, receiver, taking, sell.text, '1inch');
+  if (!NATIVE.includes(makerAsset) && sell.decimals !== undefined) await canMoveNow(env, b, chainId, maker, makerAsset, { address: makerAsset, symbol: sell.symbol!, decimals: sell.decimals }, making, { address: ONEINCH_V6, name: "1inch's router" });
   b.note('This is an off-chain signature; it costs no gas. Anyone can fill the order at this price until it expires or you cancel it.');
   return {
     title: `Sell ${sell.text} for ${buy.text} (1inch limit order)`, summary: `Signs a 1inch limit order: ${sell.text} for ${buy.text}${sameAddress(receiver, maker) ? '' : `, paid to ${shortAddress(receiver)}`}.`,
