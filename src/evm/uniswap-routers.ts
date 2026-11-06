@@ -23,6 +23,10 @@ const V2 = parseAbi([
   'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)',
   'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable',
   'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)',
+  // Forks that add a referrer after the recipient (on HyperEVM, for one).
+  'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, address referrer, uint256 deadline)',
+  'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, address referrer, uint256 deadline) payable',
+  'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, address referrer, uint256 deadline)',
 ]);
 // V3 SwapRouter's params carry a deadline; SwapRouter02's don't (it moved to multicall).
 const V3 = parseAbi([
@@ -32,6 +36,8 @@ const V3 = parseAbi([
   'function exactOutput((bytes path, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum) params) payable',
   'function multicall(bytes[] data) payable',
   'function unwrapWETH9(uint256 amountMinimum, address recipient) payable',
+  // Algebra's router (forks on HyperEVM and elsewhere): no fee tier, a price limit instead.
+  'function exactInputSingle((address tokenIn, address tokenOut, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 limitSqrtPrice) params) payable',
 ]);
 const V3_02 = parseAbi([
   'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96) params) payable',
@@ -80,7 +86,7 @@ function swapsOf(kind: 'v2' | 'v3' | 'v3-02', data: Hex, depth = 0): { swaps: Sw
   const p = a[0] as Record<string, unknown>;
   const exactIn = name.startsWith('exactInput');
   if (name.endsWith('Single')) {
-    return { swaps: [{ tokenIn: p.tokenIn as string, tokenOut: p.tokenOut as string, amountIn: (exactIn ? p.amountIn : p.amountInMaximum) as bigint, amountOut: (exactIn ? p.amountOutMinimum : p.amountOut) as bigint, exactIn, recipient: p.recipient as string, deadline: p.deadline as bigint | undefined, fees: [Number(p.fee)] }] };
+    return { swaps: [{ tokenIn: p.tokenIn as string, tokenOut: p.tokenOut as string, amountIn: (exactIn ? p.amountIn : p.amountInMaximum) as bigint, amountOut: (exactIn ? p.amountOutMinimum : p.amountOut) as bigint, exactIn, recipient: p.recipient as string, deadline: p.deadline as bigint | undefined, ...(p.fee !== undefined && { fees: [Number(p.fee)] }) }] };
   }
   const path = v3Path(p.path as Hex);
   if (!path) return null;

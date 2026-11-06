@@ -117,3 +117,15 @@ test('KyberSwap MetaAggregationRouterV2: the swap description, and a recipient e
   assert.equal((await kyber(ALICE)).title, 'Swap 640 USDC for at least 639 USDT on KyberSwap');
   assert.ok(codes(await kyber(BOB)).includes('recipient_not_sender'));
 });
+
+test('Uniswap-style forks: a referrer after the recipient, and Algebra’s fee-less exactInputSingle', async () => {
+  const A = parseAbi(['function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, address referrer, uint256 deadline)',
+    'function exactInputSingle((address tokenIn, address tokenOut, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 limitSqrtPrice) params) payable']);
+  const ROUTER = '0x00000000000000000000000000000000000f0f0f';
+  const ref = await send(ROUTER, encodeFunctionData({ abi: A, functionName: 'swapExactTokensForETHSupportingFeeOnTransferTokens', args: [100_000_000n, 3n * 10n ** 16n, [USDC, WETH], ALICE, BOB, 2_000_000_000n] }));
+  assert.equal(ref.title, 'Swap 100 USDC for at least 0.03 ETH on a Uniswap-style router (0x0000…0f0f)');
+  assert.ok(codes(ref).includes('unverified_signature'));
+  const algebra = await send(ROUTER, encodeFunctionData({ abi: A, functionName: 'exactInputSingle', args: [{ tokenIn: USDC, tokenOut: USDT, recipient: ALICE, deadline: 2_000_000_000n, amountIn: 50_000_000n, amountOutMinimum: 49_900_000n, limitSqrtPrice: 0n }] }));
+  assert.equal(algebra.title, 'Swap 50 USDC for at least 49.9 USDT on a Uniswap-style router (0x0000…0f0f)');
+  assert.equal(detail(algebra, 'Pool fees'), undefined);
+});
