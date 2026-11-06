@@ -253,6 +253,25 @@ export function buildSamples(now = Date.now()): Sample[] {
 
     { id: 'eth-approve-unlimited', group: 'Ethereum', label: 'Unlimited USDC approval', chainId: 1,
       request: tx(1, ETH_USDC, encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [SPENDER, MAX] })) },
+    ...(() => {
+      // Seaport 1.6 orders: a normal OpenSea listing, and the drainer pattern (your NFTs for 1 wei to someone else).
+      const types = {
+        EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+        OrderComponents: [{ name: 'offerer', type: 'address' }, { name: 'zone', type: 'address' }, { name: 'offer', type: 'OfferItem[]' }, { name: 'consideration', type: 'ConsiderationItem[]' }, { name: 'orderType', type: 'uint8' },
+          { name: 'startTime', type: 'uint256' }, { name: 'endTime', type: 'uint256' }, { name: 'zoneHash', type: 'bytes32' }, { name: 'salt', type: 'uint256' }, { name: 'conduitKey', type: 'bytes32' }, { name: 'counter', type: 'uint256' }],
+        OfferItem: [{ name: 'itemType', type: 'uint8' }, { name: 'token', type: 'address' }, { name: 'identifierOrCriteria', type: 'uint256' }, { name: 'startAmount', type: 'uint256' }, { name: 'endAmount', type: 'uint256' }],
+        ConsiderationItem: [{ name: 'itemType', type: 'uint8' }, { name: 'token', type: 'address' }, { name: 'identifierOrCriteria', type: 'uint256' }, { name: 'startAmount', type: 'uint256' }, { name: 'endAmount', type: 'uint256' }, { name: 'recipient', type: 'address' }],
+      };
+      const Z = '0x0000000000000000000000000000000000000000', start = Math.floor(now / 1000);
+      const nft = (id: number) => ({ itemType: '2', token: MOCK_NFT, identifierOrCriteria: String(id), startAmount: '1', endAmount: '1' });
+      const eth = (wei: string, recipient: string) => ({ itemType: '0', token: Z, identifierOrCriteria: '0', startAmount: wei, endAmount: wei, recipient });
+      const order = (offer: unknown[], consideration: unknown[]) => typed({ domain: { name: 'Seaport', version: '1.6', chainId: 1, verifyingContract: '0x0000000000000068F116a894984e2DB1123eB395' }, types, primaryType: 'OrderComponents',
+        message: { offerer: ALICE, zone: Z, offer, consideration, orderType: '0', startTime: String(start), endTime: String(start + 30 * 86_400), zoneHash: `0x${'00'.repeat(32)}`, salt: '0x1', conduitKey: '0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000', counter: '0' } });
+      return [
+        { id: 'eth-seaport-listing', group: 'Ethereum' as const, label: 'Seaport: list an NFT for 1.95 ETH', chainId: 1, request: order([nft(4242)], [eth('1950000000000000000', ALICE), eth('50000000000000000', '0x0000a26b00c1F0DF003000390027140000fAa719')]) },
+        { id: 'eth-seaport-drainer', group: 'Ethereum' as const, label: 'Seaport: a drainer-style order (your NFTs for nothing)', chainId: 1, request: order([nft(4242), nft(4243)], [eth('1', BOB)]) },
+      ];
+    })(),
     { id: 'eth-userop', group: 'Ethereum', label: 'ERC-4337 UserOperation: approve + transfer from a smart account', chainId: 1,
       request: typed({
         domain: { name: 'ERC4337', version: '1', chainId: 1, verifyingContract: '0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108' },
