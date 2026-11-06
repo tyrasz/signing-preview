@@ -85,6 +85,8 @@ const oneInchAdapter: Adapter = async (tx, env) => {
     // An ETH swap starts from WETH in the first pool.
     const start = eth ? builtinTokens(tx.chainId).find(t => t.symbol === 'WETH')?.address ?? src : src;
     dst = await unoswapOutput(env, tx.chainId, start, dexes);
+    // Bit 252 of the last pool word: unwrap the WETH out of it, so the swap pays out ETH (checked against receipts).
+    if (dst && sameAddress(dst, builtinTokens(tx.chainId).find(t => t.symbol === 'WETH')?.address ?? '') && (dexes[dexes.length - 1] >> 252n) & 1n) dst = NATIVE_ALIASES[0];
     receiver = to === undefined ? tx.from : addressOf(to);
     b.detail('Pools', dexes.map(d => `${['Uniswap v2', 'Uniswap v3', 'Curve'][Number(d >> 253n)] ?? 'unknown'} ${shortAddress(addressOf(d))}`).join(' → '));
   }
@@ -164,4 +166,66 @@ const acrossAdapter: Adapter = async (tx, env) => {
     assetChanges: info ? [{ direction: 'out', account: tx.from, amount: formatUnits(inputAmount, info.decimals), symbol: info.symbol, raw: inputAmount.toString(), asset: nativeIn ? 'native' : inputToken, basis: 'requested', standard: nativeIn ? 'native' : 'erc20' }] : [] });
 };
 
-export const aggregatorAdapters: Adapter[] = [oneInchAdapter, metaMaskAdapter, acrossAdapter];
+// --- OKX DEX router (Ethereum) ---
+const OKX: Record<string, number> = { '0x8feab81d36e7576107d5de0758c1b839be31b4f6': 1 };
+const BASE_REQUEST = '(uint256 fromToken, address toToken, uint256 fromTokenAmount, uint256 minReturnAmount, uint256 deadLine) baseRequest';
+const ROUTER_PATH = '(address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[] paths';
+const OKX_ABI = parseAbi([
+  `function dagSwapByOrderId(uint256 orderId, ${BASE_REQUEST}, ${ROUTER_PATH}) payable returns (uint256)`,
+  `function dagSwapTo(uint256 orderId, address receiver, ${BASE_REQUEST}, ${ROUTER_PATH}) payable returns (uint256)`,
+  `function smartSwapByOrderId(uint256 orderId, ${BASE_REQUEST}, uint256[] batchesAmount, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[][] batches, (uint256 pathIndex, address payer, address fromToken, address toToken, uint256 fromTokenAmountMax, uint256 toTokenAmountMax, uint256 salt, uint256 deadLine, bool isPushOrder, bytes extension)[] extraData) payable returns (uint256)`,
+  `function uniswapV3SwapToWithBaseRequest(uint256 orderId, address receiver, ${BASE_REQUEST}, uint256[] pools) payable returns (uint256)`,
+  'function unxswapByOrderId(uint256 srcToken, uint256 amount, uint256 minReturn, bytes32[] pools) payable returns (uint256)',
+  'function unxswapTo(uint256 srcToken, uint256 amount, uint256 minReturn, address receiver, bytes32[] pools) payable returns (uint256)',
+  'function uniswapV3SwapTo(uint256 receiver, uint256 amount, uint256 minReturn, uint256[] pools) payable returns (uint256)',
+]);
+
+/** The output token of a chain of v2/v3 pools from `input`, each pool in a word's low 160 bits (token0/token1 read on-chain). */
+async function poolChainOutput(env: AdapterEnv, chainId: number, input: string, pools: bigint[]): Promise<string | null> {
+  return unoswapOutput(env, chainId, input, pools.map(p => p & ADDRESS_MASK));
+}
+
+const okxAdapter: Adapter = async (tx, env) => {
+  const chain = tx.to && OKX[tx.to.toLowerCase()];
+  if (!chain || chain !== tx.chainId) return null;
+  let call;
+  try { call = decodeFunctionData({ abi: OKX_ABI, data: tx.data }); } catch { return null; }
+  const b = new PreviewBuilder().detail('Contract', `OKX DEX router (${tx.to})`, tx.to!);
+  let src: string, dst: string | null, amount: bigint, minReturn: bigint, receiver = tx.from;
+  const weth = builtinTokens(tx.chainId).find(t => t.symbol === 'WETH')?.address ?? NATIVE_ALIASES[0];
+  const req = (call.args as readonly unknown[]).find(a => !!a && typeof a === 'object' && !Array.isArray(a) && 'toToken' in a) as { fromToken: bigint; toToken: string; fromTokenAmount: bigint; minReturnAmount: bigint } | undefined;
+  if (req) {
+    const args = call.args as readonly unknown[];
+    src = addressOf(req.fromToken); dst = req.toToken; amount = req.fromTokenAmount; minReturn = req.minReturnAmount;
+    if (call.functionName === 'dagSwapTo' || call.functionName === 'uniswapV3SwapToWithBaseRequest') receiver = args[1] as string;
+  } else if (call.functionName === 'uniswapV3SwapTo') {
+    const [to, amt, min, pools] = call.args as readonly [bigint, bigint, bigint, readonly bigint[]];
+    receiver = addressOf(to); amount = amt; minReturn = min;
+    // The first pool's top bit says which way it is swapped (set: token1 in, token0 out), which names the input.
+    let first: string | null = null;
+    try { first = env.deps.rpc?.has(tx.chainId) ? `0x${String(await env.deps.rpc.call(tx.chainId, 'eth_call', [{ to: addressOf(pools[0]), data: pools[0] >> 255n ? '0xd21220a7' : '0x0dfe1681' }, 'latest'])).slice(-40)}` : null; } catch { first = null; }
+    src = tx.value > 0n && first && sameAddress(first, weth) ? NATIVE_ALIASES[0] : first ?? NATIVE_ALIASES[0];
+    dst = first ? await poolChainOutput(env, tx.chainId, first, [...pools]) : null;
+    // Bit 253 of the last pool: the WETH out is unwrapped and paid as ETH (checked against receipts).
+    if (dst && sameAddress(dst, weth) && (pools[pools.length - 1] >> 253n) & 1n) dst = NATIVE_ALIASES[0];
+  } else {
+    const args = call.args as readonly unknown[];
+    const pools = (args[args.length - 1] as readonly Hex[]).map(p => BigInt(p));
+    src = addressOf(args[0] as bigint); amount = args[1] as bigint; minReturn = args[2] as bigint;
+    if (call.functionName === 'unxswapTo') receiver = args[3] as string;
+    dst = await poolChainOutput(env, tx.chainId, isNative(src) ? weth : src, pools);
+    // Bit 254 of the last pool (bit 255 is its direction): the WETH out is paid as ETH (checked against receipts).
+    if (dst && sameAddress(dst, weth) && (pools[pools.length - 1] >> 254n) & 1n) dst = NATIVE_ALIASES[0];
+  }
+  const sent = await amountOf(env, tx.chainId, src, amount);
+  const least = dst ? await amountOf(env, tx.chainId, dst, minReturn) : `${minReturn} base units of the output token`;
+  b.detail('You send', sent).detail('You receive at least', least);
+  if (!sameAddress(receiver, tx.from)) {
+    b.detail('Recipient', receiver);
+    b.warn('caution', 'recipient_not_sender', `The tokens you buy go to ${shortAddress(receiver)}, not to you.`);
+  }
+  if (minReturn <= 1n) b.warn('caution', 'no_slippage_limit', 'Nothing limits the price: the minimum received is zero, so the swap would go through at any rate.');
+  return decoded({ title: `Swap ${sent} for at least ${least} on OKX DEX`, summary: `Swaps ${sent} through OKX's DEX router, for at least ${least}.`, decoder: 'okx_dex', status: dst ? 'full' : 'partial', b });
+};
+
+export const aggregatorAdapters: Adapter[] = [oneInchAdapter, metaMaskAdapter, acrossAdapter, okxAdapter];

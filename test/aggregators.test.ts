@@ -48,3 +48,19 @@ test('MetaMask Swaps names the aggregator; Across deposits name the destination 
   // Ethereum's SpokePool address on another chain is left to the other decoders.
   assert.notEqual((await send('0x5c7BCd6E7De5423a257D81B442095A1a6ced35C5', deposit, 0n, '0xa4b1')).decoding.decoder, 'across_deposit');
 });
+
+test('OKX DEX router: the request it carries, and pool-only swaps with the output read on-chain (and paid as ETH when the last pool says so)', async () => {
+  const OKX = '0x8feab81d36e7576107d5de0758c1b839be31b4f6';
+  const A = parseAbi([
+    'function dagSwapTo(uint256 orderId, address receiver, (uint256 fromToken, address toToken, uint256 fromTokenAmount, uint256 minReturnAmount, uint256 deadLine) baseRequest, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[] paths) payable returns (uint256)',
+    'function unxswapTo(uint256 srcToken, uint256 amount, uint256 minReturn, address receiver, bytes32[] pools) payable returns (uint256)',
+  ]);
+  const dag = await send(OKX, encodeFunctionData({ abi: A, functionName: 'dagSwapTo', args: [1n, ALICE, { fromToken: BigInt(USDC), toToken: USDT, fromTokenAmount: 10_000_000n, minReturnAmount: 9_990_000n, deadLine: 0n }, []] }));
+  assert.equal(dag.title, 'Swap 10 USDC for at least 9.99 USDT on OKX DEX');
+  // A USDC/WETH v2 pool (token0 USDC, token1 WETH); bit 254 on the last pool unwraps the WETH.
+  const PAIR = '0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc';
+  const pairs = { has: () => true, call: async (_c: number, _m: string, p: unknown[]) => { const { to, data } = p[0] as { to: string; data: string }; if (to.toLowerCase() !== PAIR) throw new Error('no'); return pad((data === '0x0dfe1681' ? USDC : WETH) as Hex); } };
+  const unx = (flags: bigint) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: OKX, chainId: '0x1', data: encodeFunctionData({ abi: A, functionName: 'unxswapTo', args: [BigInt(USDC), 100_000_000n, 3n * 10n ** 16n, ALICE, [pad(`0x${(flags | BigInt(PAIR)).toString(16)}` as Hex)]] }) }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), rpc: pairs });
+  assert.equal((await unx(0n)).title, 'Swap 100 USDC for at least 0.03 WETH on OKX DEX');
+  assert.equal((await unx(1n << 254n)).title, 'Swap 100 USDC for at least 0.03 ETH on OKX DEX');
+});
