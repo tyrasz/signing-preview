@@ -406,21 +406,21 @@ Run on 2026-11-06 (pass 2 figures; "readable" is full + partial), with the previ
 
 | | Ethereum | Arbitrum One | HyperEVM |
 |---|---|---|---|
-| Sample | 300 of 7,180 blocks: 92,575 txs | 1,500 of 309,089 blocks: 7,995 txs (1,507 ArbOS system txs excluded) | 1,500 of 87,840 blocks: 15,649 txs |
-| Full / partial / opaque | 68.3% / 24.4% / 7.3% (71.8 / 18.8 / 9.4) | 34.0% / 17.3% / 48.7% (39.7 / 14.1 / 46.2) | 62.3% / 10.6% / 27.1% (52.0 / 12.2 / 35.8) |
-| Readable without lookups (pass 1) | 78.6% (73.6%) | 26.9% (27.6%) | 6.1% (12.7%) |
-| Readable, standard ABI-encoded calldata only | 96.2% (95.4%) | 78.7% (78.2%) | 83.3% (80.1%) |
-| Readable, occasional senders only | 96.8% (94.9%) | 78.5% (76.6%) | 73.0% (78.4%) |
-| Share of the opaque rest sent by automated senders | 76.2% (70.3%) | 87.3% (82.5%) | 91.3% (92.4%) |
+| Sample | 300 of 7,180 blocks: 95,298 txs | 1,500 of 309,596 blocks: 7,472 txs (1,507 ArbOS system txs excluded) | 1,500 of 87,840 blocks: 15,366 txs |
+| Full / partial / opaque | 70.0% / 22.4% / 7.6% (71.8 / 18.8 / 9.4) | 36.4% / 17.7% / 46.0% (39.7 / 14.1 / 46.2) | 61.8% / 11.0% / 27.2% (52.0 / 12.2 / 35.8) |
+| Readable without lookups (pass 1) | 79.2% (73.6%) | 28.8% (27.6%) | 6.9% (12.7%) |
+| Readable, standard ABI-encoded calldata only | 95.9% (95.4%) | 81.5% (78.2%) | 83.5% (80.1%) |
+| Readable, occasional senders only | 96.7% (94.9%) | 80.0% (76.6%) | 74.5% (78.4%) |
+| Share of the opaque rest sent by automated senders | 76.7% (70.3%) | 87.4% (82.5%) | 91.2% (92.4%) |
 | Crashes | 0 | 0 | 0 |
 
-Between the two runs, decoders were added for Seaport, smart-account batches, ERC-4337 EntryPoints, 1inch v6, OKX's DEX router, MetaMask Swaps and Bridge, and Across deposits; on Ethereum they read about 2% of the sample offline. Some of what they read was "full" before through a verified ABI, and some is "partial" now (a MetaMask route names its aggregator but not the output), so "full" fell while opaque fell too. Traffic differs from day to day: on HyperEVM, Circle's CoreDepositWallet deposits, which pass 1 reads, were 1.5% of the sample against 5.7% the day before, and one packed-calldata contract (`0x12b6…c426`) sent 115 of the occasional senders' 369 opaque transactions.
+Between the two runs, decoders were added for Seaport, Safe, smart-account batches, ERC-4337 EntryPoints, Uniswap's older routers and their forks, 1inch v6, OKX's DEX router, KyberSwap, LI.FI, MetaMask Swaps and Bridge, Across deposits and SeaDrop; on Ethereum they read about 3% of the sample offline. Some of what they read was "full" before through a verified ABI, and some is "partial" now (a MetaMask route names its aggregator but not the output; an unverified fork is cautioned), so the full share moves less than the opaque one. Traffic differs from day to day: on HyperEVM, Circle's CoreDepositWallet deposits, which pass 1 reads, were 1.0% of the sample against 5.7% the day before, and a packed-calldata contract (`0x12b6…c426`) sent many of the occasional senders' opaque transactions.
 
 "Automated" means the sender appears in 3 or more of the sampled blocks, which are minutes apart: bots, relayers and exchanges sending around the clock. What stays opaque is mostly:
 
-- **Packed calldata** (Ethereum 3,333, Arbitrum 2,150, HyperEVM 1,826 txs): any length other than selector + 32-byte words, a custom encoding no ABI describes, used by trading bots.
-- **Vanity selectors** (143 / 641 / 138): ABI-shaped, but with selectors mined to start with zero bytes to save gas, also bots.
-- **ABI-shaped calls to contracts with no published source** (3,286 / 1,101 / 2,281), and whose selectors aren't in a signature database. Two such contracts (`0x278d…f8d2`, `0x93c3…dd17`) are among the busiest on all three chains. Some are known but verified only on Etherscan, such as Binance Web3 Wallet's router (`0xb300…028d`, an EIP-2535 diamond whose facet isn't on Sourcify): setting `ETHERSCAN_API_KEY` reads those.
+- **Packed calldata** (Ethereum 3,383, Arbitrum 2,115, HyperEVM 1,870 txs): any length other than selector + 32-byte words, a custom encoding no ABI describes, used by trading bots.
+- **Vanity selectors** (223 / 407 / 111): ABI-shaped, but with selectors mined to start with zero bytes to save gas, also bots.
+- **ABI-shaped calls to contracts with no published source** (3,661 / 913 / 2,206), and whose selectors aren't in a signature database. Two such contracts (`0x278d…f8d2`, `0x93c3…dd17`) are among the busiest on all three chains. Some are known but verified only on Etherscan, such as Binance Web3 Wallet's router (`0xb300…028d`, an EIP-2535 diamond whose facet isn't on Sourcify): setting `ETHERSCAN_API_KEY` reads those.
 
 The first run found and fixed 26 crashes (a "never expires" Permit2 approval and struct-item multicalls, now in `test/mainnet-regressions.test.ts`). It also showed that the busiest unreadable contract on Ethereum was Uniswap's current Universal Router 2.1.2, and that the busiest unreadable "contract" was an account with no code receiving text inscriptions. Both are decoded now.
 
