@@ -15,7 +15,7 @@ import { dirname } from 'node:path';
 import { createEVM, EVMError, type EVM } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
-import { Account, bytesToHex, createAddressFromString, hexToBytes, unpadBytes, type Address } from '@ethereumjs/util';
+import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
 import { keccak256 } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
@@ -478,10 +478,14 @@ export class ForkSimulator implements Simulator {
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.
     const auths = await Promise.all(reqs.map(authorizationsOf));
     const authorities = new Set(auths.flat().map(a => a.authority));
-    for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) if (o.code !== undefined && !authorities.has(hexOf(a))) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
+    for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
+      if (o.code !== undefined && !authorities.has(hexOf(a))) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
+      // Storage set for the simulation: read before the chain's value, never cached as the chain's.
+      for (const [slot, value] of Object.entries(o.stateDiff ?? {})) source.storage.set(`${hexOf(a)}_${bytesToHex(setLengthLeft(hexToBytes(slot as Hex), 32))}`, unpadBytes(hexToBytes(value as Hex)));
+    }
     // The senders and targets are certain to be read: fetch them before the first run.
     const first = newMisses();
-    for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.to) first.accounts.add(hexOf(r.to)); }
+    for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
     const prefetch = source.fetch(first);
     const fixed = this.opts.header?.(chainId);
     const [block] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => 1n } }
@@ -490,7 +494,7 @@ export class ForkSimulator implements Simulator {
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and
     // Withdrawal, not Transfer, so logs alone miss the wrapped token.
-    const skip = (a: string) => reqs.some(r => hexOf(r.from) === a) || a === ZERO || BigInt(a) < 0x10000n;
+    const skip = (a: string) => reqs.some(r => hexOf(r.from) === a || (r.account && hexOf(r.account) === a)) || a === ZERO || BigInt(a) < 0x10000n;
     const tokens = new Set<string>([
       ...reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(hexOf).slice(0, 40),
       ...builtinTokens(chainId).map(t => hexOf(t.address)),
@@ -622,12 +626,14 @@ export class ForkSimulator implements Simulator {
     const touched = new Map<string, SimulatedApproval>(watchedApprovals);
     const source_ = `local EVM over chain ${chainId} state (the RPC has no eth_simulateV1)`;
     for (const [i, req] of reqs.entries()) {
-      const from = hexOf(req.from), target = req.to ? hexOf(req.to) : ZERO;
+      // `from` is the account whose balances are reported; `caller` sends the call (the same, unless the request
+      // names another account, e.g. a smart account the EntryPoint calls into).
+      const caller = hexOf(req.from), from = hexOf(req.account ?? req.from), target = req.to ? hexOf(req.to) : ZERO;
       const watch = [...tokens];
       const before = new Map<string, bigint | undefined>();
       for (const t of watch) before.set(t, await balanceOf(t, from));
       const nativeBefore = await native(from);
-      if (req.value > nativeBefore) {
+      if (req.value > await native(caller)) {
         results.push({ status: 'reverted', source: source_, revertReason: `insufficient funds: the account holds ${units(chainId, nativeBefore)} and the call sends ${units(chainId, req.value)}`, transfers: [], basis: 'fork' });
         continue;
       }
@@ -635,10 +641,10 @@ export class ForkSimulator implements Simulator {
       // and the access list (EIP-2929, EIP-3651), and "original" storage values taken afresh (EIP-2200).
       await evm.journal.cleanup();
       state.originalStorageCache.clear();
-      for (const a of [from, target, block.header.coinbase.toString(), ...evm.precompiles.keys()]) evm.journal.addAlwaysWarmAddress(a);
+      for (const a of [caller, target, block.header.coinbase.toString(), ...evm.precompiles.keys()]) evm.journal.addAlwaysWarmAddress(a);
       for (const e of req.accessList ?? []) { evm.journal.addAlwaysWarmAddress(e.address); for (const k of e.storageKeys) evm.journal.addAlwaysWarmSlot(e.address, k); }
       // The sender's nonce goes up first, then the EIP-7702 authorizations apply (and stay, whatever the call does).
-      const sender = createAddressFromString(from);
+      const sender = createAddressFromString(caller);
       const senderAccount = (await state.getAccount(sender)) ?? new Account();
       senderAccount.nonce++;
       await state.putAccount(sender, senderAccount);

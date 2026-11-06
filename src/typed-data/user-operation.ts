@@ -7,7 +7,8 @@ import { CHAINS, chainName } from '../chains.ts';
 import { decodeTransaction, simulationNote } from '../evm/transaction.ts';
 import { netChanges } from '../evm/effects.ts';
 import type { AssetChange } from '../types.ts';
-import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
+import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
+import { entryPointDeposit, simulateExecution, type ExecutionInput } from '../erc4337-sim.ts';
 
 /** EntryPoints that sign UserOperations as EIP-712 typed data, at the same address on every chain (checked on Ethereum, Arbitrum One and HyperEVM). */
 export const ENTRY_POINTS: Record<string, string> = {
@@ -36,7 +37,7 @@ export function paymasterOf(paymasterAndData: string, packedGas: boolean): { pay
 export interface OpGas { verification: bigint; call: bigint; preVerification: bigint; maxFee: bigint; maxPriority: bigint; paymaster: string | null; paymasterGas: bigint; /** EntryPoint v0.6, which reserves verification gas three times over when a paymaster is set. */ v06?: boolean }
 
 /** Gas limits, fees and the most the operation can cost the account (or its paymaster), at the highest fee it allows. */
-export function gasDetails(b: PreviewBuilder, g: OpGas, chainId: number | null): void {
+export function gasDetails(b: PreviewBuilder, g: OpGas, chainId: number | null): bigint {
   const native = chainId !== null ? CHAINS[chainId] : undefined;
   const gas = g.v06 ? g.call + g.verification * (g.paymaster ? 3n : 1n) + g.preVerification : g.verification + g.call + g.preVerification + g.paymasterGas;
   b.detail('Gas limits', `verification ${g.verification}, call ${g.call}, pre-verification ${g.preVerification}${g.paymaster && !g.v06 ? `, paymaster ${g.paymasterGas}` : ''}`);
@@ -44,6 +45,24 @@ export function gasDetails(b: PreviewBuilder, g: OpGas, chainId: number | null):
   const cost = `${formatUnits(gas * g.maxFee, native?.nativeDecimals ?? 18)} ${native?.nativeSymbol ?? 'native'}`;
   b.detail(g.paymaster ? 'Gas paid by' : 'Maximum gas cost', g.paymaster ? `paymaster ${g.paymaster} (at most ${cost})` : `${cost}, from the account`, g.paymaster ?? undefined);
   if (g.paymaster) b.warn('info', 'userop_paymaster', `A paymaster (${shortAddress(g.paymaster)}) pays the gas. It may charge for it in tokens, through the calls below or by its own rules.`);
+  return gas * g.maxFee;
+}
+
+/**
+ * The prefund a bundler requires before including the operation: the account's EntryPoint deposit plus its balance
+ * (it pays the shortfall during validation), or the paymaster's deposit, must cover the most the gas can cost.
+ */
+export async function prefundCheck(b: PreviewBuilder, deps: TypedEnv['deps'], chainId: number | null, entryPoint: string, sender: string, paymaster: string | null, maxCost: bigint): Promise<void> {
+  if (chainId === null || maxCost === 0n || !deps.rpc?.has(chainId)) return;
+  const native = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}`;
+  const payer = paymaster ?? sender;
+  const deposit = await entryPointDeposit(deps, chainId, entryPoint, payer);
+  if (deposit === undefined) return;
+  let balance = 0n;
+  if (!paymaster) { try { balance = BigInt(String(await deps.rpc.call(chainId, 'eth_getBalance', [sender, 'latest']))); } catch { return; } }
+  if (deposit + balance < maxCost) b.warn('caution', 'userop_cannot_prefund', paymaster
+    ? `The paymaster's EntryPoint deposit (${native(deposit)}) is less than the up to ${native(maxCost)} this operation may cost: bundlers will reject it unless the deposit is topped up.`
+    : `The account has ${native(balance)} and ${native(deposit)} deposited in the EntryPoint, less than the up to ${native(maxCost)} this operation may cost in gas: bundlers will reject it.`);
 }
 
 /**
@@ -72,13 +91,17 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   const limits = halves(m.accountGasLimits), fees = halves(m.gasFees);
   const pm = paymasterOf(paymasterAndData, true);
   const gas = limits && fees && preVerificationGas !== null ? { verification: limits[0], call: limits[1], preVerification: preVerificationGas, maxPriority: fees[0], maxFee: fees[1], ...pm } : null;
-  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster }, env);
+  const packed = nonce !== null && hex(m.accountGasLimits) && hex(m.gasFees) && preVerificationGas !== null
+    ? { nonce, initCode, accountGasLimits: hex(m.accountGasLimits)!, preVerificationGas, gasFees: hex(m.gasFees)!, paymasterAndData } : undefined;
+  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, packed, userOpHash: typedDataDigest(data) ?? undefined }, env);
 };
 
 /** A UserOperation, whichever EntryPoint version and however it was signed. */
 export interface Operation {
   chainId: number | null; entryPoint: string; entryPointName: string | null; sender: string; nonce: bigint | null;
   initCode: Hex; callData: Hex | null; gas: OpGas | null; paymaster: string | null;
+  /** For accounts run through executeUserOp (EntryPoint v0.7 on): the packed operation and its hash. */
+  packed?: ExecutionInput['packed']; userOpHash?: Hex;
 }
 
 /** What a UserOperation does: its account, setup, gas, and its callData decoded and simulated as the account's own calls. */
@@ -98,7 +121,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   // The EntryPoint hashes an EIP-7702 account's initCode with its delegate in place of the 0x7702 marker, so SDKs
   // (viem's getUserOperationTypedData) put the delegate there in the typed data. An account signing for itself is an
   // EOA, which no factory can deploy: for it, that address is the delegate.
-  let deploys = false;
+  let deploys = false, delegate: string | undefined;
   const lead = initCode.length >= 42 ? `0x${initCode.slice(2, 42)}` : null;
   const init = initCode.length > 42 ? ', with an initialization call' : '';
   if (initCode === '0x') b.detail('Account setup', 'none (the account already exists)');
@@ -108,6 +131,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
     let code: unknown;
     try { code = chainId !== null && env.deps.rpc?.has(chainId) ? await env.deps.rpc.call(chainId, 'eth_getCode', [sender, 'latest']) : undefined; } catch { code = undefined; }
     if (typeof code === 'string' && code.toLowerCase() !== `0xef0100${lead.slice(2)}`) {
+      delegate = lead; // simulated with the delegation the operation is signed for
       b.warn('caution', 'userop_delegation_differs', `This operation is signed for your account delegating to ${lead}, but ${code === '0x' ? 'your account has no delegation now' : `it delegates to ${code.length === 48 ? `0x${code.slice(8)}` : 'other code'} now`}. It only runs if an EIP-7702 authorization delegating your account to ${shortAddress(lead)} is submitted with it: that contract would then run as your account, with full control of it.`);
     }
   } else if (lead) {
@@ -116,7 +140,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   }
 
   // Gas: the most the operation can cost the account (or its paymaster), at the highest fee it allows.
-  if (u.gas) gasDetails(b, u.gas, chainId);
+  if (u.gas) await prefundCheck(b, env.deps, chainId, entryPoint, sender, u.paymaster, gasDetails(b, u.gas, chainId));
 
   b.note('This is an off-chain signature; it costs no gas now. Any bundler holding it can submit the operation, which then runs its calls from the account.');
   if (!callData || callData === '0x' || chainId === null) {
@@ -129,19 +153,25 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   for (const w of inner.b.warnings) b.warnings.push(w);
   for (const n of inner.b.notes) b.note(n);
 
-  // Simulated as the account calling itself, which smart accounts allow alongside the EntryPoint. One that only
-  // takes calls from the EntryPoint reverts here, so a revert is reported as "not simulated", not as a failure.
+  // Simulated as the EntryPoint runs it: the account deployed first if it's new, then called from the EntryPoint.
   let assetChanges: AssetChange[] = inner.assetChanges;
-  if (env.deps.simulator && !deploys) {
+  if (env.deps.simulator && chainId !== null) {
     try {
-      const sim = await env.deps.simulator.simulate({ chainId, from: sender, to: sender, data: callData, value: 0n, ...(inner.watch?.length && { watch: inner.watch }) });
-      if (sim?.status === 'success' && !sim.limited) {
-        const basis = sim.basis === 'state' || sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
+      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
+      const sim = run?.result;
+      const how = run?.direct ? "directly from the account: this account only runs calls it validated in the same transaction (a flag kept in transient storage), which can't be done before it's signed"
+        : `as the EntryPoint runs it${run?.deployed ? ', after deploying the account through its factory' : ''}${delegate ? ', with the account delegating as the operation expects' : ''}`;
+      if (run?.noCode) b.warn('info', 'userop_account_no_code', `The account ${shortAddress(sender)} has no code, so the EntryPoint calling it would run nothing. The operation only does something if the account is delegated (EIP-7702) in the same transaction, and the preview can't simulate that.`);
+      // The probe measures the sender of the call (here the EntryPoint), so its balance reads aren't the account's.
+      else if (sim?.status === 'success' && !sim.limited && sim.basis !== 'state') {
+        const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
         const simulated = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
         if (simulated.length || !assetChanges.length) assetChanges = simulated;
-        b.note(`The calls were simulated as the account running them itself. ${simulationNote(sim)}`);
+        b.note(`The operation's calls were simulated ${how}. Its signature check, gas payment and any paymaster charge aren't part of the simulation. ${simulationNote(sim)}`);
+      } else if (sim?.status === 'success') {
+        b.note(`The operation's calls were checked ${how}: they succeed. Balance changes are from the decoded calls.`);
       } else if (sim?.status === 'reverted') {
-        b.note(`Simulating the calls as the account running them itself reverted${sim.revertReason ? ` (${sim.revertReason})` : ''}. Some accounts only take calls from the EntryPoint, so this doesn't mean the operation fails; balance changes are from the decoded calls.`);
+        b.warn('caution', 'userop_execution_reverts', `The operation's calls are expected to fail when the EntryPoint runs them${sim.revertReason ? `: ${sim.revertReason}` : ''}. The account (or its paymaster) would still pay the gas.`);
       }
     } catch { /* keep the decoded changes */ }
   }

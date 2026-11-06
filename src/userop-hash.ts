@@ -102,6 +102,8 @@ export async function previewSignedOperation(method: string, params: unknown[], 
   const d = await describeOperation({
     chainId, entryPoint, entryPointName: ep!.name, sender: op!.sender, nonce: op!.nonce, initCode: op!.initCode, callData: op!.callData === '0x' ? null : op!.callData, paymaster: pm.paymaster,
     gas: { verification: op!.verificationGasLimit, call: op!.callGasLimit, preVerification: op!.preVerificationGas, maxFee: op!.maxFeePerGas, maxPriority: op!.maxPriorityFeePerGas, ...pm, v06: ep!.version === '0.6' },
+    userOpHash: expected,
+    ...(ep!.version === '0.7' && { packed: { nonce: op!.nonce, initCode: op!.initCode, accountGasLimits: `0x${word(op!.verificationGasLimit)}${word(op!.callGasLimit)}` as Hex, preVerificationGas: op!.preVerificationGas, gasFees: `0x${word(op!.maxPriorityFeePerGas)}${word(op!.maxFeePerGas)}` as Hex, paymasterAndData: op!.paymasterAndData } }),
   }, env, b);
   b.detail('UserOperation hash', expected, expected);
   b.note(`The message is this operation's hash, as ${ep!.name} computes it (getUserOpHash), so the signature authorizes exactly this operation.`);

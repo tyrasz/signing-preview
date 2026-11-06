@@ -3,7 +3,11 @@
 import { decodeAbiParameters, hexToBytes, type Hex } from 'viem';
 import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
-import { describeSafeTx } from '../safe.ts';
+import { describeSafeTx, type SafeExecution } from '../safe.ts';
+import { simulateExecution } from '../erc4337-sim.ts';
+import { netChanges } from '../evm/effects.ts';
+import { simulationNote } from '../evm/transaction.ts';
+import type { AssetChange, SimulationResult } from '../types.ts';
 import { decodeTransaction } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf } from './user-operation.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
@@ -119,7 +123,13 @@ const safeOp: TypedAdapter = async (data, env) => {
   if (EXECUTE.includes(callData.slice(0, 10))) { try { decoded = decodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'bytes' }, { type: 'uint8' }], `0x${callData.slice(10)}`); } catch { decoded = null; } }
   if (decoded) {
     const [to, value, inner, operation] = decoded as [string, bigint, Hex, number];
-    r = await describeSafeTx({ safe, to, value, data: inner, operation: Number(operation), safeTxGas: 0n, baseGas: 0n, gasPrice: 0n, gasToken: ZERO, refundReceiver: ZERO }, chainId, { deps: env.deps, context: env.context }, b);
+    // Run as the EntryPoint runs it: the EntryPoint calls the Safe, whose fallback handler (the module) has it
+    // execute the call with execTransactionFromModule. Deploys the Safe first when the operation does.
+    const execution: SafeExecution = async watch => {
+      const run = await simulateExecution({ chainId, entryPoint, sender: safe, callData, ...(deploys && { initCode: initCode as Hex }), watch }, env.deps);
+      return run ? safeOutcome(run.result, safe, chainId, env, b, `The operation was simulated as the EntryPoint runs it${run.deployed ? ', after deploying the Safe' : ''}: through the Safe's 4337 module, delegatecalls included. Its signature check and gas payment aren't part of the simulation.`) : null;
+    };
+    r = await describeSafeTx({ safe, to, value, data: inner, operation: Number(operation), safeTxGas: 0n, baseGas: 0n, gasPrice: 0n, gasToken: ZERO, refundReceiver: ZERO }, chainId, { deps: env.deps, context: env.context }, b, execution);
   } else {
     b.warn('caution', 'safe_op_unsupported_call', `The operation's callData (${callData.slice(0, 10)}) isn't executeUserOp or executeUserOpWithErrorString, the only calls Safe's 4337 module runs: it would be rejected.`);
     const inner = await decodeTransaction({ chainId, from: safe, to: safe, data: callData, value: 0n }, env.deps, env.context);
@@ -138,3 +148,12 @@ const safeOp: TypedAdapter = async (data, env) => {
   b.note(`This is an off-chain owner signature; it costs no gas now. Once enough owners have signed, any bundler can submit the operation, which runs as the Safe${known ? ' through its 4337 module' : ''}, with the gas paid ${pm.paymaster ? 'by the paymaster' : 'from the Safe'}.`);
   return { title: `Safe operation: ${r.title}`, summary: `Signs an ERC-4337 operation for the Safe ${shortAddress(safe)}. ${r.summary}`, decoder: 'safe_4337_op', status: r.status, b, network: { kind: 'evm', chainId, name: chainName(chainId) }, assetChanges: r.assetChanges };
 };
+
+/** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes, or why it fails. */
+export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: TypedEnv, b: PreviewBuilder, how: string): Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null> {
+  if (sim.status === 'reverted') return { reverted: sim.revertReason ?? '' };
+  // The probe measures the call's sender, which isn't the Safe here: its balance reads don't apply.
+  if (sim.limited || sim.basis === 'state') return null;
+  const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
+  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}` };
+}

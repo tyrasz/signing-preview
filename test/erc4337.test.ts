@@ -71,14 +71,32 @@ test('An EIP-7702 account’s UserOperation as SDKs sign it (the delegate in the
   assert.match(q.warnings.find(w => w.code === 'userop_delegation_differs')!.message, /your account has no delegation now/);
 });
 
-test('UserOperation calls are simulated as the account; a revert there (EntryPoint-only accounts) is not called a failure', async () => {
-  const ok: Simulator = { simulate: async r => ({ status: 'success', source: 'test', transfers: [{ asset: USDC, from: r.from, to: BOB, raw: 1_000_000n }] }) };
-  const p = await sign(userOp(), ALICE, { ...deps, simulator: ok });
+test('UserOperation calls are simulated as the EntryPoint runs them: from the EntryPoint, after deploying a new account', async () => {
+  const seen: { from: string; to: string | null }[][] = [];
+  const ok: Simulator = {
+    simulate: async r => { seen.push([{ from: r.from, to: r.to }]); return { status: 'success', source: 'test', transfers: [{ asset: USDC, from: r.to!, to: BOB, raw: 1_000_000n }] }; },
+    simulateBatch: async rs => { seen.push(rs.map(r => ({ from: r.from, to: r.to }))); return rs.map(r => ({ status: 'success' as const, source: 'test', transfers: [{ asset: USDC, from: r.to!, to: BOB, raw: 1_000_000n }] })); },
+  };
+  const p = await sign(userOp({ initCode: '0x' }), ALICE, { ...deps, simulator: ok });
+  assert.deepEqual(seen.at(-1), [{ from: EP8.toLowerCase(), to: ALICE.toLowerCase() }]);
   assert.deepEqual(p.assetChanges.map(c => `${c.direction} ${c.amount} ${c.symbol} ${c.basis}`), ['out 1 USDC simulated_events']);
-  const reverts: Simulator = { simulate: async () => ({ status: 'reverted', source: 'test', revertReason: 'only EntryPoint', transfers: [] }) };
-  const q = await sign(userOp(), ALICE, { ...deps, simulator: reverts });
-  assert.equal(q.attention === 'danger', false);
-  assert.ok(q.decoding.notes.some(n => /doesn't mean the operation fails/.test(n)));
+  assert.match(p.decoding.notes.join(' '), /simulated as the EntryPoint runs it/);
+  // A new smart account: v0.8's SenderCreator calls the factory, then the EntryPoint calls the account.
+  const FACTORY = '0x00000000000000000000000000000000000fac70', ACCOUNT = '0x00000000000000000000000000000000000ac0c7';
+  await sign(userOp({ sender: ACCOUNT, initCode: `${FACTORY}1234` }), ALICE, { ...deps, simulator: ok });
+  assert.deepEqual(seen.at(-1), [{ from: '0x449ed7c3e6fee6a97311d4b55475df59c44add33', to: FACTORY }, { from: EP8.toLowerCase(), to: ACCOUNT }]);
+  // A revert when the EntryPoint runs the calls is how the operation would fail.
+  const reverts: Simulator = { simulate: async () => ({ status: 'reverted', source: 'test', revertReason: 'TRANSFER_FAILED', transfers: [] }) };
+  const q = await sign(userOp({ initCode: '0x' }), ALICE, { ...deps, simulator: reverts });
+  assert.match(q.warnings.find(w => w.code === 'userop_execution_reverts')!.message, /TRANSFER_FAILED/);
+});
+
+test('The gas prefund: the account’s deposit plus balance, or the paymaster’s deposit, must cover the most it can cost', async () => {
+  const rpc = (deposit: bigint, balance: bigint) => ({ has: () => true, call: async (_c: number, method: string, params: unknown[]) =>
+    method === 'eth_getBalance' ? `0x${balance.toString(16)}` : method === 'eth_getCode' ? '0x' : (params[0] as { data: string }).data.startsWith('0x70a08231') ? `0x${deposit.toString(16).padStart(64, '0')}` : `0x${'0'.repeat(64)}` });
+  // At most (100,000 + 200,000 + 50,000) gas × 3 gwei = 0.00105 ETH.
+  assert.ok(codes(await sign(userOp(), ALICE, { ...deps, rpc: rpc(0n, 10n ** 15n) })).includes('userop_cannot_prefund'));
+  assert.ok(!codes(await sign(userOp(), ALICE, { ...deps, rpc: rpc(10n ** 15n, 10n ** 14n) })).includes('userop_cannot_prefund'));
 });
 
 test('Transactions to an EntryPoint: a bundle of UserOperations, and gas deposits', async () => {

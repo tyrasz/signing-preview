@@ -97,7 +97,14 @@ async function describeCall(c: Call, safe: string, chainId: number, env: Adapter
  * What a SafeTx does, into `b`: the call or batch decoded as the Safe's own transactions, the delegatecall check,
  * the gas refund, and (when every call is a plain call) a simulation of the calls from the Safe.
  */
-export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder): Promise<{ title: string; summary: string; status: Decoded['status']; assetChanges: AssetChange[] }> {
+/**
+ * `execution`, when given, runs instead of the calls one by one: the way the Safe really runs this transaction
+ * (through the EntryPoint and the 4337 module, or execTransaction itself). It resolves the Safe's balance changes, or
+ * null when it couldn't be simulated (the calls are then simulated one by one, as before).
+ */
+export type SafeExecution = (watch: string[]) => Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null>;
+
+export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder, execution?: SafeExecution): Promise<{ title: string; summary: string; status: Decoded['status']; assetChanges: AssetChange[] }> {
   const safe = t.safe.toLowerCase();
   const lib = SAFE_LIBRARIES[t.to.toLowerCase()];
   b.detail('Safe', safe, safe);
@@ -150,10 +157,19 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     if (!/^0x0{40}$/.test(t.refundReceiver)) b.warn('caution', 'safe_gas_refund', `The Safe pays a gas refund to ${shortAddress(t.refundReceiver)}: check that the price and the receiver are what you expect.`);
   }
 
-  // Simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way).
   let assetChanges: AssetChange[] = [];
   const sim = env.deps.simulator;
-  if (sim && calls.every(c => c.operation === 0)) {
+  // The real execution path, when the caller has one: delegatecalls included.
+  let ran = false;
+  if (sim && execution) {
+    try {
+      const r = await execution(decoded.flatMap(d => (d as Decoded).watch ?? []));
+      if (r && 'reverted' in r) { ran = true; b.warn('caution', 'safe_tx_reverts', `The transaction is expected to fail when the Safe runs it${r.reverted ? `: ${r.reverted}` : ''}.`); }
+      else if (r) { ran = true; assetChanges = r.assetChanges; b.note(r.note); }
+    } catch { ran = false; }
+  }
+  // Otherwise simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way).
+  if (!ran && sim && calls.every(c => c.operation === 0)) {
     const reqs = calls.map((c, i) => ({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data, value: c.value, ...((decoded[i] as Decoded).watch?.length && { watch: (decoded[i] as Decoded).watch }) }));
     try {
       const results = reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;

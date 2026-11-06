@@ -44,7 +44,11 @@ export const ELSEWHERE = '0x0000000000000000000000000000000000000000';
 
 /** Code overrides of all the calls (EIP-7702 delegations), applied from the start of the simulated block. */
 const overridesOf = (reqs: SimulationRequest[]) => {
-  const all = Object.assign({}, ...reqs.map(r => r.stateOverrides ?? {})) as Record<string, { code?: string }>;
+  const all: Record<string, { code?: string; stateDiff?: Record<string, string> }> = {};
+  for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
+    const k = a.toLowerCase(), prev = all[k] ?? {};
+    all[k] = { ...prev, ...(o.code !== undefined && { code: o.code }), ...(o.stateDiff && { stateDiff: { ...prev.stateDiff, ...o.stateDiff } }) };
+  }
   return Object.keys(all).length ? all : undefined;
 };
 
@@ -67,7 +71,7 @@ const simulationFields = async (req: SimulationRequest) => {
  * authority's account isn't made to exist beforehand (its refund depends on that).
  */
 async function simulateV1Overrides(reqs: SimulationRequest[]) {
-  const all: Record<string, { code?: string; balance?: string; nonce?: string }> = overridesOf(reqs) ?? {};
+  const all: Record<string, { code?: string; balance?: string; nonce?: string; stateDiff?: Record<string, string> }> = overridesOf(reqs) ?? {};
   // The stand-in for unsigned authorizations: an existing account, without code, at nonce 0.
   if (reqs.some(r => r.unsignedAuthorizations?.length)) all[STAND_IN.address.toLowerCase()] = { balance: '0x1', nonce: '0x0', code: '0x' };
   for (const r of reqs) for (const a of r.authorizationList ?? []) {
@@ -215,7 +219,8 @@ export class RpcSimulator implements Simulator {
   /** The probe's answer, or eth_call's where the probe can't run. */
   private async probeOrCall(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
     // The probe takes over the sender's code, so it can't also apply code overrides (EIP-7702 delegations).
-    const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase()) && !overridesOf(reqs);
+    // It also measures the sender, so a request about another account (a smart account called into) can't use it.
+    const probeable = reqs.every(r => r.to && r.from.toLowerCase() === reqs[0].from.toLowerCase() && (!r.account || r.account.toLowerCase() === r.from.toLowerCase())) && !overridesOf(reqs);
     if (probeable && !this.noProbe.has(chainId)) {
       try {
         const results = await probeSimulate((method, params) => this.post(url, method, params), reqs, decodeRevert);
@@ -263,13 +268,13 @@ export class RpcSimulator implements Simulator {
    * from the first (the state moved on), the event-based values stand.
    */
   private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[]) {
-    const owners = [...new Set(reqs.map(r => r.from.toLowerCase()))];
+    const owners = [...new Set(reqs.map(r => (r.account ?? r.from).toLowerCase()))];
     const touched = new Map<string, SimulatedApproval>();
     const after: SimulatedApproval[][] = [];
     const unconfirmed = new Set<SimulatedApproval>(); // named approvals: kept only if the state read confirms them
     parsed.forEach((r, i) => {
       // A call that sets a permission by name is listed even if its token emits no Approval event.
-      const named = r.status === 'success' ? namedApproval(reqs[i], reqs[i].from.toLowerCase(), r.approvals ?? []) : undefined;
+      const named = r.status === 'success' ? namedApproval(reqs[i], (reqs[i].account ?? reqs[i].from).toLowerCase(), r.approvals ?? []) : undefined;
       if (named && !(r.approvals ?? []).some(a => approvalKey(a) === approvalKey(named))) { (r.approvals ??= []).push(named); unconfirmed.add(named); }
       for (const a of r.approvals ?? []) if (owners.includes(a.owner)) touched.set(approvalKey(a), a);
       after.push([...touched.values()].slice(0, 24));

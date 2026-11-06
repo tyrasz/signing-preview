@@ -167,6 +167,11 @@ export interface TokenRegistry {
 export interface SimulationRequest {
   chainId: number;
   from: string;
+  /**
+   * The account whose balances and approvals the result reports, when it isn't the caller: a smart account the
+   * EntryPoint or a Safe calls into. Defaults to `from`.
+   */
+  account?: string;
   to: string | null;
   data: string;
   value: bigint;
@@ -180,7 +185,11 @@ export interface SimulationRequest {
   gasPrice?: bigint;
   accessList?: { address: string; storageKeys: string[] }[];
   /** Code to give accounts for the simulation (EIP-7702 authorizations: the delegation designator, or none). */
-  stateOverrides?: Record<string, { code?: string }>;
+  stateOverrides?: Record<string, {
+    code?: string;
+    /** Storage slots (32-byte hex) set for the simulation, as eth_simulateV1 and eth_call take them. */
+    stateDiff?: Record<string, string>;
+  }>;
   /**
    * Signed EIP-7702 authorizations, in JSON-RPC form. Simulators that can apply them natively (eth_simulateV1) do,
    * so validity, nonces and their gas are exact; the others use `stateOverrides`.
