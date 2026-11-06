@@ -59,3 +59,16 @@ test('A batch sent to your own account does nothing when the account has no code
   const delegated = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: batch, chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), rpc: { ...rpc, call: async () => '0xef010063c0c19a282a1b52b07dd5a65b58948a07dae32b' } });
   assert.equal(delegated.title, 'Send 1 USDC');
 });
+
+test('An Arbitrum-style inbox message: the transaction it delivers to the child chain, and who signed it', async () => {
+  const { privateKeyToAccount } = await import('viem/accounts');
+  const signer = privateKeyToAccount('0x8888888888888888888888888888888888888888888888888888888888888888');
+  const signed = await signer.signTransaction({ chainId: 99901, to: BOB, value: 0n, data: '0xdeadbeef', nonce: 3, gas: 100000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, type: 'eip1559' });
+  const data = encodeFunctionData({ abi: parseAbi(['function sendL2Message(bytes messageData) returns (uint256)']), args: [`0x04${signed.slice(2)}`] });
+  const send = (from: string) => previewRequest({ method: 'eth_sendTransaction', params: [{ from, to: '0xce59f8b65ad41c9dae4c07a0571a39824bd92cff', data, chainId: '0x3e7' }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  const mine = await send(signer.address);
+  assert.equal(mine.title, 'Send a transaction to chain 99901 through its inbox (to 0xb0b0…0002)');
+  assert.equal(detail(mine, 'Calldata'), '0xdeadbeef (4 bytes)');
+  assert.ok(!codes(mine).includes('inbox_relayed'));
+  assert.ok(codes(await send(ALICE)).includes('inbox_relayed'));
+});
