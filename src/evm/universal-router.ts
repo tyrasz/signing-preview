@@ -117,6 +117,7 @@ const toOther = (c: Ctx, recipient: string) => who(c, recipient) === recipient;
 
 /** v3 paths are packed: token (20 bytes), then fee (3 bytes) + token per hop. */
 export function v3Path(path: Hex): { tokens: string[]; fees: number[] } | null {
+  if (typeof path !== 'string') return null;
   const hex = path.slice(2);
   if (hex.length < 86 || (hex.length - 40) % 46 !== 0) return null;
   const tokens = ['0x' + hex.slice(0, 40)], fees: number[] = [];

@@ -38,3 +38,11 @@ test('multicall with struct items, e.g. (address target, bytes callData)[], no l
   assert.match(detail(p, 'Batched call 1')!, /^transfer\(/);
   assert.equal(detail(p, 'Batched call 2'), '0x (not decoded)');
 });
+
+test('A multicall whose calls are not swaps (a nested multicall, as The Graph’s SubgraphService sends) is not read as one', async () => {
+  // Arbitrum 0xb06a1672… crashed the Uniswap-style reader: a nested multicall fell through to the exactInput branch.
+  const abi = parseAbi(['function multicall(bytes[] data)']);
+  const nested = encodeFunctionData({ abi, functionName: 'multicall', args: [[encodeFunctionData({ abi, functionName: 'multicall', args: [[]] })]] });
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: '0xa11ce00000000000000000000000000000000001', to: '0xb2bb92d0de618878e438b55d5846cfecd9301105', data: nested, chainId: '0xa4b1' }] }, {}, {});
+  assert.notEqual(p.decoding.decoder, 'uniswap_style_router');
+});

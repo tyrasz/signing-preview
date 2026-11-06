@@ -83,11 +83,16 @@ function swapsOf(kind: 'v2' | 'v3' | 'v3-02', data: Hex, depth = 0): { swaps: Sw
     const deadline = kind === 'v2' ? (a[a.length - 1] as bigint) : undefined;
     return { swaps: [{ tokenIn: path[0], tokenOut: path[path.length - 1], amountIn: exactIn ? x : y, amountOut: exactIn ? y : x, exactIn, recipient: to, deadline }] };
   }
-  const p = a[0] as Record<string, unknown>;
+  // Only exactInput / exactOutput (and their Single forms) are swaps from here; anything else (a nested multicall,
+  // sweepToken, refundETH, selfPermit…) moves nothing to read.
+  if (!name.startsWith('exactInput') && !name.startsWith('exactOutput')) return null;
+  const p = a[0] as Record<string, unknown> | undefined;
+  if (!p || typeof p !== 'object') return null;
   const exactIn = name.startsWith('exactInput');
   if (name.endsWith('Single')) {
     return { swaps: [{ tokenIn: p.tokenIn as string, tokenOut: p.tokenOut as string, amountIn: (exactIn ? p.amountIn : p.amountInMaximum) as bigint, amountOut: (exactIn ? p.amountOutMinimum : p.amountOut) as bigint, exactIn, recipient: p.recipient as string, deadline: p.deadline as bigint | undefined, ...(p.fee !== undefined && { fees: [Number(p.fee)] }) }] };
   }
+  if (typeof p.path !== 'string') return null;
   const path = v3Path(p.path as Hex);
   if (!path) return null;
   // exactOutput paths run backwards, from the output token to the input.
