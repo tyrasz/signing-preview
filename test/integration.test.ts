@@ -85,3 +85,18 @@ test('Interceptor shows an explicit fallback when the preview service fails', as
   await assert.rejects(provider.request({ method: 'personal_sign', params: ['0x68656c6c6f', ALICE] }));
   assert.equal((shown as unknown as { warnings: { code: string }[] }).warnings[0].code, 'preview_unavailable');
 });
+
+test('HTTP API: a UserOperation supplied in the context decodes the hash being signed', async () => {
+  const { userOpHash, readOperation } = await import('../src/userop-hash.ts');
+  const ep = '0x0000000071727de22e5e9d8baf0edac6f37da032';
+  const transfer = `0xb61d27f6${'0'.repeat(24)}a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48${'0'.repeat(64)}${'0'.repeat(62)}60${'0'.repeat(62)}44a9059cbb${'0'.repeat(24)}b0b0000000000000000000000000000000000002${(1_000_000).toString(16).padStart(64, '0')}${'0'.repeat(56)}`;
+  const operation = { sender: '0x5ca1ab1e00000000000000000000000000000007', nonce: '0x1', callData: transfer, callGasLimit: '0x10000', verificationGasLimit: '0x10000', preVerificationGas: '0x5000', maxFeePerGas: '0x3b9aca00', maxPriorityFeePerGas: '0x1' };
+  const hash = userOpHash(readOperation(operation, '0.7')!, ep, 1, '0.7');
+  await withServer(async url => {
+    const post = (context: unknown) => fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ request: { method: 'personal_sign', params: [hash, ALICE] }, context }) }).then(r => r.json());
+    const p = await post({ chainId: 1, userOperation: { entryPoint: ep, operation } });
+    assert.equal(p.title, 'Sign a UserOperation: Send 1 USDC');
+    assert.equal(p.decoding.decoder, 'erc4337_user_operation_hash');
+    assert.equal((await post({ chainId: 1, userOperation: { entryPoint: ep, operation: { ...operation, nonce: '0x2' } } })).attention, 'danger');
+  });
+});
