@@ -126,3 +126,17 @@ test('A matched buy is judged as a whole; validating a give-away order and cance
   const all = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'incrementCounter' }));
   assert.equal(all.title, 'Cancel all your Seaport orders');
 });
+
+test('SeaDrop mints: the collection, quantity and price, overpaying the drop, and minting for someone else', async () => {
+  const SEADROP = '0x00005EA00Ac477b1030CE78506496e8C2dE24bf5';
+  const A = parseAbi(['function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable']);
+  // getPublicDrop: 0.01 ETH per NFT.
+  const rpc = { has: () => true, call: async () => `0x${(10n ** 16n).toString(16).padStart(64, '0')}${'0'.repeat(64 * 5)}` };
+  const mint = (minter: string, value: bigint) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SEADROP, value: `0x${value.toString(16)}`, chainId: '0x1', data: encodeFunctionData({ abi: A, functionName: 'mintPublic', args: [APES as Hex, FEE as Hex, minter as Hex, 2n] }) }] }, { now: NOW }, { ...deps, rpc });
+  const p = await mint(ZERO, 2n * 10n ** 16n);
+  assert.equal(p.title, 'Mint 2 BAYC for 0.02 ETH (SeaDrop)');
+  assert.equal(detail(p, 'Price per NFT'), '0.01 ETH');
+  assert.equal(p.attention, 'none');
+  assert.ok(codes(await mint(ZERO, 10n ** 17n)).includes('mint_overpay'));
+  assert.ok(codes(await mint(BOB, 2n * 10n ** 16n)).includes('recipient_not_sender'));
+});
