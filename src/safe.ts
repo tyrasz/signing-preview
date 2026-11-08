@@ -10,7 +10,8 @@ import { CHAINS } from './chains.ts';
 import { decodeTransaction, simulationNote } from './evm/transaction.ts';
 import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
-import type { AssetChange } from './types.ts';
+import type { AssetChange, SimulationRequest, SimulationResult } from './types.ts';
+import { configChanges, simulateSafeExecution } from './safe-sim.ts';
 
 /** Safe's libraries (safe-global/safe-deployments v1.3.0 canonical and EIP-155, v1.4.1, v1.5.0), deployed on every chain here. */
 export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 'multisend_call_only' | 'sign_message' | 'create_call' | 'migration' }> = {
@@ -111,6 +112,16 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   if (t.nonce !== undefined) b.detail('Safe nonce', t.nonce.toString());
   let calls: Call[];
   let label = '';
+  // For the branches that return early (Safe's own libraries): the real execution still runs, for what it changes.
+  const early = async <T extends { assetChanges: AssetChange[] }>(r: T): Promise<T> => {
+    if (!env.deps.simulator || !execution) return r;
+    try {
+      const out = await execution([]);
+      if (out && 'reverted' in out) b.warn('caution', 'safe_tx_reverts', `The transaction is expected to fail when the Safe runs it${out.reverted ? `: ${out.reverted}` : ''}.`);
+      else if (out) { b.note(out.note); return { ...r, assetChanges: out.assetChanges }; }
+    } catch { /* not simulated */ }
+    return r;
+  };
   if (t.operation === 1 && (lib?.kind === 'multisend' || lib?.kind === 'multisend_call_only')) {
     const parsed = multiSendCalls(t.data);
     if (!parsed) { b.warn('danger', 'safe_delegatecall', `This delegatecalls ${lib.name} with a batch that can't be read.`); return { title: 'Run an unreadable Safe batch', summary: 'A MultiSend batch that could not be decoded.', status: 'opaque', assetChanges: [] }; }
@@ -119,13 +130,13 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     b.detail('Batch', `${calls.length} call${calls.length === 1 ? '' : 's'} through ${lib.name}`);
   } else if (t.operation === 1 && lib?.kind === 'sign_message') {
     b.warn('info', 'safe_sign_message', `This signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's.`);
-    return { title: 'Sign a message as the Safe', summary: `Marks a message as signed by the Safe, through ${lib.name}.`, status: 'full', assetChanges: [] };
+    return early({ title: 'Sign a message as the Safe', summary: `Marks a message as signed by the Safe, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
   } else if (t.operation === 1 && lib?.kind === 'migration') {
     b.warn('caution', 'safe_migration', `This upgrades the Safe's code through Safe's official ${lib.name} contract. Only sign it if you meant to upgrade the Safe.`);
-    return { title: `Upgrade the Safe (${lib.name})`, summary: `Moves the Safe to another official Safe version, through ${lib.name}.`, status: 'full', assetChanges: [] };
+    return early({ title: `Upgrade the Safe (${lib.name})`, summary: `Moves the Safe to another official Safe version, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
   } else if (t.operation === 1 && lib?.kind === 'create_call') {
     b.warn('info', 'safe_create_call', `This deploys a contract from the Safe (${lib.name}).`);
-    return { title: 'Deploy a contract from the Safe', summary: `Deploys a contract with the Safe as its creator, through ${lib.name}.`, status: 'full', assetChanges: [] };
+    return early({ title: 'Deploy a contract from the Safe', summary: `Deploys a contract with the Safe as its creator, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
   } else if (t.operation === 1) {
     b.warn('danger', 'safe_delegatecall', `This is a delegatecall: ${t.to}'s code would run as the Safe itself, able to change its owners, move everything in it or replace its code. It is not one of Safe's own libraries. A delegatecall like this is how the Bybit Safe was drained in 2025: don't sign it unless you know exactly what that contract does.`);
     calls = [{ operation: 1, to: t.to, value: t.value, data: t.data }];
@@ -191,4 +202,32 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   if (rogue) b.detail('Its calldata reads as', titles[0]);
   const title = rogue ? `Let ${shortAddress(t.to.toLowerCase())} run its code as the Safe (delegatecall)` : calls.length === 1 ? titles[0] : `Run ${calls.length} calls from the Safe`;
   return { title, summary: `The Safe ${shortAddress(safe)} ${calls.length === 1 ? (t.operation === 1 ? 'delegatecalls' : 'makes this call') : `runs ${calls.length} calls${label ? ` through ${label}` : ''}`}: ${titles.slice(0, 3).join('; ')}${calls.length > 3 ? '; …' : ''}.`, status, assetChanges };
+}
+
+/** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes, or why it fails. */
+export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: Pick<AdapterEnv, 'deps'>, b: PreviewBuilder, how: string): Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null> {
+  if (sim.status === 'reverted') return { reverted: sim.revertReason ?? '' };
+  // The probe measures the call's sender, which isn't the Safe here: its balance reads don't apply.
+  if (sim.limited || sim.basis === 'state') return null;
+  const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
+  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}` };
+}
+
+/** Static warnings that already cover a configuration change found by simulation. */
+const COVERED: Record<string, string> = { safe_owners_added: 'safe_owners_change', safe_owners_removed: 'safe_owners_change', safe_threshold_changed: 'safe_threshold_change', safe_guard_changed: 'safe_set_guard', safe_fallback_changed: 'safe_fallback_handler', safe_module_enabled: 'safe_enable_module' };
+
+/**
+ * The SafeExecution that runs execTransaction itself (for a SafeTx signature, with the hash approved by enough
+ * owners; for an execTransaction transaction, as sent) and reports what it changes in the Safe.
+ */
+export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder, opts: { executor?: string | null; request?: SimulationRequest }): SafeExecution {
+  return async () => {
+    const run = await simulateSafeExecution(t, chainId, env.deps, opts);
+    if (!run) return null;
+    if (run.after) for (const c of configChanges(run.before, run.after)) if (!b.warnings.some(w => w.code === COVERED[c.code])) b.warn(c.severity, c.code, c.message);
+    if (!run.executed) return { reverted: run.result.status === 'reverted' ? run.result.revertReason ?? '' : 'the Safe reports that the call failed (ExecutionFailure)' };
+    return safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, opts.request
+      ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'
+      : "Simulated as the Safe runs it: execTransaction itself, with the transaction approved by enough owners (the Safe's approvedHashes standing in for their signatures), so guards, the gas refund and delegatecalls run as they will.");
+  };
 }

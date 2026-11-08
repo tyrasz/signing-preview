@@ -135,3 +135,63 @@ test('SafeOp checks: delegatecalls, an unknown module or EntryPoint, a plain cal
   assert.ok(codes(used).includes('userop_nonce_used'));
   assert.ok(!codes(used).includes('safe_not_owner') && !codes(used).includes('safe_module_not_enabled'));
 });
+
+// execTransaction simulated for a SafeTx: the hash approved for enough owners, then the Safe's configuration read again.
+import { configChanges, SAFE_SINGLETONS, type SafeConfig } from '../src/safe-sim.ts';
+import { decodeFunctionData as decodeCall, encodeAbiParameters as enc, keccak256 as k256 } from 'viem';
+import type { SimulationRequest } from '../src/types.ts';
+
+const OWNERS = ['0x2000000000000000000000000000000000000002', '0x1000000000000000000000000000000000000001', '0x3000000000000000000000000000000000000003'];
+const SINGLETON = '0x41675c099f32341bf84bfc5382af534df5c7461a';
+const base: SafeConfig = { owners: OWNERS, threshold: 2n, singleton: SINGLETON, guard: ZERO, fallbackHandler: '0xfd0732dc9e303f09fcef3a7388ad10a83459ec99', modules: [] };
+
+test('What a Safe transaction changes in the Safe: code, owners, threshold, guard, fallback handler, modules', () => {
+  const codes = (after: Partial<SafeConfig>) => configChanges(base, { ...base, ...after }).map(c => `${c.severity}:${c.code}`);
+  assert.deepEqual(codes({}), []);
+  assert.deepEqual(codes({ singleton: '0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516' }), ['danger:safe_code_replaced']);
+  assert.deepEqual(codes({ singleton: '0xff51a5898e281db6dfc7855790607438df2ca44b' }), ['caution:safe_upgrade']);
+  assert.ok(SAFE_SINGLETONS[SINGLETON]);
+  assert.deepEqual(codes({ owners: [...OWNERS.slice(1), BOB.toLowerCase()], threshold: 1n }), ['caution:safe_owners_added', 'caution:safe_owners_removed', 'caution:safe_threshold_changed']);
+  assert.deepEqual(codes({ guard: BOB.toLowerCase(), fallbackHandler: ZERO, modules: [BOB.toLowerCase()] }), ['caution:safe_guard_changed', 'caution:safe_fallback_changed', 'danger:safe_module_enabled']);
+});
+
+test('A SafeTx is simulated through execTransaction itself, approved by enough owners, and a replaced singleton is danger', async () => {
+  const SAFE_ABI = parseAbi(['function getStorageAt(uint256 offset, uint256 length) view returns (bytes)', 'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool)']);
+  const HASH = `0x${'ab'.repeat(32)}` as Hex;
+  const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const slotBytes = (a: string) => enc([{ type: 'bytes' }], [`0x${a.slice(2).padStart(64, '0')}` as Hex]);
+  const view = (afterSingleton?: string) => (data: string) => {
+    const sel = data.slice(0, 10);
+    if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [OWNERS as Hex[]]);
+    if (sel === '0xe75235b8') return word(2n);
+    if (sel === '0xaffed0e0') return word(7n);
+    if (sel === '0xd8d11f78') return HASH;
+    if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[], '0x0000000000000000000000000000000000000001']);
+    if (sel === '0x5624b25b') {
+      const [offset] = decodeCall({ abi: SAFE_ABI, data: data as Hex }).args as [bigint, bigint];
+      return slotBytes(offset === 0n ? afterSingleton ?? SINGLETON : offset === BigInt('0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5') ? base.fallbackHandler : ZERO);
+    }
+    if (sel === '0x2f54bf6e') return word(1n);
+    return '0x';
+  };
+  const batches: SimulationRequest[][] = [];
+  const d = (afterSingleton?: string): Dependencies => ({ ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? view()((p[0] as { data: string }).data) : '0x' },
+    simulator: { simulate: async () => null, simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => ({ status: 'success' as const, source: 'mock', transfers: [], returnData: i === 0 ? word(1n) : view(afterSingleton)(r.data) })); } } });
+  // The Bybit pattern: a delegatecall whose calldata looks like a transfer, run as the Safe, replaces its singleton.
+  const bybit = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516'));
+  assert.ok(codes(bybit).includes('safe_code_replaced'));
+  assert.match(bybit.decoding.notes.join(' '), /execTransaction itself/);
+  // The request: from an owner, with approvedHashes set for the two lowest owners, signed with approvals (v = 1).
+  const exec = batches.at(-1)![0];
+  assert.equal(exec.to, SAFE);
+  assert.equal(exec.account, SAFE);
+  const signers = [OWNERS[1], OWNERS[0]];
+  const slot = (o: string) => k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [o as Hex, 8n]))]));
+  assert.deepEqual(Object.keys(exec.stateOverrides![SAFE].stateDiff!).sort(), signers.map(slot).sort());
+  const signatures = (decodeCall({ abi: SAFE_ABI, data: exec.data as Hex }).args as unknown[])[9] as string;
+  assert.equal(signatures, `0x${signers.map(o => `${o.slice(2).padStart(64, '0')}${'00'.repeat(32)}01`).join('')}`);
+  // Moving to an official singleton is an upgrade, a caution.
+  const upgrade = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xff51a5898e281db6dfc7855790607438df2ca44b'));
+  assert.ok(codes(upgrade).includes('safe_upgrade') && !codes(upgrade).includes('safe_code_replaced'));
+});

@@ -3,11 +3,8 @@
 import { decodeAbiParameters, hexToBytes, type Hex } from 'viem';
 import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
-import { describeSafeTx, type SafeExecution } from '../safe.ts';
+import { describeSafeTx, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
 import { simulateExecution } from '../erc4337-sim.ts';
-import { netChanges } from '../evm/effects.ts';
-import { simulationNote } from '../evm/transaction.ts';
-import type { AssetChange, SimulationResult } from '../types.ts';
 import { decodeTransaction } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf } from './user-operation.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
@@ -24,8 +21,8 @@ export const safeTxAdapter: TypedAdapter = async (data, env) => {
   const value = big(m.value), safeTxGas = big(m.safeTxGas) ?? 0n, baseGas = big(m.baseGas ?? m.dataGas) ?? 0n, gasPrice = big(m.gasPrice) ?? 0n, operation = Number(big(m.operation) ?? 0n), nonce = big(m.nonce) ?? undefined;
   if (!/^0x[0-9a-f]{40}$/.test(safe) || chainId === null || value === null) return null;
   const b = new PreviewBuilder();
-  const r = await describeSafeTx({ safe, to: str(m.to), value, data: (str(m.data) || '0x') as `0x${string}`, operation, safeTxGas, baseGas, gasPrice, gasToken: str(m.gasToken) || '0x0000000000000000000000000000000000000000', refundReceiver: str(m.refundReceiver) || '0x0000000000000000000000000000000000000000', nonce },
-    chainId, { deps: env.deps, context: env.context }, b);
+  const t = { safe, to: str(m.to), value, data: (str(m.data) || '0x') as `0x${string}`, operation, safeTxGas, baseGas, gasPrice, gasToken: str(m.gasToken) || '0x0000000000000000000000000000000000000000', refundReceiver: str(m.refundReceiver) || '0x0000000000000000000000000000000000000000', nonce };
+  const r = await describeSafeTx(t, chainId, { deps: env.deps, context: env.context }, b, viaExecTransaction(t, chainId, { deps: env.deps, context: env.context }, b, { executor: env.signer }));
   // Is the signer an owner, and is this the Safe's next transaction?
   const rpc = env.deps.rpc;
   if (rpc?.has(chainId)) {
@@ -148,12 +145,3 @@ const safeOp: TypedAdapter = async (data, env) => {
   b.note(`This is an off-chain owner signature; it costs no gas now. Once enough owners have signed, any bundler can submit the operation, which runs as the Safe${known ? ' through its 4337 module' : ''}, with the gas paid ${pm.paymaster ? 'by the paymaster' : 'from the Safe'}.`);
   return { title: `Safe operation: ${r.title}`, summary: `Signs an ERC-4337 operation for the Safe ${shortAddress(safe)}. ${r.summary}`, decoder: 'safe_4337_op', status: r.status, b, network: { kind: 'evm', chainId, name: chainName(chainId) }, assetChanges: r.assetChanges };
 };
-
-/** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes, or why it fails. */
-export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: TypedEnv, b: PreviewBuilder, how: string): Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null> {
-  if (sim.status === 'reverted') return { reverted: sim.revertReason ?? '' };
-  // The probe measures the call's sender, which isn't the Safe here: its balance reads don't apply.
-  if (sim.limited || sim.basis === 'state') return null;
-  const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
-  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}` };
-}

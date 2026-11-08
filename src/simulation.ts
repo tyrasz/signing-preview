@@ -178,7 +178,7 @@ export class RpcSimulator implements Simulator {
       const gasUsed = BigInt(result.gasUsed);
       return result.status !== '0x1'
         ? { status: 'reverted', source, gasUsed, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [] }
-        : { status: 'success', source, gasUsed, ...parseLogs(result.logs ?? []) };
+        : { status: 'success', source, gasUsed, ...parseLogs(result.logs ?? []), ...(result.returnData && { returnData: result.returnData }) };
     });
     try { await this.readState(url, reqs, parsed); } catch { /* keep the event-based values */ }
     return parsed;
