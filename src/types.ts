@@ -129,7 +129,8 @@ export interface PreviewContext {
   /**
    * ERC-4337 operations for EntryPoint v0.6 and v0.7 are signed as their bare hash (personal_sign of
    * getUserOpHash). To decode one, the caller supplies the operation, as bundlers' RPC carries it. It is hashed as
-   * the EntryPoint does and checked against the message being signed.
+   * the EntryPoint does and checked against the message being signed. A `signature` in it (the wallet's stub for
+   * the account, as for gas estimation) is what the simulation validates with; without one, a stand-in is used.
    */
   userOperation?: {
     entryPoint: string;
@@ -183,12 +184,19 @@ export interface SimulationRequest {
   /** The transaction's gas limit, gas price and EIP-2930 access list, when the request sets them (contracts can read gasleft() and tx.gasprice). */
   gas?: bigint;
   gasPrice?: bigint;
+  /**
+   * The simulated block's base fee, for calls that read it (BASEFEE): eth_simulateV1 without validation otherwise
+   * runs at 0. An ERC-4337 EntryPoint prices an operation's gas with it, and token paymasters charge from that.
+   */
+  baseFee?: bigint;
   accessList?: { address: string; storageKeys: string[] }[];
   /** Code to give accounts for the simulation (EIP-7702 authorizations: the delegation designator, or none). */
   stateOverrides?: Record<string, {
     code?: string;
     /** Storage slots (32-byte hex) set for the simulation, as eth_simulateV1 and eth_call take them. */
     stateDiff?: Record<string, string>;
+    /** For a precompile given code: the address its original moves to (eth_simulateV1's movePrecompileToAddress). */
+    movePrecompileToAddress?: string;
   }>;
   /**
    * Signed EIP-7702 authorizations, in JSON-RPC form. Simulators that can apply them natively (eth_simulateV1) do,
@@ -271,6 +279,8 @@ export interface SimulationResult {
   note?: string;
   /** What the call returned (or its revert data), when the simulator reports it. */
   returnData?: string;
+  /** The call's logs as emitted, when the simulator reports them (native transfers aren't among them). */
+  logs?: { address: string; topics: string[]; data: string }[];
   /** The amounts were read from balances before and after the call (not taken from the logs). */
   balancesRead?: boolean;
 }

@@ -3,11 +3,12 @@
 import { decodeAbiParameters, hexToBytes, type Hex } from 'viem';
 import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
-import { describeSafeTx, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
-import { simulateExecution } from '../erc4337-sim.ts';
+import { describeSafeTx, reportConfigChanges, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
+import { simulateExecution, simulateOperation, STUB_SIGNATURE } from '../erc4337-sim.ts';
+import { approvalsFor, config as safeConfig, readConfig, reads } from '../safe-sim.ts';
 import { decodeTransaction } from '../evm/transaction.ts';
-import { gasDetails, nonceCheck, paymasterOf } from './user-operation.ts';
-import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
+import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
+import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
@@ -123,6 +124,27 @@ const safeOp: TypedAdapter = async (data, env) => {
     // Run as the EntryPoint runs it: the EntryPoint calls the Safe, whose fallback handler (the module) has it
     // execute the call with execTransactionFromModule. Deploys the Safe first when the operation does.
     const execution: SafeExecution = async watch => {
+      // The whole operation as the EntryPoint runs it: the module's validation (with the owners' signatures stood in
+      // for), the call, gas and any paymaster, then the Safe's configuration read again.
+      if (known && sameAddress(entryPoint, known.entryPoint) && nonce !== null && verification !== null && call !== null && preVerification !== null && maxFee !== null && maxPriority !== null) {
+        const before = deploys ? undefined : await readConfig(env.deps, chainId, safe);
+        const digest = typedDataDigest(data);
+        const approvals = before && digest ? approvalsFor(before, digest as Hex) : null;
+        // The module's signature: validAfter and validUntil (6 bytes each), then the owners' signatures.
+        const window = `${validAfter.toString(16).padStart(12, '0')}${validUntil.toString(16).padStart(12, '0')}`;
+        const signature = `0x${window}${(approvals?.signatures ?? STUB_SIGNATURE).slice(2)}` as Hex;
+        const run = await simulateOperation({ chainId, entryPoint, sender: safe, nonce, initCode: initCode as Hex, callData, callGasLimit: call, verificationGasLimit: verification, preVerificationGas: preVerification,
+          maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...(env.signer && { signer: env.signer }), watch,
+          ...(approvals && { stateOverrides: { [safe]: { stateDiff: approvals.stateDiff } } }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
+        const changes = await reportRun(run, { sender: safe, paymaster: pm.paymaster, entryPointName: known.entryPointName, signature }, chainId, env, b,
+          { deploys, validation: approvals ? `with the Safe's ${before!.threshold === 1n ? 'owner' : `${before!.threshold} owners`} approving it on-chain in place of ${before!.threshold === 1n ? 'their signature' : 'their signatures'}` : "with a stand-in for the owner's signature, which ecrecover attributes to the signer" });
+        if (changes) {
+          const after = run?.after?.every(r => r.status === 'success') ? run.after : undefined;
+          const config = after && safeConfig(after.map(r => r.returnData as Hex));
+          if (before && config) reportConfigChanges(before, config, b);
+          return { assetChanges: changes, note: '' };
+        }
+      }
       const run = await simulateExecution({ chainId, entryPoint, sender: safe, callData, ...(deploys && { initCode: initCode as Hex }), watch }, env.deps);
       return run ? safeOutcome(run.result, safe, chainId, env, b, `The operation was simulated as the EntryPoint runs it${run.deployed ? ', after deploying the Safe' : ''}: through the Safe's 4337 module, delegatecalls included. Its signature check and gas payment aren't part of the simulation.`) : null;
     };

@@ -15,6 +15,7 @@ const ABI = parseAbi([
   'function nonce() view returns (uint256)',
   'function getStorageAt(uint256 offset, uint256 length) view returns (bytes)',
   'function getModulesPaginated(address start, uint256 pageSize) view returns (address[] array, address next)',
+  'function masterCopy() view returns (address)',
   'function getTransactionHash(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, uint256 _nonce) view returns (bytes32)',
   'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool)',
 ]);
@@ -35,26 +36,57 @@ export const SAFE_SINGLETONS: Record<string, string> = {
   '0xff51a5898e281db6dfc7855790607438df2ca44b': 'Safe 1.5.0', '0xedd160febbd92e350d4d398fb636302fccd67c7e': 'Safe 1.5.0 (L2)',
 };
 
-export interface SafeConfig { owners: string[]; threshold: bigint; singleton: string; guard: string; fallbackHandler: string; modules: string[] }
+export interface SafeConfig {
+  owners: string[]; threshold: bigint; singleton: string; guard: string; fallbackHandler: string; modules: string[];
+  /** Only the singleton could be read: the Safe no longer answers as a Safe (its code was replaced). */
+  partial?: boolean;
+}
 export interface SafeRun { result: SimulationResult; executed: boolean; before: SafeConfig; after?: SafeConfig }
 
 const word = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');
 const addr = (w: Hex | string) => `0x${w.slice(-40)}`.toLowerCase();
-const reads = (safe: string): { to: string; data: Hex }[] => [
+export const reads = (safe: string): { to: string; data: Hex }[] => [
   { to: safe, data: encodeFunctionData({ abi: ABI, functionName: 'getOwners' }) },
   { to: safe, data: encodeFunctionData({ abi: ABI, functionName: 'getThreshold' }) },
-  ...(['singleton', 'guard', 'fallbackHandler'] as const).map(k => ({ to: safe, data: encodeFunctionData({ abi: ABI, functionName: 'getStorageAt', args: [SLOTS[k], 1n] }) })),
+  // The proxy answers masterCopy() itself (from slot 0), so the singleton reads even when it no longer is a Safe's.
+  { to: safe, data: encodeFunctionData({ abi: ABI, functionName: 'masterCopy' }) },
+  ...(['guard', 'fallbackHandler'] as const).map(k => ({ to: safe, data: encodeFunctionData({ abi: ABI, functionName: 'getStorageAt', args: [SLOTS[k], 1n] }) })),
   { to: safe, data: encodeFunctionData({ abi: ABI, functionName: 'getModulesPaginated', args: [SENTINEL, 20n] }) },
 ];
-function config(out: (Hex | undefined)[]): SafeConfig | undefined {
-  if (out.some(o => !o || o === '0x')) return undefined;
+export function config(out: (Hex | undefined)[]): SafeConfig | undefined {
+  const singleton = out[2] && /^0x[0-9a-f]{64}$/i.test(out[2]) ? addr(out[2]) : undefined;
+  if (!singleton) return undefined;
+  const partial = { owners: [], threshold: 0n, singleton, guard: '', fallbackHandler: '', modules: [], partial: true };
+  if (out.some(o => !o || o === '0x')) return partial;
   try {
     const [owners] = decodeAbiParameters([{ type: 'address[]' }], out[0]!);
     const [threshold] = decodeAbiParameters([{ type: 'uint256' }], out[1]!);
     const slot = (o: Hex) => addr(decodeAbiParameters([{ type: 'bytes' }], o)[0]);
     const [modules] = decodeAbiParameters([{ type: 'address[]' }, { type: 'address' }], out[5]!);
-    return { owners: owners.map(o => o.toLowerCase()), threshold, singleton: slot(out[2]!), guard: slot(out[3]!), fallbackHandler: slot(out[4]!), modules: modules.map(m => m.toLowerCase()) };
-  } catch { return undefined; }
+    return { owners: owners.map(o => o.toLowerCase()), threshold, singleton, guard: slot(out[3]!), fallbackHandler: slot(out[4]!), modules: modules.map(m => m.toLowerCase()) };
+  } catch { return partial; }
+}
+
+/** The Safe's configuration now (owners, threshold, singleton, guard, fallback handler, modules), undefined if it isn't a readable Safe. */
+export async function readConfig(deps: Dependencies, chainId: number, safe: string): Promise<SafeConfig | undefined> {
+  const rpc = deps.rpc;
+  if (!rpc?.has(chainId)) return undefined;
+  const c = config(await Promise.all(reads(safe.toLowerCase()).map(r => rpc.call(chainId, 'eth_call', [{ to: r.to, data: r.data }, 'latest']).then(o => String(o) as Hex).catch(() => undefined))));
+  return c?.partial ? undefined : c;
+}
+
+/**
+ * Signatures by the first `threshold` owners (ascending, as checkSignatures requires) for a hash the Safe checks,
+ * standing in as on-chain approvals: the hash marked approved for each in approvedHashes (the storage to override),
+ * and their approved-hash signatures (r = owner, s = 0, v = 1). Null if the Safe has fewer owners than its threshold.
+ */
+export function approvalsFor(before: SafeConfig, hash: Hex): { stateDiff: Record<string, string>; signatures: Hex } | null {
+  const signers = [...before.owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1)).slice(0, Number(before.threshold));
+  if (signers.length < Number(before.threshold) || !/^0x[0-9a-f]{64}$/i.test(hash)) return null;
+  return {
+    stateDiff: Object.fromEntries(signers.map(o => [keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [hash, keccak256(`0x${word(o)}${word(APPROVED_HASHES_SLOT)}` as Hex)])), `0x${word(1n)}`])),
+    signatures: concatHex(signers.map(o => `0x${word(o)}${word(0n)}01` as Hex)),
+  };
 }
 
 /**
@@ -67,7 +99,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   const safe = t.safe.toLowerCase();
   const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, 'latest'])) as Hex;
   const before = config(await Promise.all(reads(safe).map(r => call(r.data).catch(() => undefined))));
-  if (!before) return null; // not a readable Safe
+  if (!before || before.partial) return null; // not a readable Safe
   let exec: SimulationRequest;
   if (opts.request) exec = { ...opts.request, account: safe };
   else {
@@ -75,10 +107,9 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     // `threshold` owners, in ascending order as checkSignatures requires, and sign with those approvals (v = 1).
     const nonce = BigInt(await call(encodeFunctionData({ abi: ABI, functionName: 'nonce' })));
     const hash = await call(encodeFunctionData({ abi: ABI, functionName: 'getTransactionHash', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, nonce] }));
-    const signers = [...before.owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1)).slice(0, Number(before.threshold));
-    if (signers.length < Number(before.threshold) || !/^0x[0-9a-f]{64}$/i.test(hash)) return null;
-    const stateDiff = Object.fromEntries(signers.map(o => [keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [hash, keccak256(`0x${word(o)}${word(APPROVED_HASHES_SLOT)}` as Hex)])), `0x${word(1n)}`]));
-    const signatures = concatHex(signers.map(o => `0x${word(o)}${word(0n)}01` as Hex));
+    const approvals = approvalsFor(before, hash);
+    if (!approvals) return null;
+    const { stateDiff, signatures } = approvals;
     const executor = (opts.executor && before.owners.includes(opts.executor.toLowerCase()) ? opts.executor : before.owners[0]).toLowerCase();
     exec = { chainId, from: executor, account: safe, to: safe, value: 0n, stateOverrides: { [safe]: { stateDiff } },
       data: encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, signatures] }) };
@@ -99,7 +130,8 @@ export function configChanges(before: SafeConfig, after: SafeConfig): ConfigChan
   const zero = (a: string) => /^0x0{40}$/.test(a);
   if (after.singleton !== before.singleton) out.push(SAFE_SINGLETONS[after.singleton]
     ? { severity: 'caution', code: 'safe_upgrade', message: `The Safe's code changes to ${SAFE_SINGLETONS[after.singleton]} (${after.singleton}), from ${SAFE_SINGLETONS[before.singleton] ?? before.singleton}.` }
-    : { severity: 'danger', code: 'safe_code_replaced', message: `After this transaction the Safe runs the code at ${after.singleton}, which isn't one of Safe's own: whoever controls that code controls the Safe and everything in it. This is what the Bybit theft did.` });
+    : { severity: 'danger', code: 'safe_code_replaced', message: `After this transaction the Safe runs the code at ${after.singleton}, which isn't one of Safe's own${after.partial ? ' (the Safe no longer even answers as a Safe)' : ''}: whoever controls that code controls the Safe and everything in it. This is what the Bybit theft did.` });
+  if (after.partial) return out; // nothing else can be read
   const added = after.owners.filter(o => !before.owners.includes(o)), removed = before.owners.filter(o => !after.owners.includes(o));
   if (added.length) out.push({ severity: 'caution', code: 'safe_owners_added', message: `Adds ${added.length === 1 ? 'an owner' : `${added.length} owners`}: ${added.join(', ')}.` });
   if (removed.length) out.push({ severity: 'caution', code: 'safe_owners_removed', message: `Removes ${removed.length === 1 ? 'an owner' : `${removed.length} owners`}: ${removed.join(', ')}.` });

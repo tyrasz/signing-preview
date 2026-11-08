@@ -177,3 +177,61 @@ contract BlockHashReader {
         if (h == 0) revert L1BlockHashNotAvailable();
     }
 }
+
+/// ERC-4337 (EntryPoint v0.7): an account whose owner signs the operation's hash (eth_sign form), and a paymaster
+/// that charges in a token after the calls (postOp).
+struct PackedUserOperation { address sender; uint256 nonce; bytes initCode; bytes callData; bytes32 accountGasLimits; uint256 preVerificationGas; bytes32 gasFees; bytes paymasterAndData; bytes signature; }
+contract Account4337 {
+    address public owner;
+    address public entryPoint;
+    constructor(address o, address ep) { owner = o; entryPoint = ep; }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        bytes calldata sig = op.signature;
+        if (sig.length != 65) return 1;
+        bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        return ecrecover(h, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64])) == owner ? 0 : 1;
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
+contract TokenPaymaster {
+    address public entryPoint;
+    Token public token;
+    constructor(address ep, Token t) { entryPoint = ep; token = t; }
+    function validatePaymasterUserOp(PackedUserOperation calldata op, bytes32, uint256) external view returns (bytes memory, uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        return (abi.encode(op.sender), 0);
+    }
+    /// 1 token base unit per 10^9 wei of gas cost, plus one.
+    function postOp(uint8, bytes calldata context, uint256 actualGasCost, uint256) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        token.transferFrom(abi.decode(context, (address)), address(this), actualGasCost / 1e9 + 1);
+    }
+}
+/// The same account for EntryPoint v0.6, whose operations aren't packed.
+struct UserOperationV06 { address sender; uint256 nonce; bytes initCode; bytes callData; uint256 callGasLimit; uint256 verificationGasLimit; uint256 preVerificationGas; uint256 maxFeePerGas; uint256 maxPriorityFeePerGas; bytes paymasterAndData; bytes signature; }
+contract Account4337V06 {
+    address public owner;
+    address public entryPoint;
+    constructor(address o, address ep) { owner = o; entryPoint = ep; }
+    function validateUserOp(UserOperationV06 calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        bytes calldata sig = op.signature;
+        if (sig.length != 65) return 1;
+        bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        return ecrecover(h, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64])) == owner ? 0 : 1;
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}

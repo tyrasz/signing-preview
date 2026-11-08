@@ -11,7 +11,7 @@ import { decodeTransaction, simulationNote } from './evm/transaction.ts';
 import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
 import type { AssetChange, SimulationRequest, SimulationResult } from './types.ts';
-import { configChanges, simulateSafeExecution } from './safe-sim.ts';
+import { configChanges, simulateSafeExecution, type SafeConfig } from './safe-sim.ts';
 
 /** Safe's libraries (safe-global/safe-deployments v1.3.0 canonical and EIP-155, v1.4.1, v1.5.0), deployed on every chain here. */
 export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 'multisend_call_only' | 'sign_message' | 'create_call' | 'migration' }> = {
@@ -118,7 +118,7 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     try {
       const out = await execution([]);
       if (out && 'reverted' in out) b.warn('caution', 'safe_tx_reverts', `The transaction is expected to fail when the Safe runs it${out.reverted ? `: ${out.reverted}` : ''}.`);
-      else if (out) { b.note(out.note); return { ...r, assetChanges: out.assetChanges }; }
+      else if (out) { if (out.note) b.note(out.note); return { ...r, assetChanges: out.assetChanges }; }
     } catch { /* not simulated */ }
     return r;
   };
@@ -176,7 +176,7 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     try {
       const r = await execution(decoded.flatMap(d => (d as Decoded).watch ?? []));
       if (r && 'reverted' in r) { ran = true; b.warn('caution', 'safe_tx_reverts', `The transaction is expected to fail when the Safe runs it${r.reverted ? `: ${r.reverted}` : ''}.`); }
-      else if (r) { ran = true; assetChanges = r.assetChanges; b.note(r.note); }
+      else if (r) { ran = true; assetChanges = r.assetChanges; if (r.note) b.note(r.note); }
     } catch { ran = false; }
   }
   // Otherwise simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way).
@@ -204,13 +204,18 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   return { title, summary: `The Safe ${shortAddress(safe)} ${calls.length === 1 ? (t.operation === 1 ? 'delegatecalls' : 'makes this call') : `runs ${calls.length} calls${label ? ` through ${label}` : ''}`}: ${titles.slice(0, 3).join('; ')}${calls.length > 3 ? '; …' : ''}.`, status, assetChanges };
 }
 
-/** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes, or why it fails. */
+/** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes (and a note, unless it added its own), or why it fails. */
 export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: Pick<AdapterEnv, 'deps'>, b: PreviewBuilder, how: string): Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null> {
   if (sim.status === 'reverted') return { reverted: sim.revertReason ?? '' };
   // The probe measures the call's sender, which isn't the Safe here: its balance reads don't apply.
   if (sim.limited || sim.basis === 'state') return null;
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}` };
+}
+
+/** Warns of what a simulated transaction changes in the Safe's configuration, unless a static warning already says it. */
+export function reportConfigChanges(before: SafeConfig, after: SafeConfig, b: PreviewBuilder): void {
+  for (const c of configChanges(before, after)) if (!b.warnings.some(w => w.code === COVERED[c.code])) b.warn(c.severity, c.code, c.message);
 }
 
 /** Static warnings that already cover a configuration change found by simulation. */
@@ -224,7 +229,7 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
   return async () => {
     const run = await simulateSafeExecution(t, chainId, env.deps, opts);
     if (!run) return null;
-    if (run.after) for (const c of configChanges(run.before, run.after)) if (!b.warnings.some(w => w.code === COVERED[c.code])) b.warn(c.severity, c.code, c.message);
+    if (run.after) reportConfigChanges(run.before, run.after, b);
     if (!run.executed) return { reverted: run.result.status === 'reverted' ? run.result.revertReason ?? '' : 'the Safe reports that the call failed (ExecutionFailure)' };
     return safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, opts.request
       ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'

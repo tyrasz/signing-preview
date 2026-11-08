@@ -160,8 +160,11 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   const HASH = `0x${'ab'.repeat(32)}` as Hex;
   const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
   const slotBytes = (a: string) => enc([{ type: 'bytes' }], [`0x${a.slice(2).padStart(64, '0')}` as Hex]);
-  const view = (afterSingleton?: string) => (data: string) => {
+  // After a takeover (`broken`), the Safe's code is the attacker's: only the proxy's own masterCopy() still answers.
+  const view = (afterSingleton?: string, broken = false) => (data: string) => {
     const sel = data.slice(0, 10);
+    if (sel === '0xa619486e') return enc([{ type: 'address' }], [(afterSingleton ?? SINGLETON) as Hex]);
+    if (broken) return '0x';
     if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [OWNERS as Hex[]]);
     if (sel === '0xe75235b8') return word(2n);
     if (sel === '0xaffed0e0') return word(7n);
@@ -175,12 +178,12 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
     return '0x';
   };
   const batches: SimulationRequest[][] = [];
-  const d = (afterSingleton?: string): Dependencies => ({ ...deps,
+  const d = (afterSingleton?: string, broken = false): Dependencies => ({ ...deps,
     rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? view()((p[0] as { data: string }).data) : '0x' },
-    simulator: { simulate: async () => null, simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => ({ status: 'success' as const, source: 'mock', transfers: [], returnData: i === 0 ? word(1n) : view(afterSingleton)(r.data) })); } } });
+    simulator: { simulate: async () => null, simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => ({ status: 'success' as const, source: 'mock', transfers: [], returnData: i === 0 ? word(1n) : view(afterSingleton, broken)(r.data) })); } } });
   // The Bybit pattern: a delegatecall whose calldata looks like a transfer, run as the Safe, replaces its singleton.
-  const bybit = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516'));
-  assert.ok(codes(bybit).includes('safe_code_replaced'));
+  const bybit = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516', true));
+  assert.match(bybit.warnings.find(w => w.code === 'safe_code_replaced')?.message ?? '', /runs the code at 0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516, which isn't one of Safe's own \(the Safe no longer even answers as a Safe\)/);
   assert.match(bybit.decoding.notes.join(' '), /execTransaction itself/);
   // The request: from an owner, with approvedHashes set for the two lowest owners, signed with approvals (v = 1).
   const exec = batches.at(-1)![0];

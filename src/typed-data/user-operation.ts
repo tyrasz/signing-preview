@@ -8,7 +8,8 @@ import { decodeTransaction, simulationNote } from '../evm/transaction.ts';
 import { netChanges } from '../evm/effects.ts';
 import type { AssetChange } from '../types.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
-import { entryPointDeposit, simulateExecution, type ExecutionInput } from '../erc4337-sim.ts';
+import { entryPointDeposit, simulateExecution, simulateOperation, type ExecutionInput, type OperationRun } from '../erc4337-sim.ts';
+import { tokenInfo } from '../evm/common.ts';
 
 /** EntryPoints that sign UserOperations as EIP-712 typed data, at the same address on every chain (checked on Ethereum, Arbitrum One and HyperEVM). */
 export const ENTRY_POINTS: Record<string, string> = {
@@ -93,7 +94,7 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   const gas = limits && fees && preVerificationGas !== null ? { verification: limits[0], call: limits[1], preVerification: preVerificationGas, maxPriority: fees[0], maxFee: fees[1], ...pm } : null;
   const packed = nonce !== null && hex(m.accountGasLimits) && hex(m.gasFees) && preVerificationGas !== null
     ? { nonce, initCode, accountGasLimits: hex(m.accountGasLimits)!, preVerificationGas, gasFees: hex(m.gasFees)!, paymasterAndData } : undefined;
-  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, packed, userOpHash: typedDataDigest(data) ?? undefined }, env);
+  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, paymasterAndData, packed, userOpHash: typedDataDigest(data) ?? undefined }, env);
 };
 
 /** A UserOperation, whichever EntryPoint version and however it was signed. */
@@ -102,6 +103,74 @@ export interface Operation {
   initCode: Hex; callData: Hex | null; gas: OpGas | null; paymaster: string | null;
   /** For accounts run through executeUserOp (EntryPoint v0.7 on): the packed operation and its hash. */
   packed?: ExecutionInput['packed']; userOpHash?: Hex;
+  /** The paymaster's field as signed (needed to simulate the whole operation). */
+  paymasterAndData?: Hex;
+  /** A signature to validate with in simulation: the wallet's stub for this account, when it supplies one. */
+  signature?: Hex;
+}
+
+/** What the EntryPoint's rejection codes mean (eth-infinitism's EntryPoint, all versions). */
+const REJECTIONS: Record<string, string> = {
+  AA10: 'it deploys the account, which already exists', AA13: 'deploying the account fails', AA14: "the factory doesn't deploy this account", AA15: "the factory doesn't deploy this account",
+  AA20: "the account doesn't exist and the operation doesn't deploy it", AA21: "the account can't prefund its gas: its EntryPoint deposit and balance are less than the most the operation can cost",
+  AA22: 'it has expired or is not valid yet', AA23: "the account's validation reverts", AA25: "its nonce isn't the account's next", AA26: "the account's validation needs more gas than the operation allows",
+  AA30: 'the paymaster has no code', AA31: "the paymaster's EntryPoint deposit can't cover the gas", AA32: "the paymaster's approval has expired or is not valid yet", AA33: 'the paymaster refuses to pay for it',
+  AA34: "the paymaster's signature doesn't check out", AA36: "the paymaster's validation needs more gas than the operation allows", AA40: 'validation needs more gas than the operation allows', AA41: 'validation needs more gas than the operation allows',
+  AA50: "the paymaster's charge after the calls (postOp) fails", AA51: "the gas cost is more than the account prefunded", AA95: 'the EntryPoint runs out of gas',
+};
+/** Warnings that already say what a rejection code does. */
+const REJECTION_COVERED: Record<string, string> = { AA21: 'userop_cannot_prefund', AA25: 'userop_nonce_used' };
+
+/**
+ * Reports a whole-operation simulation (see simulateOperation) and returns its balance changes. Null when the
+ * operation's calls should be simulated on their own instead: the simulation didn't run, or the account's
+ * validation reverted on the stand-in signature.
+ */
+export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'sender' | 'paymaster' | 'entryPointName' | 'signature'>, chainId: number, env: TypedEnv, b: PreviewBuilder,
+  how: { deploys: boolean; delegate?: string; /** How validation was run, in place of the stand-in signature's wording. */ validation?: string }): Promise<AssetChange[] | null> {
+  if (!run) return null;
+  const sender = u.sender.toLowerCase();
+  const native = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}`;
+  if (run.rejected) {
+    const code = run.rejected.slice(0, 4);
+    // A reverting validation is most likely the stand-in signature's shape (passkeys, wrapped signatures): the
+    // calls are simulated on their own instead. Anything else is the bundler's answer.
+    if (code === 'AA23') { b.note(`The account's validation reverts on a stand-in for the signature (${run.rejected}), so only its calls were simulated.`); return null; }
+    // No code and nothing deploying it: an EIP-7702 account delegated in the same transaction (see userop_account_no_code).
+    if (code === 'AA20' && !how.deploys) return null;
+    // A nonce ahead of the account's waits for the operations before it (the nonce check notes that): not a rejection.
+    if (code === 'AA25' && b.notes.some(n => /must run before this one/.test(n))) return null;
+    if (!REJECTION_COVERED[code] || !b.warnings.some(w => w.code === REJECTION_COVERED[code])) b.warn('caution', 'userop_rejected', `Bundlers would reject this operation: ${REJECTIONS[code] ?? 'the EntryPoint refuses it'} (${run.rejected}). Nothing it does happens unless that changes.`);
+    return null;
+  }
+  const sim = run.result;
+  const now = env.now / 1000;
+  const pm = u.paymaster;
+  if (run.paymaster?.signatureFailed) b.warn('caution', 'userop_paymaster_signature', `The paymaster's signature in this operation doesn't check out (it may be for other gas values, or stale): bundlers will reject it until the paymaster signs again.`);
+  else if (run.paymaster && run.paymaster.validUntil && run.paymaster.validUntil < now) b.warn('caution', 'userop_paymaster_expired', `The paymaster's sponsorship expired at ${new Date(run.paymaster.validUntil * 1000).toISOString()}: bundlers will reject this operation.`);
+  else if (run.paymaster && run.paymaster.validAfter > now) b.warn('info', 'userop_paymaster_not_yet', `The paymaster's sponsorship starts at ${new Date(run.paymaster.validAfter * 1000).toISOString()}: bundlers will hold the operation until then.`);
+  if (run.account?.validUntil && run.account.validUntil < now) b.warn('caution', 'userop_expired', `The account only accepts this operation until ${new Date(run.account.validUntil * 1000).toISOString()}, which has passed.`);
+  else if (run.account && run.account.validAfter > now) b.warn('info', 'userop_not_yet_valid', `The account accepts this operation from ${new Date(run.account.validAfter * 1000).toISOString()}: bundlers will hold it until then.`);
+
+  b.detail('Gas cost (simulated)', `${native(run.paid)}, paid by ${pm ? `the paymaster ${shortAddress(pm)} from its EntryPoint deposit` : 'the account (from its EntryPoint deposit, topped up from its balance)'}`, run.paid.toString());
+  // A token paymaster's charge: what the account's tokens went to the paymaster, net (some refund in postOp).
+  if (pm) {
+    const charge = new Map<string, bigint>();
+    for (const l of sim.logs ?? []) if (l.topics[0] === '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef' && l.topics.length === 3 && l.data.length >= 66) {
+      const from = `0x${l.topics[1].slice(26)}`, to = `0x${l.topics[2].slice(26)}`, v = BigInt(l.data.slice(0, 66));
+      if (from === sender && to === pm) charge.set(l.address, (charge.get(l.address) ?? 0n) + v);
+      if (from === pm && to === sender) charge.set(l.address, (charge.get(l.address) ?? 0n) - v);
+    }
+    const parts: string[] = [];
+    for (const [token, v] of charge) if (v > 0n) { const info = await tokenInfo(env, chainId, token); parts.push(info ? `${formatUnits(v, info.decimals)} ${info.symbol}` : `${v} base units of ${shortAddress(token)}`); }
+    if (parts.length) b.detail('Paymaster charge', `${parts.join(' and ')}, from the account (included in the balance changes)`);
+  }
+  if (run.postOpReverted) b.warn('caution', 'userop_postop_reverts', `The paymaster's charge after the calls (postOp) fails: ${run.postOpReverted}. The EntryPoint then undoes the calls, and the operation still pays ${native(run.paid)} for gas.`);
+  else if (!run.executed) b.warn('caution', 'userop_execution_reverts', `The operation's calls fail when the EntryPoint runs them${run.revertReason ? `: ${run.revertReason}` : ''}. It can still be included, and ${pm ? 'the paymaster' : 'the account'} pays ${native(run.paid)} for the gas.`);
+  const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
+  const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
+  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : u.signature ? " (with the wallet's stand-in signature)" : ` (with a stand-in for the signature, which doesn't exist until it's signed: ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}${run.account?.signatureFailed ? ", but the account doesn't accept it as theirs, so its own signature check isn't simulated" : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
+  return changes;
 }
 
 /** What a UserOperation does: its account, setup, gas, and its callData decoded and simulated as the account's own calls. */
@@ -153,9 +222,22 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   for (const w of inner.b.warnings) b.warnings.push(w);
   for (const n of inner.b.notes) b.note(n);
 
-  // Simulated as the EntryPoint runs it: the account deployed first if it's new, then called from the EntryPoint.
+  // The whole operation simulated as the EntryPoint runs it: validation, the calls, gas and the paymaster's charge.
   let assetChanges: AssetChange[] = inner.assetChanges;
-  if (env.deps.simulator && chainId !== null) {
+  let whole: AssetChange[] | null = null;
+  if (env.deps.simulator && chainId !== null && u.gas && nonce !== null && u.paymasterAndData !== undefined) {
+    // The EntryPoint receives an EIP-7702 account's initCode with the 0x7702 marker where the typed data has its delegate.
+    const onChainInit = lead && mine && !deploys && !initCode.startsWith(EIP7702_MARKER) && u.entryPointName && !u.entryPointName.endsWith('v0.6') && !u.entryPointName.endsWith('v0.7')
+      ? `${EIP7702_MARKER}${initCode.slice(42)}` as Hex : initCode;
+    try {
+      const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData, callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
+        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
+      whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
+    } catch { whole = null; }
+    if (whole && (whole.length || !assetChanges.length)) assetChanges = whole;
+  }
+  // Otherwise its calls alone, as the EntryPoint makes them: the account deployed first if it's new, then called.
+  if (whole === null && env.deps.simulator && chainId !== null) {
     try {
       const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
       const sim = run?.result;

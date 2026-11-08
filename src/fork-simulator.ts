@@ -12,7 +12,7 @@
 // Approvals come from Approval logs and are read back from the token after each call.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createEVM, EVMError, type EVM } from '@ethereumjs/evm';
+import { createEVM, EVMError, getActivePrecompiles, type EVM } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
@@ -583,7 +583,15 @@ export class ForkSimulator implements Simulator {
       putBlock: async () => {},
       shallowCopy() { return this; },
     };
-    const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: forwarded, blockchain });
+    // Precompiles given code for the simulation (eth_simulateV1's movePrecompileToAddress): the code runs at the
+    // precompile's address, which is no longer a precompile, and the precompile at the address it moves to.
+    const active = getActivePrecompiles(common);
+    const moved = reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).flatMap(([a, o]) => {
+      const fn = o.movePrecompileToAddress ? active.get(hexOf(a).slice(2)) : undefined;
+      return fn ? [{ address: hexOf(a) as Hex }, { address: hexOf(o.movePrecompileToAddress!) as Hex, function: fn }] : [];
+    });
+    const precompiles = [...forwarded, ...moved];
+    const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain });
     // Only the calls themselves are traced, not the balance and approval reads around them.
     let trace: StorageStep[] | undefined, callIndex = 0, recording = false;
     if (this.opts.trace) {
@@ -608,7 +616,7 @@ export class ForkSimulator implements Simulator {
     // second EVM, instead of running everything again with the token watched from the start.
     let pre: EVM | undefined;
     const balanceBefore = async (token: string, owner: string) => {
-      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: forwarded, blockchain });
+      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: precompiles, blockchain });
       const r = await viewOn(pre, token, `0x70a08231${owner.slice(2).padStart(64, '0')}` as Hex);
       return r ? word(r) : undefined;
     };
@@ -709,7 +717,7 @@ export class ForkSimulator implements Simulator {
         const s = r && decodeState(ap, bytesToHex(r) as Hex);
         if (s) approvalState.push(s);
       }
-      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue) });
+      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })) });
     }
     return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, trace };
   }
