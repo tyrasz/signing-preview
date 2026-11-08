@@ -189,7 +189,7 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   const signers = [OWNERS[1], OWNERS[0]];
   const slot = (o: string) => k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [o as Hex, 8n]))]));
   assert.deepEqual(Object.keys(exec.stateOverrides![SAFE].stateDiff!).sort(), signers.map(slot).sort());
-  const signatures = (decodeCall({ abi: SAFE_ABI, data: exec.data as Hex }).args as unknown[])[9] as string;
+  const signatures = (decodeCall({ abi: SAFE_ABI, data: exec.data as Hex }).args as unknown as unknown[])[9] as string;
   assert.equal(signatures, `0x${signers.map(o => `${o.slice(2).padStart(64, '0')}${'00'.repeat(32)}01`).join('')}`);
   // Moving to an official singleton is an upgrade, a caution.
   const upgrade = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xff51a5898e281db6dfc7855790607438df2ca44b'));
