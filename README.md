@@ -415,6 +415,12 @@ npm run accuracy -- --blocks 20 --per-block 3 --max-index 6
 npm run accuracy -- --chain 42161 --blocks 15 --per-block 2 --max-index 12 --simulators eth_simulateV1
 ```
 
+`--follow <seconds>` keeps up with the chain instead of looking back: each new block is replayed as soon as it appears, while its parent's state is still there, and senders seen earlier in the run are left out, so bots don't fill the sample. This makes long runs possible on Arbitrum, whose public RPC keeps only about 30 seconds of state:
+
+```bash
+npm run accuracy -- --chain 42161 --follow 420 --per-block 2 --simulators eth_simulateV1
+```
+
 Run on 2026-11-05:
 
 | | Transactions | Outcome | Token movements | Native change | Approvals | Gas exact |
@@ -423,6 +429,7 @@ Run on 2026-11-05:
 | `ForkSimulator` | 47 | 100% | 11/11 | 100% | 2/2 | 46/47 |
 | `eth_simulateV1`, EIP-7702 transactions only (`--only-type 0x4`) | 21 | 100% | 3/3 | 100% | 5/5 | 0/21 |
 | `eth_simulateV1` on Arbitrum One (`--chain 42161`) | 21 | 100% | 6/6 | 100% | 1/1 | 100% (L2 part) |
+| `eth_simulateV1` on Arbitrum One, following the chain for 7 minutes (`--follow 420`) | 69 | 100% | 25/25 | 100% | 6/6 | 68/69 (L2 part, below) |
 | Both, a later run with signed authorizations passed natively | 46 (34 for `eth_simulateV1`: the node throttled 12) | 100% | 14/14 and 15/15 | 100% | 1/1 | 100% |
 | Both, after the `BLOCKHASH` fix (below) | 74 (71 for `eth_simulateV1`: the node throttled 3) | 100% | 29/29 | 100% | 1/1 | 100% |
 
@@ -432,7 +439,7 @@ Run on 2026-11-05:
 - Unsigned authorizations (a request the wallet has yet to sign) can't be applied by a node, so the code override stands in for their effect, and for their gas, an authorization signed by a throwaway account set up the same way (it exists, its nonce matches) goes in the call's list: the node charges and refunds it as the chain will the wallet's own. Replaying the sender's own authorizations as unsigned (`--unsigned-7702`), gas was exact in all 8 transactions the node answered; an earlier estimate (adding 25,000 less 12,500) was 7,500 short in 2 of 5, where the refund cap depended on the call's own refunds.
 - `ForkSimulator` applies authorizations as the chain does: the sender's nonce first, then each one for this chain whose authority has no code (or a delegation) and whose nonce matches sets the code, bumps the nonce, and earns the refund. It was exact on the type-4 transactions replayed with it, signed and unsigned (few: its replays include every earlier transaction of the block, so only those early in a block were run).
 - A self-sponsored type-4 transaction (DAI −1,000, USDC +1,000 through the account's own batch) showed no balance changes: a call to the account itself gave its changes the account as counterparty, so they cancelled out. All three simulation paths now give such changes an unknown counterparty.
-- On Arbitrum, ArbOS's own transactions are skipped and gas is compared without the receipt's L1 data part; the fork simulator, which doesn't model ArbOS, isn't used there. Arbitrum's public RPC keeps about 30 seconds of state and rate-limits hard, so runs are short (two of 23 transactions were rate-limited in that run; the simulator now retries).
+- On Arbitrum, ArbOS's own transactions are skipped; the fork simulator, which doesn't model ArbOS, isn't used there. Arbitrum's public RPC keeps about 30 seconds of state and rate-limits hard, so looking back only reaches a few blocks (two of 23 transactions were rate-limited in that run; the simulator now retries); following the chain replays each block within seconds. Given a base fee, as replays give it (the block's own), the node's `eth_simulateV1` now also charges the L1 data part, estimated for the unsigned transaction at a moving price: gas matches when it is the receipt's L2 part plus an L1 charge between none and twice the receipt's. In the 7-minute run that charge was 86–133% of the receipt's (median 111%); the one difference is a swap whose L2 gas came out 2,525 lower with its token movements exact. A preview doesn't give the simulated block a base fee, so its gas has no L1 part, and the network fee adds `gasEstimateL1Component`'s once.
 - What a replay can't show: anything that happens between the preview and inclusion. A price, balance or nonce that moves in between moves the result too.
 
 ## Coverage of real traffic
