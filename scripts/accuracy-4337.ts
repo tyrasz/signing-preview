@@ -155,7 +155,9 @@ async function replay(hash: string): Promise<void> {
     const form = rpcForm(op);
     digest = userOpHash(readOperation(form, VERSION)!, EP, CHAIN, VERSION);
     ctx = { ...context, userOperation: { entryPoint: EP, operation: form } };
-    request = signer => ({ method: 'personal_sign', params: [digest, signer] });
+    // The hash as it is (eth_sign) for a signer whose real signature is over the bare hash, else personal_sign:
+    // an account that tries one form first (Kernel v2: the personal_sign form) runs as that wallet's signature makes it.
+    request = signer => bare.has(signer) ? { method: 'eth_sign', params: [signer, digest] } : { method: 'personal_sign', params: [digest, signer] };
   } else {
     kind = 'typed';
     // SDKs put an EIP-7702 account's delegate where the EntryPoint receives the 0x7702 marker.
@@ -165,10 +167,16 @@ async function replay(hash: string): Promise<void> {
     digest = hashTypedData(typed as never);
     request = signer => ({ method: 'eth_signTypedData_v4', params: [signer, JSON.stringify(typed)] });
   }
-  const signers: string[] = [];
+  const signers: string[] = [], bare = new Set<string>();
   const add = (a: string | undefined) => { if (a && /^0x[0-9a-f]{40}$/.test(a) && !/^0x0+$/.test(a) && !signers.includes(a)) signers.push(a); };
   if (code.startsWith('0xef0100')) add(sender);
-  for (const inner of module ? [] : innerSignatures(op.signature)) for (const h of [hashMessage({ raw: digest }), digest]) { try { add((await recoverAddress({ hash: h, signature: inner })).toLowerCase()); } catch { /* not ECDSA */ } }
+  for (const inner of module ? [] : innerSignatures(op.signature)) for (const h of [hashMessage({ raw: digest }), digest]) {
+    try {
+      const a = (await recoverAddress({ hash: h, signature: inner })).toLowerCase();
+      if (h === digest && !signers.includes(a)) bare.add(a);
+      add(a);
+    } catch { /* not ECDSA */ }
+  }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
   add(sender);
