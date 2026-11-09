@@ -185,15 +185,19 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   const bybit = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516', true));
   assert.match(bybit.warnings.find(w => w.code === 'safe_code_replaced')?.message ?? '', /runs the code at 0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516, which isn't one of Safe's own \(the Safe no longer even answers as a Safe\)/);
   assert.match(bybit.decoding.notes.join(' '), /execTransaction itself/);
-  // The request: from an owner, with approvedHashes set for the two lowest owners, signed with approvals (v = 1).
+  // The request: from an owner (the first, as the signer isn't one), who signs with the ECDSA stand-in that the
+  // replaced ecrecover attributes to them over the hash; the lowest other owner approves on-chain (v = 1).
   const exec = batches.at(-1)![0];
   assert.equal(exec.to, SAFE);
   assert.equal(exec.account, SAFE);
-  const signers = [OWNERS[1], OWNERS[0]];
+  assert.equal(exec.from, OWNERS[0]);
   const slot = (o: string) => k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [o as Hex, 8n]))]));
-  assert.deepEqual(Object.keys(exec.stateOverrides![SAFE].stateDiff!).sort(), signers.map(slot).sort());
+  assert.deepEqual(Object.keys(exec.stateOverrides![SAFE].stateDiff!), [slot(OWNERS[1])]);
+  assert.ok(exec.stateOverrides!['0x0000000000000000000000000000000000000001']?.code?.includes(OWNERS[0].slice(2)), 'ecrecover stands in for the owner');
+  const { STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
   const signatures = (decodeCall({ abi: SAFE_ABI, data: exec.data as Hex }).args as unknown as unknown[])[9] as string;
-  assert.equal(signatures, `0x${signers.map(o => `${o.slice(2).padStart(64, '0')}${'00'.repeat(32)}01`).join('')}`);
+  // Ascending by owner: 0x1000… (approval), then 0x2000… (the stand-in signature).
+  assert.equal(signatures, `0x${OWNERS[1].slice(2).padStart(64, '0')}${'00'.repeat(32)}01${STUB_SIGNATURE.slice(2)}`);
   // Moving to an official singleton is an upgrade, a caution.
   const upgrade = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xff51a5898e281db6dfc7855790607438df2ca44b'));
   assert.ok(codes(upgrade).includes('safe_upgrade') && !codes(upgrade).includes('safe_code_replaced'));

@@ -350,6 +350,16 @@ export function ecrecoverAs(signer: string, digest?: Hex): Hex {
     + `5b61${hex2(turns)}5b600190038061${hex2(loop)}5750${'5b'.repeat(sled)}` // JUMPDEST; PUSH2 turns; loop: JUMPDEST, 1, SWAP1, SUB, DUP1, PUSH2 loop, JUMPI; POP; sled
     + `73${signer.toLowerCase().slice(2)}60005260206000f3` as Hex;
 }
+/**
+ * What a simulation request needs for ecrecover to recover STUB_SIGNATURE as `signer` (over `digest`, if given): the
+ * precompile's stand-in (see ecrecoverAs), with both addresses warm as the precompile is. For Safe transactions too.
+ */
+export function ecdsaStandIn(signer: string, digest?: Hex): Pick<SimulationRequest, 'stateOverrides' | 'accessList'> {
+  return {
+    stateOverrides: { '0x0000000000000000000000000000000000000001': { code: ecrecoverAs(signer, digest), movePrecompileToAddress: ECRECOVER_MOVED } },
+    accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] }],
+  };
+}
 /** P256VERIFY (0x100, RIP-7212 / EIP-7951) accepting P256_STUB: a passkey's assertion (see webAuthnStub) verifies. */
 export const p256Accepting = (): Hex => standIn(P256_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
 

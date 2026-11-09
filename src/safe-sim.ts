@@ -8,6 +8,7 @@
 import { concatHex, decodeAbiParameters, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
+import { ecdsaStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
 
 const ABI = parseAbi([
   'function getOwners() view returns (address[])',
@@ -113,11 +114,16 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     // `threshold` owners, in ascending order as checkSignatures requires, and sign with those approvals (v = 1).
     const nonce = BigInt(await call(encodeFunctionData({ abi: ABI, functionName: 'nonce' })));
     const hash = await call(encodeFunctionData({ abi: ABI, functionName: 'getTransactionHash', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, nonce] }));
-    const approvals = approvalsFor(before, hash);
+    // The signing owner (the executor, or else the first owner) signs with the ECDSA stand-in, which the replaced
+    // ecrecover attributes to them over this hash, so the Safe's check costs what it will; any other owners the
+    // threshold needs approve on-chain.
+    const executor = (opts.executor && before.owners.includes(opts.executor.toLowerCase()) ? opts.executor : before.owners[0]).toLowerCase();
+    const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE });
     if (!approvals) return null;
     const { stateDiff, signatures } = approvals;
-    const executor = (opts.executor && before.owners.includes(opts.executor.toLowerCase()) ? opts.executor : before.owners[0]).toLowerCase();
-    exec = { chainId, from: executor, account: safe, to: safe, value: 0n, stateOverrides: { [safe]: { stateDiff } },
+    const standIn = ecdsaStandIn(executor, hash);
+    exec = { chainId, from: executor, account: safe, to: safe, value: 0n, accessList: standIn.accessList,
+      stateOverrides: { ...standIn.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) },
       data: encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, signatures] }) };
   }
   const results = await sim.simulateBatch([exec, ...reads(safe).map(r => ({ chainId, from: exec.from, to: r.to, data: r.data, value: 0n }))]);
