@@ -273,7 +273,8 @@ const coinbaseWrapper = (ownerIndex: bigint, signatureData: Hex) => encodeAbiPar
 /**
  * Coinbase Smart Wallet: abi.encode(SignatureWrapper(ownerIndex, signatureData)). The signer's own index when it is
  * an address owner; when the account itself is asked to sign (a passkey wallet's way) and it has a passkey owner,
- * that passkey's, with a WebAuthn assertion; else index 0.
+ * that passkey's, with a WebAuthn assertion; else the first address owner's (the account then reports the
+ * signature as not its own, where a passkey's index would make its validation revert), or index 0.
  */
 async function coinbaseFor(owners: (Hex | undefined)[], c: StubContext): Promise<Stub> {
   const mine = encodeAbiParameters([{ type: 'address' }], [c.signer as Hex]);
@@ -282,7 +283,8 @@ async function coinbaseFor(owners: (Hex | undefined)[], c: StubContext): Promise
   const k = owners.findIndex(o => o && o.length === 2 + 128);
   const hash = k >= 0 && c.signer === c.sender ? await c.hash() : undefined;
   if (hash) return { signature: coinbaseWrapper(BigInt(k), webAuthnStub(hash)), p256: true };
-  return { signature: coinbaseWrapper(0n, STUB_SIGNATURE) };
+  const address = owners.findIndex(o => o && o.length === 2 + 64);
+  return { signature: coinbaseWrapper(BigInt(Math.max(address, 0)), STUB_SIGNATURE) };
 }
 /** An existing Coinbase Smart Wallet: its owners read from the account. */
 async function coinbaseStub(c: StubContext): Promise<Stub> {

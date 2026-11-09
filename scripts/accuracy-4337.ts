@@ -175,7 +175,9 @@ async function replay(hash: string): Promise<void> {
     tried++;
     p = await previewRequest(request(signer), ctx, deps);
     if (!ran(p) && prefix.length) { prefix = tx.authorizationList?.length ? before.slice(-1) : []; prefixDropped = true; p = await previewRequest(request(signer), ctx, deps); }
-    if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x))) break;
+    // A wrong guess shows as the account rejecting the stand-in, or as its validation reverting on a shape for
+    // another key (a passkey account given an ECDSA stand-in for a non-owner): either way, the next candidate.
+    if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x) || /validation reverts on a stand-in/.test(x))) break;
   }
 
   // What happened, and what the preview says.
