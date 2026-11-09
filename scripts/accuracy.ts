@@ -87,7 +87,9 @@ async function replay(b: B, seen?: Set<string>) {
   const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
   const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000, trace });
   const simulators = ([
-    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time: b.timestamp, feeRecipient: b.miner, prevRandao: b.mixHash, baseFeePerGas: b.baseFeePerGas, gasLimit: b.gasLimit } }) })],
+    // Not the block's gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on publicnode,
+    // below Ethereum's 60M); the parent's, the node's default, is all but the same.
+    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time: b.timestamp, feeRecipient: b.miner, prevRandao: b.mixHash, baseFeePerGas: b.baseFeePerGas } }) })],
     ['fork', forkAt()],
   ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name) && !(CHAIN === 42161 && name === 'fork'));
   let taken = 0;

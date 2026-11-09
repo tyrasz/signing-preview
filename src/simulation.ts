@@ -32,8 +32,12 @@ export interface RpcSimulatorOptions {
    */
   fork?: FallbackSimulator;
   forkBudgetMs?: number;
-  /** Replays (accuracy checks): simulate on top of `block` instead of 'latest', with these simulated-block fields. */
-  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string> } | undefined;
+  /**
+   * Replays (accuracy checks): simulate on top of `block` instead of 'latest', with these simulated-block fields,
+   * and (eth_simulateV1) after `before`, calls run first in the same simulated block (the replayed block's earlier
+   * transactions) whose results are dropped.
+   */
+  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[] } | undefined;
 }
 
 /**
@@ -151,6 +155,11 @@ export class RpcSimulator implements Simulator {
     const r = this.replay?.(chainId);
     return r ? { tag: r.block, overrides: r.blockOverrides } : { tag: 'latest' };
   }
+  /** A replay's earlier calls (see RpcSimulatorOptions.replay), as eth_simulateV1 calls. */
+  private async before(chainId: number): Promise<unknown[]> {
+    const before = this.replay?.(chainId)?.before ?? [];
+    return Promise.all(before.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
+  }
   /** eth_simulateV1's blockOverrides: the replayed block's header, and a base fee the calls ask for (see SimulationRequest.baseFee). */
   private blockOverrides(reqs: SimulationRequest[]): Record<string, string> | undefined {
     const replayed = this.at(reqs[0].chainId).overrides;
@@ -171,12 +180,13 @@ export class RpcSimulator implements Simulator {
     const calls = await Promise.all(reqs.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
     const stateOverrides = await simulateV1Overrides(reqs);
     const blockOverrides = this.blockOverrides(reqs);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
+    const before = await this.before(chainId);
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
       return this.withoutSimulateV1(url, chainId, reqs);
     }
-    const results = body.result?.[0]?.calls;
+    const results = body.result?.[0]?.calls?.slice(before.length);
     const source = `eth_simulateV1 @ chain ${chainId}`;
     // Errors that are the answer for a single transaction: the network would reject it the same way.
     const rejected = body.error?.message && reqs.length === 1 ? rejection(body.error.message) : null;
@@ -312,8 +322,9 @@ export class RpcSimulator implements Simulator {
     });
     const stateOverrides = await simulateV1Overrides(reqs);
     const blockOverrides = this.blockOverrides(reqs);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls, ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId).tag]) as { result?: { calls: RawCallResult[] }[] };
-    const out = body.result?.[0]?.calls;
+    const before = await this.before(reqs[0].chainId);
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId).tag]) as { result?: { calls: RawCallResult[] }[] };
+    const out = body.result?.[0]?.calls?.slice(before.length);
     if (!out || out.length !== calls.length) return;
     // The re-run must have gone the same way, or its reads describe a different execution.
     if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success'))) return;
