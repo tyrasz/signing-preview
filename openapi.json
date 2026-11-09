@@ -500,6 +500,28 @@
                 }
               }
             }
+          },
+          "safeOperations": {
+            "type": "array",
+            "description": "For a Safe4337MultiChainSignatureModule MerkleTreeRoot signature (one signature for SafeOps on several chains, none of which the message shows): the operations the tree holds, as the wallet built it, each with its chain and its SafeOp message (at most 64). The root is recomputed from them, and they are shown only if it matches the root being signed; otherwise the preview is a danger mismatch.",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "required": [
+                "chainId",
+                "operation"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "chainId": {
+                  "type": "integer"
+                },
+                "operation": {
+                  "type": "object",
+                  "description": "The SafeOp message (safe, nonce, initCode, callData, gas fields, paymasterAndData, validAfter, validUntil, entryPoint)."
+                }
+              }
+            }
           }
         }
       },

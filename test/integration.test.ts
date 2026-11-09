@@ -100,3 +100,20 @@ test('HTTP API: a UserOperation supplied in the context decodes the hash being s
     assert.equal((await post({ chainId: 1, userOperation: { entryPoint: ep, operation: { ...operation, nonce: '0x2' } } })).attention, 'danger');
   });
 });
+
+test('HTTP API: the Safe operations behind a multi-chain root, supplied in the context, are checked against it', async () => {
+  const { hashTypedData } = await import('viem');
+  const MC = '0x22939e839e3c0f479b713eaf95e0df128554aead';
+  const operation = { safe: '0x5ca1ab1e00000000000000000000000000000007', nonce: '1', initCode: '0x', callData: '0x', verificationGasLimit: '100000', callGasLimit: '100000', preVerificationGas: '50000', maxPriorityFeePerGas: '1', maxFeePerGas: '2', paymasterAndData: '0x', validAfter: '0', validUntil: '0', entryPoint: '0x433709009b8330fda32311df1c2afa402ed8d009' };
+  const types = { SafeOp: [{ type: 'address', name: 'safe' }, { type: 'uint256', name: 'nonce' }, { type: 'bytes', name: 'initCode' }, { type: 'bytes', name: 'callData' }, { type: 'uint128', name: 'verificationGasLimit' }, { type: 'uint128', name: 'callGasLimit' }, { type: 'uint256', name: 'preVerificationGas' }, { type: 'uint128', name: 'maxPriorityFeePerGas' }, { type: 'uint128', name: 'maxFeePerGas' }, { type: 'bytes', name: 'paymasterAndData' }, { type: 'uint48', name: 'validAfter' }, { type: 'uint48', name: 'validUntil' }, { type: 'address', name: 'entryPoint' }] };
+  // A tree of one operation: its root is the operation's digest on its chain.
+  const root = hashTypedData({ domain: { chainId: 42161, verifyingContract: MC }, types, primaryType: 'SafeOp', message: operation as never });
+  const request = { method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify({ domain: { verifyingContract: MC }, types: { EIP712Domain: [{ name: 'verifyingContract', type: 'address' }], MerkleTreeRoot: [{ name: 'merkleTreeRoot', type: 'bytes32' }] }, primaryType: 'MerkleTreeRoot', message: { merkleTreeRoot: root } })] };
+  await withServer(async url => {
+    const post = (context: unknown) => fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ request, context }) }).then(r => r.json());
+    const codes = (p: { warnings: { code: string }[] }) => p.warnings.map(w => w.code);
+    assert.ok(codes(await post({ safeOperations: [{ chainId: 42161, operation }] })).includes('safe_multichain_root_verified'));
+    assert.ok(codes(await post({ safeOperations: [{ chainId: 1, operation }] })).includes('safe_multichain_root_mismatch'));
+    assert.ok(codes(await post({})).includes('safe_multichain_root'));
+  });
+});

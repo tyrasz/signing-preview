@@ -138,7 +138,7 @@ test('SafeOp checks: delegatecalls, an unknown module or EntryPoint, a plain cal
 
 // execTransaction simulated for a SafeTx: the hash approved for enough owners, then the Safe's configuration read again.
 import { configChanges, SAFE_SINGLETONS, type SafeConfig } from '../src/safe-sim.ts';
-import { decodeFunctionData as decodeCall, encodeAbiParameters as enc, keccak256 as k256 } from 'viem';
+import { concatHex as concat, decodeFunctionData as decodeCall, encodeAbiParameters as enc, hashTypedData, keccak256 as k256 } from 'viem';
 import type { SimulationRequest } from '../src/types.ts';
 
 const OWNERS = ['0x2000000000000000000000000000000000000002', '0x1000000000000000000000000000000000000001', '0x3000000000000000000000000000000000000003'];
@@ -209,4 +209,30 @@ test('Safe4337MultiChainSignatureModule (EntryPoint v0.9): its SafeOps, and a Me
   assert.equal(root.attention, 'danger');
   assert.ok(codes(root).includes('safe_multichain_root'));
   assert.equal(root.decoding.decoder, 'safe_multichain_root');
+});
+
+test('A multi-chain Safe root, with the operations the wallet built it from: shown when they make up the root exactly', async () => {
+  const MC = '0x22939e839e3c0f479b713eaf95e0df128554aead', EP9 = '0x433709009b8330fda32311df1c2afa402ed8d009';
+  const types = { SafeOp: SAFE_OP_V03.types.SafeOp };
+  const op = (chainId: number, nonce: string) => ({ chainId, operation: { ...SAFE_OP_V03.message, nonce, entryPoint: EP9 } });
+  const ops = [op(1, '7'), op(42161, '8'), op(42161, '9')];
+  // The tree as OpenZeppelin's merkle-tree builds it: leaves (each SafeOp's digest on its chain) sorted, then a
+  // complete binary tree in an array with the leaves at its end; pairs hashed smaller first, as the module does.
+  const leaves = ops.map(o => hashTypedData({ domain: { chainId: o.chainId, verifyingContract: MC }, types, primaryType: 'SafeOp', message: o.operation as never })).sort((a, z) => (BigInt(a) < BigInt(z) ? -1 : 1));
+  const pairHash = (a: Hex, z: Hex) => k256(BigInt(a) < BigInt(z) ? concat([a, z]) : concat([z, a]));
+  const tree: Hex[] = new Array(2 * leaves.length - 1);
+  leaves.forEach((l, i) => { tree[tree.length - 1 - i] = l; });
+  for (let i = tree.length - 1 - leaves.length; i >= 0; i--) tree[i] = pairHash(tree[2 * i + 1], tree[2 * i + 2]);
+  const sign = (root: Hex, safeOperations?: typeof ops) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNERS[0], JSON.stringify({ domain: { verifyingContract: MC },
+    types: { EIP712Domain: [{ name: 'verifyingContract', type: 'address' }], MerkleTreeRoot: [{ name: 'merkleTreeRoot', type: 'bytes32' }] }, primaryType: 'MerkleTreeRoot', message: { merkleTreeRoot: root } })] }, { now: NOW, ...(safeOperations && { safeOperations }) }, deps);
+  const shown = await sign(tree[0], ops);
+  assert.ok(codes(shown).includes('safe_multichain_root_verified') && !codes(shown).includes('safe_multichain_root'), codes(shown).join());
+  assert.match(shown.title, /^Sign Safe operations: 3 operations on 2 chains$/);
+  assert.ok(String(detail(shown, 'Operation 2 (Arbitrum One)')).endsWith(`from the Safe ${SAFE_OP_V03.message.safe.slice(0, 6).toLowerCase()}…${SAFE_OP_V03.message.safe.slice(-4).toLowerCase()}`), String(detail(shown, 'Operation 2 (Arbitrum One)')));
+  // One left out: the root covers an operation that isn't shown.
+  const partial = await sign(tree[0], ops.slice(0, 2));
+  assert.ok(codes(partial).includes('safe_multichain_root_mismatch'));
+  assert.equal(partial.attention, 'danger');
+  // A single operation's root is its own digest.
+  assert.ok(codes(await sign(leaves[0], [ops.find(o => hashTypedData({ domain: { chainId: o.chainId, verifyingContract: MC }, types, primaryType: 'SafeOp', message: o.operation as never }) === leaves[0])!])).includes('safe_multichain_root_verified'));
 });

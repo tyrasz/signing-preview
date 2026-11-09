@@ -139,6 +139,12 @@ export interface PreviewContext {
     operation: Record<string, unknown>;
   };
   /**
+   * A Safe4337MultiChainSignatureModule MerkleTreeRoot signature covers SafeOps on several chains, none of which the
+   * message shows. The wallet that built the tree supplies them (each with its chain and its SafeOp message); the
+   * root is recomputed from them, and they are shown only if it matches the root being signed.
+   */
+  safeOperations?: { chainId: number; operation: Record<string, unknown> }[];
+  /**
    * The account's transactions the wallet has sent and that aren't mined yet, oldest first. The transaction being
    * previewed is simulated after them, as it will run, instead of on the latest state alone.
    */

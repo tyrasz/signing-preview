@@ -106,6 +106,12 @@ function sanitizeContext(raw: unknown): PreviewContext {
   if (uo && typeof uo === 'object' && typeof uo.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(uo.entryPoint) && uo.operation && typeof uo.operation === 'object' && !Array.isArray(uo.operation)) {
     out.userOperation = { entryPoint: uo.entryPoint, operation: uo.operation as Record<string, unknown>, ...(typeof uo.chainId === 'number' && Number.isSafeInteger(uo.chainId) && { chainId: uo.chainId }) };
   }
+  // At most 64 operations: a larger tree can't be checked here, so its root stays a danger mismatch.
+  if (Array.isArray(c.safeOperations)) {
+    out.safeOperations = c.safeOperations.slice(0, 64).filter(o => o && typeof o === 'object').map(o => o as Record<string, unknown>)
+      .filter(o => typeof o.chainId === 'number' && Number.isSafeInteger(o.chainId) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
+      .map(o => ({ chainId: o.chainId as number, operation: o.operation as Record<string, unknown> }));
+  }
   return out;
 }
 

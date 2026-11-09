@@ -1,6 +1,6 @@
 // Safe multisig owner signatures: EIP-712 SafeTx (domain: the chain and the Safe itself), SafeMessage, and SafeOp
 // (ERC-4337 operations through Safe's 4337 module). See src/safe.ts.
-import { decodeAbiParameters, hexToBytes, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, hexToBytes, keccak256, type Hex } from 'viem';
 import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
 import { describeSafeTx, reportConfigChanges, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
@@ -9,6 +9,7 @@ import { approvalsFor, config as safeConfig, readConfig, reads } from '../safe-s
 import { decodeTransaction } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
+import type { AssetChange } from '../types.ts';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
@@ -175,10 +176,47 @@ const safeOp: TypedAdapter = async (data, env) => {
   return { title: `Safe operation: ${r.title}`, summary: `Signs an ERC-4337 operation for the Safe ${shortAddress(safe)}. ${r.summary}`, decoder: 'safe_4337_op', status: r.status, b, network: { kind: 'evm', chainId, name: chainName(chainId) }, assetChanges: r.assetChanges };
 };
 
+/** The SafeOp type the multi-chain module signs (domain: chainId, verifyingContract), as its SAFE_OP_TYPEHASH states. */
+const SAFE_OP_TYPES = {
+  EIP712Domain: [{ name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+  SafeOp: [{ type: 'address', name: 'safe' }, { type: 'uint256', name: 'nonce' }, { type: 'bytes', name: 'initCode' }, { type: 'bytes', name: 'callData' }, { type: 'uint128', name: 'verificationGasLimit' }, { type: 'uint128', name: 'callGasLimit' }, { type: 'uint256', name: 'preVerificationGas' }, { type: 'uint128', name: 'maxPriorityFeePerGas' }, { type: 'uint128', name: 'maxFeePerGas' }, { type: 'bytes', name: 'paymasterAndData' }, { type: 'uint48', name: 'validAfter' }, { type: 'uint48', name: 'validUntil' }, { type: 'address', name: 'entryPoint' }],
+};
+
+/** The module's pair hash: keccak256 of the two nodes, the smaller first. */
+const hashPair = (a: Hex, b: Hex) => keccak256(BigInt(a) < BigInt(b) ? concatHex([a, b]) : concatHex([b, a]));
+/**
+ * The roots a tree of these leaves can have, as tree builders lay them out: OpenZeppelin's merkle-tree (a complete
+ * binary tree in an array, leaves at its end) and level by level (an odd node carried up, or paired with itself),
+ * with the leaves in the order given or sorted. With the module's commutative pair hash, a root that matches commits
+ * to exactly these leaves: no other operation has a proof to it.
+ */
+export function merkleRoots(leaves: Hex[]): Set<string> {
+  const roots = new Set<string>();
+  if (!leaves.length) return roots;
+  for (const order of [leaves, [...leaves].sort((a, z) => (BigInt(a) < BigInt(z) ? -1 : BigInt(a) > BigInt(z) ? 1 : 0))]) {
+    const tree: Hex[] = new Array(2 * order.length - 1);
+    order.forEach((leaf, i) => { tree[tree.length - 1 - i] = leaf; });
+    for (let i = tree.length - 1 - order.length; i >= 0; i--) tree[i] = hashPair(tree[2 * i + 1], tree[2 * i + 2]);
+    roots.add(tree[0].toLowerCase());
+    for (const odd of ['carry', 'self'] as const) {
+      let level = order;
+      while (level.length > 1) {
+        const next: Hex[] = [];
+        for (let i = 0; i < level.length; i += 2) next.push(i + 1 < level.length ? hashPair(level[i], level[i + 1]) : odd === 'self' ? hashPair(level[i], level[i]) : level[i]);
+        level = next;
+      }
+      roots.add(level[0].toLowerCase());
+    }
+  }
+  return roots;
+}
+
 /**
  * Safe4337MultiChainSignatureModule's multi-chain signature: one signature over the root of a Merkle tree whose
  * leaves are SafeOps, on any chains (the domain has no chain). Each operation is later submitted with a proof of its
- * leaf. The message holds only the root: which operations, on which chains, and how many, isn't in it.
+ * leaf (its SafeOp digest on its chain). The message holds only the root, so the operations are shown only when the
+ * wallet supplies them (context.safeOperations) and they make up the root exactly; each is then previewed as a
+ * SafeOp on its own chain.
  */
 const merkleTreeRoot: TypedAdapter = async (data, env) => {
   const module = str(data.domain.verifyingContract).toLowerCase();
@@ -189,7 +227,38 @@ const merkleTreeRoot: TypedAdapter = async (data, env) => {
   b.detail('Module', `${known.version} (${module})`, module);
   b.detail('EntryPoint', `${known.entryPointName} (${known.entryPoint})`, known.entryPoint);
   b.detail('Merkle tree root', root, root);
-  b.warn('danger', 'safe_multichain_root', `This signs the root of a Merkle tree of Safe operations, valid on every chain where the module runs (the signature names no chain). The message doesn't say which operations it covers, on which chains, or how many: any operation in the tree runs with this one signature. Only sign it if your wallet shows every operation in the tree and you have checked each.`);
   b.note('An off-chain signature; it costs no gas now. A bundler submits each operation in the tree with a proof that it is one of the leaves.');
-  return { title: 'Sign Safe operations on several chains (contents not shown)', summary: `Authorizes every Safe operation in a Merkle tree, on any chain where ${known.version} runs. The operations themselves aren't in the message.`, decoder: 'safe_multichain_root', status: 'opaque', b, network: env.context.chainId ? { kind: 'evm', chainId: env.context.chainId, name: chainName(env.context.chainId) } : null };
+  const network = env.context.chainId ? { kind: 'evm' as const, chainId: env.context.chainId, name: chainName(env.context.chainId) } : null;
+  const supplied = env.context.safeOperations ?? [];
+  const typedOf = (o: { chainId: number; operation: Record<string, unknown> }) => ({ domain: { chainId: o.chainId, verifyingContract: module }, types: SAFE_OP_TYPES, primaryType: 'SafeOp', message: o.operation });
+  const leaves = supplied.map(o => typedDataDigest(typedOf(o)));
+  const opaque = { title: 'Sign Safe operations on several chains (contents not shown)', summary: `Authorizes every Safe operation in a Merkle tree, on any chain where ${known.version} runs. The operations themselves aren't in the message.`, decoder: 'safe_multichain_root', status: 'opaque' as const, b, network };
+  if (!supplied.length) {
+    b.warn('danger', 'safe_multichain_root', `This signs the root of a Merkle tree of Safe operations, valid on every chain where the module runs (the signature names no chain). The message doesn't say which operations it covers, on which chains, or how many: any operation in the tree runs with this one signature. Only sign it if your wallet shows every operation in the tree and you have checked each.`);
+    return opaque;
+  }
+  if (leaves.some(l => !l) || !merkleRoots(leaves as Hex[]).has(root)) {
+    b.warn('danger', 'safe_multichain_root_mismatch', `The ${supplied.length} operation${supplied.length === 1 ? '' : 's'} supplied with this signature don't make up the root it signs: it covers other operations, which aren't shown. What you would sign may not be what the app shows.`);
+    return opaque;
+  }
+  // The tree is exactly these operations: each previewed as the SafeOp it is, on its chain.
+  const chains = [...new Set(supplied.map(o => o.chainId))];
+  b.warn('info', 'safe_multichain_root_verified', `The wallet supplied the ${supplied.length} operation${supplied.length === 1 ? '' : 's'} this root covers, on ${chains.map(chainName).join(', ')}, and they make up the root exactly: the signature authorizes these and nothing else. Each runs once its bundler submits it with its proof.`);
+  const titles: string[] = [];
+  let assetChanges: AssetChange[] = [];
+  for (const [i, o] of supplied.entries()) {
+    const r = await safeOp(typedOf(o), { ...env, context: { ...env.context, chainId: o.chainId } });
+    const label = `Operation ${i + 1} (${chainName(o.chainId)})`;
+    if (!r) { b.detail(label, 'not a SafeOp the module would run'); continue; }
+    titles.push(r.title.replace(/^Safe operation: /, ''));
+    b.detail(label, `${r.title.replace(/^Safe operation: /, '')}, from the Safe ${shortAddress(str(o.operation.safe))}`);
+    for (const d of r.b.details) b.detail(`${label}: ${d.label}`, d.value, d.raw);
+    for (const w of r.b.warnings) b.warn(w.severity, w.code, `${label}: ${w.message}`);
+    for (const n of r.b.notes) b.note(`${label}: ${n}`);
+    // Balance changes of the context's chain go in the preview's list; another chain's are described with its operation.
+    if (!network || o.chainId === network.chainId) assetChanges = assetChanges.concat(r.assetChanges ?? []);
+    else if (r.assetChanges?.length) b.detail(`${label}: balance changes`, r.assetChanges.map(c => `${c.direction === 'out' ? '−' : '+'}${c.amount} ${c.symbol}`).join(', '));
+  }
+  const many = titles.length === 1 ? titles[0] : `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}`;
+  return { title: `Sign Safe operations: ${many}`, summary: `Authorizes ${supplied.length} Safe operation${supplied.length === 1 ? '' : 's'} with one signature, on ${chains.map(chainName).join(', ')}: ${titles.join('; ')}.`, decoder: 'safe_multichain_root', status: 'partial', b, network, assetChanges };
 };
