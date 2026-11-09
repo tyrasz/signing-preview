@@ -76,16 +76,22 @@ export async function readConfig(deps: Dependencies, chainId: number, safe: stri
 }
 
 /**
- * Signatures by the first `threshold` owners (ascending, as checkSignatures requires) for a hash the Safe checks,
- * standing in as on-chain approvals: the hash marked approved for each in approvedHashes (the storage to override),
- * and their approved-hash signatures (r = owner, s = 0, v = 1). Null if the Safe has fewer owners than its threshold.
+ * Signatures by `threshold` owners (ascending, as checkSignatures requires) for a hash the Safe checks. Each stands in
+ * as an on-chain approval: the hash marked approved for the owner in approvedHashes (the storage to override), and
+ * an approved-hash signature (r = owner, s = 0, v = 1). With `ecdsa`, that owner (one of them) signs with this ECDSA
+ * signature instead (a stand-in that a replaced ecrecover attributes to them, so validation costs what it will), and
+ * the lowest other owners approve. Null if the Safe has fewer owners than its threshold.
  */
-export function approvalsFor(before: SafeConfig, hash: Hex): { stateDiff: Record<string, string>; signatures: Hex } | null {
-  const signers = [...before.owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1)).slice(0, Number(before.threshold));
+export function approvalsFor(before: SafeConfig, hash: Hex, ecdsa?: { owner: string; signature: Hex }): { stateDiff: Record<string, string>; signatures: Hex } | null {
+  const ascending = [...before.owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+  const own = ecdsa && ascending.includes(ecdsa.owner.toLowerCase()) ? ecdsa.owner.toLowerCase() : undefined;
+  const signers = (own ? [own, ...ascending.filter(o => o !== own).slice(0, Number(before.threshold) - 1)] : ascending.slice(0, Number(before.threshold)))
+    .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
   if (signers.length < Number(before.threshold) || !/^0x[0-9a-f]{64}$/i.test(hash)) return null;
+  const approving = signers.filter(o => o !== own);
   return {
-    stateDiff: Object.fromEntries(signers.map(o => [keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [hash, keccak256(`0x${word(o)}${word(APPROVED_HASHES_SLOT)}` as Hex)])), `0x${word(1n)}`])),
-    signatures: concatHex(signers.map(o => `0x${word(o)}${word(0n)}01` as Hex)),
+    stateDiff: Object.fromEntries(approving.map(o => [keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [hash, keccak256(`0x${word(o)}${word(APPROVED_HASHES_SLOT)}` as Hex)])), `0x${word(1n)}`])),
+    signatures: concatHex(signers.map(o => o === own ? ecdsa!.signature : `0x${word(o)}${word(0n)}01` as Hex)),
   };
 }
 

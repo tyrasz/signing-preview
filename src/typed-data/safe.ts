@@ -133,15 +133,18 @@ const safeOp: TypedAdapter = async (data, env) => {
       if (known && sameAddress(entryPoint, known.entryPoint) && nonce !== null && verification !== null && call !== null && preVerification !== null && maxFee !== null && maxPriority !== null) {
         const before = deploys ? undefined : await readConfig(env.deps, chainId, safe);
         const digest = typedDataDigest(data);
-        const approvals = before && digest ? approvalsFor(before, digest as Hex) : null;
+        // The signing owner (or, if the signer isn't one, the first) signs with the ECDSA stand-in, which the replaced
+        // ecrecover attributes to them, so the Safe's check costs what it will; any others the threshold needs approve.
+        const owner = before && (env.signer && before.owners.includes(env.signer.toLowerCase()) ? env.signer.toLowerCase() : [...before.owners].sort((a, z) => (BigInt(a) < BigInt(z) ? -1 : 1))[0]);
+        const approvals = before && digest ? approvalsFor(before, digest as Hex, owner ? { owner, signature: STUB_SIGNATURE } : undefined) : null;
         // The module's signature: validAfter and validUntil (6 bytes each), then the owners' signatures.
         const window = `${validAfter.toString(16).padStart(12, '0')}${validUntil.toString(16).padStart(12, '0')}`;
         const signature = `0x${known.signaturePrefix ?? ''}${window}${(approvals?.signatures ?? STUB_SIGNATURE).slice(2)}` as Hex;
         const run = await simulateOperation({ chainId, entryPoint, sender: safe, nonce, initCode: initCode as Hex, callData, callGasLimit: call, verificationGasLimit: verification, preVerificationGas: preVerification,
-          maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...(env.signer && { signer: env.signer }), watch,
-          ...(approvals && { stateOverrides: { [safe]: { stateDiff: approvals.stateDiff } } }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
+          maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...((owner ?? env.signer) && { signer: (owner ?? env.signer)! }), watch,
+          ...(approvals && Object.keys(approvals.stateDiff).length && { stateOverrides: { [safe]: { stateDiff: approvals.stateDiff } } }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
         const changes = await reportRun(run, { sender: safe, paymaster: pm.paymaster, entryPointName: known.entryPointName, signature }, chainId, env, b,
-          { deploys, validation: approvals ? `with the Safe's ${before!.threshold === 1n ? 'owner' : `${before!.threshold} owners`} approving it on-chain in place of ${before!.threshold === 1n ? 'their signature' : 'their signatures'}` : "with a stand-in for the owner's signature, which ecrecover attributes to the signer" });
+          { deploys, validation: approvals ? `with a stand-in for ${owner === env.signer?.toLowerCase() ? 'your' : 'an owner\'s'} signature, which ecrecover attributes to ${owner === env.signer?.toLowerCase() ? 'you' : 'that owner'}${before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : ''}` : "with a stand-in for the owner's signature, which ecrecover attributes to the signer" });
         if (changes) {
           const after = run?.after?.every(r => r.status === 'success') ? run.after : undefined;
           const config = after && safeConfig(after.map(r => r.returnData as Hex));
