@@ -188,3 +188,26 @@ test('A Kernel passkey stand-in: ZeroDev’s WebAuthn validator form, and Daimo�
   assert.equal(BigInt(await verify(P256_STUB.r, P256_STUB.s)), 1n);
   assert.equal(BigInt(await verify(P256_STUB.r, `0x${'26'.repeat(32)}`)), 0n); // the real code's answer
 });
+
+test('A Kernel v3.1 passkey account: the stand-in passes ZeroDev’s own WebAuthn checks, through Daimo’s verifier', async () => {
+  const { DAIMO_P256_VERIFIER } = await import('../src/erc4337-sim.ts');
+  const { compiled } = await import('./evm-chain.ts');
+  // Kernel v3.1's implementation address runs KernelPasskey (ZeroDev's validator checks, its WebAuthn.sol), behind
+  // an ERC-1967 proxy as Kernel accounts are; its root validator is ZeroDev's WebAuthn validator.
+  const KERNEL_V31 = '0xbac849bb641841b44e965fb01a4bf5f074f84b4d';
+  await chain.putCode(KERNEL_V31, `0x${compiled('KernelPasskey').evm.deployedBytecode.object}`);
+  const kernel = await chain.deploy('Proxy1967', 'address', [KERNEL_V31]);
+  const key = { x: 0x65a2fa44daad46eab0278703edb6c4dcf5e30b8a9aec09fdc71a56f52aa392e4n, y: 0x4a7a9e4604aa36898209997288e902ac544a555e4b5e0a9efef2b59233f3f437n };
+  await chain.exec(kernel, encodeFunctionData({ abi: parseAbi(['function init(address,uint256,uint256)']), functionName: 'init', args: [EP, key.x, key.y] }));
+  await chain.exec(usdc, call('mint', [kernel, 100_000_000n]));
+  await chain.setBalance(kernel, E);
+  // Daimo's verifier on this chain (which has no P256 precompile, so ZeroDev's SDK signs for the verifier): here one
+  // that accepts nothing. The stand-in runs it, then answers the stub.
+  await chain.putCode(DAIMO_P256_VERIFIER, '0x600060005260206000f3' as Hex);
+  // The account itself is asked to sign: a passkey wallet's way.
+  const p = await preview(operation({ sender: kernel }), kernel);
+  const whole = p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? p.decoding.notes.join(' | ');
+  assert.match(whole, /a passkey's assertion over the operation's hash/);
+  assert.doesNotMatch(whole, /doesn't accept/);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+});

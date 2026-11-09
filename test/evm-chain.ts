@@ -4,14 +4,22 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createEVM, type EVM } from '@ethereumjs/evm';
+import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft } from '@ethereumjs/util';
 import { encodeAbiParameters, keccak256, type Hex } from 'viem';
 
 const solc = createRequire(import.meta.url)('solc');
-const out = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources: { 'M.sol': { content: readFileSync(new URL('./fixtures/SimulationMocks.sol', import.meta.url), 'utf8') } },
+const fixture = (path: string) => ({ content: readFileSync(new URL(`./fixtures/${path}`, import.meta.url), 'utf8') });
+// ZeroDev's WebAuthn verification, which KernelPasskey uses (see fixtures/zerodev-webauthn/README.md).
+const zerodev = { 'zerodev/WebAuthn.sol': fixture('zerodev-webauthn/WebAuthn.sol'), 'zerodev/P256.sol': fixture('zerodev-webauthn/P256.sol'), 'zerodev/Base64URL.sol': fixture('zerodev-webauthn/Base64URL.sol'),
+  'openzeppelin-contracts/contracts/utils/Base64.sol': fixture('zerodev-webauthn/openzeppelin-contracts/contracts/utils/Base64.sol') };
+const out = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources: { 'M.sol': fixture('SimulationMocks.sol') },
   settings: { evmVersion: 'paris', optimizer: { enabled: true, runs: 200 }, outputSelection: { '*': { '*': ['evm.bytecode.object', 'evm.deployedBytecode.object'] } } } })));
 for (const e of out.errors ?? []) if (e.severity === 'error') throw new Error(e.formattedMessage);
-export const compiled = (name: string) => out.contracts['M.sol'][name] as { evm: { bytecode: { object: string }; deployedBytecode: { object: string } } };
+const passkey = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources: { 'K.sol': fixture('KernelPasskey.sol'), ...zerodev },
+  settings: { evmVersion: 'paris', viaIR: true, optimizer: { enabled: true, runs: 200 }, outputSelection: { 'K.sol': { '*': ['evm.bytecode.object', 'evm.deployedBytecode.object'] } } } })));
+for (const e of passkey.errors ?? []) if (e.severity === 'error') throw new Error(e.formattedMessage);
+export const compiled = (name: string) => (out.contracts['M.sol'][name] ?? passkey.contracts['K.sol'][name]) as { evm: { bytecode: { object: string }; deployedBytecode: { object: string } } };
 
 export const PRECOMPILE = '0x0000000000000000000000000000000000000800';
 const DEPLOYER = '0xde9100000000000000000000000000000000d001';
@@ -33,7 +41,8 @@ export interface TestChain {
 
 export async function testChain(): Promise<TestChain> {
   // The chain's own precompile: returns x * 2 + 7 for an ABI-encoded uint32 x.
-  const evm = await createEVM({ customPrecompiles: [{ address: PRECOMPILE, function: input => ({ executionGasUsed: 100n, returnValue: hexToBytes(encodeAbiParameters([{ type: 'uint256' }], [BigInt(bytesToHex(input.data)) * 2n + 7n])) }) }] });
+  // Chain 999, as the previews are told: eth_call and the fork simulator then agree on chainid (an operation's hash).
+  const evm = await createEVM({ common: createCustomCommon({ chainId: 999 }, Mainnet), customPrecompiles: [{ address: PRECOMPILE, function: input => ({ executionGasUsed: 100n, returnValue: hexToBytes(encodeAbiParameters([{ type: 'uint256' }], [BigInt(bytesToHex(input.data)) * 2n + 7n])) }) }] });
   const sm = evm.stateManager;
   const setBalance = async (a: string, balance: bigint) => {
     const acct = (await sm.getAccount(at(a))) ?? new Account();
