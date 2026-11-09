@@ -46,6 +46,8 @@ const HANDLE_OPS = parseAbi([`function handleOps(${OP}[] ops, address beneficiar
 type Op = { sender: Hex; nonce: bigint; initCode: Hex; callData: Hex; callGasLimit?: bigint; verificationGasLimit?: bigint; accountGasLimits?: Hex; preVerificationGas: bigint; maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint; gasFees?: Hex; paymasterAndData: Hex; signature: Hex };
 const UOE = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f';
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+/** WETH-style wrappers' Deposit(dst, wad) and Withdrawal(src, wad): their balance changes without a Transfer. */
+const DEPOSIT = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c', WITHDRAWAL = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65';
 const FALLBACK_SLOT = '0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5';
 const SAFE_EXECUTE = ['0x7bb37428', '0x541d63c8'];
 const hi = (w: Hex) => BigInt(`0x${w.slice(2, 34)}`), lo = (w: Hex) => BigInt(`0x${w.slice(34)}`);
@@ -204,6 +206,10 @@ async function replay(hash: string): Promise<void> {
   const simCost = p.details.find(d => d.label === 'Gas cost (simulated)')?.raw;
   const moved = new Map<string, bigint>(), fees = new Map<string, bigint>();
   const paymaster = op.paymasterAndData.length >= 42 ? `0x${op.paymasterAndData.slice(2, 42)}`.toLowerCase() : null;
+  for (const l of r.logs) if ((l.topics[0] === DEPOSIT || l.topics[0] === WITHDRAWAL) && l.topics.length === 2 && `0x${l.topics[1].slice(26)}` === sender) {
+    const token = l.address.toLowerCase(), v = BigInt(l.data.slice(0, 66));
+    moved.set(token, (moved.get(token) ?? 0n) + (l.topics[0] === DEPOSIT ? v : -v));
+  }
   for (const l of r.logs) if (l.topics[0] === TRANSFER && l.topics.length === 3) {
     const from = `0x${l.topics[1].slice(26)}`, to = `0x${l.topics[2].slice(26)}`, token = l.address.toLowerCase(), v = BigInt(l.data);
     if (from === sender) { moved.set(token, (moved.get(token) ?? 0n) - v); if (to === paymaster || !fees.has(token) || v < fees.get(token)!) fees.set(token, v); }
