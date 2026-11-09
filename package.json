@@ -71,7 +71,8 @@
     "coverage": "NODE_USE_ENV_PROXY=1 node scripts/coverage.ts",
     "build:probe": "node scripts/build-probe.ts",
     "accuracy": "NODE_USE_ENV_PROXY=1 node scripts/accuracy.ts",
-    "accuracy:4337": "NODE_USE_ENV_PROXY=1 node scripts/accuracy-4337.ts"
+    "accuracy:4337": "NODE_USE_ENV_PROXY=1 node scripts/accuracy-4337.ts",
+    "build:entrypoints": "NODE_USE_ENV_PROXY=1 node scripts/build-entrypoint-simulations.ts"
   },
   "dependencies": {
     "@ethereumjs/common": "10.1.3",

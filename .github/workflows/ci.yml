@@ -37,3 +37,25 @@ jobs:
       - run: npm run build
       # Pack the library, install it into a fresh project and use it (JavaScript, TypeScript, CLI).
       - run: npm run check:package
+
+  entrypoint-simulations:
+    # src/entrypoint-simulations.ts is generated: check that it is what its pinned sources compile to.
+    name: EntryPoint simulation code is reproducible
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      # The packages and compilers (npm) and EntryPoint v0.9's verified sources (Sourcify), each checked against its
+      # pinned hash; cached so that a later run needs neither service.
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/entrypoint-sources
+          key: entrypoint-sources-${{ hashFiles('scripts/build-entrypoint-simulations.ts') }}
+      - run: npm run build:entrypoints -- --check --cache ~/.cache/entrypoint-sources
