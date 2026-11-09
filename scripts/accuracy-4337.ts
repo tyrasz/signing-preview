@@ -1,4 +1,11 @@
-// npm run accuracy:4337 -- [--chain 1|42161] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 | --blocks 100 | --tx 0x…] [--max 30] [--no-prefix] [--out report.json]
+// npm run accuracy:4337 -- [--chain 1|42161] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 [--backfill 100] | --blocks 100 | --tx 0x…]
+//   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict]
+//
+// --concurrency replays that many operations at once (each on its own state), newest first, while --follow keeps
+// watching for new blocks: on Arbitrum an operation must be replayed within about 30 seconds of its block. --backfill
+// first takes the operations of the blocks already behind the head (Ethereum keeps about 128 blocks of state).
+// --summary-md appends the results as Markdown (a CI job summary). --strict exits with 1 when an operation's outcome
+// differs from its receipt, its gas is 5% or more off, or its token movements differ beyond the fee's rounding.
 //
 // How accurate whole-operation simulation is (src/erc4337-sim.ts), measured against what happened. Recent
 // single-operation bundles of an EntryPoint are rebuilt as the request their owner signed:
@@ -17,7 +24,7 @@
 // form or the bare hash, or the account's owner(); tried in turn while the account rejects the stand-in as theirs.
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { decodeAbiParameters, decodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
@@ -30,8 +37,10 @@ import type { Preview, SimulationRequest } from '../src/types.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
-const PREFIX = !process.argv.includes('--no-prefix');
-const URL_ = CHAIN === 42161 ? process.env.ARBITRUM_RPC_URL ?? 'https://arb1.arbitrum.io/rpc' : process.env.ETHEREUM_RPC_URL ?? 'https://ethereum-rpc.publicnode.com';
+const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.includes('--strict');
+const CONCURRENCY = Math.max(1, Number(arg('concurrency', '1'))), BACKFILL = Number(arg('backfill', '0'));
+// ARBITRUM_RPC_URL / ETHEREUM_RPC_URL replace the public RPCs (empty counts as unset, as an unset CI secret is).
+const URL_ = CHAIN === 42161 ? process.env.ARBITRUM_RPC_URL || 'https://arb1.arbitrum.io/rpc' : process.env.ETHEREUM_RPC_URL || 'https://ethereum-rpc.publicnode.com';
 const ENTRY_POINTS: Record<string, string> = { '0.6': '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789', '0.7': '0x0000000071727de22e5e9d8baf0edac6f37da032', '0.8': '0x4337084d9e255ff0702461cf8895ce9e3b5ff108', '0.9': '0x433709009b8330fda32311df1c2afa402ed8d009' };
 const EP = ENTRY_POINTS[VERSION];
 if (!EP) throw new Error(`--entrypoint is one of ${Object.keys(ENTRY_POINTS).join(', ')}`);
@@ -220,50 +229,84 @@ async function replay(hash: string): Promise<void> {
   const tokens = [...new Set([...moved.keys(), ...simulated.keys()])].map(t => ({ token: t, actual: (moved.get(t) ?? 0n).toString(), simulated: (simulated.get(t) ?? 0n).toString() }));
   const abs = (x: bigint) => (x < 0n ? -x : x);
   // A gas-priced fee (a paymaster's, or a fee collector's) moves with the gas: within 1% of the smallest transfer out.
+  // A share-based token's balance can move a base unit or two from the amount its Transfer event logs: the preview reads
+  // balances, the receipt side here reads events.
   const tokenMatch = tokens.every(t => t.actual === t.simulated) ? 'exact'
-    : tokens.every(t => t.actual === t.simulated || (fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)!)) ? 'fee' : 'other';
+    : tokens.every(t => t.actual === t.simulated || (fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)!)) ? 'fee'
+    : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || (fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)!)) ? 'units' : 'other';
   rows.push({
     hash, block: n, kind, sender, signersTried: tried, ...(prefixDropped && { prefix: 'dropped: the node refused the block with its earlier transactions' }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
     gas: simCost !== undefined && actualGasCost > 0n ? { simulated: simCost, actual: actualGasCost.toString(), percent: Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 } : undefined,
-    tokens: tokens.length ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' ? undefined : tokens.filter(t => t.actual !== t.simulated),
+    // Without any simulation (the node refused it) there are no simulated movements to compare.
+    ...(!ran(p) && { notSimulated: true }),
+    tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
   process.stdout.write('.');
 }
 
 const head = Number(await call<string>('eth_blockNumber', []));
 const pending = async (from: number, to: number) => [...new Set((await call<{ transactionHash: string }[]>('eth_getLogs', [{ address: EP, topics: [UOE], fromBlock: hex(BigInt(from)), toBlock: hex(BigInt(to)) }])).map(l => l.transactionHash))];
-const run = async (hashes: string[]) => { for (const h of hashes) { if (rows.length >= MAX) return; try { await replay(h); } catch (e) { skip(`error: ${(e as Error).message.slice(0, 80)}`); } } };
+// Replays, CONCURRENCY at a time, newest first: an older operation's state is the first to go.
+const queue: string[] = [];
+let active = 0;
+const idle: (() => void)[] = [];
+const pump = () => {
+  while (active < CONCURRENCY && queue.length && rows.length + active < MAX) {
+    const h = queue.pop()!;
+    active++;
+    replay(h).catch(e => skip(`error: ${(e as Error).message.slice(0, 80)}`)).finally(() => { active--; pump(); if (!active && (!queue.length || rows.length >= MAX)) idle.splice(0).forEach(f => f()); });
+  }
+};
+const enqueue = (hashes: string[]) => { queue.push(...hashes); pump(); };
+const drained = () => new Promise<void>(r => (active || (queue.length && rows.length < MAX) ? idle.push(r) : r()));
 const ONE = arg('tx', '');
-if (ONE) await run([ONE]);
-else if (!FOLLOW) await run((await pending(head - BLOCKS, head - 1)).reverse()); // newest first, while their state is there
+if (ONE) { enqueue([ONE]); await drained(); }
+else if (!FOLLOW) { enqueue(await pending(head - BLOCKS, head - 1)); await drained(); }
 else {
   const deadline = Date.now() + FOLLOW * 1000;
   let last = head;
+  if (BACKFILL > 0) enqueue(await pending(head - BACKFILL, head));
   while (Date.now() < deadline && rows.length < MAX) {
-    const now = Number(await call<string>('eth_blockNumber', []));
+    const now = Number(await call<string>('eth_blockNumber', []).catch(() => last));
     if (now <= last) { await new Promise(r => setTimeout(r, CHAIN === 1 ? 3000 : 500)); continue; }
     let hashes: string[];
     try { hashes = await pending(last + 1, now); } catch { await new Promise(r => setTimeout(r, 1000)); continue; }
     last = now;
-    await run(hashes);
+    enqueue(hashes);
   }
+  // What's under way finishes; what's queued past the deadline doesn't start.
+  queue.length = 0;
+  await drained();
 }
 
 const out = arg('out', '');
 if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
+const lines: string[] = [];
+const say = (line: string) => { lines.push(line); console.log(line); };
 const count = (f: (r: Row) => boolean) => rows.filter(f).length;
 const g = (r: Row) => r.gas as { percent: number } | undefined;
 const range = [...blocks].sort((a, b) => a - b);
-console.log(`\n${rows.length} single-operation bundles of EntryPoint v${VERSION} on ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
-if (PREFIX && count(r => !!r.prefix)) console.log(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: the node refused the block with them)`);
-console.log(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | SafeOps ${count(r => r.kind === 'SafeOp')}`);
-console.log(`  gas paid, of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
-console.log(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, other ${count(r => r.tokens === 'other')}`);
-if (Object.keys(skipped).length) console.log('  skipped:', skipped);
+console.log('');
+say(`${rows.length} single-operation bundles of EntryPoint v${VERSION} on ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
+if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: the node refused the block with them)`);
+say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
+say(`  gas paid, of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
+say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
+if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
     r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}`].filter(Boolean);
-  if (issues.length) console.log(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
+  if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
+
+// Differences that mean the preview was wrong (not a shape the stand-in doesn't take, or a node refusing).
+const wrong = rows.filter(r => !r.notSimulated && (!r.outcome || (g(r) && Math.abs(g(r)!.percent) >= 5) || r.tokens === 'other'));
+const md = arg('summary-md', '');
+if (md) {
+  const chain = CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum';
+  const [title, ...rest] = lines;
+  appendFileSync(md, `### ${chain}, EntryPoint v${VERSION}${wrong.length ? ` — ${wrong.length} differing from the receipts` : ''}\n\n${title}\n\n\`\`\`\n${rest.join('\n')}\n\`\`\`\n\n`);
+}
+if (STRICT && wrong.length) { console.error(`${wrong.length} operation(s) differ from their receipts`); process.exitCode = 1; }

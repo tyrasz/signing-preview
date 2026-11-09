@@ -340,6 +340,10 @@ async function coinbaseDeployStub(c: StubContext, factoryData: Hex): Promise<Stu
 const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promise<Stub>> = {
   // Coinbase Smart Wallet's factories (v1 and v1.1).
   '0x0ba5ed0c6aa8c49038f819e587e2633c4a9f428a': coinbaseDeployStub, '0xba5ed110efdba3d005bfc882d75358acbbb85842': coinbaseDeployStub,
+  // Alchemy's Modular Account v2 factory: createAccount (a ModularAccount with its single-signer validation) and
+  // createSemiModularAccount sign in Modular Account v2's 0xff00 form (its verified source); a WebAuthn account isn't
+  // given a passkey's here.
+  '0x00000000000017c61b5bee81050ec8efc9c6fecd': async (_c, factoryData) => ['0xafa63a10', '0x8b4e464e'].includes(factoryData.slice(0, 10)) ? shaped('0xff00')() : { signature: STUB_SIGNATURE },
 };
 
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });

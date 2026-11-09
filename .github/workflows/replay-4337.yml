@@ -1,0 +1,99 @@
+name: UserOperation replays
+
+# Replays recent ERC-4337 operations on Ethereum and Arbitrum One as their blocks arrive, each previewed on the state
+# it met (the block before, its header, its earlier transactions), and compares the preview with the receipt:
+# npm run accuracy:4337 (README, Simulation accuracy). Read-only: nothing is signed with a real key or sent.
+# Public RPCs by default; ETHEREUM_RPC_URL / ARBITRUM_RPC_URL repository secrets replace them.
+# Fails when an operation's outcome differs from its receipt, its gas is 5% or more off, or its token movements
+# differ beyond a gas-priced fee's rounding. Operations whose signature the stand-in can't take only show in the
+# summary: that is a missing shape, not a wrong preview.
+
+on:
+  schedule:
+    - cron: '23 5 * * *' # daily at 05:23 UTC
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: How long each replay follows new blocks (minutes)
+        default: '40'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replay-4337
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Three at a time: the Ethereum ones share one public RPC.
+      max-parallel: 3
+      matrix:
+        include:
+          # Ethereum keeps about 128 blocks of state: start with the operations already in it.
+          - { name: 'Ethereum, EntryPoint v0.7', chain: '1', entrypoint: '0.7', backfill: '100' }
+          - { name: 'Arbitrum One, EntryPoint v0.7', chain: '42161', entrypoint: '0.7', backfill: '0' }
+          - { name: 'Ethereum, EntryPoint v0.8', chain: '1', entrypoint: '0.8', backfill: '100' }
+          - { name: 'Ethereum, EntryPoint v0.6', chain: '1', entrypoint: '0.6', backfill: '100' }
+          - { name: 'Arbitrum One, EntryPoint v0.6', chain: '42161', entrypoint: '0.6', backfill: '0' }
+          - { name: 'Arbitrum One, EntryPoint v0.9', chain: '42161', entrypoint: '0.9', backfill: '0' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Replay and compare with the receipts
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          MINUTES: ${{ inputs.minutes || '40' }}
+          CHAIN: ${{ matrix.chain }}
+          ENTRYPOINT: ${{ matrix.entrypoint }}
+          BACKFILL: ${{ matrix.backfill }}
+        run: |
+          set -o pipefail
+          [[ "$MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
+          npm run accuracy:4337 -- --chain "$CHAIN" --entrypoint "$ENTRYPOINT" --follow $((MINUTES * 60)) --backfill "$BACKFILL" \
+            --max 300 --concurrency 3 --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee replay.log
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: replay-${{ matrix.chain }}-v${{ matrix.entrypoint }}
+          path: |
+            report.json
+            replay.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  report-failure:
+    needs: replay
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="UserOperation replays differ from receipts"
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          body="The scheduled UserOperation replays found operations whose preview differs from what happened, or could not run: $RUN_URL. Each job's summary lists them; the reports (report.json, replay.log) are attached to the run as artifacts. A difference is an outcome the preview got wrong, gas 5% or more off, or token movements beyond a gas-priced fee's rounding. A public RPC being unavailable also fails a job."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
