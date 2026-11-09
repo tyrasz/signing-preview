@@ -356,9 +356,10 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
   '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
-  // An account implementation (ERC-1967) on Ethereum and Arbitrum whose signatures carry a type byte, 0x00 for the
-  // owner's ECDSA (checked: it validates the shape as signed by its owner).
-  '0x8e8e658e22b12ada97b402ff0b044d6a325013c7': shaped('0x00'),
+  // Alchemy's LightAccount v2.0.0 and MultiOwnerLightAccount v2.0.0 implementations (ERC-1967): a type byte, 0x00
+  // for an EOA owner, then its signature over the personal_sign form of the hash (their verified sources; checked
+  // on LightAccount: it validates the shape as signed by its owner).
+  '0x8e8e658e22b12ada97b402ff0b044d6a325013c7': shaped('0x00'), '0xd2c27f9ee8e4355f71915ffd5568cb3433b6823d': shaped('0x00'),
   '0x000100abaad02f1cfc8bbe32bd5a564817339e72': coinbaseStub, '0x00000110dcdedc9581cb5ecb8467282f2926534d': coinbaseStub,
   // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,
