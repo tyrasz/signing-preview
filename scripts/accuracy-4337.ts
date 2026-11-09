@@ -109,11 +109,17 @@ async function replay(hash: string): Promise<void> {
     .map(t => ({ chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), ...(t.authorizationList?.length && { authorizationList: t.authorizationList as SimulationRequest['authorizationList'] }) })) : [];
   // An account the bundle itself delegates (EIP-7702, in the bundle transaction's own authorizations): the
   // authorizations apply first, as they do on-chain, and the account's code reads as the delegation.
+  // The authorities are warm in the bundle transaction from its start (EIP-7702), so they are in the replay too.
   let delegation: string | undefined;
+  const warm: string[] = [];
   if (tx.authorizationList?.length) {
     before.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: tx.from.toLowerCase(), data: '0x', value: 0n, authorizationList: tx.authorizationList });
     for (const a of tx.authorizationList) {
-      try { if ((await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase() === sender) delegation = `0xef0100${a.address.slice(2).toLowerCase()}`; } catch { /* unreadable */ }
+      try {
+        const authority = (await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase();
+        warm.push(authority);
+        if (authority === sender) delegation = `0xef0100${a.address.slice(2).toLowerCase()}`;
+      } catch { /* unreadable */ }
     }
   }
   // Reads on the parent block, and the block itself for its header (the base fee the operation's gas is priced at).
@@ -122,7 +128,7 @@ async function replay(hash: string): Promise<void> {
   // The block's header, but not its gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on
   // publicnode, below Ethereum's 60M), and the parent's limit, the node's default, is all but the same.
   let prefix = before; // dropped if the node refuses the block with it (see below)
-  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time: block.timestamp, feeRecipient: block.miner, prevRandao: block.mixHash, baseFeePerGas: block.baseFeePerGas }, before: prefix }) });
+  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time: block.timestamp, feeRecipient: block.miner, prevRandao: block.mixHash, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
   const deps = { ...liveDependencies({ [CHAIN === 42161 ? 'ARBITRUM_RPC_URL' : 'ETHEREUM_RPC_URL']: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
   const code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest']).catch(() => '0x'));

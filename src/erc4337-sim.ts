@@ -269,7 +269,7 @@ const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SI
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
  * delegate or ERC-1967 implementation). Others get STUB_SIGNATURE as is, unless the wallet supplies its own stub.
  */
-const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Promise<Stub>> = {
+const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<Stub>> = {
   // Alchemy's Modular Account v2 for EIP-7702: its fallback validation (0xff), an EOA signature (0x00), the signature.
   '0x69007702764179f14f51cdce752f4f775d74e139': shaped('0xff00'),
   // An EIP-7702 delegate whose operations on Ethereum carry the same 0xff00 prefix (checked: it validates the shape).
@@ -284,6 +284,9 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Promise<Stub>> = {
   // owner's ECDSA (checked: it validates the shape as signed by its owner).
   '0x8e8e658e22b12ada97b402ff0b044d6a325013c7': shaped('0x00'),
   '0x000100abaad02f1cfc8bbe32bd5a564817339e72': coinbaseStub, '0x00000110dcdedc9581cb5ecb8467282f2926534d': coinbaseStub,
+  // ZeroDev Kernel v3.1: its validator's signature as it is, or after a 0xff byte (both seen on-chain for the same
+  // implementation, by how each account is set up; checked: 0xff + signature validates as signed by its owner).
+  '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': () => [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }],
 };
 
 /**
@@ -302,12 +305,12 @@ async function implementationOf(deps: Dependencies, chainId: number, account: st
 }
 
 /** The stand-in for this account: shaped for the code it runs (see STUB_SHAPES) or its factory's, or STUB_SIGNATURE. */
-async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promise<Stub> {
+async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promise<Stub[]> {
   const factory = initCode && initCode.length >= 42 ? `0x${initCode.slice(2, 42)}`.toLowerCase() : undefined;
-  if (factory && FACTORY_STUBS[factory]) return FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`);
+  if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)];
   const runs = delegate?.toLowerCase() ?? await implementationOf(c.deps, c.chainId, c.sender);
   const shape = runs ? STUB_SHAPES[runs] : undefined;
-  return shape ? await shape(c) : { signature: STUB_SIGNATURE };
+  return shape ? [await shape(c)].flat() : [{ signature: STUB_SIGNATURE }];
 }
 
 /** Where the real ecrecover and P256VERIFY move while their stand-ins take their addresses. */
@@ -457,18 +460,29 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       return /^0x[0-9a-f]{64}$/i.test(out) ? out as Hex : undefined;
     } catch { return undefined; }
   };
-  const stub: Stub = op.signature && op.signature !== '0x' ? { signature: op.signature } : await stubFor({ deps, chainId: op.chainId, sender, signer, hash }, op.delegate, op.initCode);
-  const data = ep.version === '0.6'
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature }] : await stubFor({ deps, chainId: op.chainId, sender, signer, hash }, op.delegate, op.initCode);
+  const fee = await baseFee(deps, op.chainId);
+  // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
+  let result: OperationRun | null = null;
+  for (const stub of stubs) {
+    result = await withStub(stub);
+    if (result && !result.account?.signatureFailed && !result.rejected?.startsWith('AA23')) break;
+  }
+  return result;
+
+  async function withStub(stub: Stub): Promise<OperationRun | null> {
+  const data = ep!.version === '0.6'
     ? encodeFunctionData({ abi: HANDLE_V06, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] })
     : encodeFunctionData({ abi: HANDLE, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] }); // v0.7 to v0.9: packed
-  const fee = await baseFee(deps, op.chainId);
-  const run = (bundler: string, recover: Hex) => runOperation(op, sim, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(op.watch?.length && { watch: op.watch }),
+  const run = (bundler: string, recover: Hex) => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(op.watch?.length && { watch: op.watch }),
     // The moved precompile is warm, as precompiles are (EIP-2929), so validation costs what it will.
+    // An account the bundle delegates (EIP-7702) is warm from its authorization on, as the chain has it.
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] },
+      ...(op.delegate ? [{ address: sender, storageKeys: [] }] : []),
       ...(stub.p256 ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : [])],
     stateOverrides: { ...op.stateOverrides, [entryPoint]: { code: ep.code }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
       ...(stub.p256 && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
-      ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep.version);
+      ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
     const first = await run(BUNDLER, recover);
@@ -486,6 +500,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest)) : null;
   if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(ecrecoverAs(signer));
   return result && { ...result, standIn };
+  }
 }
 
 async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, req: SimulationRequest, version: '0.6' | '0.7' | '0.8' | '0.9'): Promise<OperationRun | null> {

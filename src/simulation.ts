@@ -35,9 +35,10 @@ export interface RpcSimulatorOptions {
   /**
    * Replays (accuracy checks): simulate on top of `block` instead of 'latest', with these simulated-block fields,
    * and (eth_simulateV1) after `before`, calls run first in the same simulated block (the replayed block's earlier
-   * transactions) whose results are dropped.
+   * transactions) whose results are dropped. `warm`: addresses the replayed transaction had warm from its start
+   * (its EIP-7702 authorities), added to each request's access list.
    */
-  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[] } | undefined;
+  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[]; warm?: string[] } | undefined;
 }
 
 /**
@@ -155,6 +156,11 @@ export class RpcSimulator implements Simulator {
     const r = this.replay?.(chainId);
     return r ? { tag: r.block, overrides: r.blockOverrides } : { tag: 'latest' };
   }
+  /** The requests with a replay's warm addresses in their access lists (see RpcSimulatorOptions.replay). */
+  private warmed(reqs: SimulationRequest[]): SimulationRequest[] {
+    const warm = reqs.length ? this.replay?.(reqs[0].chainId)?.warm : undefined;
+    return warm?.length ? reqs.map(r => ({ ...r, accessList: [...(r.accessList ?? []), ...warm.map(address => ({ address, storageKeys: [] }))] })) : reqs;
+  }
   /** A replay's earlier calls (see RpcSimulatorOptions.replay), as eth_simulateV1 calls. */
   private async before(chainId: number): Promise<unknown[]> {
     const before = this.replay?.(chainId)?.before ?? [];
@@ -177,7 +183,7 @@ export class RpcSimulator implements Simulator {
     const url = this.urls[chainId];
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
-    const calls = await Promise.all(reqs.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
+    const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
     const stateOverrides = await simulateV1Overrides(reqs);
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(chainId);
@@ -313,7 +319,7 @@ export class RpcSimulator implements Simulator {
     const balances: { owner: string; token: string; index: number }[][] = [balanceReads()];
     const reads: { call: number; approval: SimulatedApproval; index: number }[] = [];
     const callIndex: number[] = [];
-    const fields = await Promise.all(reqs.map(simulationFields));
+    const fields = await Promise.all(this.warmed(reqs).map(simulationFields));
     reqs.forEach((req, i) => {
       calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...fields[i] });
       callIndex.push(calls.length - 1);
