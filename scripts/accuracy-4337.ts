@@ -85,6 +85,9 @@ function innerSignature(sig: Hex): Hex | null {
   return sig.length >= 132 ? `0x${sig.slice(-130)}` : null;
 }
 
+/** Rhinestone's SmartSession module (source verified on Sourcify, Arbitrum One). */
+const SESSION_VALIDATORS = ['0x00000000008bdaba73cd9815d79069c247eb4bda'];
+
 type Row = Record<string, unknown>;
 const rows: Row[] = [];
 const blocks = new Set<number>();
@@ -99,6 +102,9 @@ async function replay(hash: string): Promise<void> {
   try { ops = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0] as unknown as Op[]; } catch { return skip('not handleOps'); }
   if (ops.length !== 1) return skip('a bundle of several operations');
   const op = ops[0], sender = op.sender.toLowerCase();
+  // A session key's operation (an ERC-7579 account validating through Rhinestone's SmartSession module, which its
+  // nonce names): the dApp holding the key signs it, not the user's wallet, so nothing previews it.
+  if (SESSION_VALIDATORS.some(v => BigInt(op.nonce).toString(16).padStart(64, '0').includes(v.slice(2)))) return skip("a session key's operation (signed by a dApp, not a wallet)");
   const r = await call<{ blockNumber: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] }>('eth_getTransactionReceipt', [hash]);
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
   const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
