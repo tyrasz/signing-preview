@@ -121,7 +121,8 @@ async function replay(hash: string): Promise<void> {
     : m === 'eth_getCode' && delegation && String(ps[0]).toLowerCase() === sender ? Promise.resolve(delegation) : rpc.call(c, m, ps.map(x => x === 'latest' ? parent : x)) };
   // The block's header, but not its gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on
   // publicnode, below Ethereum's 60M), and the parent's limit, the node's default, is all but the same.
-  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time: block.timestamp, feeRecipient: block.miner, prevRandao: block.mixHash, baseFeePerGas: block.baseFeePerGas }, before }) });
+  let prefix = before; // dropped if the node refuses the block with it (see below)
+  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time: block.timestamp, feeRecipient: block.miner, prevRandao: block.mixHash, baseFeePerGas: block.baseFeePerGas }, before: prefix }) });
   const deps = { ...liveDependencies({ [CHAIN === 42161 ? 'ARBITRUM_RPC_URL' : 'ETHEREUM_RPC_URL']: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
   const code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest']).catch(() => '0x'));
@@ -160,9 +161,14 @@ async function replay(hash: string): Promise<void> {
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
   add(sender);
   let p!: Preview, tried = 0;
+  // Public nodes refuse heavy simulations: with the block's earlier transactions, a full block can be one. The
+  // preview then has no simulation at all, and runs again without them.
+  const ran = (q: Preview) => q.decoding.notes.some(x => /simulat/.test(x)) || q.details.some(d => d.label === 'Gas cost (simulated)');
+  let prefixDropped = false;
   for (const signer of signers.slice(0, 3)) {
     tried++;
     p = await previewRequest(request(signer), ctx, deps);
+    if (!ran(p) && prefix.length) { prefix = tx.authorizationList?.length ? before.slice(-1) : []; prefixDropped = true; p = await previewRequest(request(signer), ctx, deps); }
     if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x))) break;
   }
 
@@ -189,7 +195,7 @@ async function replay(hash: string): Promise<void> {
   const tokenMatch = tokens.every(t => t.actual === t.simulated) ? 'exact'
     : tokens.every(t => t.actual === t.simulated || (fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)!)) ? 'fee' : 'other';
   rows.push({
-    hash, block: n, kind, sender, signersTried: tried, outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
+    hash, block: n, kind, sender, signersTried: tried, ...(prefixDropped && { prefix: 'dropped: the node refused the block with its earlier transactions' }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
     gas: simCost !== undefined && actualGasCost > 0n ? { simulated: simCost, actual: actualGasCost.toString(), percent: Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 } : undefined,
@@ -223,6 +229,7 @@ const count = (f: (r: Row) => boolean) => rows.filter(f).length;
 const g = (r: Row) => r.gas as { percent: number } | undefined;
 const range = [...blocks].sort((a, b) => a - b);
 console.log(`\n${rows.length} single-operation bundles of EntryPoint v${VERSION} on ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
+if (PREFIX && count(r => !!r.prefix)) console.log(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: the node refused the block with them)`);
 console.log(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 console.log(`  gas paid, of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 console.log(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, other ${count(r => r.tokens === 'other')}`);
