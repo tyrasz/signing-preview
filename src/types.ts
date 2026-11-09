@@ -131,6 +131,8 @@ export interface PreviewContext {
    * getUserOpHash). To decode one, the caller supplies the operation, as bundlers' RPC carries it. It is hashed as
    * the EntryPoint does and checked against the message being signed. A `signature` in it (the wallet's stub for
    * the account, as for gas estimation) is what the simulation validates with; without one, a stand-in is used.
+   * A typed PackedUserOperation (v0.8, v0.9) needs no help to decode; for one, this supplies only the wallet's stub:
+   * `{ sender, nonce, signature }` of the same operation (and its callData, checked if given).
    */
   userOperation?: {
     entryPoint: string;

@@ -124,6 +124,26 @@ test('EntryPoint v0.8 and v0.9: typed-data operations run whole through their ow
   }
 });
 
+test('A typed operation validates with the wallet’s own stub when context.userOperation is the same operation', async () => {
+  const owner = privateKeyToAccount('0x7777777777777777777777777777777777777777777777777777777777777777');
+  const types = { PackedUserOperation: [{ name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' }, { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' }] };
+  const domain = { name: 'ERC4337', version: '1', chainId: 999, verifyingContract: EP8 as Hex };
+  const message = { sender: account8 as Hex, nonce: 0n, initCode: '0x' as Hex, callData: sendUsdc, accountGasLimits: concatHex([word(200_000n), word(200_000n)]), preVerificationGas: 50_000n, gasFees: concatHex([word(1_000_000_000n), word(2_000_000_000n)]), paymasterAndData: '0x' as Hex };
+  // A signature that isn't the stand-in's goes to the real ecrecover: the owner's own here, so the account accepts it.
+  const signature = await owner.signTypedData({ domain, types, primaryType: 'PackedUserOperation', message });
+  const typed = JSON.stringify({ domain, types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], ...types }, primaryType: 'PackedUserOperation',
+    message: { ...message, nonce: '0', preVerificationGas: '50000' } });
+  const run = (operation: Record<string, unknown>) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNER, typed] }, { now: NOW, userOperation: { entryPoint: EP8, operation } }, deps);
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? p.decoding.notes.join(' | ');
+  const stubbed = await run({ sender: account8, nonce: '0x0', callData: sendUsdc, signature });
+  assert.match(whole(stubbed), /with the wallet's stand-in signature/);
+  assert.deepEqual(usdcChange(stubbed), ['out 50']);
+  // Another operation's (another nonce, or other calls): the wallet's stub isn't for this one, and the stand-in is used.
+  for (const other of [{ sender: account8, nonce: '0x1', signature }, { sender: account8, nonce: '0x0', callData: '0x', signature }]) {
+    assert.match(whole(await run(other)), /with a stand-in for the signature/, JSON.stringify(other));
+  }
+});
+
 test('A passkey stand-in: a WebAuthn assertion over the operation hash, and a P256 verifier that accepts only it', async () => {
   const { webAuthnStub, p256Accepting, P256_STUB } = await import('../src/erc4337-sim.ts');
   const { decodeAbiParameters } = await import('viem');

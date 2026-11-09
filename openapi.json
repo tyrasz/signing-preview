@@ -456,7 +456,7 @@
               "operation"
             ],
             "additionalProperties": false,
-            "description": "For ERC-4337 operations on EntryPoint v0.6 or v0.7, which smart accounts sign as a bare hash (personal_sign of getUserOpHash): the operation, as bundlers' RPC carries it (v0.7 fields unpacked or packed). It is decoded only if it hashes to the message being signed. A signature in it (the wallet's stub signature for the account, as for gas estimation) is what the simulation validates with; without one, a stand-in is used.",
+            "description": "For ERC-4337 operations on EntryPoint v0.6 or v0.7, which smart accounts sign as a bare hash (personal_sign of getUserOpHash): the operation, as bundlers' RPC carries it (v0.7 fields unpacked or packed). It is decoded only if it hashes to the message being signed. A signature in it (the wallet's stub signature for the account, as for gas estimation) is what the simulation validates with; without one, a stand-in is used. For a typed PackedUserOperation (v0.8, v0.9) the typed data is decoded as it is, and this only supplies the stub: { sender, nonce, signature } (and callData, checked if given) of the same operation.",
             "properties": {
               "entryPoint": {
                 "type": "string",

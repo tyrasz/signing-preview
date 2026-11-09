@@ -96,8 +96,26 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
     ? { nonce, initCode, accountGasLimits: hex(m.accountGasLimits)!, preVerificationGas, gasFees: hex(m.gasFees)!, paymasterAndData } : undefined;
   // The typed data's digest is the operation's hash (v0.8 on) and what the owner signs.
   const digest = typedDataDigest(data) ?? undefined;
-  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, paymasterAndData, packed, userOpHash: digest, ...(digest && { digest }) }, env);
+  const signature = walletStub(env, entryPoint, sender, nonce, callData);
+  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, paymasterAndData, packed, userOpHash: digest, ...(digest && { digest }), ...(signature && { signature }) }, env);
 };
+
+/**
+ * The wallet's stub signature for a typed operation, as it would pass it to a bundler's gas estimation: the
+ * `signature` of `context.userOperation` when that is this operation (the same EntryPoint, sender and nonce, and the
+ * same callData if it has one). The typed data itself carries everything else.
+ */
+function walletStub(env: TypedEnv, entryPoint: string, sender: string, nonce: bigint | null, callData: Hex | null): Hex | undefined {
+  const supplied = env.context.userOperation;
+  const op = supplied?.operation;
+  if (!op || !sameAddress(supplied.entryPoint, entryPoint) || typeof op.sender !== 'string' || !sameAddress(op.sender, sender)) return undefined;
+  let n: bigint | null = null;
+  try { n = typeof op.nonce === 'string' || typeof op.nonce === 'number' || typeof op.nonce === 'bigint' ? BigInt(op.nonce) : null; } catch { n = null; }
+  if (n === null || n !== nonce) return undefined;
+  if (op.callData !== undefined && hex(op.callData) !== (callData ?? '0x')) return undefined;
+  const sig = hex(op.signature);
+  return sig && sig !== '0x' ? sig : undefined;
+}
 
 /** A UserOperation, whichever EntryPoint version and however it was signed. */
 export interface Operation {
@@ -176,7 +194,7 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   else if (!run.executed) b.warn('caution', 'userop_execution_reverts', `The operation's calls fail when the EntryPoint runs them${run.revertReason ? `: ${run.revertReason}` : ''}. It can still be included, and ${pm ? 'the paymaster' : 'the account'} pays ${native(run.paid)} for the gas.`);
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
-  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : u.signature ? " (with the wallet's stand-in signature)" : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? ", but the account doesn't accept it as theirs, so its own signature check isn't simulated" : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
+  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : u.signature ? ` (with the wallet's stand-in signature${run.account?.signatureFailed ? ", which the account doesn't accept as signed, as gas-estimation stubs often aren't" : ''})` : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? ", but the account doesn't accept it as theirs, so its own signature check isn't simulated" : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
   return changes;
 }
 
