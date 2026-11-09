@@ -1,7 +1,8 @@
 // Simulating a Safe transaction the way the Safe runs it: execTransaction itself, so the Safe's own logic decides
 // (guards, the gas refund, delegatecalls of any contract). An owner's signature doesn't exist yet when previewing,
-// so the simulation marks the transaction's hash as approved by enough owners (Safe's approvedHashes, the on-chain
-// approval that signature type 1 accepts) and signs with those approvals: the threshold and owners stay as they are.
+// so the signing owner signs with the ECDSA stand-in (ecrecover attributes it to them over the transaction's hash),
+// and the other owners the threshold needs approve the hash on-chain (Safe's approvedHashes, the approval signature
+// type 1 accepts): the threshold and owners stay as they are.
 // In the same simulated block, the Safe's configuration is read again (owners, threshold, singleton, guard,
 // fallback handler, modules) and compared with now: what a delegatecall did to the Safe shows even when its
 // calldata looks harmless, as in the 2025 Bybit theft (a delegatecall that replaced the Safe's singleton).
@@ -110,8 +111,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   let exec: SimulationRequest;
   if (opts.request) exec = { ...opts.request, account: safe };
   else {
-    // Approve the transaction's hash (at the Safe's current nonce, as execTransaction computes it) for the first
-    // `threshold` owners, in ascending order as checkSignatures requires, and sign with those approvals (v = 1).
+    // The transaction's hash at the Safe's current nonce, as execTransaction computes it.
     const nonce = BigInt(await call(encodeFunctionData({ abi: ABI, functionName: 'nonce' })));
     const hash = await call(encodeFunctionData({ abi: ABI, functionName: 'getTransactionHash', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, nonce] }));
     // The signing owner (the executor, or else the first owner) signs with the ECDSA stand-in, which the replaced
