@@ -243,3 +243,26 @@ test('A paymaster field naming address 0 is no paymaster, as the EntryPoint take
   assert.match(detail(p, 'Gas cost (simulated)') ?? '', /paid by the account/);
   assert.deepEqual(usdcChange(p), ['out 50']);
 });
+
+test('The EntryPoint override hashes operations as the deployed EntryPoint does, for calls before a simulation too', async () => {
+  const { entryPointOverride } = await import('../src/erc4337-sim.ts');
+  const { hashTypedData, encodeFunctionData: enc, parseAbi: abi } = await import('viem');
+  const HASH = abi(['function getUserOpHash((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) op) view returns (bytes32)']);
+  const op = { sender: account8 as Hex, nonce: 7n, initCode: '0x' as Hex, callData: sendUsdc, accountGasLimits: concatHex([word(200_000n), word(200_000n)]), preVerificationGas: 50_000n, gasFees: concatHex([word(1_000_000_000n), word(2_000_000_000n)]), paymasterAndData: '0x' as Hex };
+  const types = { PackedUserOperation: [{ name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' }, { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' }] };
+  for (const ep of [EP8, EP9]) {
+    // v0.8 on: the operation's hash is its EIP-712 digest under the EntryPoint's domain.
+    const expected = hashTypedData({ domain: { name: 'ERC4337', version: '1', chainId: 999, verifyingContract: ep as Hex }, types, primaryType: 'PackedUserOperation', message: op });
+    const data = enc({ abi: HASH, functionName: 'getUserOpHash', args: [{ ...op, signature: '0x' }] });
+    // A plain call (as an earlier bundle's handleOps makes before the simulation starts) reads the domain the
+    // simulation code keeps in storage: with the override's storage it is the EntryPoint's own; without, it was zero.
+    const withOverride = await deps.rpc!.call(999, 'eth_call', [{ to: ep, data }, 'latest', { [ep]: entryPointOverride(ep, 999) }]);
+    assert.equal(withOverride, expected, `v${ep === EP8 ? '0.8' : '0.9'}`);
+    const codeOnly = await deps.rpc!.call(999, 'eth_call', [{ to: ep, data }, 'latest', { [ep]: { code: entryPointOverride(ep, 999)!.code } }]);
+    assert.notEqual(codeOnly, expected);
+  }
+  // Its SenderCreator, which deploys accounts, is the EntryPoint's first creation, as on-chain (public from v0.8).
+  const { getContractAddress } = await import('viem');
+  const created = await deps.rpc!.call(999, 'eth_call', [{ to: EP8, data: enc({ abi: abi(['function senderCreator() view returns (address)']), functionName: 'senderCreator' }) }, 'latest', { [EP8]: entryPointOverride(EP8, 999) }]);
+  assert.equal(`0x${String(created).slice(26)}`, getContractAddress({ from: EP8 as Hex, nonce: 1n }).toLowerCase());
+});

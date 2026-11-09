@@ -1,5 +1,5 @@
 // npm run accuracy:4337 -- [--chain 1|42161] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 [--backfill 100] | --blocks 100 | --tx 0x…]
-//   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict]
+//   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict] [--dump preview.json]
 //
 // --concurrency replays that many operations at once (each on its own state), newest first, while --follow keeps
 // watching for new blocks: on Arbitrum an operation must be replayed within about 30 seconds of its block. --backfill
@@ -205,6 +205,9 @@ async function replay(hash: string): Promise<void> {
     if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x) || /validation reverts on a stand-in/.test(x))) break;
   }
 
+  // --dump: the preview itself, to look at one operation closely.
+  if (arg('dump', '')) writeFileSync(arg('dump', ''), JSON.stringify(p, null, 1));
+
   // What happened, and what the preview says.
   const event = r.logs.find(l => l.address.toLowerCase() === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender)!;
   const succeeded = BigInt(`0x${event.data.slice(66, 130)}`) === 1n, actualGasCost = BigInt(`0x${event.data.slice(130, 194)}`);
@@ -225,7 +228,8 @@ async function replay(hash: string): Promise<void> {
     if (to === sender) moved.set(token, (moved.get(token) ?? 0n) + v);
   }
   for (const [k, v] of moved) if (v === 0n) moved.delete(k);
-  const simulated = new Map((p.assetChanges ?? []).filter(c => c.asset && c.asset !== 'native' && c.raw).map(c => [c.asset!.toLowerCase(), (c.direction === 'out' ? -1n : 1n) * BigInt(c.raw!)]));
+  // Simulated movements only: a preview whose calls revert shows what they ask for (basis 'requested'), with a warning.
+  const simulated = new Map((p.assetChanges ?? []).filter(c => c.asset && c.asset !== 'native' && c.raw && c.basis !== 'requested').map(c => [c.asset!.toLowerCase(), (c.direction === 'out' ? -1n : 1n) * BigInt(c.raw!)]));
   const tokens = [...new Set([...moved.keys(), ...simulated.keys()])].map(t => ({ token: t, actual: (moved.get(t) ?? 0n).toString(), simulated: (simulated.get(t) ?? 0n).toString() }));
   const abs = (x: bigint) => (x < 0n ? -x : x);
   // A gas-priced fee (a paymaster's, or a fee collector's) moves with the gas: within 1% of the smallest transfer out.

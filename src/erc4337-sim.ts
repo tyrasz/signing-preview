@@ -12,10 +12,11 @@
 // deployed through its SenderCreator if it's new, then called with the operation's callData from the EntryPoint
 // (or with executeUserOp(userOp, userOpHash) when callData starts with its selector). Validation, the gas prefund
 // and refund, and a paymaster's postOp charge aren't part of it.
-import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, hexToBytes, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, keccak256, encodeFunctionData, hexToBytes, parseAbi, sha256, stringToHex, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import { decodeRevert } from './simulation.ts';
-import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V09 } from './entrypoint-simulations.ts';
+import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
+  ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 
 /** Each EntryPoint's SenderCreator: v0.8 and v0.9 report theirs (senderCreator()); v0.6's and v0.7's are fixed. */
 export const SENDER_CREATORS: Record<string, string> = {
@@ -147,13 +148,40 @@ export async function entryPointDeposit(deps: Dependencies, chainId: number, ent
   try { return BigInt(String(await deps.rpc.call(chainId, 'eth_call', [{ to: entryPoint, data: `0x70a08231${account.toLowerCase().slice(2).padStart(64, '0')}` }, 'latest']))); } catch { return undefined; }
 }
 
-/** The simulation code for each EntryPoint (see entrypoint-simulations.ts). */
-const SIMULATIONS: Record<string, { version: '0.6' | '0.7' | '0.8' | '0.9'; code: string }> = {
-  '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789': { version: '0.6', code: ENTRY_POINT_SIMULATIONS_V06 },
-  '0x0000000071727de22e5e9d8baf0edac6f37da032': { version: '0.7', code: ENTRY_POINT_SIMULATIONS_V07 },
-  '0x4337084d9e255ff0702461cf8895ce9e3b5ff108': { version: '0.8', code: ENTRY_POINT_SIMULATIONS_V08 },
-  '0x433709009b8330fda32311df1c2afa402ed8d009': { version: '0.9', code: ENTRY_POINT_SIMULATIONS_V09 },
+/** The simulation code for each EntryPoint (see entrypoint-simulations.ts), with where its immutables and own storage are. */
+const SIMULATIONS: Record<string, { version: '0.6' | '0.7' | '0.8' | '0.9'; code: string; immutables: Record<string, number[]>; slots: Record<string, string> }> = {
+  '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789': { version: '0.6', code: ENTRY_POINT_SIMULATIONS_V06, immutables: ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, slots: ENTRY_POINT_SIMULATIONS_V06_SLOTS },
+  '0x0000000071727de22e5e9d8baf0edac6f37da032': { version: '0.7', code: ENTRY_POINT_SIMULATIONS_V07, immutables: ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, slots: ENTRY_POINT_SIMULATIONS_V07_SLOTS },
+  '0x4337084d9e255ff0702461cf8895ce9e3b5ff108': { version: '0.8', code: ENTRY_POINT_SIMULATIONS_V08, immutables: ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, slots: ENTRY_POINT_SIMULATIONS_V08_SLOTS },
+  '0x433709009b8330fda32311df1c2afa402ed8d009': { version: '0.9', code: ENTRY_POINT_SIMULATIONS_V09, immutables: ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, slots: ENTRY_POINT_SIMULATIONS_V09_SLOTS },
 };
+/** OpenZeppelin's ShortString: a string of up to 31 bytes, left-aligned, its length in the last byte. */
+const shortString = (text: string) => `${stringToHex(text).slice(2).padEnd(62, '0')}${text.length.toString(16).padStart(2, '0')}`;
+const EIP712_DOMAIN = keccak256(stringToHex('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)'));
+/**
+ * The state override that puts an EntryPoint's simulation code in its place on this chain: the code with the
+ * immutables its constructor would have set (the EIP-712 name and version of v0.8 on), and the storage
+ * EntryPointSimulations sets for itself when a simulation starts (its SenderCreator, the first contract the
+ * EntryPoint created, and from v0.8 the EIP-712 domain separator operations are hashed with). Without that storage,
+ * a plain handleOps in the same simulated block (an earlier bundle, replayed before the operation) hashed operations
+ * with a zero domain and failed on its real signatures, and couldn't deploy accounts.
+ */
+export function entryPointOverride(entryPoint: string, chainId: number): { code: Hex; stateDiff?: Record<string, Hex> } | undefined {
+  const ep = SIMULATIONS[entryPoint.toLowerCase()];
+  if (!ep) return undefined;
+  const words: Record<string, string> = { _name: shortString('ERC4337'), _version: shortString('1') };
+  let code = ep.code.slice(2);
+  for (const [name, starts] of Object.entries(ep.immutables)) {
+    const word = words[name];
+    if (word) for (const at of starts) code = `${code.slice(0, at * 2)}${word}${code.slice(at * 2 + 64)}`;
+  }
+  const word = (v: string) => `0x${v.replace(/^0x/, '').padStart(64, '0')}` as Hex;
+  const domain = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }],
+    [EIP712_DOMAIN, keccak256(stringToHex('ERC4337')), keccak256(stringToHex('1')), BigInt(chainId), getAddress(entryPoint)]));
+  const values: Record<string, Hex> = { _senderCreator: word(getContractAddress({ from: getAddress(entryPoint), nonce: 1n }).toLowerCase()), __domainSeparatorV4: domain };
+  const stateDiff = Object.fromEntries(Object.entries(ep.slots).filter(([name]) => values[name]).map(([name, slot]) => [slot, values[name]]));
+  return { code: `0x${code}` as Hex, ...(Object.keys(stateDiff).length && { stateDiff }) };
+}
 const HANDLE = parseAbi(['function simulateHandleOp((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) op, address target, bytes targetCallData)']);
 const HASH = parseAbi(['function getUserOpHash((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) op) view returns (bytes32)']);
 const HASH_V06 = parseAbi(['function getUserOpHash((address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature) op) view returns (bytes32)']);
@@ -617,7 +645,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(stub.p256 === true ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []),
       // The verifier itself stays cold, as it is on-chain; only the call on to its moved code is warm.
       ...(daimo ? [{ address: DAIMO_MOVED, storageKeys: [] }] : [])],
-    stateOverrides: { ...op.stateOverrides, [entryPoint]: { code: ep.code }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
+    stateOverrides: { ...op.stateOverrides, [entryPoint]: { ...entryPointOverride(entryPoint, op.chainId)!, ...(op.stateOverrides?.[entryPoint]?.stateDiff && { stateDiff: { ...entryPointOverride(entryPoint, op.chainId)!.stateDiff, ...op.stateOverrides[entryPoint].stateDiff } }) }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
       ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
       ...(daimo && { [DAIMO_P256_VERIFIER]: { code: daimoAccepting() }, [DAIMO_MOVED]: { code: daimo } }),
       ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);

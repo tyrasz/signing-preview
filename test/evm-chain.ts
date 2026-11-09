@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createEVM, type EVM } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
-import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft } from '@ethereumjs/util';
+import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes } from '@ethereumjs/util';
 import { encodeAbiParameters, keccak256, type Hex } from 'viem';
 
 const solc = createRequire(import.meta.url)('solc');
@@ -80,12 +80,13 @@ export async function testChain(): Promise<TestChain> {
         return { result: { number: `0x${n.toString(16)}`, hash: keccak256(encodeAbiParameters([{ type: 'uint256' }], [n])), timestamp: '0x65000000', miner: '0x0000000000000000000000000000000000000000', mixHash: `0x${'00'.repeat(32)}`, gasLimit: '0x1c9c380', baseFeePerGas: '0x0' } };
       }
       case 'eth_call': {
-        const [tx, , overrides] = params as [{ from?: string; to: string; data: string; value?: string; gas?: string }, string, Record<string, { code?: Hex; balance?: Hex }> | undefined];
+        const [tx, , overrides] = params as [{ from?: string; to: string; data: string; value?: string; gas?: string }, string, Record<string, { code?: Hex; balance?: Hex; stateDiff?: Record<string, Hex> }> | undefined];
         await sm.checkpoint();
         try {
           for (const [a, o] of Object.entries(overrides ?? {})) {
             if (o.balance) await setBalance(a, BigInt(o.balance));
             if (o.code) await sm.putCode(at(a), hexToBytes(o.code));
+            for (const [slot, v] of Object.entries(o.stateDiff ?? {})) await sm.putStorage(at(a), setLengthLeft(hexToBytes(slot as Hex), 32), unpadBytes(hexToBytes(v)));
           }
           const from = tx.from ?? '0x0000000000000000000000000000000000000000', value = BigInt(tx.value ?? 0);
           const balance = (await sm.getAccount(at(from)))?.balance ?? 0n;

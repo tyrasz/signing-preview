@@ -141,21 +141,51 @@ const plainDeposit = (source: string) => patch('EntryPointSimulations', source, 
   ZERO_PAYMASTER,
 ]);
 
-function compile(solcDir: string, aa: string, oz: string, file: string, contract: string, settings: object, edit?: (s: string) => string): { code: string; version: string } {
+type Built = { code: string; version: string; immutables: Record<string, number[]>; slots: Record<string, string> };
+/** The names solc gives the immutables it leaves zeroed in runtime code (by AST id), and their byte offsets. */
+function built(out: { errors?: { severity: string; formattedMessage: string }[]; sources: Record<string, { ast: unknown }>; contracts: Record<string, Record<string, { storageLayout?: { storage: { label: string; slot: string; offset: number }[] }; evm: { deployedBytecode: { object: string; immutableReferences?: Record<string, { start: number; length: number }[]> } } }>> }, file: string, contract: string, version: string): Built {
+  const errors = (out.errors ?? []).filter(e => e.severity === 'error');
+  if (errors.length) throw new Error(errors.map(e => e.formattedMessage).join('\n'));
+  const names = new Map<number, string>();
+  const walk = (n: unknown): void => {
+    if (!n || typeof n !== 'object') return;
+    const node = n as { nodeType?: string; mutability?: string; id?: number; name?: string };
+    if (node.nodeType === 'VariableDeclaration' && node.mutability === 'immutable' && node.id !== undefined) names.set(node.id, node.name!);
+    for (const v of Object.values(n)) if (v && typeof v === 'object') walk(v);
+  };
+  for (const src of Object.values(out.sources)) walk(src.ast);
+  const bytecode = out.contracts[file][contract].evm.deployedBytecode;
+  const immutables: Record<string, number[]> = {};
+  for (const [id, refs] of Object.entries(bytecode.immutableReferences ?? {})) {
+    const name = names.get(Number(id));
+    if (!name) throw new Error(`${contract}: immutable ${id} has no name`);
+    if (refs.some(r => r.length !== 32)) throw new Error(`${contract}: ${name} isn't a 32-byte immutable`);
+    immutables[name] = refs.map(r => r.start);
+  }
+  // The storage EntryPointSimulations sets for itself when a simulation starts (initSenderCreator): its
+  // SenderCreator and EIP-712 domain separator, which a plain handleOps (an earlier bundle in a replayed block)
+  // reads too. Each takes a slot of its own.
+  const slots: Record<string, string> = {};
+  for (const v of out.contracts[file][contract].storageLayout?.storage ?? []) {
+    if (v.label !== '_senderCreator' && v.label !== '__domainSeparatorV4') continue;
+    if (v.offset !== 0) throw new Error(`${contract}: ${v.label} shares a slot`);
+    slots[v.label] = `0x${BigInt(v.slot).toString(16).padStart(64, '0')}`;
+  }
+  return { code: `0x${bytecode.object}`, version, immutables, slots };
+}
+
+function compile(solcDir: string, aa: string, oz: string, file: string, contract: string, settings: object, edit?: (s: string) => string): Built {
   const solc = solcFrom(solcDir);
   // Only the EntryPoint's own folders: the package's samples have dependencies of their own.
   const own = Object.fromEntries(['core', 'interfaces', 'utils'].flatMap(d => Object.entries(sources(join(aa, d), `${d}/`))));
   if (edit) own[file] = { content: edit(own[file].content) };
   const input = { language: 'Solidity', sources: { ...own, ...sources(oz, '@openzeppelin/contracts/') },
-    settings: { ...settings, outputSelection: { [file]: { [contract]: ['evm.deployedBytecode.object'] } } } };
-  const out = JSON.parse(solc.compile(JSON.stringify(input)));
-  const errors = (out.errors ?? []).filter((e: { severity: string }) => e.severity === 'error');
-  if (errors.length) throw new Error(errors.map((e: { formattedMessage: string }) => e.formattedMessage).join('\n'));
-  return { code: `0x${out.contracts[file][contract].evm.deployedBytecode.object}`, version: solc.version().split('+')[0] };
+    settings: { ...settings, outputSelection: { '*': { '': ['ast'] }, [file]: { [contract]: ['evm.deployedBytecode.object', 'evm.deployedBytecode.immutableReferences', 'storageLayout'] } } } };
+  return built(JSON.parse(solc.compile(JSON.stringify(input))), file, contract, solc.version().split('+')[0]);
 }
 
 /** v0.9: the deployed EntryPoint's verified sources and settings (Sourcify), with rc.1's simulation contract. */
-function compileV09(solcDir: string, verified: Verified, aa: string): { code: string; version: string } {
+function compileV09(solcDir: string, verified: Verified, aa: string): Built {
   const solc = solcFrom(solcDir);
   if (!verified.compilation.compilerVersion.startsWith(solc.version().split('.Emscripten')[0])) throw new Error(`EntryPoint v0.9 was compiled with ${verified.compilation.compilerVersion}, not ${solc.version()}`);
   const file = 'contracts/core/EntryPointSimulations.sol';
@@ -163,10 +193,8 @@ function compileV09(solcDir: string, verified: Verified, aa: string): { code: st
     [file]: { content: plainDeposit(readFileSync(join(aa, 'core/EntryPointSimulations.sol'), 'utf8')) },
     'contracts/interfaces/IEntryPointSimulations.sol': { content: readFileSync(join(aa, 'interfaces/IEntryPointSimulations.sol'), 'utf8') } };
   const { viaIR, optimizer, evmVersion } = verified.compilation.compilerSettings;
-  const out = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources, settings: { viaIR, optimizer, evmVersion, outputSelection: { [file]: { EntryPointSimulations: ['evm.deployedBytecode.object'] } } } })));
-  const errors = (out.errors ?? []).filter((e: { severity: string }) => e.severity === 'error');
-  if (errors.length) throw new Error(errors.map((e: { formattedMessage: string }) => e.formattedMessage).join('\n'));
-  return { code: `0x${out.contracts[file].EntryPointSimulations.evm.deployedBytecode.object}`, version: solc.version().split('+')[0] };
+  const out = JSON.parse(solc.compile(JSON.stringify({ language: 'Solidity', sources, settings: { viaIR, optimizer, evmVersion, outputSelection: { '*': { '': ['ast'] }, [file]: { EntryPointSimulations: ['evm.deployedBytecode.object', 'evm.deployedBytecode.immutableReferences', 'storageLayout'] } } } })));
+  return built(out, file, 'EntryPointSimulations', solc.version().split('+')[0]);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -188,18 +216,33 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 // in one call, returning (preOpGas, paid, accountValidationData, paymasterValidationData, targetSuccess,
 // targetResult) instead of reverting. Each is compiled as its deployed EntryPoint was (via IR, 1,000,000 runs), so
 // operations cost the gas they will.
+//
+// Runtime code has its immutables zeroed (a constructor sets them, and a code override runs none): each
+// *_IMMUTABLES gives the byte offsets of each one's 32-byte word, which src/erc4337-sim.ts fills as the EntryPoint's
+// own constructor did. EntryPointSimulations keeps what it can't take from immutables in storage of its own, set when
+// a simulation starts: *_SLOTS gives those slots (its SenderCreator, and for v0.8 on its EIP-712 domain separator,
+// which operations are hashed with), which src/erc4337-sim.ts sets for every call in the simulated block, so a plain
+// handleOps before the simulation (an earlier bundle) runs as the EntryPoint does.
 
 /** EntryPoint v0.6 (0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789): @account-abstraction/contracts 0.6.0 core/EntryPoint.sol, patched, with @openzeppelin/contracts 4.9.6; solc ${v06.version}. */
 export const ENTRY_POINT_SIMULATIONS_V06 = '${v06.code}';
+export const ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES: Record<string, number[]> = ${JSON.stringify(v06.immutables)};
+export const ENTRY_POINT_SIMULATIONS_V06_SLOTS: Record<string, string> = ${JSON.stringify(v06.slots)};
 
 /** EntryPoint v0.7 (0x0000000071727De22E5E9d8BAf0edAc6f37da032): 0.7.0 core/EntryPointSimulations.sol with 5.0.2; solc ${v07.version}, paris. */
 export const ENTRY_POINT_SIMULATIONS_V07 = '${v07.code}';
+export const ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES: Record<string, number[]> = ${JSON.stringify(v07.immutables)};
+export const ENTRY_POINT_SIMULATIONS_V07_SLOTS: Record<string, string> = ${JSON.stringify(v07.slots)};
 
 /** EntryPoint v0.8 (0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108): 0.8.0 core/EntryPointSimulations.sol with 5.1.0; solc ${v08.version}, cancun. */
 export const ENTRY_POINT_SIMULATIONS_V08 = '${v08.code}';
+export const ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES: Record<string, number[]> = ${JSON.stringify(v08.immutables)};
+export const ENTRY_POINT_SIMULATIONS_V08_SLOTS: Record<string, string> = ${JSON.stringify(v08.slots)};
 
 /** EntryPoint v0.9 (0x433709009B8330FDa32311DF1C2AFA402eD8D009): its verified sources (Sourcify) with 0.9.0-rc.1 core/EntryPointSimulations.sol; solc ${v09.version}, cancun. */
 export const ENTRY_POINT_SIMULATIONS_V09 = '${v09.code}';
+export const ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES: Record<string, number[]> = ${JSON.stringify(v09.immutables)};
+export const ENTRY_POINT_SIMULATIONS_V09_SLOTS: Record<string, string> = ${JSON.stringify(v09.slots)};
 `;
   const target = `${root}src/entrypoint-simulations.ts`;
   if (args.includes('--check')) {
