@@ -194,10 +194,13 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
  */
 export const STUB_SIGNATURE = '0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c' as Hex;
 
-/** A stand-in signature; `p256` when it is a passkey's, which P256VERIFY (0x100) must accept too (see standIn). */
-interface Stub { signature: Hex; p256?: boolean }
+/**
+ * A stand-in signature; `p256` when it is a passkey's, which P256VERIFY (0x100) must accept too (see standIn), or
+ * `'daimo'` when the account verifies it with Daimo's P256 verifier contract instead.
+ */
+interface Stub { signature: Hex; p256?: boolean | 'daimo' }
 type StubContext = {
-  deps: Dependencies; chainId: number; sender: string; signer: string;
+  deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
   hash: () => Promise<Hex | undefined>;
 };
@@ -225,6 +228,46 @@ export function webAuthnStub(hash: Hex): Hex {
   const authenticatorData = concatHex([sha256(stringToHex('keys.coinbase.com')), '0x05', '0x00000000']);
   return encodeAbiParameters([{ type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' }, { name: 'typeIndex', type: 'uint256' }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }],
     [{ authenticatorData, clientDataJSON, challengeIndex: BigInt(clientDataJSON.indexOf('"challenge"')), typeIndex: BigInt(clientDataJSON.indexOf('"type"')), r: BigInt(P256_STUB.r), s: BigInt(P256_STUB.s) }]);
+}
+/** Daimo's P256 verifier contract (the same address on every chain here), which passkey accounts call without RIP-7212. */
+export const DAIMO_P256_VERIFIER = '0xc2b78104907f722dabac4c69f826a522b2754de4';
+/** ZeroDev's WebAuthn validator for Kernel v3 (source verified on Sourcify, Arbitrum One). */
+const ZERODEV_WEBAUTHN_VALIDATORS = new Set(['0x7ab16ff354acb328452f1d445b3ddee9a91e9e69']);
+/** Chains here on which ZeroDev's SDK signs with the P256 precompile (its isRIP7212SupportedNetwork). */
+const ZERODEV_PRECOMPILED = new Set([1, 42161]);
+/**
+ * A passkey's assertion as ZeroDev's WebAuthn validator decodes it: abi.encode(authenticatorData, clientDataJSON,
+ * responseTypeLocation, r, s, usePrecompiled), with `"type":"webauthn.get"` at clientDataJSON[1] and the hash as
+ * the challenge at clientDataJSON[23], where the validator looks for them; user present and verified.
+ */
+export function zeroDevWebAuthnStub(hash: Hex, usePrecompiled: boolean): Hex {
+  const clientDataJSON = `{"type":"webauthn.get","challenge":"${base64url(hash)}","origin":"https://passkeys.zerodev.app","crossOrigin":false}`;
+  const authenticatorData = concatHex([sha256(stringToHex('passkeys.zerodev.app')), '0x05', '0x00000000']);
+  return encodeAbiParameters([{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }],
+    [authenticatorData, clientDataJSON, 1n, BigInt(P256_STUB.r), BigInt(P256_STUB.s), usePrecompiled]);
+}
+const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)']);
+/**
+ * ZeroDev Kernel v3.1: the validator its nonce names (bytes 2-21 when the validation type, byte 1, is 0x01), else
+ * its root validator. A passkey's (ZeroDev's WebAuthn validator) gets a passkey's assertion; any other, the ECDSA
+ * stand-in as it is or after a 0xff byte (both seen on-chain for the same implementation, by how each account is
+ * set up; checked: 0xff + signature validates as signed by its owner).
+ */
+async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
+  const ecdsa: Stub[] = [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }];
+  const nonce = c.nonce.toString(16).padStart(64, '0');
+  let validator = nonce.slice(2, 4) === '01' ? `0x${nonce.slice(4, 44)}` : undefined;
+  if (!validator && c.deps.rpc?.has(c.chainId)) {
+    try {
+      const root = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']));
+      if (/^0x[0-9a-f]{64}$/i.test(root)) validator = `0x${root.slice(4, 44)}`;
+    } catch { /* not readable: the ECDSA forms */ }
+  }
+  if (!validator || !ZERODEV_WEBAUTHN_VALIDATORS.has(validator.toLowerCase())) return ecdsa;
+  const hash = await c.hash();
+  if (!hash) return ecdsa;
+  const precompiled = ZERODEV_PRECOMPILED.has(c.chainId);
+  return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
 }
 const coinbaseWrapper = (ownerIndex: bigint, signatureData: Hex) => encodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], [{ ownerIndex, signatureData }]);
 /**
@@ -269,7 +312,7 @@ const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SI
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
  * delegate or ERC-1967 implementation). Others get STUB_SIGNATURE as is, unless the wallet supplies its own stub.
  */
-const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<Stub>> = {
+const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<Stub | Stub[]>> = {
   // Alchemy's Modular Account v2 for EIP-7702: its fallback validation (0xff), an EOA signature (0x00), the signature.
   '0x69007702764179f14f51cdce752f4f775d74e139': shaped('0xff00'),
   // An EIP-7702 delegate whose operations on Ethereum carry the same 0xff00 prefix (checked: it validates the shape).
@@ -284,9 +327,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // owner's ECDSA (checked: it validates the shape as signed by its owner).
   '0x8e8e658e22b12ada97b402ff0b044d6a325013c7': shaped('0x00'),
   '0x000100abaad02f1cfc8bbe32bd5a564817339e72': coinbaseStub, '0x00000110dcdedc9581cb5ecb8467282f2926534d': coinbaseStub,
-  // ZeroDev Kernel v3.1: its validator's signature as it is, or after a 0xff byte (both seen on-chain for the same
-  // implementation, by how each account is set up; checked: 0xff + signature validates as signed by its owner).
-  '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': () => [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }],
+  // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
+  '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,
 };
 
 /**
@@ -314,7 +356,7 @@ async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promi
 }
 
 /** Where the real ecrecover and P256VERIFY move while their stand-ins take their addresses. */
-const ECRECOVER_MOVED = '0x0000000000000000000000000000000000ec0001', P256_MOVED = '0x0000000000000000000000000000000000ec0100';
+const ECRECOVER_MOVED = '0x0000000000000000000000000000000000ec0001', P256_MOVED = '0x0000000000000000000000000000000000ec0100', DAIMO_MOVED = '0x0000000000000000000000000000000000ec0da1';
 /**
  * Code for a signature precompile that answers `answer` (EVM code leaving one word on the stack) for the stand-in
  * signature (r and s at calldata offsets rAt and rAt + 32), and anything else as the real precompile does (moved to
@@ -362,6 +404,12 @@ export function ecdsaStandIn(signer: string, digest?: Hex): Pick<SimulationReque
 }
 /** P256VERIFY (0x100, RIP-7212 / EIP-7951) accepting P256_STUB: a passkey's assertion (see webAuthnStub) verifies. */
 export const p256Accepting = (): Hex => standIn(P256_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
+/**
+ * Daimo's verifier accepting P256_STUB: its code moves to DAIMO_MOVED and this takes its address. Every input still
+ * runs through the real code first (the stub's verification costs what a real one does, and fails), then the stub
+ * is answered 1; anything else gets the real answer.
+ */
+export const daimoAccepting = (): Hex => standIn(DAIMO_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
 
 export interface OperationInput {
   chainId: number; entryPoint: string; sender: string; nonce: bigint;
@@ -470,7 +518,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       return /^0x[0-9a-f]{64}$/i.test(out) ? out as Hex : undefined;
     } catch { return undefined; }
   };
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature }] : await stubFor({ deps, chainId: op.chainId, sender, signer, hash }, op.delegate, op.initCode);
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   let result: OperationRun | null = null;
@@ -481,6 +529,12 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   return result;
 
   async function withStub(stub: Stub): Promise<OperationRun | null> {
+  // Daimo's verifier, moved to make room for its stand-in: its code is the chain's own.
+  let daimo: Hex | undefined;
+  if (stub.p256 === 'daimo') {
+    try { daimo = deps.rpc?.has(op.chainId) ? String(await deps.rpc.call(op.chainId, 'eth_getCode', [DAIMO_P256_VERIFIER, 'latest'])) as Hex : undefined; } catch { daimo = undefined; }
+    if (!daimo || daimo === '0x') return null;
+  }
   const data = ep!.version === '0.6'
     ? encodeFunctionData({ abi: HANDLE_V06, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] })
     : encodeFunctionData({ abi: HANDLE, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] }); // v0.7 to v0.9: packed
@@ -489,9 +543,12 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     // An account the bundle delegates (EIP-7702) is warm from its authorization on, as the chain has it.
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] },
       ...(op.delegate ? [{ address: sender, storageKeys: [] }] : []),
-      ...(stub.p256 ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : [])],
+      ...(stub.p256 === true ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []),
+      // The verifier itself stays cold, as it is on-chain; only the call on to its moved code is warm.
+      ...(daimo ? [{ address: DAIMO_MOVED, storageKeys: [] }] : [])],
     stateOverrides: { ...op.stateOverrides, [entryPoint]: { code: ep.code }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
-      ...(stub.p256 && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
+      ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
+      ...(daimo && { [DAIMO_P256_VERIFIER]: { code: daimoAccepting() }, [DAIMO_MOVED]: { code: daimo } }),
       ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {

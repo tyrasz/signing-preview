@@ -164,3 +164,27 @@ test('A passkey stand-in: a WebAuthn assertion over the operation hash, and a P2
   assert.equal(BigInt(await verify(P256_STUB.r, P256_STUB.s)), 1n);
   assert.equal(await verify(P256_STUB.r, `0x${'26'.repeat(32)}`), '0x');
 });
+
+test('A Kernel passkey stand-in: ZeroDev’s WebAuthn validator form, and Daimo’s verifier answering it after running its own code', async () => {
+  const { zeroDevWebAuthnStub, daimoAccepting, DAIMO_P256_VERIFIER, P256_STUB } = await import('../src/erc4337-sim.ts');
+  const { decodeAbiParameters } = await import('viem');
+  const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');
+  const hash = `0x${'cd'.repeat(32)}` as Hex;
+  for (const precompiled of [true, false]) {
+    const [authenticatorData, clientDataJSON, responseTypeLocation, r, s, usePrecompiled] = decodeAbiParameters([{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }], zeroDevWebAuthnStub(hash, precompiled));
+    // Where ZeroDev's validator looks: the type at responseTypeLocation, the challenge (the hash, base64url) at 23.
+    assert.equal(clientDataJSON.slice(Number(responseTypeLocation), Number(responseTypeLocation) + 21), '"type":"webauthn.get"');
+    assert.equal(clientDataJSON.slice(23, 36), '"challenge":"');
+    assert.equal(`0x${Buffer.from(JSON.parse(clientDataJSON).challenge, 'base64url').toString('hex')}`, hash);
+    assert.equal(authenticatorData.length, 2 + 37 * 2);
+    assert.equal(parseInt(authenticatorData.slice(2 + 64, 2 + 66), 16) & 0x1d, 0x05); // present and verified; no backup flags
+    assert.deepEqual([r, s, usePrecompiled], [BigInt(P256_STUB.r), BigInt(P256_STUB.s), precompiled]);
+  }
+  // Daimo's verifier: its real code (here, one answering 0 to everything) runs first, at the address it moves to.
+  const moved = '0x0000000000000000000000000000000000ec0da1';
+  await chain.putCode(moved, '0x60006000526020' + '6000f3' as Hex); // mstore(0, 0); return(0, 32)
+  await chain.putCode(DAIMO_P256_VERIFIER, daimoAccepting());
+  const verify = async (r: Hex, s: Hex) => toHex((await chain.evm.runCall({ caller: at(OWNER), to: at(DAIMO_P256_VERIFIER), data: toBytes(concatHex([hash, r, s, `0x${'11'.repeat(32)}`, `0x${'22'.repeat(32)}`])), gasLimit: 100_000n })).execResult.returnValue);
+  assert.equal(BigInt(await verify(P256_STUB.r, P256_STUB.s)), 1n);
+  assert.equal(BigInt(await verify(P256_STUB.r, `0x${'26'.repeat(32)}`)), 0n); // the real code's answer
+});
