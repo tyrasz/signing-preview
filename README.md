@@ -442,12 +442,14 @@ The simulated block takes the replayed block's header but not its gas limit: pub
 `npm run accuracy:4337` does the same for UserOperations ([how they're simulated](#useroperations-simulated-as-the-entrypoint-runs-them)). It takes recent single-operation bundles of one EntryPoint (`--entrypoint 0.6|0.7|0.8|0.9`) and rebuilds each as the request its owner signed. A Safe whose fallback handler is a known 4337 module gets a `SafeOp`. Other accounts get `personal_sign` of the operation's hash with the operation as `context.userOperation` (v0.6/v0.7), or the `PackedUserOperation` typed data (v0.8/v0.9). Each is previewed on the state the operation met: the parent block with the block's header, after the block's earlier transactions (`--no-prefix` skips them; an earlier transaction can change what a paymaster or a token holds, and on Ethereum one operation went from 10% off to within 0.05% with them), and after the bundle's own EIP-7702 authorizations. It is compared with the receipt: the outcome, whether the operation ran whole, whether the account accepted the stand-in signature, the gas it paid (`actualGasCost`) and the account's token movements. The signer isn't on the chain, so it is guessed: the account itself for an EIP-7702 account, else whoever the real signature recovers to (as `personal_sign`, or over the bare hash, which is then replayed as `eth_sign`; from its last 65 bytes, or its first after a prefix byte when it carries a cosigner's too), or the account's `owner()`, trying the next when the account rejects the stand-in or its validation reverts on it. A wrong guess shows as "the account rejected the stand-in". Token movements count WETH's `Deposit` and `Withdrawal` as well as `Transfer`s, and session-key operations (an ERC-7579 account validating through Rhinestone's SmartSession, signed by a dApp rather than a wallet) are skipped. `--follow` replays each new block's operations as they arrive, which is what Arbitrum's 30 seconds of state needs; `--tx` replays one bundle.
 
 ```bash
-npm run accuracy:4337 -- --chain 1 --entrypoint 0.7 --follow 1200 --max 30
+npm run accuracy:4337 -- --chain 1 --entrypoint 0.7 --follow 1200 --backfill 100 --concurrency 3 --max 300
 ```
 
 ```bash
-npm run accuracy:4337 -- --chain 42161 --entrypoint 0.7 --follow 1200 --max 25
+npm run accuracy:4337 -- --chain 42161 --entrypoint 0.7 --follow 1200 --concurrency 3 --max 300
 ```
+
+`--concurrency` replays that many operations at once, newest first, while `--follow` keeps watching for new blocks; `--backfill` starts with the operations of the blocks already behind the head (Ethereum keeps about 128 blocks of state). With both, an Ethereum v0.7 run replayed 60 operations in under a minute, where one at a time it had taken 25 in about 20 minutes, and an Arbitrum run 25 in 4 minutes. `--summary-md` appends the results as Markdown, and `--strict` exits with 1 when an operation's outcome differs from its receipt, its gas is 5% or more off, or its token movements differ beyond a gas-priced fee's rounding or a share token's base unit or two. An operation the node refused to simulate at all is counted apart and not compared. `ETHEREUM_RPC_URL` and `ARBITRUM_RPC_URL` replace the public RPCs.
 
 Run on 2026-11-05:
 
@@ -626,6 +628,10 @@ Still not verified live:
 
 - **`.github/workflows/ci.yml`** runs on every push to `main` and on pull requests, on Node 22 and 24: `npm ci`, typecheck, tests and the browser build. It needs no network beyond npm.
   - A second job rebuilds the EntryPoint simulation code (`npm run build:entrypoints -- --check`) and fails if `src/entrypoint-simulations.ts` isn't what its pinned sources compile to. Its inputs come from npm and Sourcify, and are cached between runs.
+- **`.github/workflows/replay-4337.yml`** replays recent UserOperations daily at 05:23 UTC (and on demand, with how many minutes to follow), with `npm run accuracy:4337 --strict`: Ethereum with EntryPoint v0.6, v0.7 and v0.8, Arbitrum One with v0.6, v0.7 and v0.9, each following new blocks for 40 minutes, three replays at a time and up to 300 operations, three chains-and-versions at a time.
+  - Each job's summary has its results, and its report (`report.json`, `replay.log`) is kept as a run artifact for 30 days.
+  - A job fails when an operation's preview differs from its receipt (above), and a failed scheduled run opens an issue titled "UserOperation replays differ from receipts", or comments on the open one. Operations whose signature no stand-in takes only show in the summary: a shape to add, not a wrong preview.
+  - It is read-only, on the public RPCs unless `ETHEREUM_RPC_URL` / `ARBITRUM_RPC_URL` repository secrets are set; an archive RPC there would also let older operations be replayed.
 - **`.github/workflows/verify-live.yml`** runs `npm run verify:live` daily at 03:41 UTC, and on demand from the Actions tab ("Run workflow").
   - It is read-only against Ethereum, Arbitrum One, HyperEVM and `api.hyperliquid.xyz`, and fails when the deployed contracts, fees or markets no longer match the previewer.
   - The log is kept as a run artifact for 30 days.
