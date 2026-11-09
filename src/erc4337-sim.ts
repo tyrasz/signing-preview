@@ -248,15 +248,18 @@ export function zeroDevWebAuthnStub(hash: Hex, usePrecompiled: boolean): Hex {
 }
 const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)']);
 /**
- * ZeroDev Kernel v3.1: the validator its nonce names (bytes 2-21 when the validation type, byte 1, is 0x01), else
- * its root validator. A passkey's (ZeroDev's WebAuthn validator) gets a passkey's assertion; any other, the ECDSA
+ * ZeroDev Kernel v3.1: the validator its nonce names (bytes 2-21 when the validation type, byte 1, is 0x01), or
+ * its root validator (type 0x00). A passkey's (ZeroDev's WebAuthn validator) gets a passkey's assertion; any other, the ECDSA
  * stand-in as it is or after a 0xff byte (both seen on-chain for the same implementation, by how each account is
  * set up; checked: 0xff + signature validates as signed by its owner).
  */
 async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
   const ecdsa: Stub[] = [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }];
+  // The nonce: mode (byte 0), validation type (byte 1: 0x00 root, 0x01 a validator, 0x02 a permission), validator.
   const nonce = c.nonce.toString(16).padStart(64, '0');
-  let validator = nonce.slice(2, 4) === '01' ? `0x${nonce.slice(4, 44)}` : undefined;
+  const type = nonce.slice(2, 4);
+  if (type !== '00' && type !== '01') return ecdsa;
+  let validator = type === '01' ? `0x${nonce.slice(4, 44)}` : undefined;
   if (!validator && c.deps.rpc?.has(c.chainId)) {
     try {
       const root = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']));
