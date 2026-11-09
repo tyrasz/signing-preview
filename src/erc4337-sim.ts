@@ -277,8 +277,9 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Promise<Stub>> = {
   // Account implementations (ERC-1967) with the same 0xff00 prefix (Modular Account v2's own shape), on Ethereum and
   // on Arbitrum (checked there: it validates the shape as signed by its owner).
   '0x000000000000c5a9089039570dd36455b5c07383': shaped('0xff00'), '0x00000000000002377b26b1eda7b0bc371c60dd4f': shaped('0xff00'),
-  // ZeroDev Kernel v2.4: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the signature.
-  '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'),
+  // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
+  // signature (checked on v2.3: it validates the shape as signed by its owner).
+  '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
   // An account implementation (ERC-1967) on Ethereum and Arbitrum whose signatures carry a type byte, 0x00 for the
   // owner's ECDSA (checked: it validates the shape as signed by its owner).
   '0x8e8e658e22b12ada97b402ff0b044d6a325013c7': shaped('0x00'),
