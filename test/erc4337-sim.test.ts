@@ -9,7 +9,7 @@ import { StaticTokenRegistry } from '../src/chains.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
-import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07 } from '../src/entrypoint-simulations.ts';
+import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V09 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
 import type { Dependencies, Preview } from '../src/types.ts';
 import { codes, detail, NOW } from './helpers.ts';
@@ -27,12 +27,21 @@ const account = await chain.deploy('Account4337', 'address,address', [OWNER, EP]
 const paymaster = await chain.deploy('TokenPaymaster', 'address,address', [EP, usdc]);
 const broke = await chain.deploy('TokenPaymaster', 'address,address', [EP, usdc]);
 const account6 = await chain.deploy('Account4337V06', 'address,address', [OWNER, EP6]);
+// EntryPoint v0.8 and v0.9 take the same packed operation as v0.7, signed as EIP-712 typed data.
+const EP8 = '0x4337084d9e255ff0702461cf8895ce9e3b5ff108', EP9 = '0x433709009b8330fda32311df1c2afa402ed8d009';
+const account8 = await chain.deploy('Account4337', 'address,address', [OWNER, EP8]);
+const account9 = await chain.deploy('Account4337', 'address,address', [OWNER, EP9]);
 // The EntryPoint's storage is what matters (deposits, nonces): its code here is the simulation's own, which has depositTo.
 await chain.putCode(EP, ENTRY_POINT_SIMULATIONS_V07 as Hex);
 const A = parseAbi(['function mint(address,uint256)', 'function approve(address,uint256)', 'function transfer(address,uint256)', 'function depositTo(address)', 'function execute(address,uint256,bytes)']);
 const call = (fn: string, args: unknown[]) => encodeFunctionData({ abi: A, functionName: fn, args } as never);
 await chain.exec(usdc, call('mint', [account, 100_000_000n]));
 await chain.exec(usdc, call('mint', [account6, 100_000_000n]));
+for (const [a, ep, code] of [[account8, EP8, ENTRY_POINT_SIMULATIONS_V08], [account9, EP9, ENTRY_POINT_SIMULATIONS_V09]] as const) {
+  await chain.exec(usdc, call('mint', [a, 100_000_000n]));
+  await chain.setBalance(a, E);
+  await chain.putCode(ep, code as Hex);
+}
 await chain.setBalance(account6, E);
 await chain.putCode(EP6, ENTRY_POINT_SIMULATIONS_V06 as Hex);
 await chain.exec(usdc, call('approve', [paymaster, (1n << 256n) - 1n]), account);
@@ -101,4 +110,37 @@ test('EntryPoint v0.6: the patched EntryPoint returns its simulateHandleOp resul
   assert.ok(BigInt(String(p.details.find(d => d.label === 'Gas cost (simulated)')?.raw)) > 50_000n * 10n ** 9n);
   assert.ok(p.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.6 runs it/.test(n)), p.decoding.notes.join(' | '));
   assert.ok(!p.decoding.notes.some(n => /doesn't accept it as theirs/.test(n)));
+});
+
+test('EntryPoint v0.8 and v0.9: typed-data operations run whole through their own simulation code', async () => {
+  const types = { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+    PackedUserOperation: [{ name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' }, { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' }] };
+  for (const [ep, account, name] of [[EP8, account8, 'v0.8'], [EP9, account9, 'v0.9']] as const) {
+    const message = { sender: account, nonce: '0', initCode: '0x', callData: sendUsdc, accountGasLimits: concatHex([word(200_000n), word(200_000n)]), preVerificationGas: '50000', gasFees: concatHex([word(1_000_000_000n), word(2_000_000_000n)]), paymasterAndData: '0x' };
+    const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [OWNER, JSON.stringify({ domain: { name: 'ERC4337', version: '1', chainId: 999, verifyingContract: ep }, types, primaryType: 'PackedUserOperation', message })] }, { now: NOW }, deps);
+    assert.deepEqual(usdcChange(p), ['out 50'], name);
+    assert.ok(p.decoding.notes.some(n => new RegExp(`whole operation was simulated as EntryPoint ${name.replace('.', '\\.')} runs it`).test(n) && !/doesn't accept/.test(n)), p.decoding.notes.join(' | '));
+    assert.ok(BigInt(String(p.details.find(d => d.label === 'Gas cost (simulated)')?.raw)) > 50_000n * 10n ** 9n, name);
+  }
+});
+
+test('A passkey stand-in: a WebAuthn assertion over the operation hash, and a P256 verifier that accepts only it', async () => {
+  const { webAuthnStub, p256Accepting, P256_STUB } = await import('../src/erc4337-sim.ts');
+  const { decodeAbiParameters } = await import('viem');
+  const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');
+  const hash = `0x${'ab'.repeat(32)}` as Hex;
+  const [auth] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' }, { name: 'typeIndex', type: 'uint256' }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }], webAuthnStub(hash));
+  const client = JSON.parse(auth.clientDataJSON);
+  assert.equal(client.type, 'webauthn.get');
+  assert.equal(`0x${Buffer.from(client.challenge, 'base64url').toString('hex')}`, hash); // the challenge is the hash, base64url
+  assert.equal(auth.clientDataJSON.slice(Number(auth.challengeIndex), Number(auth.challengeIndex) + 11), '"challenge"');
+  assert.equal(auth.clientDataJSON.slice(Number(auth.typeIndex), Number(auth.typeIndex) + 21), '"type":"webauthn.get"');
+  assert.equal(auth.authenticatorData.length, 2 + 37 * 2);
+  assert.equal(parseInt(auth.authenticatorData.slice(2 + 64, 2 + 66), 16) & 0x05, 0x05); // user present and verified
+  assert.ok(auth.s <= 0x7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a8n); // low s
+  // The verifier at 0x100 (no P256 precompile on this EVM): 1 for the stand-in, and nothing for anything else.
+  await chain.putCode('0x0000000000000000000000000000000000000100', p256Accepting());
+  const verify = async (r: Hex, s: Hex) => toHex((await chain.evm.runCall({ caller: at(OWNER), to: at('0x0000000000000000000000000000000000000100'), data: toBytes(concatHex([hash, r, s, `0x${'11'.repeat(32)}`, `0x${'22'.repeat(32)}`])), gasLimit: 100_000n })).execResult.returnValue);
+  assert.equal(BigInt(await verify(P256_STUB.r, P256_STUB.s)), 1n);
+  assert.equal(await verify(P256_STUB.r, `0x${'26'.repeat(32)}`), '0x');
 });

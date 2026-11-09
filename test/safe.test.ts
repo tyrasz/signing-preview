@@ -198,3 +198,15 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   const upgrade = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xff51a5898e281db6dfc7855790607438df2ca44b'));
   assert.ok(codes(upgrade).includes('safe_upgrade') && !codes(upgrade).includes('safe_code_replaced'));
 });
+
+test('Safe4337MultiChainSignatureModule (EntryPoint v0.9): its SafeOps, and a Merkle root signature that names no operations', async () => {
+  const MC = '0x22939e839e3c0f479b713eaf95e0df128554aead', EP9 = '0x433709009b8330fda32311df1c2afa402ed8d009';
+  const op = await signOp(SAFE_OP_V03, { entryPoint: EP9 }, { verifyingContract: MC });
+  assert.ok(!codes(op).includes('unknown_safe_module') && !codes(op).includes('safe_op_entrypoint_mismatch'), codes(op).join());
+  assert.match(String(detail(op, 'EntryPoint')), /^EntryPoint v0\.9 /);
+  const root = await previewRequest({ method: 'eth_signTypedData_v4', params: [OWNERS[0], JSON.stringify({ domain: { verifyingContract: MC },
+    types: { EIP712Domain: [{ name: 'verifyingContract', type: 'address' }], MerkleTreeRoot: [{ name: 'merkleTreeRoot', type: 'bytes32' }] }, primaryType: 'MerkleTreeRoot', message: { merkleTreeRoot: `0x${'cd'.repeat(32)}` } })] }, { now: NOW }, deps);
+  assert.equal(root.attention, 'danger');
+  assert.ok(codes(root).includes('safe_multichain_root'));
+  assert.equal(root.decoding.decoder, 'safe_multichain_root');
+});

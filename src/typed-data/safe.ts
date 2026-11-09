@@ -15,6 +15,7 @@ const ZERO = '0x0000000000000000000000000000000000000000';
 export const safeTxAdapter: TypedAdapter = async (data, env) => {
   if (data.primaryType === 'SafeMessage') return safeMessage(data, env);
   if (data.primaryType === 'SafeOp') return safeOp(data, env);
+  if (data.primaryType === 'MerkleTreeRoot') return merkleTreeRoot(data, env);
   if (data.primaryType !== 'SafeTx') return null;
   const m = data.message;
   const safe = str(data.domain.verifyingContract).toLowerCase();
@@ -65,13 +66,16 @@ async function ownerCheck(safe: string, chainId: number, env: TypedEnv, b: Previ
 }
 
 /**
- * Safe's ERC-4337 modules, at the same address on Ethereum, Arbitrum One and HyperEVM (checked on all three, with
- * SUPPORTED_ENTRYPOINT()). The domain is the module; the SafeOp's own fields name the Safe and the EntryPoint.
- * Sources: safe-global/safe-modules (v0.3.0) and the v0.2.0 source verified on Sourcify.
+ * ERC-4337 modules for Safe accounts. The domain is the module; the SafeOp's own fields name the Safe and the
+ * EntryPoint. Safe's own (safe-global/safe-modules v0.3.0, and v0.2.0 verified on Sourcify) are at the same address
+ * on Ethereum, Arbitrum One and HyperEVM (checked with SUPPORTED_ENTRYPOINT()). Safe4337MultiChainSignatureModule,
+ * verified on Sourcify and used by Safes on EntryPoint v0.9, is at the same address on Ethereum and Arbitrum One; its
+ * signatures start with the depth of a Merkle tree (0 for a single operation; see merkleTreeRoot).
  */
-export const SAFE_4337_MODULES: Record<string, { version: string; entryPoint: string; entryPointName: string }> = {
+export const SAFE_4337_MODULES: Record<string, { version: string; entryPoint: string; entryPointName: string; /** Before the validity window in the operation's signature. */ signaturePrefix?: string; multiChain?: boolean }> = {
   '0x75cf11467937ce3f2f357ce24ffc3dbf8fd5c226': { version: 'Safe4337Module v0.3.0', entryPoint: '0x0000000071727de22e5e9d8baf0edac6f37da032', entryPointName: 'EntryPoint v0.7' },
   '0xa581c4a4db7175302464ff3c06380bc3270b4037': { version: 'Safe4337Module v0.2.0', entryPoint: '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789', entryPointName: 'EntryPoint v0.6' },
+  '0x22939e839e3c0f479b713eaf95e0df128554aead': { version: 'Safe4337MultiChainSignatureModule', entryPoint: '0x433709009b8330fda32311df1c2afa402ed8d009', entryPointName: 'EntryPoint v0.9', signaturePrefix: '00', multiChain: true },
 };
 /** The only calls the module lets an operation make: executeUserOp and executeUserOpWithErrorString(to, value, data, operation). */
 const EXECUTE = ['0x7bb37428', '0x541d63c8'];
@@ -92,7 +96,7 @@ const safeOp: TypedAdapter = async (data, env) => {
   const entryPoint = str(m.entryPoint).toLowerCase();
   const b = new PreviewBuilder();
   b.detail('Module', known ? `${known.version} (${module})` : module, module);
-  if (!known) b.warn('caution', 'unknown_safe_module', `${shortAddress(module)} is not one of Safe's ERC-4337 modules (v0.2.0 or v0.3.0), though the request is shaped like one. Only sign operations for the module your Safe has enabled.`);
+  if (!known) b.warn('caution', 'unknown_safe_module', `${shortAddress(module)} is not a known ERC-4337 module for Safe accounts, though the request is shaped like one. Only sign operations for the module your Safe has enabled.`);
   b.detail('EntryPoint', known && sameAddress(entryPoint, known.entryPoint) ? `${known.entryPointName} (${entryPoint})` : entryPoint, entryPoint);
   if (known && !sameAddress(entryPoint, known.entryPoint)) b.warn('caution', 'safe_op_entrypoint_mismatch', `${known.version} only works with ${known.entryPointName} (${shortAddress(known.entryPoint)}), not ${shortAddress(entryPoint)}: the module won't accept this signature.`);
 
@@ -132,7 +136,7 @@ const safeOp: TypedAdapter = async (data, env) => {
         const approvals = before && digest ? approvalsFor(before, digest as Hex) : null;
         // The module's signature: validAfter and validUntil (6 bytes each), then the owners' signatures.
         const window = `${validAfter.toString(16).padStart(12, '0')}${validUntil.toString(16).padStart(12, '0')}`;
-        const signature = `0x${window}${(approvals?.signatures ?? STUB_SIGNATURE).slice(2)}` as Hex;
+        const signature = `0x${known.signaturePrefix ?? ''}${window}${(approvals?.signatures ?? STUB_SIGNATURE).slice(2)}` as Hex;
         const run = await simulateOperation({ chainId, entryPoint, sender: safe, nonce, initCode: initCode as Hex, callData, callGasLimit: call, verificationGasLimit: verification, preVerificationGas: preVerification,
           maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...(env.signer && { signer: env.signer }), watch,
           ...(approvals && { stateOverrides: { [safe]: { stateDiff: approvals.stateDiff } } }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
@@ -166,4 +170,23 @@ const safeOp: TypedAdapter = async (data, env) => {
   }
   b.note(`This is an off-chain owner signature; it costs no gas now. Once enough owners have signed, any bundler can submit the operation, which runs as the Safe${known ? ' through its 4337 module' : ''}, with the gas paid ${pm.paymaster ? 'by the paymaster' : 'from the Safe'}.`);
   return { title: `Safe operation: ${r.title}`, summary: `Signs an ERC-4337 operation for the Safe ${shortAddress(safe)}. ${r.summary}`, decoder: 'safe_4337_op', status: r.status, b, network: { kind: 'evm', chainId, name: chainName(chainId) }, assetChanges: r.assetChanges };
+};
+
+/**
+ * Safe4337MultiChainSignatureModule's multi-chain signature: one signature over the root of a Merkle tree whose
+ * leaves are SafeOps, on any chains (the domain has no chain). Each operation is later submitted with a proof of its
+ * leaf. The message holds only the root: which operations, on which chains, and how many, isn't in it.
+ */
+const merkleTreeRoot: TypedAdapter = async (data, env) => {
+  const module = str(data.domain.verifyingContract).toLowerCase();
+  const known = SAFE_4337_MODULES[module];
+  if (!known?.multiChain) return null;
+  const root = str(data.message.merkleTreeRoot).toLowerCase();
+  const b = new PreviewBuilder();
+  b.detail('Module', `${known.version} (${module})`, module);
+  b.detail('EntryPoint', `${known.entryPointName} (${known.entryPoint})`, known.entryPoint);
+  b.detail('Merkle tree root', root, root);
+  b.warn('danger', 'safe_multichain_root', `This signs the root of a Merkle tree of Safe operations, valid on every chain where the module runs (the signature names no chain). The message doesn't say which operations it covers, on which chains, or how many: any operation in the tree runs with this one signature. Only sign it if your wallet shows every operation in the tree and you have checked each.`);
+  b.note('An off-chain signature; it costs no gas now. A bundler submits each operation in the tree with a proof that it is one of the leaves.');
+  return { title: 'Sign Safe operations on several chains (contents not shown)', summary: `Authorizes every Safe operation in a Merkle tree, on any chain where ${known.version} runs. The operations themselves aren't in the message.`, decoder: 'safe_multichain_root', status: 'opaque', b, network: env.context.chainId ? { kind: 'evm', chainId: env.context.chainId, name: chainName(env.context.chainId) } : null };
 };

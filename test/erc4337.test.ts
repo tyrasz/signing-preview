@@ -157,3 +157,12 @@ test('A hash that isn’t the supplied operation’s is danger; an unknown Entry
   const plain = await previewRequest({ method: 'personal_sign', params: [HASH_V07, OWNER_V07] }, { now: NOW }, deps);
   assert.equal(plain.decoding.decoder, 'personal_sign');
 });
+
+test('A v0.7 operation the account itself is asked to sign, with a factory: a deployment, not an EIP-7702 delegation', async () => {
+  const { readOperation, userOpHash } = await import('../src/userop-hash.ts');
+  const op = { ...OP_V07, factory: '0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67', factoryData: '0x1688f0b9' };
+  const hash = userOpHash(readOperation(op, '0.7')!, EP7.toLowerCase(), 1, '0.7');
+  const p = await signHash(hash, OP_V07.sender, EP7, op, 1);
+  assert.match(String(detail(p, 'Account setup')), /^deploys the account first, with factory 0x4e1d/);
+  assert.ok(!codes(p).includes('userop_delegation_differs'), codes(p).join());
+});

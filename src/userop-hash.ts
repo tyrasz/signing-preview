@@ -2,7 +2,7 @@
 // getUserOpHash): the message says nothing about what the operation does. The wallet (or SDK) holding the operation
 // supplies it as context.userOperation; it is hashed exactly as the EntryPoint hashes it, and decoded only when that
 // is the hash being signed. Anything else is shown as the opaque message it is, with a danger.
-import { encodeAbiParameters, keccak256, type Hex } from 'viem';
+import { encodeAbiParameters, hashMessage, keccak256, type Hex } from 'viem';
 import { attentionOf, PreviewBuilder, shortAddress } from './format.ts';
 import { previewMessage } from './message.ts';
 import { describeOperation, paymasterOf } from './typed-data/user-operation.ts';
@@ -103,6 +103,8 @@ export async function previewSignedOperation(method: string, params: unknown[], 
     chainId, entryPoint, entryPointName: ep!.name, sender: op!.sender, nonce: op!.nonce, initCode: op!.initCode, callData: op!.callData === '0x' ? null : op!.callData, paymaster: pm.paymaster,
     gas: { verification: op!.verificationGasLimit, call: op!.callGasLimit, preVerification: op!.preVerificationGas, maxFee: op!.maxFeePerGas, maxPriority: op!.maxPriorityFeePerGas, ...pm, v06: ep!.version === '0.6' },
     userOpHash: expected, paymasterAndData: op!.paymasterAndData,
+    // What the wallet's signature will be over: personal_sign prefixes the hash; eth_sign signs it as it is.
+    digest: method === 'eth_sign' ? expected : hashMessage({ raw: expected }),
     // A signature the wallet supplies with the operation (its stub for this account) is what simulation validates with.
     ...(typeof supplied.operation.signature === 'string' && /^0x([0-9a-fA-F]{2})+$/.test(supplied.operation.signature) && { signature: supplied.operation.signature.toLowerCase() as Hex }),
     ...(ep!.version === '0.7' && { packed: { nonce: op!.nonce, initCode: op!.initCode, accountGasLimits: `0x${word(op!.verificationGasLimit)}${word(op!.callGasLimit)}` as Hex, preVerificationGas: op!.preVerificationGas, gasFees: `0x${word(op!.maxPriorityFeePerGas)}${word(op!.maxFeePerGas)}` as Hex, paymasterAndData: op!.paymasterAndData } }),

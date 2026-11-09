@@ -94,7 +94,9 @@ export const userOperationAdapter: TypedAdapter = async (data, env) => {
   const gas = limits && fees && preVerificationGas !== null ? { verification: limits[0], call: limits[1], preVerification: preVerificationGas, maxPriority: fees[0], maxFee: fees[1], ...pm } : null;
   const packed = nonce !== null && hex(m.accountGasLimits) && hex(m.gasFees) && preVerificationGas !== null
     ? { nonce, initCode, accountGasLimits: hex(m.accountGasLimits)!, preVerificationGas, gasFees: hex(m.gasFees)!, paymasterAndData } : undefined;
-  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, paymasterAndData, packed, userOpHash: typedDataDigest(data) ?? undefined }, env);
+  // The typed data's digest is the operation's hash (v0.8 on) and what the owner signs.
+  const digest = typedDataDigest(data) ?? undefined;
+  return describeOperation({ chainId, entryPoint, entryPointName: ENTRY_POINTS[entryPoint] ?? null, sender, nonce, initCode, callData, gas, paymaster: pm.paymaster, paymasterAndData, packed, userOpHash: digest, ...(digest && { digest }) }, env);
 };
 
 /** A UserOperation, whichever EntryPoint version and however it was signed. */
@@ -107,6 +109,8 @@ export interface Operation {
   paymasterAndData?: Hex;
   /** A signature to validate with in simulation: the wallet's stub for this account, when it supplies one. */
   signature?: Hex;
+  /** The digest the signature is over (the message's personal_sign form, or the typed data's digest). */
+  digest?: Hex;
 }
 
 /** What the EntryPoint's rejection codes mean (eth-infinitism's EntryPoint, all versions). */
@@ -146,11 +150,14 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   const sim = run.result;
   const now = env.now / 1000;
   const pm = u.paymaster;
-  if (run.paymaster?.signatureFailed) b.warn('caution', 'userop_paymaster_signature', `The paymaster's signature in this operation doesn't check out (it may be for other gas values, or stale): bundlers will reject it until the paymaster signs again.`);
-  else if (run.paymaster && run.paymaster.validUntil && run.paymaster.validUntil < now) b.warn('caution', 'userop_paymaster_expired', `The paymaster's sponsorship expired at ${new Date(run.paymaster.validUntil * 1000).toISOString()}: bundlers will reject this operation.`);
-  else if (run.paymaster && run.paymaster.validAfter > now) b.warn('info', 'userop_paymaster_not_yet', `The paymaster's sponsorship starts at ${new Date(run.paymaster.validAfter * 1000).toISOString()}: bundlers will hold the operation until then.`);
-  if (run.account?.validUntil && run.account.validUntil < now) b.warn('caution', 'userop_expired', `The account only accepts this operation until ${new Date(run.account.validUntil * 1000).toISOString()}, which has passed.`);
-  else if (run.account && run.account.validAfter > now) b.warn('info', 'userop_not_yet_valid', `The account accepts this operation from ${new Date(run.account.validAfter * 1000).toISOString()}: bundlers will hold it until then.`);
+  // Validity in block numbers (EntryPoint v0.9) isn't compared with the time.
+  const timed = (v: OperationRun['account']) => v?.blocks ? { ...v, validAfter: 0, validUntil: 0 } : v;
+  const paymasterValidity = timed(run.paymaster), accountValidity = timed(run.account);
+  if (paymasterValidity?.signatureFailed) b.warn('caution', 'userop_paymaster_signature', `The paymaster's signature in this operation doesn't check out (it may be for other gas values, or stale): bundlers will reject it until the paymaster signs again.`);
+  else if (paymasterValidity && paymasterValidity.validUntil && paymasterValidity.validUntil < now) b.warn('caution', 'userop_paymaster_expired', `The paymaster's sponsorship expired at ${new Date(paymasterValidity.validUntil * 1000).toISOString()}: bundlers will reject this operation.`);
+  else if (paymasterValidity && paymasterValidity.validAfter > now) b.warn('info', 'userop_paymaster_not_yet', `The paymaster's sponsorship starts at ${new Date(paymasterValidity.validAfter * 1000).toISOString()}: bundlers will hold the operation until then.`);
+  if (accountValidity?.validUntil && accountValidity.validUntil < now) b.warn('caution', 'userop_expired', `The account only accepts this operation until ${new Date(accountValidity.validUntil * 1000).toISOString()}, which has passed.`);
+  else if (accountValidity && accountValidity.validAfter > now) b.warn('info', 'userop_not_yet_valid', `The account accepts this operation from ${new Date(accountValidity.validAfter * 1000).toISOString()}: bundlers will hold it until then.`);
 
   b.detail('Gas cost (simulated)', `${native(run.paid)}, paid by ${pm ? `the paymaster ${shortAddress(pm)} from its EntryPoint deposit` : 'the account (from its EntryPoint deposit, topped up from its balance)'}`, run.paid.toString());
   // A token paymaster's charge: what the account's tokens went to the paymaster, net (some refund in postOp).
@@ -169,7 +176,7 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   else if (!run.executed) b.warn('caution', 'userop_execution_reverts', `The operation's calls fail when the EntryPoint runs them${run.revertReason ? `: ${run.revertReason}` : ''}. It can still be included, and ${pm ? 'the paymaster' : 'the account'} pays ${native(run.paid)} for the gas.`);
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
-  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : u.signature ? " (with the wallet's stand-in signature)" : ` (with a stand-in for the signature, which doesn't exist until it's signed: ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}${run.account?.signatureFailed ? ", but the account doesn't accept it as theirs, so its own signature check isn't simulated" : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
+  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : u.signature ? " (with the wallet's stand-in signature)" : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? ", but the account doesn't accept it as theirs, so its own signature check isn't simulated" : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
   return changes;
 }
 
@@ -195,7 +202,8 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   const init = initCode.length > 42 ? ', with an initialization call' : '';
   if (initCode === '0x') b.detail('Account setup', 'none (the account already exists)');
   else if (initCode.startsWith(EIP7702_MARKER)) b.detail('Account setup', `EIP-7702 account (its current delegation)${init}`);
-  else if (lead && mine) {
+  // EntryPoint v0.6 and v0.7 know nothing of EIP-7702: their initCode is always a factory and its data.
+  else if (lead && mine && !/v0\.[67]$/.test(u.entryPointName ?? '')) {
     b.detail('Account setup', `EIP-7702 account, delegating to ${lead}${init}`, lead);
     let code: unknown;
     try { code = chainId !== null && env.deps.rpc?.has(chainId) ? await env.deps.rpc.call(chainId, 'eth_getCode', [sender, 'latest']) : undefined; } catch { code = undefined; }
@@ -231,7 +239,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
       ? `${EIP7702_MARKER}${initCode.slice(42)}` as Hex : initCode;
     try {
       const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData, callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
-        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
+        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
     } catch { whole = null; }
     if (whole && (whole.length || !assetChanges.length)) assetChanges = whole;
