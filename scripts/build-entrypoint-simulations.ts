@@ -20,11 +20,14 @@
 //
 // v0.7 and v0.8: eth-infinitism's EntryPointSimulations, which keeps the EntryPoint's storage and SenderCreator and
 // whose simulateHandleOp returns its result. Its depositTo, which wastes a little gas on purpose (bundlers want
-// simulation to cost no less than the chain), is plain here: an account paying its prefund pays what it will.
+// simulation to cost no less than the chain), is plain here: an account paying its prefund pays what it will. Its
+// simulation-only check that the paymaster has code skips a zero paymaster, which the EntryPoint takes as none
+// (all versions; that check runs outside the operation's gas).
 // v0.6 has no EntryPointSimulations: its own simulateHandleOp always reverts, which discards the operation's logs.
-// It is compiled from EntryPoint.sol with two changes: simulateHandleOp returns its result (the account's and the
-// paymaster's validation data whole, in v0.7's ExecutionResult order) instead of reverting, and the SenderCreator,
-// an immutable the override can't set, is the deployed one as a constant. Storage is unchanged.
+// It is compiled from EntryPoint.sol with two changes of its own: simulateHandleOp returns its result (the account's
+// and the paymaster's validation data whole, in v0.7's ExecutionResult order) instead of reverting, and the
+// SenderCreator, an immutable the override can't set, is the deployed one as a constant (and, as above, a zero
+// paymaster is none). Storage is unchanged.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -120,15 +123,22 @@ function patch(what: string, source: string, swaps: [string, string][]): string 
   return source;
 }
 
+/**
+ * The simulation-only check that the paymaster has code, which also refused a zero paymaster: the EntryPoint takes
+ * one (paymasterAndData naming address 0) as no paymaster, and such operations are included on-chain.
+ */
+const ZERO_PAYMASTER: [string, string] = ['            if (paymaster.code.length == 0) {', '            if (paymaster != address(0) && paymaster.code.length == 0) {'];
 /** v0.6's EntryPoint.sol with simulateHandleOp returning instead of reverting (see the top of the file). */
 const patchV06 = (source: string) => patch('EntryPoint v0.6', source, [
+  ZERO_PAYMASTER,
   ['SenderCreator private immutable senderCreator = new SenderCreator();', `SenderCreator private constant senderCreator = SenderCreator(${getAddress(V06_SENDER_CREATOR)});`],
   ['        revert ExecutionResult(opInfo.preOpGas, paid, data.validAfter, data.validUntil, targetSuccess, targetResult);',
     '        bytes memory result = abi.encode(opInfo.preOpGas, paid, validationData, paymasterValidationData, targetSuccess, targetResult);\n        assembly { return(add(result, 32), mload(result)) }'],
 ]);
-/** EntryPointSimulations without its depositTo's deliberate gas waste. */
+/** EntryPointSimulations without its depositTo's deliberate gas waste, and taking a zero paymaster as none. */
 const plainDeposit = (source: string) => patch('EntryPointSimulations', source, [
   ['            uint256 x = 1;\n            while (x < 5) {\n                x++;\n            }\n', ''],
+  ZERO_PAYMASTER,
 ]);
 
 function compile(solcDir: string, aa: string, oz: string, file: string, contract: string, settings: object, edit?: (s: string) => string): { code: string; version: string } {

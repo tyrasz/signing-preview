@@ -234,3 +234,12 @@ test('The ecrecover stand-in: each stand-in signature recovers as its signer for
   }
   assert.notEqual(STUB_COSIGNATURE.slice(2, 66), STUB_SIGNATURE.slice(2, 66));
 });
+
+test('A paymaster field naming address 0 is no paymaster, as the EntryPoint takes it: the account pays', async () => {
+  const p = await preview(operation({ ...withPaymaster('0x0000000000000000000000000000000000000000'), nonce: '0x0' }));
+  assert.ok(!codes(p).includes('userop_rejected'), codes(p).join(','));
+  assert.ok(!codes(p).includes('userop_paymaster'), 'no paymaster is named');
+  assert.match(p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? '', /and the gas payment\./);
+  assert.match(detail(p, 'Gas cost (simulated)') ?? '', /paid by the account/);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+});

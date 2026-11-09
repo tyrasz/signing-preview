@@ -30,7 +30,9 @@ const halves = (v: unknown): [bigint, bigint] | null => {
 
 /** The paymaster in paymasterAndData, and (from EntryPoint v0.7 on) the gas it may use: verification and post-op limits after its address. */
 export function paymasterOf(paymasterAndData: string, packedGas: boolean): { paymaster: string | null; paymasterGas: bigint } {
-  const paymaster = paymasterAndData.length >= 42 ? `0x${paymasterAndData.slice(2, 42)}`.toLowerCase() : null;
+  // A paymaster field naming address 0 is no paymaster: the EntryPoint skips it, and the account pays.
+  const named = paymasterAndData.length >= 42 ? `0x${paymasterAndData.slice(2, 42)}`.toLowerCase() : null;
+  const paymaster = named && !/^0x0{40}$/.test(named) ? named : null;
   const paymasterGas = packedGas && paymasterAndData.length >= 106 ? BigInt(`0x${paymasterAndData.slice(42, 74)}`) + BigInt(`0x${paymasterAndData.slice(74, 106)}`) : 0n;
   return { paymaster, paymasterGas };
 }

@@ -261,8 +261,8 @@ const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
  * ZeroDev Kernel v3.1, by how it validates: what its nonce names (byte 1 the validation type: 0x00 its root
  * validation, 0x01 the validator in bytes 2-21, 0x02 the permission in bytes 2-5), the root read from
  * rootValidator(), which has the same type byte. A passkey's validator (ZeroDev's WebAuthn validator) gets a
- * passkey's assertion; a permission without policies whose signer takes a cosignature, 0xff (the signer's part) and
- * the owner's and the cosigner's stand-ins; anything else, the ECDSA stand-in as it is or after a 0xff byte (both
+ * passkey's assertion; a permission whose signer takes a cosignature, 0xff (the signer's part) and the owner's and
+ * the cosigner's stand-ins; anything else, the ECDSA stand-in as it is or after a 0xff byte (both
  * seen on-chain for the same implementation, by how each account is set up; checked: 0xff + signature validates as
  * signed by its owner).
  */
@@ -290,7 +290,9 @@ async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
     try {
       const out = await view(encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [`0x${id.slice(0, 8)}`] }));
       const config = out && decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out });
-      if (config && !config.policyData.length && COSIGNING_SIGNERS.has(config.signer.toLowerCase())) {
+      // Policies before the signer each read their own part of the signature, tagged with their index; one that
+      // starts with 0xff (the signer's) gives every policy an empty part, as these wallets' signatures do.
+      if (config && COSIGNING_SIGNERS.has(config.signer.toLowerCase())) {
         const cosigner = String(await rpc.call(c.chainId, 'eth_call', [{ to: config.signer, data: encodeFunctionData({ abi: COSIGNER, functionName: 'cosigner' }) }, 'latest']));
         if (/^0x0{24}[0-9a-f]{40}$/i.test(cosigner) && !/^0x0+$/.test(cosigner)) {
           return [{ signature: `0xff${STUB_SIGNATURE.slice(2)}${STUB_COSIGNATURE.slice(2)}` as Hex, cosigners: [{ signature: STUB_COSIGNATURE, signer: `0x${cosigner.slice(26)}`.toLowerCase() }] }];
@@ -662,7 +664,7 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   // The prefund the account pays the EntryPoint during validation is gas, shown as `paid` (the rest stays deposited).
   // The EntryPoint answers balanceOf with deposits, so a balance read can list the deposit too: also gas.
   const transfers = r.transfers.filter(t => !(t.asset === 'native' && t.from === sender && t.to === entryPoint) && t.asset !== entryPoint);
-  const paymaster = op.paymasterAndData.length >= 42;
+  const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData); // address 0 is none
   return { result: { ...r, transfers }, executed: success, ...(revertReason && { revertReason }), ...(postOpReverted && { postOpReverted }),
     paid, gasUsed: actualGasUsed, account: validity(accountData), ...(paymaster && { paymaster: validity(paymasterData) }), ...(results!.length > 1 && { after: results!.slice(1) as SimulationResult[] }) };
 }
