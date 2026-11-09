@@ -12,7 +12,7 @@
 // deployed through its SenderCreator if it's new, then called with the operation's callData from the EntryPoint
 // (or with executeUserOp(userOp, userOpHash) when callData starts with its selector). Validation, the gas prefund
 // and refund, and a paymaster's postOp charge aren't part of it.
-import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, hexToBytes, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, hexToBytes, parseAbi, sha256, stringToHex, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import { decodeRevert } from './simulation.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V09 } from './entrypoint-simulations.ts';
@@ -193,12 +193,15 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
  * some address and an account's check fails rather than reverting. Bundlers use the same one to estimate gas.
  */
 export const STUB_SIGNATURE = '0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c' as Hex;
+/** A second stand-in signature, for an account that needs another key's signature too (a cosigner's). */
+export const STUB_COSIGNATURE = `0x${STUB_SIGNATURE.slice(2, 65)}1${STUB_SIGNATURE.slice(66)}` as Hex;
 
 /**
  * A stand-in signature; `p256` when it is a passkey's, which P256VERIFY (0x100) must accept too (see standIn), or
- * `'daimo'` when the account verifies it with Daimo's P256 verifier contract instead.
+ * `'daimo'` when the account verifies it with Daimo's P256 verifier contract instead. `cosigners`: other stand-in
+ * ECDSA signatures in it and whose they are (ecrecover recovers each as its signer).
  */
-interface Stub { signature: Hex; p256?: boolean | 'daimo' }
+interface Stub { signature: Hex; p256?: boolean | 'daimo'; cosigners?: { signature: Hex; signer: string }[] }
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
@@ -246,31 +249,56 @@ export function zeroDevWebAuthnStub(hash: Hex, usePrecompiled: boolean): Hex {
   return encodeAbiParameters([{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }],
     [authenticatorData, clientDataJSON, 1n, BigInt(P256_STUB.r), BigInt(P256_STUB.s), usePrecompiled]);
 }
-const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)']);
+const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)', 'struct PermissionConfig { bytes1 permissionFlag; address signer; bytes22[] policyData; }', 'function permissionConfig(bytes4 pId) view returns (PermissionConfig)']);
 /**
- * ZeroDev Kernel v3.1: the validator its nonce names (bytes 2-21 when the validation type, byte 1, is 0x01), or
- * its root validator (type 0x00). A passkey's (ZeroDev's WebAuthn validator) gets a passkey's assertion; any other, the ECDSA
- * stand-in as it is or after a 0xff byte (both seen on-chain for the same implementation, by how each account is
- * set up; checked: 0xff + signature validates as signed by its owner).
+ * Signers of Kernel permissions that take the owner's signature and then a cosigner's (65 bytes each), whose
+ * cosigner() names that key: Bleap's CosigningModuleV2 (source verified on Sourcify, Base; the same address on
+ * Arbitrum One).
+ */
+const COSIGNING_SIGNERS = new Set(['0x5b424d5133fae2ce64ce739cec0796343e957131']);
+const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
+/**
+ * ZeroDev Kernel v3.1, by how it validates: what its nonce names (byte 1 the validation type: 0x00 its root
+ * validation, 0x01 the validator in bytes 2-21, 0x02 the permission in bytes 2-5), the root read from
+ * rootValidator(), which has the same type byte. A passkey's validator (ZeroDev's WebAuthn validator) gets a
+ * passkey's assertion; a permission without policies whose signer takes a cosignature, 0xff (the signer's part) and
+ * the owner's and the cosigner's stand-ins; anything else, the ECDSA stand-in as it is or after a 0xff byte (both
+ * seen on-chain for the same implementation, by how each account is set up; checked: 0xff + signature validates as
+ * signed by its owner).
  */
 async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
   const ecdsa: Stub[] = [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }];
-  // The nonce: mode (byte 0), validation type (byte 1: 0x00 root, 0x01 a validator, 0x02 a permission), validator.
+  const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
+  const view = async (data: Hex) => rpc ? String(await rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data }, 'latest'])) as Hex : undefined;
+  // What validates: [type, id] from the nonce, or from rootValidator() for the root (a bytes21, left-aligned).
   const nonce = c.nonce.toString(16).padStart(64, '0');
-  const type = nonce.slice(2, 4);
-  if (type !== '00' && type !== '01') return ecdsa;
-  let validator = type === '01' ? `0x${nonce.slice(4, 44)}` : undefined;
-  if (!validator && c.deps.rpc?.has(c.chainId)) {
+  let type = nonce.slice(2, 4), id = nonce.slice(4, 44);
+  if (type === '00') {
     try {
-      const root = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']));
-      if (/^0x[0-9a-f]{64}$/i.test(root)) validator = `0x${root.slice(4, 44)}`;
+      const root = await view(encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }));
+      if (!root || !/^0x[0-9a-f]{64}$/i.test(root)) return ecdsa;
+      type = root.slice(2, 4); id = root.slice(4, 44);
+    } catch { return ecdsa; }
+  }
+  if (type === '01' && ZERODEV_WEBAUTHN_VALIDATORS.has(`0x${id}`.toLowerCase())) {
+    const hash = await c.hash();
+    if (!hash) return ecdsa;
+    const precompiled = ZERODEV_PRECOMPILED.has(c.chainId);
+    return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
+  }
+  if (type === '02' && rpc) {
+    try {
+      const out = await view(encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [`0x${id.slice(0, 8)}`] }));
+      const config = out && decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out });
+      if (config && !config.policyData.length && COSIGNING_SIGNERS.has(config.signer.toLowerCase())) {
+        const cosigner = String(await rpc.call(c.chainId, 'eth_call', [{ to: config.signer, data: encodeFunctionData({ abi: COSIGNER, functionName: 'cosigner' }) }, 'latest']));
+        if (/^0x0{24}[0-9a-f]{40}$/i.test(cosigner) && !/^0x0+$/.test(cosigner)) {
+          return [{ signature: `0xff${STUB_SIGNATURE.slice(2)}${STUB_COSIGNATURE.slice(2)}` as Hex, cosigners: [{ signature: STUB_COSIGNATURE, signer: `0x${cosigner.slice(26)}`.toLowerCase() }] }];
+        }
+      }
     } catch { /* not readable: the ECDSA forms */ }
   }
-  if (!validator || !ZERODEV_WEBAUTHN_VALIDATORS.has(validator.toLowerCase())) return ecdsa;
-  const hash = await c.hash();
-  if (!hash) return ecdsa;
-  const precompiled = ZERODEV_PRECOMPILED.has(c.chainId);
-  return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
+  return ecdsa;
 }
 const coinbaseWrapper = (ownerIndex: bigint, signatureData: Hex) => encodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], [{ ownerIndex, signatureData }]);
 /**
@@ -383,8 +411,10 @@ function standIn(moved: string, r: Hex, s: Hex, rAt: number, answer: string): He
  * the real precompile, for about 200 gas more than calling it directly.
  *   if (calldata[64:96] == r && calldata[96:128] == s [&& calldata[0:32] == digest]) { burn; return signer }
  *   calldatacopy(0, 0, calldatasize); staticcall(gas, MOVED, 0, calldatasize, 0, 32); return its output
+ * With `cosigners`, each of their stand-in signatures is recovered as its signer the same way, also for 3,000 gas.
  */
-export function ecrecoverAs(signer: string, digest?: Hex): Hex {
+export function ecrecoverAs(signer: string, digest?: Hex, cosigners: { signature: Hex; signer: string }[] = []): Hex {
+  if (cosigners.length) return ecrecoverAsMany([{ signature: STUB_SIGNATURE, signer }, ...cosigners], digest);
   const r = STUB_SIGNATURE.slice(2, 66), s = STUB_SIGNATURE.slice(66, 130);
   // The stand-in's path: 59 gas of its own (the checks, the jump, and returning a word; 74 with the digest's check), and the burn.
   const burn = 3000 - (digest ? 74 : 59), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
@@ -396,6 +426,31 @@ export function ecrecoverAs(signer: string, digest?: Hex): Hex {
   return `0x${check}60${dest.toString(16).padStart(2, '0')}57${forward}`
     + `5b61${hex2(turns)}5b600190038061${hex2(loop)}5750${'5b'.repeat(sled)}` // JUMPDEST; PUSH2 turns; loop: JUMPDEST, 1, SWAP1, SUB, DUP1, PUSH2 loop, JUMPI; POP; sled
     + `73${signer.toLowerCase().slice(2)}60005260206000f3` as Hex;
+}
+/**
+ * ecrecoverAs for several stand-in signatures, each recovered as its own signer: the checks in turn (each jumping to
+ * its signature's burn and answer), then the real precompile for anything else. The k-th signature's path runs k + 1
+ * checks before its jump, and burns what makes it exactly 3,000 gas too.
+ */
+function ecrecoverAsMany(pairs: { signature: Hex; signer: string }[], digest?: Hex): Hex {
+  const hex2 = (n: number) => n.toString(16).padStart(4, '0');
+  // Each check: r, s (and the digest), then PUSH2 dest JUMPI: 40 gas (55 with the digest); the answer, 19.
+  const checkGas = digest ? 55 : 40;
+  const checks = pairs.map(p => `7f${p.signature.slice(2, 66)}60403514` + `7f${p.signature.slice(66, 130)}6060351416` + (digest ? `7f${digest.slice(2)}60003514${'16'}` : ''));
+  const forward = `366000600037` + `6020600036600073${ECRECOVER_MOVED.slice(2)}5afa50` + `3d6000f3`;
+  const head = checks.reduce((n, c) => n + c.length / 2 + 4, 0) + forward.length / 2; // each check, then 61 xxxx 57
+  const sections: string[] = [];
+  const dests: number[] = [];
+  let at = head;
+  pairs.forEach((p, k) => {
+    const burn = 3000 - ((k + 1) * checkGas + 19), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
+    const loop = at + 1 + 3;
+    const section = `5b61${hex2(turns)}5b600190038061${hex2(loop)}5750${'5b'.repeat(sled)}` + `73${p.signer.toLowerCase().slice(2)}60005260206000f3`;
+    dests.push(at);
+    sections.push(section);
+    at += section.length / 2;
+  });
+  return `0x${checks.map((c, k) => `${c}61${hex2(dests[k])}57`).join('')}${forward}${sections.join('')}` as Hex;
 }
 /**
  * What a simulation request needs for ecrecover to recover STUB_SIGNATURE as `signer` (over `digest`, if given): the
@@ -569,8 +624,8 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     return first;
   };
   // Over the digest the wallet will sign first; if the account checks another form of the hash, over any.
-  let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest)) : null;
-  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(ecrecoverAs(signer));
+  let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest, stub.cosigners)) : null;
+  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(ecrecoverAs(signer, undefined, stub.cosigners));
   return result && { ...result, standIn };
   }
 }

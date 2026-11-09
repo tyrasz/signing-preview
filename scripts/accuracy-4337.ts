@@ -80,9 +80,10 @@ function safeOpTyped(op: Op, module: string, prefixBytes: number) {
       validAfter: BigInt(`0x${op.signature.slice(at, at + 12)}`).toString(), validUntil: BigInt(`0x${op.signature.slice(at + 12, at + 24)}`).toString(), entryPoint: EP } };
 }
 /** The ECDSA signature inside the operation's: a Coinbase Smart Wallet's SignatureWrapper, or its last 65 bytes. */
-function innerSignature(sig: Hex): Hex | null {
-  try { const [w] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], sig); if (w.signatureData.length === 132) return w.signatureData; } catch { /* not a wrapper */ }
-  return sig.length >= 132 ? `0x${sig.slice(-130)}` : null;
+/** The ECDSA signatures an account's signature may carry its owner's in: a wrapper's, its last 65 bytes, or (a prefix byte and two signatures, the owner's then a cosigner's) its first after the prefix. */
+function innerSignatures(sig: Hex): Hex[] {
+  try { const [w] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], sig); if (w.signatureData.length === 132) return [w.signatureData]; } catch { /* not a wrapper */ }
+  return [...(sig.length === 2 + 131 * 2 ? [`0x${sig.slice(4, 4 + 130)}` as Hex] : []), ...(sig.length >= 132 ? [`0x${sig.slice(-130)}` as Hex] : [])];
 }
 
 /** Rhinestone's SmartSession module (source verified on Sourcify, Arbitrum One). */
@@ -167,8 +168,7 @@ async function replay(hash: string): Promise<void> {
   const signers: string[] = [];
   const add = (a: string | undefined) => { if (a && /^0x[0-9a-f]{40}$/.test(a) && !/^0x0+$/.test(a) && !signers.includes(a)) signers.push(a); };
   if (code.startsWith('0xef0100')) add(sender);
-  const inner = module ? null : innerSignature(op.signature);
-  if (inner) for (const h of [hashMessage({ raw: digest }), digest]) { try { add((await recoverAddress({ hash: h, signature: inner })).toLowerCase()); } catch { /* not ECDSA */ } }
+  for (const inner of module ? [] : innerSignatures(op.signature)) for (const h of [hashMessage({ raw: digest }), digest]) { try { add((await recoverAddress({ hash: h, signature: inner })).toLowerCase()); } catch { /* not ECDSA */ } }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
   add(sender);

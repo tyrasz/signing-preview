@@ -211,3 +211,26 @@ test('A Kernel v3.1 passkey account: the stand-in passes ZeroDev’s own WebAuth
   assert.doesNotMatch(whole, /doesn't accept/);
   assert.deepEqual(usdcChange(p), ['out 50']);
 });
+
+test('The ecrecover stand-in: each stand-in signature recovers as its signer for exactly the precompile’s 3,000 gas', async () => {
+  const { ecrecoverAs, STUB_SIGNATURE, STUB_COSIGNATURE } = await import('../src/erc4337-sim.ts');
+  const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');
+  const COSIGNER = '0xc051000000000000000000000000000000000c05';
+  const digest = `0x${'d1'.repeat(32)}` as Hex;
+  const input = (sig: Hex, hash: Hex) => concatHex([hash, `0x${sig.slice(130).padStart(64, '0')}`, `0x${sig.slice(2, 66)}`, `0x${sig.slice(66, 130)}`]);
+  const where = '0x0000000000000000000000000000000000ec0bad';
+  for (const [code, d, expect] of [
+    [ecrecoverAs(OWNER), undefined, [[STUB_SIGNATURE, OWNER]]],
+    [ecrecoverAs(OWNER, digest), digest, [[STUB_SIGNATURE, OWNER]]],
+    [ecrecoverAs(OWNER, undefined, [{ signature: STUB_COSIGNATURE, signer: COSIGNER }]), undefined, [[STUB_SIGNATURE, OWNER], [STUB_COSIGNATURE, COSIGNER]]],
+    [ecrecoverAs(OWNER, digest, [{ signature: STUB_COSIGNATURE, signer: COSIGNER }]), digest, [[STUB_SIGNATURE, OWNER], [STUB_COSIGNATURE, COSIGNER]]],
+  ] as const) {
+    await chain.putCode(where, code);
+    for (const [sig, signer] of expect) {
+      const r = await chain.evm.runCall({ caller: at(OWNER), to: at(where), data: toBytes(input(sig, d ?? `0x${'99'.repeat(32)}`)), gasLimit: 100_000n });
+      assert.equal(`0x${toHex(r.execResult.returnValue).slice(-40)}`, signer);
+      assert.equal(r.execResult.executionGasUsed, 3000n, `${signer} ${d ? 'over the digest' : ''}`);
+    }
+  }
+  assert.notEqual(STUB_COSIGNATURE.slice(2, 66), STUB_SIGNATURE.slice(2, 66));
+});
