@@ -358,6 +358,10 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
   '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
+  // Uniswap's Calibur (an EIP-7702 delegate): its wallet's signature as Calibur decodes it, the key's hash (0: the
+  // root key, the account's own), the signature and no hook data, which costs a little more to validate than the
+  // bare signature it also accepts (its verified source; seen so on Ethereum).
+  '0x000000005c84f8fd50b21cac312528a64437030e': () => ({ signature: encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes' }, { type: 'bytes' }], [`0x${'00'.repeat(32)}`, STUB_SIGNATURE, '0x']) }),
   // Alchemy's LightAccount v2.0.0 and MultiOwnerLightAccount v2.0.0 implementations (ERC-1967): a type byte, 0x00
   // for an EOA owner, then its signature over the personal_sign form of the hash (their verified sources; checked
   // on LightAccount: it validates the shape as signed by its owner).
