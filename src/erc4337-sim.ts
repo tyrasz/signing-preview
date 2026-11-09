@@ -398,6 +398,9 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // for an EOA owner, then its signature over the personal_sign form of the hash (their verified sources; checked
   // on LightAccount: it validates the shape as signed by its owner).
   '0x8e8e658e22b12ada97b402ff0b044d6a325013c7': shaped('0x00'), '0xd2c27f9ee8e4355f71915ffd5568cb3433b6823d': shaped('0x00'),
+  // A later LightAccount implementation, seen with EntryPoint v0.8: the same type byte, then the owner's signature
+  // over the operation's hash (its verified source).
+  '0x2c53d0bd33a60db8881c7b049df6fd762a1f059c': shaped('0x00'),
   '0x000100abaad02f1cfc8bbe32bd5a564817339e72': coinbaseStub, '0x00000110dcdedc9581cb5ecb8467282f2926534d': coinbaseStub,
   // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,

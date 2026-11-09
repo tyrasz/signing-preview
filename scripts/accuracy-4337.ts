@@ -5,7 +5,8 @@
 // watching for new blocks: on Arbitrum an operation must be replayed within about 30 seconds of its block. --backfill
 // first takes the operations of the blocks already behind the head (Ethereum keeps about 128 blocks of state).
 // --summary-md appends the results as Markdown (a CI job summary). --strict exits with 1 when an operation's outcome
-// differs from its receipt, its gas is 5% or more off, or its token movements differ beyond the fee's rounding.
+// differs from its receipt or, for one simulated whole on its block's state, its gas is 5% or more off or its token
+// movements differ beyond rounding.
 //
 // How accurate whole-operation simulation is (src/erc4337-sim.ts), measured against what happened. Recent
 // single-operation bundles of an EntryPoint are rebuilt as the request their owner signed:
@@ -305,8 +306,12 @@ for (const r of rows) {
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 
-// Differences that mean the preview was wrong (not a shape the stand-in doesn't take, or a node refusing).
-const wrong = rows.filter(r => !r.notSimulated && (!r.outcome || (g(r) && Math.abs(g(r)!.percent) >= 5) || r.tokens === 'other'));
+// Differences that mean the preview was wrong (not a shape the stand-in doesn't take, or a node refusing): an outcome
+// it got wrong; and, where it simulated the whole operation on the state the operation met, gas 5% or more off or
+// token movements beyond rounding. (Calls simulated alone leave out the gas payment and any paymaster's charge, as
+// their preview says; without the block's earlier transactions, amounts can move.)
+const judged = (r: Row) => r.whole === true && !r.prefix;
+const wrong = rows.filter(r => !r.notSimulated && (!r.outcome || (judged(r) && ((g(r) && Math.abs(g(r)!.percent) >= 5) || r.tokens === 'other'))));
 const md = arg('summary-md', '');
 if (md) {
   const chain = CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum';

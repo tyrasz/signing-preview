@@ -4,9 +4,10 @@ name: UserOperation replays
 # it met (the block before, its header, its earlier transactions), and compares the preview with the receipt:
 # npm run accuracy:4337 (README, Simulation accuracy). Read-only: nothing is signed with a real key or sent.
 # Public RPCs by default; ETHEREUM_RPC_URL / ARBITRUM_RPC_URL repository secrets replace them.
-# Fails when an operation's outcome differs from its receipt, its gas is 5% or more off, or its token movements
-# differ beyond a gas-priced fee's rounding. Operations whose signature the stand-in can't take only show in the
-# summary: that is a missing shape, not a wrong preview.
+# Fails when an operation's outcome differs from its receipt, or, for one simulated whole on the state it met, its
+# gas is 5% or more off or its token movements differ beyond rounding (scripts/accuracy-4337.ts --strict).
+# Operations whose signature the stand-in can't take only show in the summary: that is a missing shape, not a wrong
+# preview.
 
 on:
   schedule:
