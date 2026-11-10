@@ -198,21 +198,29 @@ const BUNDLER = '0x0000000000000000000000000000000000004337';
  * Bundlers that recently submitted operations this paymaster paid for (at most five): paymasters that only accept
  * certain bundlers (tx.origin) refuse any other, which says nothing about the operation itself. A paymaster can take
  * any bundler for some of its operations and only its own for others, by a setting in its data: bundlers whose
- * operations had the same first byte of paymaster data as this one come first, the busiest first. Looks back 1,000
- * blocks, then 20,000 (minutes on Arbitrum) if that finds none.
+ * operations had the same first byte of paymaster data as this one come first, the busiest first. Looks back 200
+ * blocks, then 2,000, then 20,000 (minutes on Arbitrum) while that finds none, and remembers what it found for ten
+ * minutes: a busy paymaster's logs over many blocks are a heavy read that nodes refuse under load, and an empty
+ * answer left the refusal standing.
  */
+const RECENT_BUNDLERS = new Map<string, { at: number; bundlers: string[] }>();
 async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: string, paymasterAndData: Hex): Promise<string[]> {
   const paymaster = paymasterAndData.slice(0, 42).toLowerCase();
   // The paymaster's own data starts after its address, and from v0.7 on its two gas limits.
   const at = SIMULATIONS[entryPoint]?.version === '0.6' ? 20 : 52;
   const config = paymasterAndData.length > 2 + at * 2 ? paymasterAndData.slice(2 + at * 2, 4 + at * 2).toLowerCase() : undefined;
+  const key = `${chainId}:${entryPoint}:${paymaster}:${config ?? ''}`;
+  const known = RECENT_BUNDLERS.get(key);
+  if (known && Date.now() - known.at < 600_000) return known.bundlers;
   const rpc = deps.rpc;
   if (!rpc?.has(chainId)) return [];
   try {
     const head = BigInt(String(await rpc.call(chainId, 'eth_blockNumber', [])));
-    for (const span of [1000n, 20_000n]) {
+    for (const span of [200n, 2000n, 20_000n]) {
       let logs: { transactionHash: string }[];
-      try { logs = await rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as { transactionHash: string }[]; } catch { continue; }
+      // A refused read is tried once more before a wider (heavier) one.
+      const read = () => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
+      try { logs = await read().catch(async () => { await new Promise(r => setTimeout(r, 500)); return read(); }); } catch { continue; }
       const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
       if (!hashes.length) continue;
       const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
@@ -225,7 +233,9 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
         const same = config !== undefined && i >= 0 && input.slice(i + at * 2, i + at * 2 + 2) === config;
         score.set(from, (score.get(from) ?? 0) + (same ? 100 : 1));
       }
-      return [...score].sort((a, b) => b[1] - a[1]).map(([f]) => f).slice(0, 5);
+      const bundlers = [...score].sort((a, b) => b[1] - a[1]).map(([f]) => f).slice(0, 5);
+      if (bundlers.length) RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers });
+      return bundlers;
     }
   } catch { /* none */ }
   return [];
