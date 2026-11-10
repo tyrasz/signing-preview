@@ -302,6 +302,13 @@ export function webAuthnStub(hash: Hex): Hex {
 export const DAIMO_P256_VERIFIER = '0xc2b78104907f722dabac4c69f826a522b2754de4';
 /** ZeroDev's WebAuthn validator for Kernel v3 (source verified on Sourcify, Arbitrum One). */
 const ZERODEV_WEBAUTHN_VALIDATORS = new Set(['0x7ab16ff354acb328452f1d445b3ddee9a91e9e69']);
+/**
+ * Kernel validators that take a passkey's assertion as webauthn-sol's WebAuthnAuth struct (the form webAuthnStub
+ * builds, with the operation's hash as the challenge) and verify it through the P256 precompile: the validator of
+ * Paribu's wallets (unpublished; seen on BNB Chain as the root validator of Kernel v3.3 accounts, their signatures'
+ * challenge the operation's hash; checked live: the stand-in validates).
+ */
+const KERNEL_WEBAUTHN_SOL_VALIDATORS = new Set(['0xbbbe97d3d0e926231975e0b69acb54d534d35b1e']);
 /** Chains here on which ZeroDev's SDK signs with the P256 precompile (its isRIP7212SupportedNetwork). */
 const ZERODEV_PRECOMPILED = new Set([1, 42161]);
 /**
@@ -351,6 +358,11 @@ async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
     if (!hash) return ecdsa;
     const precompiled = ZERODEV_PRECOMPILED.has(c.chainId);
     return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
+  }
+  if (type === '01' && KERNEL_WEBAUTHN_SOL_VALIDATORS.has(`0x${id}`.toLowerCase())) {
+    const hash = await c.hash();
+    if (!hash) return ecdsa;
+    return [{ signature: webAuthnStub(hash), p256: true }];
   }
   if (type === '02' && rpc) {
     try {

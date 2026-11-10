@@ -62,7 +62,12 @@ const EP = ENTRY_POINTS[VERSION];
 if (!EP) throw new Error(`--entrypoint is one of ${Object.keys(ENTRY_POINTS).join(', ')}`);
 const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : OP_STACK.has(CHAIN) ? new Set(['0x7e']) : new Set<string>();
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 30_000, retries: 6, retryDelayMs: 800 });
-const call = <T>(method: string, params: unknown[]) => rpc.call(CHAIN, method, params) as Promise<T>;
+/** A read; a block or transaction the answering backend doesn't have yet (null) is asked for again, twice, a second apart. */
+const call = async <T>(method: string, params: unknown[]): Promise<T> => {
+  let out = await rpc.call(CHAIN, method, params) as T;
+  for (let i = 0; i < 2 && out === null && /^eth_get(Block|Transaction)/.test(method); i++) { await new Promise(r => setTimeout(r, 1000)); out = await rpc.call(CHAIN, method, params) as T; }
+  return out;
+};
 
 const OP = VERSION === '0.6'
   ? '(address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature)'
@@ -361,9 +366,12 @@ async function replay(item: string): Promise<void> {
   // (and for one run a second after its block, BNB Chain, whose gas isn't judged either, see below)
   const feeSlack = BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? Math.abs(gasPercent) : 0)));
   const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack;
+  // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
+  // ten-thousandth (as scripts/accuracy.ts allows).
+  const secondLate = (t: { actual: string; simulated: string }) => timeBumped && abs(BigInt(t.simulated) - BigInt(t.actual)) * 10_000n <= abs(BigInt(t.actual));
   const tokenMatch = tokens.every(t => t.actual === t.simulated) ? 'exact'
     : tokens.every(t => t.actual === t.simulated || feeLike(t)) ? 'fee'
-    : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || feeLike(t)) ? 'units' : 'other';
+    : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || feeLike(t) || secondLate(t)) ? 'units' : 'other';
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
