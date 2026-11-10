@@ -270,3 +270,130 @@ test('When the fork simulator runs out of budget, the probe reads the tokens it 
   const blind = (await new RpcSimulator({ 999: URL_ }, { fetchImpl: chain.fetchImpl, fork: { ...stuck, discovered: () => [] }, forkBudgetMs: 50 }).simulateBatch(reqs))!;
   assert.deepEqual(blind[1].transfers.filter(t => t.asset === hUsdc), []);
 });
+
+test('A call trace: every call in order, with its kind, its own events, why one failed, and the state changed', async () => {
+  const target = await chain.deploy('TraceTarget'), lib = await chain.deploy('TraceLib'), noisy = await chain.deploy('Noisy');
+  await chain.exec(usdc, call('mint', [target, 100n]));
+  const RUN = parseAbi(['function run(address token, address to, address noisy, address lib) payable returns (uint256)']);
+  const data = encodeFunctionData({ abi: RUN, functionName: 'run', args: [usdc as Hex, BOB as Hex, noisy as Hex, lib as Hex] });
+  const r = await fork().simulate({ chainId: 999, from: USER, to: target, data, value: 7n, trace: true });
+  assert.equal(r?.status, 'success');
+  const t = r!.trace!;
+  assert.deepEqual([t.type, t.from, t.to, t.value], ['call', USER, target, 7n]);
+  // The calls it makes, in order: a token transfer, a call that fails, a delegatecall, a read, a payment, a creation.
+  const kinds = t.calls!.map(c => [c.type, c.to === target ? 'target' : c.to === usdc ? 'usdc' : c.to === noisy ? 'noisy' : c.to === lib ? 'lib' : c.to === BOB ? 'bob' : 'new', c.error ?? '']);
+  assert.deepEqual(kinds, [['call', 'usdc', ''], ['call', 'noisy', 'after an event'], ['delegatecall', 'lib', ''], ['staticcall', 'usdc', ''], ['call', 'bob', ''], ['create', 'new', '']]);
+  const [transfer, failed, bump, read, pay, created] = t.calls!;
+  // A delegatecall runs as its caller: it comes from the target, and so does its event.
+  assert.equal(bump.from, target);
+  assert.deepEqual(bump.logs!.map(l => [l.index, l.address]), [[2, target]]);
+  // Events are numbered across the transaction, each under the call whose code emitted it; the failed call's is gone.
+  assert.deepEqual(t.logs!.map(l => l.index), [0, 3]);
+  assert.deepEqual(transfer.logs!.map(l => [l.index, l.address, l.topics[0]]), [[1, usdc, '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef']]);
+  assert.equal(failed.logs, undefined);
+  assert.deepEqual(r!.logs!.map(l => l.address), [target, usdc, target, target]);
+  // Inputs, outputs and value: the read returns Bob's balance, which the call itself returns; the payment carries 7.
+  assert.equal(read.input.slice(0, 10), '0x70a08231');
+  assert.equal(BigInt(read.output!), 5n);
+  assert.equal(BigInt(t.output!), 5n);
+  assert.deepEqual([pay.value, pay.input], [7n, '0x']);
+  assert.ok(created.to && created.to !== target && created.output === undefined);
+  assert.ok(t.gasUsed > transfer.gasUsed && transfer.gasUsed > 0n);
+
+  // The state it changed, account by account: balances moved in the token, the target's counter (written by the
+  // delegatecall) and nonce (it created a contract), the new contract's code, and 7 wei from the sender to Bob.
+  const by = new Map(r!.stateChanges!.map(s => [s.address, s]));
+  assert.equal(by.get(usdc)!.storage!.length, 2);
+  assert.deepEqual(by.get(target)!.storage!.map(s => [BigInt(s.slot), BigInt(s.before), BigInt(s.after)]), [[0n, 0n, 1n]]);
+  assert.deepEqual([by.get(target)!.nonce!.after - by.get(target)!.nonce!.before, by.get(target)!.balance], [1n, undefined]);
+  assert.equal(by.get(created.to!)!.code, true);
+  assert.equal(by.get(BOB)!.balance!.after - by.get(BOB)!.balance!.before, 7n);
+  assert.equal(by.get(USER)!.balance!.after - by.get(USER)!.balance!.before, -7n);
+  // What the failed call wrote or emitted isn't among them.
+  assert.equal(by.has(noisy), false);
+  // Without the flag, no trace is kept.
+  assert.equal((await fork().simulate({ chainId: 999, from: USER, to: target, data, value: 7n }))!.trace, undefined);
+
+  // In a preview: the trace decoded with what is known (standard functions and events, the tokens' names, "you").
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: USER, to: target, data, value: '0x7', chainId: '0x3e7' }] }, { now: NOW, trace: true }, deps);
+  const calls = p.trace!.calls;
+  assert.equal(calls.length, 7);
+  assert.deepEqual(calls.map(c => c.depth), [0, 1, 1, 1, 1, 1, 1]);
+  assert.equal(calls[0].fromLabel, 'you');
+  assert.deepEqual([calls[1].label, calls[1].function, calls[1].named, calls[1].text], ['USDC', 'transfer(address,uint256)', 'standard', `USDC.transfer(${BOB}, 5)`]);
+  assert.deepEqual(calls[1].args, [{ name: 'to', type: 'address', value: BOB }, { name: 'amount', type: 'uint256', value: '5' }]);
+  assert.deepEqual(calls[1].events!.map(e => [e.index, e.label, e.name, e.args!.map(a => a.value).join(' ')]), [[1, 'USDC', 'Transfer', `${target} ${BOB} 5`]]);
+  assert.match(calls[2].text!, /failed: after an event$/);
+  assert.deepEqual([calls[4].function, calls[4].returns], ['balanceOf(address)', [{ type: 'uint256', value: '5' }]]);
+  assert.match(calls[5].text!, /with 0\.000000000000000007 HYPE$/);
+  assert.match(calls[6].text!, /^create new contract \(\d+ bytes of creation code\) at 0x[0-9a-f]{40}$/);
+  // The traced run did what the simulation shown did: the same outcome and events.
+  assert.equal(p.trace!.agrees, true);
+  assert.equal(p.trace!.note, undefined);
+  assert.equal(p.trace!.source, "a local EVM over HyperEVM's state");
+  assert.equal(p.trace!.stateChanges!.find(s => s.address === BOB)!.balance!.change, '+0.000000000000000007 HYPE');
+  // Not asked for, not there.
+  assert.equal((await send(target, data, 7n)).trace, undefined);
+});
+
+test('Chains with their own rules: Polygon’s storage prices, Arbitrum’s two block numbers, and a block named by the request', async () => {
+  const AT = '0x00000000000000000000000000000000000c0de1', FROM = '0x00000000000000000000000000000000000c0de2';
+  const SLOT1 = `0x${'00'.repeat(31)}01`;
+  const gasOf = async (sim: ForkSimulator, code: string, extra: Record<string, unknown> = {}) =>
+    Number((await sim.simulate({ chainId: 999, from: FROM, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code, ...extra } } }))!.gasUsed) - 21000;
+  // Polygon's rules on this chain: what its node charged for each of these (measured 2026-11-10), and Ethereum's.
+  const polygon = fork({ profiles: { 999: { ...CHAIN_PROFILES[137] } } }), ethereum = fork({ profiles: { 999: { ...CHAIN_PROFILES[1] } } });
+  const set = { stateDiff: { [SLOT1]: `0x${'00'.repeat(31)}07` } };
+  const cases: [string, string, Record<string, unknown>, number, number][] = [
+    ['a cold SLOAD', '0x6000545000', {}, 5465, 2105],
+    ['a cold SLOAD, then the same slot again', '0x600054506000545000', {}, 5570, 2210],
+    ['SSTORE to an empty slot', '0x600160005500', {}, 22946, 22106],
+    ['SSTORE changing a set slot', '0x600860015500', set, 5006, 5006],
+    ['SSTORE of the value already there', '0x600760015500', set, 3046, 2206],
+    ['SSTORE clearing a slot (with its refund)', '0x600060015500', set, 1046, 206],
+    ['SLOAD, then SSTORE to the same empty slot', '0x60005450600160005500', {}, 25471, 22111],
+    ['a cold account read', '0x61dead3b5000', {}, 2605, 2605],
+  ];
+  for (const [name, code, extra, onPolygon, onEthereum] of cases) {
+    assert.equal(await gasOf(polygon, code, extra), onPolygon, `Polygon: ${name}`);
+    assert.equal(await gasOf(ethereum, code, extra), onEthereum, `Ethereum: ${name}`);
+  }
+
+  // Arbitrum: NUMBER is the L1 block the chain last saw, and ArbSys.arbBlockNumber() the chain's own; opcode 0x44 is 1.
+  // The code returns NUMBER, what ArbSys (0x64) answers arbBlockNumber() with, and PREVRANDAO.
+  const reads = '0x4360005263a3b1b31d60e01b60205260206040600460206064' + '5afa50' + '4460605260806000f3';
+  const arbitrum = fork({ profiles: { 999: { ...CHAIN_PROFILES[42161] } } });
+  const header = { number: 21_000_000n, arbBlockNumber: 523_000_000n, timestamp: 1_800_000_000n, coinbase: BOB, prevRandao: `0x${'00'.repeat(31)}01` as Hex, gasLimit: 30_000_000n, baseFeePerGas: 10_000_000n };
+  const r = await arbitrum.simulate({ chainId: 999, from: FROM, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: reads } }, at: { block: 'latest', header } });
+  const words = r!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`));
+  assert.deepEqual([words[0], words[2], words[3]], [21_000_000n, 523_000_000n, 1n]);
+  // The request's block wins over the simulator's own: the same code on another header sees that one.
+  const again = await arbitrum.simulate({ chainId: 999, from: FROM, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: reads } }, at: { block: 'latest', header: { ...header, number: 5n, arbBlockNumber: 9n } } });
+  assert.deepEqual(again!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`)).filter((_, i) => i !== 1), [5n, 9n, 1n]);
+});
+
+test('A traced preview, sent through the HTTP server, matches the API’s schema', async () => {
+  const { createPreviewServer, openApiDocument } = await import('../src/server.ts');
+  const Ajv2020Module = (await import('ajv/dist/2020.js')).default as unknown as { default?: unknown };
+  const Ajv2020 = (Ajv2020Module.default ?? Ajv2020Module) as new (o: object) => { addSchema(s: object): void; getSchema(k: string): (((d: unknown) => boolean) & { errors?: unknown[] }) | undefined };
+  const ajv = new Ajv2020({ strict: false, allErrors: true });
+  ajv.addSchema({ ...openApiDocument(), $id: 'signing-preview-openapi' });
+  const target = await chain.deploy('TraceTarget'), lib = await chain.deploy('TraceLib'), noisy = await chain.deploy('Noisy');
+  await chain.exec(usdc, call('mint', [target, 100n]));
+  const data = encodeFunctionData({ abi: parseAbi(['function run(address token, address to, address noisy, address lib) payable returns (uint256)']), functionName: 'run', args: [usdc as Hex, BOB as Hex, noisy as Hex, lib as Hex] });
+  const server = createPreviewServer({ deps });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address() as { port: number };
+    const body = { request: { method: 'eth_sendTransaction', params: [{ from: USER, to: target, data, value: '0x7', chainId: '0x3e7' }] }, context: { trace: true } };
+    const request = ajv.getSchema('signing-preview-openapi#/components/schemas/PreviewRequest')!;
+    assert.ok(request(body), JSON.stringify(request.errors?.slice(0, 3)));
+    const res = await fetch(`http://127.0.0.1:${port}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const preview = await res.json() as Preview;
+    assert.equal(res.status, 200);
+    assert.equal(preview.trace!.calls.length, 7);
+    assert.ok(preview.trace!.stateChanges!.length >= 4);
+    const valid = ajv.getSchema('signing-preview-openapi#/components/schemas/Preview')!;
+    assert.ok(valid(preview), JSON.stringify(valid.errors?.slice(0, 3)));
+  } finally { server.close(); }
+});

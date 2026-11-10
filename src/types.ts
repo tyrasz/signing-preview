@@ -106,6 +106,83 @@ export interface Preview {
   simulation?: SimulationSummary;
   /** Per-call previews for batches (wallet_sendCalls). */
   calls?: Preview[];
+  /** The simulated call's trace and state changes, when the context asked for them (PreviewContext.trace) and the simulator could. */
+  trace?: PreviewTrace;
+}
+
+/** A decoded argument, return value or event field. */
+export interface TraceValue { name?: string; type: string; value: string }
+
+/** An event a call emitted. Named from the contract's verified source or the standard events; otherwise its topics and data. */
+export interface TraceEvent {
+  /** Its place among the transaction's events. */
+  index: number;
+  address: string;
+  /** A name for the emitting contract: a known token's symbol, a verified contract's name. */
+  label?: string;
+  name?: string;
+  args?: TraceValue[];
+  named?: 'verified' | 'standard';
+  topics: string[];
+  data: string;
+}
+
+/** One call of the trace. */
+export interface TraceEntry {
+  /** 0 for the transaction's own call; a call's own calls follow it, one deeper. */
+  depth: number;
+  type: 'call' | 'staticcall' | 'delegatecall' | 'callcode' | 'create' | 'create2';
+  from: string;
+  /** The code that runs: the contract called or created (null when the creation fails). */
+  to: string | null;
+  /** Names for `to` and `from`: "you", a known token's symbol, a verified contract's name, a precompile's. */
+  label?: string;
+  fromLabel?: string;
+  /** The call in a line: "USDC.transfer(0x…, 1000000)". */
+  text?: string;
+  /** The native amount sent, in base units. */
+  value?: string;
+  precompile?: boolean;
+  selector?: string;
+  /** The function called, as its signature ("transfer(address,uint256)"). */
+  function?: string;
+  args?: TraceValue[];
+  returns?: TraceValue[];
+  /**
+   * Where the function's name comes from: the contract's verified source, the built-in list of standard functions,
+   * or a signature database by selector alone (a guess: different functions can share a selector).
+   */
+  named?: 'verified' | 'standard' | 'signature';
+  /** The raw input and output, when not decoded (cut when long). */
+  input?: string;
+  output?: string;
+  /** The gas the call used, the calls it makes included. */
+  gasUsed: string;
+  /** Why the call failed. What a failed call did is undone, the calls under it included. */
+  error?: string;
+  events?: TraceEvent[];
+}
+
+export interface PreviewTrace {
+  /** What ran the trace. */
+  source: string;
+  /** False when the run that was traced did not do what the simulation shown did (its outcome or events differ): the trace is then a guide only. */
+  agrees?: boolean;
+  note?: string;
+  calls: TraceEntry[];
+  /** The trace has more calls than are listed. */
+  truncated?: boolean;
+  totalCalls?: number;
+  /** What the call changed, account by account (the gas payment apart). */
+  stateChanges?: {
+    address: string; label?: string;
+    balance?: { before: string; after: string; change: string };
+    nonce?: { before: string; after: string };
+    code?: boolean;
+    storage?: { slot: string; before: string; after: string }[];
+    /** How many slots changed, when more than are listed. */
+    storageSlots?: number;
+  }[];
 }
 
 /** Extra context that is not part of the signing request itself. */
@@ -116,6 +193,11 @@ export interface PreviewContext {
   origin?: string;
   /** Signing account, when the wallet knows it. */
   account?: string;
+  /**
+   * Also return the simulated call's trace (the calls it makes, decoded, with their events) and the state it
+   * changes: Preview.trace. It takes a second run, in a local EVM, so it is off unless asked for.
+   */
+  trace?: boolean;
   /**
    * Hyperliquid L1 actions are signed as an opaque hash. To decode one, the
    * caller must supply the original action. It is checked against the hash.
@@ -219,6 +301,50 @@ export interface SimulationRequest {
    * costs, and ForkSimulator applies them as the chain will.
    */
   unsignedAuthorizations?: { address: string; chainId: number }[];
+  /**
+   * Also report the call's trace (the tree of calls it makes, with the events each emits) and the state it changes.
+   * Simulators that can't trace leave both out.
+   */
+  trace?: boolean;
+  /**
+   * The block to simulate on top of and the header of the block the call runs in, instead of the chain's latest and a
+   * header of the simulator's making (src/block.ts): for a simulation that has to be the same in two simulators, or
+   * one that looks back at a past block. A batch runs in its first request's.
+   */
+  at?: import('./block.ts').BlockAt;
+}
+
+/** One call in a simulated call's tree: the call itself first, then the calls its code makes, in order. */
+export interface TraceCall {
+  type: 'call' | 'staticcall' | 'delegatecall' | 'callcode' | 'create' | 'create2';
+  /** Who makes the call: the sender, or the contract whose code is running (for a delegatecall, the account it runs as). */
+  from: string;
+  /** The code that runs: the contract called, or created (null when the creation fails). */
+  to: string | null;
+  /** The native amount sent with it. */
+  value: bigint;
+  input: string;
+  /** What it returned (a created contract's code is left out). */
+  output?: string;
+  /** The gas it was given and the gas it used, the calls it makes included. */
+  gas: bigint; gasUsed: bigint;
+  /** Why it failed: the revert reason, or the EVM's error (out of gas, invalid opcode...). What a failed call did is undone, the calls under it included. */
+  error?: string;
+  /** A precompile (ecrecover, sha256...), not a contract. */
+  precompile?: boolean;
+  /** The events this call's own code emitted, numbered across the transaction. Those of a call that failed, or under one, aren't kept. */
+  logs?: { index: number; address: string; topics: string[]; data: string }[];
+  calls?: TraceCall[];
+}
+
+/** What a simulated call changed in one account: its balance, nonce, code and storage (before and after, each only if changed). */
+export interface StateChange {
+  address: string;
+  balance?: { before: bigint; after: bigint };
+  nonce?: { before: bigint; after: bigint };
+  /** Its code changed: a contract created, or an EIP-7702 delegation set or cleared. */
+  code?: boolean;
+  storage?: { slot: string; before: string; after: string }[];
 }
 
 export interface SimulatedTransfer {
@@ -293,11 +419,22 @@ export interface SimulationResult {
   logs?: { address: string; topics: string[]; data: string }[];
   /** The amounts were read from balances before and after the call (not taken from the logs). */
   balancesRead?: boolean;
+  /** The call's trace and the state it changed, when the request asked for them and the simulator can (see SimulationRequest.trace). */
+  trace?: TraceCall;
+  stateChanges?: StateChange[];
+  /** Why a requested trace is missing, or how far it can be relied on (a local run that differed from the node's). */
+  traceNote?: string;
 }
 
 export interface Simulator {
   /** Resolves null when this simulator does not cover the call (e.g. no RPC for that chain). Rejects on failure. */
   simulate(request: SimulationRequest): Promise<SimulationResult | null>;
+  /**
+   * The same calls, in order, run where they can be traced (a local EVM): each result with its trace and the state it
+   * changed. Null when nothing here can trace calls on that chain. A caller compares the outcome with its own
+   * simulation's (same block: SimulationRequest.at) before trusting the trace to be of it.
+   */
+  trace?(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
   /**
    * Simulates calls in order in one block, each seeing the state the previous ones left (EIP-5792 batches, e.g.
    * approve then swap). Resolves one result per call, or null when this simulator does not cover the chain.

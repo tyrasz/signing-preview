@@ -382,6 +382,42 @@ export function mockHyperEvmRpc(): RpcClient {
   };
 }
 
+/**
+ * A trace for the unknown router's swap, as a local EVM would record it (the demo's "trace" switch): the router
+ * pulls the USDC into a Uniswap v2 pair and has it swap, the pair pays out WETH and reads its balances.
+ */
+function swapTrace(sample: Sample): Pick<SimulationResult, 'trace' | 'stateChanges'> {
+  const p = (sample.request.params as Record<string, string>[])[0];
+  const erc20 = parseAbi(['function transferFrom(address from, address to, uint256 amount) returns (bool)', 'function transfer(address to, uint256 amount) returns (bool)', 'function balanceOf(address account) view returns (uint256)']);
+  const pair = parseAbi(['function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)']);
+  const word = (v: bigint | string) => pad(typeof v === 'string' ? v as Hex : `0x${v.toString(16)}` as Hex, { size: 32 });
+  const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const usdcIn = 1_000_000_000n, wethOut = 284_350_000_000_000_000n, reserves = [41_250_000_000_000n, 11_640_000_000_000_000_000_000n] as const;
+  const frame = { value: 0n, gas: 250_000n };
+  return {
+    trace: { ...frame, type: 'call', from: ALICE, to: ROUTER, input: p.data, gasUsed: 161_331n, calls: [
+      { ...frame, type: 'call', from: ROUTER, to: ETH_USDC, input: encodeFunctionData({ abi: erc20, functionName: 'transferFrom', args: [ALICE, POOL, usdcIn] }), output: word(1n), gasUsed: 38_412n,
+        logs: [{ index: 0, address: ETH_USDC, topics: [TRANSFER, word(ALICE), word(POOL)], data: word(usdcIn) }] },
+      { ...frame, type: 'call', from: ROUTER, to: POOL, input: encodeFunctionData({ abi: pair, functionName: 'swap', args: [0n, wethOut, ALICE, '0x'] }), gasUsed: 92_604n,
+        logs: [
+          { index: 2, address: POOL, topics: ['0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1'], data: `${word(reserves[0] + usdcIn)}${word(reserves[1] - wethOut).slice(2)}` },
+          { index: 3, address: POOL, topics: ['0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822', word(ROUTER), word(ALICE)], data: `${word(usdcIn)}${word(0n).slice(2)}${word(0n).slice(2)}${word(wethOut).slice(2)}` },
+        ],
+        calls: [
+          { ...frame, type: 'call', from: POOL, to: ETH_WETH, input: encodeFunctionData({ abi: erc20, functionName: 'transfer', args: [ALICE, wethOut] }), output: word(1n), gasUsed: 29_962n,
+            logs: [{ index: 1, address: ETH_WETH, topics: [TRANSFER, word(POOL), word(ALICE)], data: word(wethOut) }] },
+          { ...frame, type: 'staticcall', from: POOL, to: ETH_USDC, input: encodeFunctionData({ abi: erc20, functionName: 'balanceOf', args: [POOL] }), output: word(reserves[0] + usdcIn), gasUsed: 2_553n },
+          { ...frame, type: 'staticcall', from: POOL, to: ETH_WETH, input: encodeFunctionData({ abi: erc20, functionName: 'balanceOf', args: [POOL] }), output: word(reserves[1] - wethOut), gasUsed: 534n },
+        ] },
+    ] },
+    stateChanges: [
+      { address: ETH_USDC, storage: [{ slot: word(7n), before: word(5_000_000_000n), after: word(4_000_000_000n) }, { slot: word(8n), before: word(reserves[0]), after: word(reserves[0] + usdcIn) }] },
+      { address: ETH_WETH, storage: [{ slot: word(3n), before: word(reserves[1]), after: word(reserves[1] - wethOut) }, { slot: word(4n), before: word(0n), after: word(wethOut) }] },
+      { address: POOL, storage: [{ slot: word(8n), before: word(reserves[0]), after: word(reserves[0] + usdcIn) }] },
+    ],
+  };
+}
+
 export function mockSimulator(): MockSimulator {
   const samples = buildSamples(0);
   const call = (id: string) => {
@@ -395,10 +431,10 @@ export function mockSimulator(): MockSimulator {
   const ok = (transfers: SimulationResult['transfers'], gasUsed: bigint): SimulationResult => ({ status: 'success', source: 'mock', gasUsed, transfers });
   return new MockSimulator({
     [call('eth-send')]: ok([{ asset: 'native', from: ALICE, to: BOB, raw: 250_000_000_000_000_000n }], 21_000n),
-    [call('eth-unknown-swap')]: ok([
+    [call('eth-unknown-swap')]: { ...ok([
       { asset: ETH_USDC, from: ALICE, to: POOL, raw: 1_000_000_000n },
       { asset: ETH_WETH, from: POOL, to: ALICE, raw: 284_350_000_000_000_000n },
-    ], 182_331n),
+    ], 182_331n), ...swapTrace(samples.find(s => s.id === 'eth-unknown-swap')!) },
     // A router buys an NFT with USDC and, along the way, records an unlimited Permit2 allowance for itself.
     [call('eth-nft-buy')]: { ...ok([{ asset: ETH_USDC, from: ALICE, to: POOL, raw: 1_500_000_000n }], 214_870n),
       nftTransfers: [{ standard: 'erc721', collection: MOCK_NFT, from: POOL, to: ALICE, tokenId: 4242n, amount: 1n }],

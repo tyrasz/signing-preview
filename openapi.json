@@ -522,6 +522,10 @@
                 }
               }
             }
+          },
+          "trace": {
+            "type": "boolean",
+            "description": "Also return the simulated call's trace (the calls it makes, decoded, with their events) and the state it changes, as `trace` in the preview. It takes a second run, in a local EVM over the chain's state, so it is off unless asked for."
           }
         }
       },
@@ -621,6 +625,9 @@
               "$ref": "#/components/schemas/Preview"
             },
             "description": "Batches (`wallet_sendCalls`): one preview per call."
+          },
+          "trace": {
+            "$ref": "#/components/schemas/PreviewTrace"
           }
         }
       },
@@ -901,6 +908,304 @@
           },
           "error": {
             "type": "string"
+          }
+        }
+      },
+      "PreviewTrace": {
+        "type": "object",
+        "description": "The simulated call's trace and the state it changed, when the context asked for them (`trace: true`) and a local EVM is set up for the chain.",
+        "required": [
+          "source",
+          "calls"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "What ran the trace."
+          },
+          "agrees": {
+            "type": "boolean",
+            "description": "False when the traced run did not do what the simulation shown did (its outcome or events differ): the trace is then a guide only."
+          },
+          "note": {
+            "type": "string"
+          },
+          "calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceEntry"
+            }
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "The trace has more calls than are listed."
+          },
+          "totalCalls": {
+            "type": "integer"
+          },
+          "stateChanges": {
+            "type": "array",
+            "description": "What the call changed, account by account (the gas payment apart).",
+            "items": {
+              "type": "object",
+              "required": [
+                "address"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "balance": {
+                  "type": "object",
+                  "required": [
+                    "before",
+                    "after",
+                    "change"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "before": {
+                      "type": "string"
+                    },
+                    "after": {
+                      "type": "string"
+                    },
+                    "change": {
+                      "type": "string",
+                      "description": "e.g. \"+0.01 ETH\"."
+                    }
+                  }
+                },
+                "nonce": {
+                  "type": "object",
+                  "required": [
+                    "before",
+                    "after"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "before": {
+                      "type": "string"
+                    },
+                    "after": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "code": {
+                  "type": "boolean",
+                  "description": "Its code changed: a contract created, or an EIP-7702 delegation set or cleared."
+                },
+                "storage": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "slot",
+                      "before",
+                      "after"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "slot": {
+                        "type": "string"
+                      },
+                      "before": {
+                        "type": "string"
+                      },
+                      "after": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "storageSlots": {
+                  "type": "integer",
+                  "description": "How many slots changed, when more than are listed."
+                }
+              }
+            }
+          }
+        }
+      },
+      "TraceEntry": {
+        "type": "object",
+        "description": "One call of the trace.",
+        "required": [
+          "depth",
+          "type",
+          "from",
+          "to",
+          "gasUsed"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "type": "integer",
+            "description": "0 for the transaction's own call; a call's own calls follow it, one deeper."
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "call",
+              "staticcall",
+              "delegatecall",
+              "callcode",
+              "create",
+              "create2"
+            ]
+          },
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The code that runs: the contract called or created (null when the creation fails)."
+          },
+          "label": {
+            "type": "string",
+            "description": "A name for `to`: \"you\", a known token's symbol, a verified contract's name, a precompile's."
+          },
+          "fromLabel": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string",
+            "description": "The call in a line, e.g. \"USDC.transfer(0x…, 1000000)\"."
+          },
+          "value": {
+            "type": "string",
+            "description": "The native amount sent, in base units."
+          },
+          "precompile": {
+            "type": "boolean"
+          },
+          "selector": {
+            "type": "string"
+          },
+          "function": {
+            "type": "string",
+            "description": "The function called, as its signature."
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceValue"
+            }
+          },
+          "returns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceValue"
+            }
+          },
+          "named": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "standard",
+              "signature"
+            ],
+            "description": "Where the function's name comes from: the contract's verified source, the built-in list of standard functions, or a signature database by selector alone (a guess)."
+          },
+          "input": {
+            "type": "string",
+            "description": "The raw input, when not decoded (cut when long)."
+          },
+          "output": {
+            "type": "string"
+          },
+          "gasUsed": {
+            "type": "string",
+            "description": "The gas the call used, the calls it makes included."
+          },
+          "error": {
+            "type": "string",
+            "description": "Why the call failed. What a failed call did is undone, the calls under it included."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceEvent"
+            }
+          }
+        }
+      },
+      "TraceEvent": {
+        "type": "object",
+        "description": "An event a call emitted, named from the contract's verified source or the standard events where it can be.",
+        "required": [
+          "index",
+          "address",
+          "topics",
+          "data"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "index": {
+            "type": "integer",
+            "description": "Its place among the transaction's events."
+          },
+          "address": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "description": "A name for the emitting contract: a known token's symbol, a verified contract's name."
+          },
+          "name": {
+            "type": "string"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceValue"
+            }
+          },
+          "named": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "standard"
+            ]
+          },
+          "topics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "data": {
+            "type": "string"
+          }
+        }
+      },
+      "TraceValue": {
+        "type": "object",
+        "required": [
+          "type",
+          "value"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "description": "The Solidity type."
+          },
+          "value": {
+            "type": "string",
+            "description": "The value as text: numbers in decimal, bytes in hex (cut when long), arrays and tuples in brackets."
           }
         }
       },

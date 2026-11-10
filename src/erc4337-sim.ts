@@ -14,6 +14,7 @@
 // and refund, and a paymaster's postOp charge aren't part of it.
 import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, keccak256, encodeFunctionData, hexToBytes, parseAbi, sha256, stringToHex, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
+import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
@@ -728,6 +729,8 @@ export const verifierAccepting = (): Hex => standIn(VERIFIER_MOVED, P256_STUB.r,
 export const daimoAccepting = verifierAccepting;
 
 export interface OperationInput {
+  /** The block to simulate on top of and the header to run in, instead of the latest and the simulator's own (src/block.ts). */
+  at?: BlockAt;
   chainId: number; entryPoint: string; sender: string; nonce: bigint;
   /** As the EntryPoint receives it: factory + factoryData, or (v0.8) the EIP-7702 marker + initialization data. */
   initCode: Hex; callData: Hex;
@@ -786,6 +789,8 @@ export interface OperationRun {
   standIn?: 'wallet' | 'ecdsa' | 'passkey';
   /** The `after` calls' results. */
   after?: SimulationResult[];
+  /** What was simulated for `result` (and the `after` calls): for tracing it. */
+  requests?: SimulationRequest[];
 }
 
 export function validity(data: bigint): Validity {
@@ -924,12 +929,14 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
 
 async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, req: SimulationRequest, version: '0.6' | '0.7' | '0.8' | '0.9'): Promise<OperationRun | null> {
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
-  const results = op.after?.length ? await sim.simulateBatch!([req, ...op.after]) : [await sim.simulate(req)];
+  if (op.at) req = { ...req, at: op.at };
+  const requests = [req, ...(op.after ?? []).map(a => (op.at ? { ...a, at: op.at } : a))];
+  const results = requests.length > 1 ? await sim.simulateBatch!(requests) : [await sim.simulate(req)];
   const r = results?.[0];
   if (!r) return null;
   if (r.status === 'reverted') {
     const rejected = failedOp(r.returnData);
-    return rejected ? { rejected, result: r, executed: false, paid: 0n } : null;
+    return rejected ? { rejected, result: r, executed: false, paid: 0n, requests } : null;
   }
   if (r.limited || !r.returnData || !r.logs) return null;
   let decoded: readonly [bigint, bigint, bigint, bigint, boolean, Hex];
@@ -955,5 +962,5 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   const transfers = r.transfers.filter(t => !(t.asset === 'native' && t.from === sender && t.to === entryPoint) && t.asset !== entryPoint);
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData); // address 0 is none
   return { result: { ...r, transfers }, executed: success, ...(revertReason && { revertReason }), ...(postOpReverted && { postOpReverted }),
-    paid, gasUsed: actualGasUsed, account: validity(accountData), ...(paymaster && { paymaster: validity(paymasterData) }), ...(results!.length > 1 && { after: results!.slice(1) as SimulationResult[] }) };
+    paid, gasUsed: actualGasUsed, account: validity(accountData), ...(paymaster && { paymaster: validity(paymasterData) }), ...(results!.length > 1 && { after: results!.slice(1) as SimulationResult[] }), requests };
 }

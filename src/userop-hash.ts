@@ -117,5 +117,6 @@ export async function previewSignedOperation(method: string, params: unknown[], 
     schema: 'signing-preview/1', method, kind: 'message', network: d.network,
     title: d.title, summary: d.summary, details: b.details, assetChanges: d.assetChanges ?? [], warnings: b.warnings, attention: attentionOf(b.warnings),
     decoding: { status: d.status, decoder: 'erc4337_user_operation_hash', notes: b.notes },
+    ...(b.trace && { trace: b.trace }),
   };
 }

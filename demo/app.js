@@ -36,13 +36,27 @@ function renderBody(p) {
   const short = a => `${a.slice(0, 6)}…${a.slice(-4)}`;
   const approvals = p.approvals?.length ? `<div class="changes">${p.approvals.map(a => `<div class="change approval${a.revoked ? ' revoked' : ''}"><span>${a.revoked ? 'Permission removed' : 'Permission left in place'} <small>(${a.direct ? 'this call' : 'set along the way'})</small></span><span class="amt">${esc(short(a.spender))} → ${esc(a.allowance === 'unlimited' ? `unlimited ${a.symbol ?? ''}` : a.allowance)}</span></div>`).join('')}</div>` : '';
   const sim = p.simulation ? `<div class="network">Simulation: <span class="chip">${esc(p.simulation.status)}</span>${p.simulation.gasUsed ? `<span class="chip">gas ${esc(p.simulation.gasUsed)}</span>` : ''}</div>` : '';
-  const calls = p.calls ? p.calls.map((c, i) => `<div class="call"><div class="network">Call ${i + 1}</div><div class="title" style="font-size:15px">${esc(c.title)}</div>${c.details.length ? `<dl>${c.details.map(d => `<dt>${esc(d.label)}</dt><dd>${esc(d.value)}</dd>`).join('')}</dl>` : ''}</div>`).join('') : '';
+  const calls = p.calls ? p.calls.map((c, i) => `<div class="call"><div class="network">Call ${i + 1}</div><div class="title" style="font-size:15px">${esc(c.title)}</div>${c.details.length ? `<dl>${c.details.map(d => `<dt>${esc(d.label)}</dt><dd>${esc(d.value)}</dd>`).join('')}</dl>` : ''}${renderTrace(c.trace)}</div>`).join('') : '';
   return `
     <div class="network">${net}<span class="chip">${esc(p.method)}</span><span class="chip">decoded: ${esc(p.decoding.status)}</span><span class="badge ${p.attention}">${ATTENTION[p.attention]}</span></div>
     <div class="title">${esc(p.title)}</div>
     <p class="summary">${esc(p.summary)}</p>
-    ${warnings}${changes}${approvals}${sim}${details}${calls}
+    ${warnings}${changes}${approvals}${sim}${details}${calls}${renderTrace(p.trace)}
     ${p.decoding.notes.length ? `<div class="network">${p.decoding.notes.map(esc).join(' ')}</div>` : ''}`;
+}
+
+// The call trace (context.trace): each call on a line, indented under its caller, with its events; then what changed.
+function renderTrace(t) {
+  if (!t) return '';
+  const pad = n => '  '.repeat(n);
+  const lines = t.calls.flatMap(c => [
+    `${pad(c.depth)}<span class="${c.error ? 'failed' : ''}${c.named === 'signature' ? ' guess' : ''}">${esc(c.text ?? c.to ?? '')}</span>${c.returns ? ` → ${esc(c.returns.map(r => r.value).join(', ').slice(0, 80))}` : ''} <span class="gas">${esc(Number(c.gasUsed).toLocaleString('en-US'))} gas</span>`,
+    ...(c.events ?? []).map(e => `${pad(c.depth + 1)}<span class="event">emits ${esc(e.label ?? e.address.slice(0, 10) + '…')}.${esc(e.name ?? e.topics[0]?.slice(0, 10) ?? 'anonymous')}(${esc((e.args ?? []).map(a => `${a.name ? a.name + ': ' : ''}${a.value}`).join(', ').slice(0, 160))})</span>`),
+  ]);
+  const changes = (t.stateChanges ?? []).map(s => `${esc(s.label ?? s.address)}: ${[s.balance && esc(s.balance.change), s.nonce && `nonce ${esc(s.nonce.before)} → ${esc(s.nonce.after)}`, s.code && 'code set', s.storage && `${s.storageSlots ?? s.storage.length} storage slot${(s.storageSlots ?? s.storage.length) === 1 ? '' : 's'}`].filter(Boolean).join(', ')}`);
+  return `<details open><summary>Call trace: ${t.totalCalls ?? t.calls.length} call${(t.totalCalls ?? t.calls.length) === 1 ? '' : 's'}${t.truncated ? ` (the first ${t.calls.length} shown)` : ''}, from ${esc(t.source)}</summary>
+    ${t.note ? `<div class="warning caution" role="note">${esc(t.note)}</div>` : ''}<div class="trace">${lines.join('\n')}</div>
+    ${changes.length ? `<div class="network">State changed: ${changes.join('; ')}</div>` : ''}</details>`;
 }
 
 function render(p) {
@@ -70,7 +84,7 @@ function log(text) {
 async function send(request, chainId, context = {}) {
   if (pendingConfirm) settle(false);
   mockWallet.chainId = chainId;
-  activeContext = context;
+  activeContext = $('trace').checked ? { ...context, trace: true } : context;
   $('preview').className = 'empty';
   $('preview').textContent = 'Previewing…';
   try {

@@ -50,8 +50,10 @@ const FOLLOW = Number(arg('follow', '0'));
 const MAX = Number(arg('max', '0')) || Infinity, STRICT = process.argv.includes('--strict'), SUMMARY_MD = arg('summary-md', '');
 const BLOCKS = Number(arg('blocks', '30')), PER_BLOCK = Number(arg('per-block', '3')), MAX_INDEX = Number(arg('max-index', '8'));
 const UNSIGNED = process.argv.includes('--unsigned-7702');
-// The fork simulator doesn't model ArbOS or OP Stack fees: it runs on Ethereum only.
-const ONLY_TYPE = arg('only-type', ''), SIMULATORS = arg('simulators', 'eth_simulateV1,fork').split(',').filter(n => CHAIN === 1 || n !== 'fork');
+// The fork simulator (a local EVM) runs beside the node's on Ethereum by default, and on any chain with --simulators
+// eth_simulateV1,fork: it runs each chain's EVM rules, with what the chain adds around them (ArbOS's precompiles,
+// answered by the chain; the L1 data fees, charged outside the EVM) left to the comparison below.
+const ONLY_TYPE = arg('only-type', ''), SIMULATORS = arg('simulators', CHAIN === 1 ? 'eth_simulateV1,fork' : 'eth_simulateV1').split(',');
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 20_000, retries: CHAIN === 42161 ? 8 : 4, retryDelayMs: CHAIN === 42161 ? 1000 : 400 });
 type Hex = `0x${string}`;
 type Auth = { address: Hex; chainId: Hex; nonce: Hex; r: Hex; s: Hex; yParity: Hex };
@@ -119,7 +121,12 @@ async function replay(b: B, seen?: Set<string>) {
   const difficulty = (b as B & { difficulty?: Hex }).difficulty ?? '0x0';
   const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: b.mixHash, difficulty } : { prevRandao: b.mixHash };
   const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
-  const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000, trace });
+  // The local EVM's block: opcode 0x44 as the chain answers it (above; 1 on Arbitrum), and on Arbitrum NUMBER as the
+  // L1 block the chain had seen, with the chain's own number for ArbSys.
+  const word32 = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
+  const l1Number = (b as B & { l1BlockNumber?: Hex }).l1BlockNumber;
+  const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: CHAIN === 42161 && l1Number ? BigInt(l1Number) : BigInt(n), arbBlockNumber: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner,
+    prevRandao: CHAIN === 42161 ? word32(1n) : CHAIN === 56 || CHAIN === 137 ? word32(BigInt(difficulty)) : b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000, trace });
   const simulators = ([
     // Not the block's gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on publicnode,
     // below Ethereum's 60M); the parent's, the node's default, is all but the same.

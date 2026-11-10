@@ -1,4 +1,4 @@
-import type { Detail, Preview, Severity, Warning } from './types.ts';
+import type { Detail, Preview, PreviewTrace, Severity, Warning } from './types.ts';
 
 /** Exact decimal formatting of an integer amount. Never goes through floats. */
 export function formatUnits(raw: bigint, decimals: number): string {
@@ -118,6 +118,8 @@ export class PreviewBuilder {
   details: Detail[] = [];
   warnings: Warning[] = [];
   notes: string[] = [];
+  /** The trace of the simulation shown, when the context asked for one (Preview.trace). */
+  trace?: PreviewTrace;
   detail(label: string, value: string, raw?: string): this {
     this.details.push(raw === undefined || raw === value ? { label, value } : { label, value, raw });
     return this;

@@ -12,17 +12,18 @@
 // Approvals come from Approval logs and are read back from the token after each call.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createEVM, EVMError, getActivePrecompiles, type EVM } from '@ethereumjs/evm';
+import { createEVM, EVMError, getActivePrecompiles, paramsEVM, type EVM } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
 import { keccak256 } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
+import { headerAfter, NEXT_BLOCK } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
 import { approvalKey, decodeRevert, decodeState, ELSEWHERE, namedApproval, parseLogs, stateCall } from './simulation.ts';
-import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
+import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
 type Hex = `0x${string}`;
 interface AccountData { balance: bigint; nonce: bigint; code: Uint8Array }
@@ -39,6 +40,24 @@ export interface ChainProfile {
   forwardedPrecompiles?: string[];
   /** Gas a forwarded precompile call costs. */
   precompileGas?: (inputBytes: number, outputBytes: number) => bigint;
+  /**
+   * What the chain's opcode 0x44 returns: the block's mixHash (PREVRANDAO, the default), its difficulty (BNB Chain
+   * and Polygon, whose blocks still carry one), or 1 (Arbitrum).
+   */
+  randomness?: 'mixHash' | 'difficulty' | 'one';
+  /**
+   * Arbitrum: NUMBER is the L1 block the chain last saw (the header's l1BlockNumber), and ArbSys answers
+   * arbBlockNumber() with the chain's own.
+   */
+  arbitrum?: boolean;
+  /** See NEXT_BLOCK (src/block.ts), where these last four come from. */
+  difficultyOverride?: boolean;
+  /**
+   * Storage prices where the chain's differ from Ethereum's: what the first read of a slot in a transaction costs
+   * (SLOAD: 2,100 on Ethereum), and what the first write to one adds (SSTORE's cold surcharge, also 2,100 there, on
+   * which the price of changing a set slot, 5,000 less it, and the refund for clearing one follow).
+   */
+  storageGas?: { coldRead: number; coldWrite: number };
 }
 
 /** HyperEVM's read precompiles (0x…0800 onward: positions, spot balances, prices, L1 block number...). */
@@ -52,12 +71,36 @@ const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).to
  */
 const hyperCoreReadGas = (input: number, output: number) => 1000n + 33n * BigInt(input + output);
 
-/** Measured on each chain (2026-11-05): HyperEVM runs Cancun rules (no CLZ, no BLS precompiles); Ethereum, Osaka. */
+const low = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
+/**
+ * ArbOS's precompiles (ArbSys at 0x64 to ArbWasmCache at 0x72, and ArbDebug at 0xff): the chain answers them, as it
+ * does HyperCore's reads. What one of them would change (ArbSys sending a message to L1) isn't kept.
+ */
+const ARBOS = [...Array.from({ length: 15 }, (_, i) => low(0x64 + i)), low(0xff)];
+/** BNB Chain's own precompiles (light-client and BLS checks at 0x64 to 0x69), answered by the chain. */
+const BSC_PRECOMPILES = Array.from({ length: 6 }, (_, i) => low(0x64 + i));
+
+/**
+ * Measured on each chain with a code override (2026-11-05, the others 2026-11-10): HyperEVM runs Cancun rules (no
+ * CLZ, no BLS precompiles); Ethereum, Arbitrum One, Base, OP Mainnet, Polygon and BNB Chain run Osaka's (CLZ, the
+ * BLS precompiles, P256VERIFY at 6,900 gas). Block times are for the simulated next block's timestamp, in whole
+ * seconds: chains that make several blocks a second get the next second (BNB Chain) or the same one (Arbitrum).
+ */
 export const CHAIN_PROFILES: Record<number, ChainProfile> = {
-  1: { hardfork: 'osaka', blockTime: 12 },
-  11155111: { hardfork: 'osaka', blockTime: 12 },
-  999: { hardfork: 'cancun', blockTime: 1, forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
-  998: { hardfork: 'cancun', blockTime: 1, forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
+  1: { hardfork: 'osaka', ...NEXT_BLOCK[1] },
+  11155111: { hardfork: 'osaka', ...NEXT_BLOCK[11155111] },
+  42161: { hardfork: 'osaka', ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS },
+  8453: { hardfork: 'osaka', ...NEXT_BLOCK[8453] },
+  10: { hardfork: 'osaka', ...NEXT_BLOCK[10] },
+  // Polygon prices storage its own way. Measured on its node with code overrides (2026-11-10): a cold SLOAD costs
+  // 5,460; a cold SSTORE adds 2,940 (setting an empty slot 22,940, changing a set one 5,000 as on Ethereum, writing
+  // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and
+  // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
+  // low, by a multiple of 840.
+  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 } },
+  56: { hardfork: 'osaka', ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
+  999: { hardfork: 'cancun', ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
+  998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
 
 export interface ForkSimulatorOptions {
@@ -76,7 +119,7 @@ export interface ForkSimulatorOptions {
    * The simulated block's header. By default, the next block after `block`: its number + 1, its timestamp plus the
    * chain's block time, and its fee recipient, randomness and base fee. Replays pass the real block's header.
    */
-  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint } | undefined;
+  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint } | undefined;
   profiles?: Record<number, ChainProfile>;
   /**
    * A file to keep the caches shared by all simulations in (contract code and the last value seen of each slot), so
@@ -96,6 +139,11 @@ export interface ForkSimulatorOptions {
 
 /** A storage read or write of a traced run: the call it was in (by index), the contract, slot, value written and gas charged. */
 export interface StorageStep { call: number; op: 'SLOAD' | 'SSTORE'; address: string; slot: string; value?: string; gas: string; refund: string; depth: number }
+
+/** The call reaches something the local EVM can't run as the chain does (a Stylus contract on Arbitrum). */
+export class ForkUnsupported extends Error {
+  constructor(message: string) { super(message); this.name = 'ForkUnsupported'; }
+}
 
 /** The simulation ran out of its time budget. */
 export class ForkTimeout extends Error {
@@ -207,17 +255,17 @@ class StateSource {
   /** Code given to accounts for this simulation (EIP-7702 delegation designators), instead of theirs. */
   codeOverrides = new Map<string, Uint8Array>();
   private url: string; private block: string; private fetchImpl: typeof fetch; private batchSize: number; private concurrency: number; private deadline: number;
-  private chainId: number;
+  readonly chainId: number;
   constructor(chainId: number, url: string, block: string, fetchImpl: typeof fetch, batchSize: number, concurrency: number, deadline: number) {
     this.chainId = chainId; this.url = url; this.block = block; this.fetchImpl = fetchImpl; this.batchSize = batchSize; this.concurrency = concurrency; this.deadline = deadline;
   }
 
   /** The header of block `tag` (with the same retries as state reads). */
-  async header(tag: string): Promise<{ number: Hex; timestamp: Hex; miner: Hex; mixHash?: Hex; gasLimit: Hex; baseFeePerGas?: Hex }> {
+  async header(tag: string): Promise<{ number: Hex; timestamp: Hex; miner: Hex; mixHash?: Hex; gasLimit: Hex; baseFeePerGas?: Hex; difficulty?: Hex; l1BlockNumber?: Hex }> {
     let h: unknown;
     await this.send([{ method: 'eth_getBlockByNumber', params: [tag, false], done: r => { h = r; } }]);
     if (!h) throw new Error(`block ${tag} not found`);
-    return h as { number: Hex; timestamp: Hex; miner: Hex; mixHash?: Hex; gasLimit: Hex; baseFeePerGas?: Hex };
+    return h as { number: Hex; timestamp: Hex; miner: Hex; mixHash?: Hex; gasLimit: Hex; baseFeePerGas?: Hex; difficulty?: Hex; l1BlockNumber?: Hex };
   }
 
   async fetch(m: Misses): Promise<void> {
@@ -326,6 +374,19 @@ class LazyState extends SimpleStateManager {
   private cleared = new Set<string>();
   private source: StateSource; private misses: Misses | null;
   constructor(source: StateSource, misses: Misses | null, opts: ConstructorParameters<typeof SimpleStateManager>[0]) { super(opts); this.source = source; this.misses = misses; }
+  /**
+   * While set (a traced call is running): every account read and every storage slot written, as each was when the
+   * call first came to it (an account is noted when read, not when written: the EVM changes the account it was
+   * handed before writing it back). What they hold afterwards is read once the call is done, so what a revert undid
+   * shows no change.
+   */
+  written?: { accounts: Map<string, { balance: bigint; nonce: bigint; code: string }>; storage: Map<string, { address: string; slot: string; before: string }> };
+
+  override async putStorage(address: Address, key: Uint8Array, value: Uint8Array): Promise<void> {
+    const k = `${address.toString()}_${bytesToHex(key)}`;
+    if (this.written && !this.written.storage.has(k)) this.written.storage.set(k, { address: address.toString(), slot: bytesToHex(key), before: bytesToHex(setLengthLeft(await this.getStorage(address, key), 32)) });
+    return super.putStorage(address, key, value);
+  }
 
   private async data(key: string): Promise<AccountData | undefined> {
     if (this.source.accounts.has(key)) return this.source.accounts.get(key);
@@ -335,10 +396,19 @@ class LazyState extends SimpleStateManager {
   }
 
   override async getAccount(address: Address): Promise<Account | undefined> {
-    const key = address.toString();
+    const key = address.toString() as Hex;
+    const account = await this.load(key);
+    if (this.written && !this.written.accounts.has(key)) {
+      this.written.accounts.set(key, { balance: account?.balance ?? 0n, nonce: account?.nonce ?? 0n, code: bytesToHex(this.topCodeStack().get(key) ?? new Uint8Array(0)) });
+    }
+    return account;
+  }
+  private async load(key: Hex): Promise<Account | undefined> {
     if (this.topAccountStack().has(key)) return this.topAccountStack().get(key);
     const a = await this.data(key);
     if (!a) return undefined;
+    // Arbitrum's Stylus contracts are WASM behind a 0xEFF000 prefix, which no EVM runs: better no answer than a wrong one.
+    if (NEXT_BLOCK[this.source.chainId]?.arbitrum && a.code.length > 3 && a.code[0] === 0xef && a.code[1] === 0xf0 && a.code[2] === 0x00) throw new ForkUnsupported(`${key} is a Stylus (WASM) contract, which the local EVM can't run`);
     const exists = a.balance > 0n || a.nonce > 0n || a.code.length > 0;
     const make = () => exists ? new Account(a.nonce, a.balance, undefined, hexToBytes(keccak256(a.code))) : undefined;
     for (const layer of this.accountStack) if (!layer.has(key)) layer.set(key, make());
@@ -371,6 +441,36 @@ class LazyState extends SimpleStateManager {
     await super.clearStorage(address);
     this.cleared.add(address.toString());
   }
+}
+
+/**
+ * The EVM options for a chain's own storage prices (ChainProfile.storageGas): the cold write surcharge as the
+ * EIP-2929 parameter the SSTORE rules read, with what follows from it (EIP-2929's reset price, EIP-3529's refund
+ * for clearing: the reset price plus an access-list slot's 1,900), and SLOAD replaced by one that charges the cold
+ * read price, which those rules would otherwise take from the same parameter.
+ */
+function storagePricing(profile: ChainProfile) {
+  const g = profile.storageGas;
+  if (!g) return {};
+  const params = JSON.parse(JSON.stringify(paramsEVM)) as Record<string, Record<string, number>>;
+  Object.assign(params[2929], { coldsloadGas: g.coldWrite, sstoreCleanEIP2200Gas: 5000 - g.coldWrite });
+  Object.assign(params[3529], { sstoreClearRefundEIP2200Gas: 5000 - g.coldWrite + 1900 });
+  type RunState = { stack: { peek(): bigint[]; pop(): bigint; push(v: bigint): void }; interpreter: { getAddress(): Address; storageLoad(key: Uint8Array): Promise<Uint8Array>; journal: { isWarmedStorage(a: Uint8Array, k: Uint8Array): boolean; addWarmedStorage(a: Uint8Array, k: Uint8Array): void } } };
+  const slot = (key: bigint) => hexToBytes(`0x${key.toString(16).padStart(64, '0')}`);
+  const sload = {
+    opcode: 0x54, opcodeName: 'SLOAD', baseFee: 0,
+    gasFunction: (runState: RunState, gas: bigint) => {
+      const address = runState.interpreter.getAddress().bytes, key = slot(runState.stack.peek()[0]);
+      if (runState.interpreter.journal.isWarmedStorage(address, key)) return gas + 100n;
+      runState.interpreter.journal.addWarmedStorage(address, key);
+      return gas + BigInt(g.coldRead);
+    },
+    logicFunction: async (runState: RunState) => {
+      const value = await runState.interpreter.storageLoad(slot(runState.stack.pop()));
+      runState.stack.push(value.length ? BigInt(bytesToHex(value)) : 0n);
+    },
+  };
+  return { params, customOpcodes: [sload] } as unknown as { params: never; customOpcodes: never };
 }
 
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
@@ -465,6 +565,11 @@ export class ForkSimulator implements Simulator {
     return (await this.simulateBatch([req]))?.[0] ?? null;
   }
 
+  /** The calls with their traces and state changes (Simulator.trace). */
+  trace(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
+    return this.simulateBatch(reqs.map(r => ({ ...r, trace: true })));
+  }
+
   async simulateBatch(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
@@ -472,7 +577,9 @@ export class ForkSimulator implements Simulator {
     const url = this.urls[chainId], profile = this.opts.profiles[chainId];
     if (!url || !profile) return null;
     const started = Date.now(), deadline = started + this.opts.timeoutMs;
-    const tag = this.opts.block?.(chainId) ?? 'latest';
+    // The requests' own block (SimulationRequest.at), else this simulator's (a replay's), else the latest.
+    const at = reqs[0].at;
+    const tag = at?.block ?? this.opts.block?.(chainId) ?? 'latest';
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.
@@ -487,8 +594,8 @@ export class ForkSimulator implements Simulator {
     const first = newMisses();
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
     const prefetch = source.fetch(first);
-    const fixed = this.opts.header?.(chainId);
-    const [block] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => 1n } }
+    const fixed = at?.header ?? this.opts.header?.(chainId);
+    const [block] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number }
       : this.blockContext(source, tag, profile), prefetch]);
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never });
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
@@ -527,7 +634,7 @@ export class ForkSimulator implements Simulator {
       try {
         run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId);
       } catch (e) {
-        if (e instanceof ForkTimeout || !misses || !missCount(misses)) throw e;
+        if (e instanceof ForkTimeout || e instanceof ForkUnsupported || !misses || !missCount(misses)) throw e;
         run = undefined as never; // a speculative run broke on made-up values: fetch what it asked for and retry
       }
       const grew = !!run && run.rerun;
@@ -546,11 +653,11 @@ export class ForkSimulator implements Simulator {
   }
 
   private async blockContext(source: StateSource, tag: string, profile: ChainProfile) {
-    const h = await source.header(tag);
-    // Replaying at a block's pre-state (tag = that block's parent) means simulating the next block: the parent + 1.
-    return { header: { number: BigInt(h.number) + 1n, coinbase: createAddressFromString(h.miner), timestamp: BigInt(h.timestamp) + BigInt(profile.blockTime),
-      difficulty: 0n, prevRandao: hexToBytes(h.mixHash ?? `0x${'00'.repeat(32)}`), gasLimit: BigInt(h.gasLimit) > GAS ? BigInt(h.gasLimit) : GAS,
-      baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n, getBlobGasPrice: () => 1n } };
+    // Replaying at a block's pre-state (tag = that block's parent) means simulating the next block: the parent + 1,
+    // a block time later, with opcode 0x44 as the chain answers it (src/block.ts).
+    const next = headerAfter(source.chainId, await source.header(tag));
+    return { header: { number: next.number, coinbase: createAddressFromString(next.coinbase), timestamp: next.timestamp, difficulty: 0n, prevRandao: hexToBytes(next.prevRandao),
+      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n }, arbBlockNumber: next.arbBlockNumber ?? next.number };
   }
 
   /** One run of the calls, in order, on a fresh state over `source`. */
@@ -558,6 +665,8 @@ export class ForkSimulator implements Simulator {
     profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number) {
     const state = new LazyState(source, misses, { common });
     const forwarded = (profile.forwardedPrecompiles ?? []).map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
+      // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
+      if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
       const key = `${address}_${bytesToHex(input.data)}`;
       let c = source.calls.get(key);
       if (!c && misses) {
@@ -591,7 +700,7 @@ export class ForkSimulator implements Simulator {
       return fn ? [{ address: hexOf(a) as Hex }, { address: hexOf(o.movePrecompileToAddress!) as Hex, function: fn }] : [];
     });
     const precompiles = [...forwarded, ...moved];
-    const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain });
+    const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
     // Only the calls themselves are traced, not the balance and approval reads around them.
     let trace: StorageStep[] | undefined, callIndex = 0, recording = false;
     if (this.opts.trace) {
@@ -606,6 +715,82 @@ export class ForkSimulator implements Simulator {
         next?.();
       });
     }
+    // The call tree of each traced call (SimulationRequest.trace): a frame opens at each message and closes with its
+    // result. A frame's own events are those in its result that none of the calls under it returned; the events of a
+    // call that failed aren't in any result, as on the chain.
+    type Frame = { call: TraceCall; context: string; isStatic: boolean; own: unknown[]; under: Set<unknown> };
+    const frames: Frame[] = [];
+    let root: Frame | undefined;
+    const owned = new Map<TraceCall, unknown[]>();
+    if (reqs.some(r => r.trace)) {
+      evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; caller: Address; value: bigint; data: Uint8Array; gasLimit: bigint; isStatic: boolean; isCompiled: boolean; delegatecall: boolean; salt?: Uint8Array }, next?: () => void) => {
+        if (recording) {
+          const parent = frames.at(-1);
+          const to = m.to?.toString(), code = (m._codeAddress ?? m.to)?.toString() ?? null;
+          const callcode = !!parent && !m.delegatecall && !!to && to === parent.context && code !== to;
+          const type = !to ? (m.salt ? 'create2' : 'create') : m.delegatecall ? 'delegatecall' : callcode ? 'callcode' : m.isStatic ? 'staticcall' : 'call';
+          const call: TraceCall = { type, from: parent ? parent.context : m.caller.toString(), to: code, value: m.delegatecall ? 0n : m.value, input: bytesToHex(m.data), gas: m.gasLimit, gasUsed: 0n,
+            ...((m.isCompiled || (!!code && evm.precompiles.has(code.slice(2)))) && { precompile: true }) };
+          frames.push({ call, context: m.delegatecall || callcode ? parent?.context ?? to! : to ?? '', isStatic: m.isStatic, own: [], under: new Set() });
+        }
+        next?.();
+      });
+      evm.events!.on('afterMessage', (r: { createdAddress?: Address; execResult: { executionGasUsed: bigint; returnValue: Uint8Array; exceptionError?: { error: string }; logs?: unknown[] } }, next?: () => void) => {
+        const f = recording ? frames.pop() : undefined;
+        if (f) {
+          const ex = r.execResult, parent = frames.at(-1);
+          f.call.gasUsed = ex.executionGasUsed;
+          if (r.createdAddress) f.call.to = r.createdAddress.toString();
+          if (ex.exceptionError) {
+            const data = bytesToHex(ex.returnValue) as Hex;
+            f.call.error = ex.exceptionError.error === 'revert' ? decodeRevert(data) ?? 'reverted' : ex.exceptionError.error;
+            if (ex.returnValue.length) f.call.output = data;
+          } else {
+            if (f.call.type !== 'create' && f.call.type !== 'create2' && ex.returnValue.length) f.call.output = bytesToHex(ex.returnValue);
+            owned.set(f.call, (ex.logs ?? []).filter(l => !f.under.has(l)));
+            if (parent) for (const l of ex.logs ?? []) parent.under.add(l);
+          }
+          if (parent) (parent.call.calls ??= []).push(f.call);
+          else root = f;
+        }
+        next?.();
+      });
+    }
+    /** The finished trace of the call just run: each frame's events numbered by their place among the call's. */
+    const traceOf = (logs: unknown[]): TraceCall | undefined => {
+      const done = root?.call;
+      root = undefined; frames.length = 0;
+      if (!done) return undefined;
+      const index = new Map(logs.map((l, i) => [l, i]));
+      const number = (c: TraceCall) => {
+        const mine = (owned.get(c) ?? []).filter(l => index.has(l)) as [Uint8Array, Uint8Array[], Uint8Array][];
+        if (mine.length) c.logs = mine.map(l => ({ index: index.get(l)!, address: bytesToHex(l[0]).toLowerCase(), topics: l[1].map(t => bytesToHex(t)), data: bytesToHex(l[2]) }));
+        for (const k of c.calls ?? []) number(k);
+      };
+      number(done);
+      owned.clear();
+      return done;
+    };
+    /** What the call just run changed, from what it wrote (LazyState.written) and what those hold now. */
+    const changesOf = async (): Promise<StateChange[]> => {
+      const w = state.written;
+      state.written = undefined;
+      if (!w) return [];
+      const out = new Map<string, StateChange>();
+      const at = (a: string) => { if (!out.has(a)) out.set(a, { address: a }); return out.get(a)!; };
+      for (const [a, before] of w.accounts) {
+        const address = createAddressFromString(a), now = await state.getAccount(address);
+        const balance = now?.balance ?? 0n, nonce = now?.nonce ?? 0n;
+        if (balance !== before.balance) at(a).balance = { before: before.balance, after: balance };
+        if (nonce !== before.nonce) at(a).nonce = { before: before.nonce, after: nonce };
+        if (bytesToHex(await state.getCode(address)) !== before.code) at(a).code = true;
+      }
+      for (const s of w.storage.values()) {
+        const after = bytesToHex(setLengthLeft(await state.getStorage(createAddressFromString(s.address), hexToBytes(s.slot as Hex)), 32));
+        if (after !== s.before) (at(s.address).storage ??= []).push({ slot: s.slot, before: s.before, after });
+      }
+      return [...out.values()];
+    };
     const viewOn = async (on: EVM, to: string, data: Hex) => {
       const r = await on.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 1_000_000n, isStatic: true, block });
       return r.execResult.exceptionError ? undefined : r.execResult.returnValue;
@@ -616,7 +801,7 @@ export class ForkSimulator implements Simulator {
     // second EVM, instead of running everything again with the token watched from the start.
     let pre: EVM | undefined;
     const balanceBefore = async (token: string, owner: string) => {
-      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: precompiles, blockchain });
+      pre ??= await createEVM({ common, stateManager: new LazyState(source, misses, { common }), customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
       const r = await viewOn(pre, token, `0x70a08231${owner.slice(2).padStart(64, '0')}` as Hex);
       return r ? word(r) : undefined;
     };
@@ -660,14 +845,16 @@ export class ForkSimulator implements Simulator {
       const gasLimit = req.gas ? req.gas - transactionGas({ ...req, data: req.data }, 0n, 0n, false) : GAS;
       callIndex = i;
       recording = true;
+      if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block });
       recording = false;
       const ex = res.execResult;
+      const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
       const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + authRefund, profile.hardfork !== 'cancun');
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
-        results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data });
+        results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data, ...(traced?.trace && { trace: traced.trace }) });
         continue;
       }
       const logs = (ex.logs ?? []).map(([address, topics, data]) => ({ address: bytesToHex(address), topics: topics.map(t => bytesToHex(t)), data: bytesToHex(data) }));
@@ -717,7 +904,8 @@ export class ForkSimulator implements Simulator {
         const s = r && decodeState(ap, bytesToHex(r) as Hex);
         if (s) approvalState.push(s);
       }
-      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })) });
+      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })),
+        ...(traced?.trace && { trace: traced.trace, stateChanges: traced.stateChanges }) });
     }
     return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, trace };
   }

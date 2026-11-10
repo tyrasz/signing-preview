@@ -1,8 +1,10 @@
 import { attentionOf, PreviewBuilder } from './format.ts';
 import { chainName } from './chains.ts';
-import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
+import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
 import { decodeTransaction, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
+import { pinLatest } from './block.ts';
+import { tracePreviews } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
 import { approvalChanges, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './evm/effects.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
@@ -74,6 +76,7 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
     schema: 'signing-preview/1', method, kind: 'typed_data', network: d.network,
     title: d.title, summary: d.summary, details: d.b.details, assetChanges: d.assetChanges ?? [], warnings: d.b.warnings, attention: attentionOf(d.b.warnings),
     decoding: { status: d.status, decoder: d.decoder, notes: d.b.notes },
+    ...(d.b.trace && { trace: d.b.trace }),
   };
 }
 
@@ -98,11 +101,16 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);
   let results: SimulationResult[] | null = null;
   let priced: { gasPrice: bigint; tip: bigint } | undefined;
+  // What was simulated for the results shown, for tracing them.
+  let ran: SimulationRequest[] | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
     if (deps.simulator.simulateBatch && sameChain) {
       try {
-        const requests = txs.map((tx, i) => simulationRequest(tx, decoded[i]));
+        // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
+        const at = context.trace ? await pinLatest(deps.rpc, txs[0].chainId) : undefined;
+        const requests = txs.map((tx, i) => ({ ...simulationRequest(tx, decoded[i]), ...(at && { at }) }));
+        ran = requests;
         results = await deps.simulator.simulateBatch(requests);
         if (results && results.length !== txs.length) throw new Error(`the simulator returned ${results.length} results for ${txs.length} calls`);
         // Once more at the price the batch would pay now, as a single transaction is (src/evm/transaction.ts): if
@@ -110,8 +118,9 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
         if (results?.every(r => r.status === 'success' && !r.limited && r.gasUsed !== undefined)) {
           try {
             const price = await expectedGasPrice(txs[0], deps);
-            const again = price && await deps.simulator.simulateBatch(requests.map((q, i) => ({ ...q, gas: txs[i].gas ?? roomFor(results![i].gasUsed!), gasPrice: price.gasPrice, baseFee: price.baseFee })));
-            if (price && again && again.length === txs.length && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; }
+            const pricedRequests = requests.map((q, i) => ({ ...q, gas: txs[i].gas ?? roomFor(results![i].gasUsed!), gasPrice: price?.gasPrice, baseFee: price?.baseFee }));
+            const again = price && await deps.simulator.simulateBatch(pricedRequests);
+            if (price && again && again.length === txs.length && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
           } catch { /* the node refused the priced run: the first stands */ }
         }
         presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));
@@ -127,6 +136,13 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   }
   const calls: Preview[] = [];
   for (const [i, tx] of txs.entries()) calls.push(await previewTransaction(tx, deps, context, 'wallet_sendCalls', presets[i], decoded[i]));
+  // Each call's trace (PreviewContext.trace), from the calls run in order where they can be traced.
+  let untraced: string | undefined;
+  if (context.trace && results && ran) {
+    const traces = await tracePreviews(ran, results, { chainId: txs[0].chainId, account: txs[0].from, deps });
+    for (const [i, t] of (traces ?? []).entries()) if (t) calls[i].trace = t;
+    if (!traces) untraced = "No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.";
+  }
 
   const b = new PreviewBuilder();
   let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
@@ -138,6 +154,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (untraced) b.note(untraced);
     if (priced) b.note(pricedNote('calls', priced));
     if (results[0].basis === 'state' || results[0].basis === 'fork' || results.some(r => r.balancesRead)) b.note(simulationNote({ basis: results[0].basis, tokensRead: Math.max(...results.map(r => r.tokensRead ?? 0)), balancesRead: results.some(r => r.balancesRead) }));
     if (failed === -1) {

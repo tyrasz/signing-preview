@@ -88,6 +88,7 @@ function sanitizeContext(raw: unknown): PreviewContext {
   if (typeof c.chainId === 'number' && Number.isSafeInteger(c.chainId)) out.chainId = c.chainId;
   if (typeof c.origin === 'string') out.origin = c.origin.slice(0, 256);
   if (typeof c.account === 'string' && /^0x[0-9a-fA-F]{40}$/.test(c.account)) out.account = c.account;
+  if (c.trace === true) out.trace = true;
   const hl = c.hyperliquid as Record<string, unknown> | undefined;
   if (hl && typeof hl === 'object' && hl.action && typeof hl.action === 'object' && typeof hl.nonce === 'number') {
     out.hyperliquid = {

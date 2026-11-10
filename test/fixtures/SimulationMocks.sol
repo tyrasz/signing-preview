@@ -253,3 +253,33 @@ contract Account4337V06 {
     }
     receive() external payable {}
 }
+
+/// For call traces: one call that makes a call of each kind, one of which emits an event and then fails (caught).
+contract TraceTarget {
+    event Step(uint256 n);
+    uint256 public counter;
+    function run(Token token, address to, address noisy, address lib) external payable returns (uint256) {
+        emit Step(1);
+        token.transfer(to, 5);
+        (bool failed, ) = noisy.call(abi.encodeWithSignature("fail()"));
+        require(!failed, "expected to fail");
+        (bool bumped, ) = lib.delegatecall(abi.encodeWithSignature("bump()"));
+        require(bumped, "bump");
+        uint256 balance = token.balanceOf(to);
+        if (msg.value > 0) { (bool sent, ) = to.call{value: msg.value}(""); require(sent, "send"); }
+        new Reverter();
+        emit Step(3);
+        return balance;
+    }
+}
+/// Run by delegatecall: it writes the caller's storage and its event comes from the caller's address.
+contract TraceLib {
+    event Step(uint256 n);
+    uint256 public counter;
+    function bump() external payable { counter += 1; emit Step(2); }
+}
+/// Emits an event, then fails: the event is undone with the call.
+contract Noisy {
+    event Step(uint256 n);
+    function fail() external { emit Step(99); revert("after an event"); }
+}

@@ -1,6 +1,8 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
-import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
+import type { ApprovalChange, Dependencies, Preview, PreviewContext, PreviewTrace, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
+import { pinLatest } from '../block.ts';
+import { tracePreviews } from './trace.ts';
 import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
@@ -178,6 +180,9 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   let approvals: ApprovalChange[] = [];
   let simulation: SimulationSummary | undefined;
   let outcome = preset;
+  // What was simulated for the result shown (the wallet's pending transactions, then this one), for tracing it.
+  let ran: SimulationRequest[] | undefined;
+  let trace: PreviewTrace | undefined;
   // Simulating without the delegation would run the call against the account's old code, so it would show nothing
   // about what the delegate does.
   // With the delegations applied as code overrides, the simulation runs the transaction as it will be: calls to the
@@ -195,7 +200,12 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         if (unsigned.length) request.unsignedAuthorizations = unsigned.map(a => ({ address: a.address, chainId: a.chainId ?? tx.chainId }));
         b.note('Simulated with the EIP-7702 authorizations applied: the delegated accounts run their new code.');
       }
-      const pending = pendingRequests(tx, context);
+      // A trace is run apart, in a local EVM: the block is named (the latest, and the header of the one after it), so
+      // that both simulations run in the same one.
+      const at = context.trace ? await pinLatest(deps.rpc, tx.chainId) : undefined;
+      if (at) request.at = at;
+      const pending = pendingRequests(tx, context).map(p => (at ? { ...p, at } : p));
+      ran = [...pending, request];
       // What the transaction would pay now, read while the simulation runs (see the priced run below).
       const pricing = expectedGasPrice(tx, deps).catch(() => undefined);
       if (pending.length && deps.simulator.simulateBatch) {
@@ -221,6 +231,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
           const again = pending.length && deps.simulator.simulateBatch ? (await deps.simulator.simulateBatch([...pending, priced]))?.at(-1) : await deps.simulator.simulate(priced);
           if (again && effectOf(again, tx.from) !== effectOf(first, tx.from)) {
             outcome = { result: again };
+            ran = [...pending, priced];
             b.note(pricedNote('transaction', price));
           }
         } catch { /* the node refused the priced run (the balance doesn't cover its gas, say): the first stands */ }
@@ -262,6 +273,12 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       b.note(simulationNote(sim));
     }
   }
+  // The trace of what was shown (PreviewContext.trace): the calls the transaction makes and the state it changes.
+  if (context.trace && ran && outcome && 'result' in outcome && outcome.result && !outcome.result.limited) {
+    const traced = await tracePreviews(ran, [...ran.slice(0, -1).map(() => null), outcome.result], { chainId: tx.chainId, account: tx.from, deps });
+    trace = traced?.at(-1);
+    if (!trace) b.note(traced ? "No trace: the run that would trace this transaction didn't produce one." : "No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
+  }
   // What the network checks before including it, and the fee. A batch call's fee belongs to the whole batch.
   if (method !== 'wallet_sendCalls') {
     const gasUsed = outcome && 'result' in outcome && outcome.result ? outcome.result.gasUsed : undefined;
@@ -273,6 +290,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     title, summary, details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings: b.warnings, attention: attentionOf(b.warnings),
     decoding: { status: d.status, decoder: d.decoder, notes: b.notes },
     ...(simulation && { simulation }),
+    ...((trace ?? b.trace) && { trace: trace ?? b.trace }),
   };
 }
 

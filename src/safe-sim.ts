@@ -9,6 +9,7 @@
 import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
+import type { BlockAt } from './block.ts';
 import { ecdsaStandIn, P256_STUB, STUB_SIGNATURE } from './erc4337-sim.ts';
 import { effectOf, roomFor } from './evm/effects.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
@@ -49,6 +50,8 @@ export interface SafeRun {
   result: SimulationResult; executed: boolean; before: SafeConfig; after?: SafeConfig;
   /** The price the run shown was simulated at, when the price changes what the transaction does for the Safe. */
   priced?: { gasPrice: bigint; tip: bigint };
+  /** What was simulated for `result` (execTransaction, then the configuration reads): for tracing it. */
+  requests?: SimulationRequest[];
 }
 
 const word = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');
@@ -162,7 +165,7 @@ const SUBMITTER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
  * execTransaction simulated for this SafeTx (or `request`: an execTransaction transaction as sent, with its own
  * signatures), followed by the configuration reads. Null without an RPC and a simulator that runs batches.
  */
-export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest } = {}): Promise<SafeRun | null> {
+export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt } = {}): Promise<SafeRun | null> {
   const rpc = deps.rpc, sim = deps.simulator;
   if (!rpc?.has(chainId) || !sim?.simulateBatch) return null;
   const safe = t.safe.toLowerCase();
@@ -187,8 +190,10 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
       stateOverrides: { ...standIn.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) },
       data: encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, signatures] }) };
   }
-  const batch = (first: SimulationRequest) => [first, ...reads(safe).map(r => ({ chainId, from: exec.from, to: r.to, data: r.data, value: 0n }))];
-  let results = await sim.simulateBatch(batch(exec));
+  if (opts.at) exec = { ...exec, at: opts.at };
+  const batch = (first: SimulationRequest) => [first, ...reads(safe).map(r => ({ chainId, from: exec.from, to: r.to, data: r.data, value: 0n, ...(opts.at && { at: opts.at }) }))];
+  let requests = batch(exec);
+  let results = await sim.simulateBatch(requests);
   if (!results) return null;
   // Once more at the price the transaction would pay now, as a single transaction is (src/evm/transaction.ts). A
   // Safe's refund in the native token is gas × min(its gasPrice, tx.gasprice): nothing at no price. If the price
@@ -199,15 +204,16 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   if (results[0].status === 'success' && !results[0].limited && results[0].gasUsed !== undefined) {
     try {
       const price = await expectedGasPrice({ chainId, from: exec.from, to: exec.to, data: exec.data as Hex, value: exec.value }, deps);
-      const again = price && await sim.simulateBatch(batch({ ...exec, gas: exec.gas ?? roomFor(results[0].gasUsed), gasPrice: price.gasPrice, baseFee: price.baseFee,
-        ...(!opts.request && { stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: SUBMITTER_BALANCE } } }) }));
-      if (price && again && again[0].status === 'success' && effectOf(again[0], safe) !== effectOf(results[0], safe)) { results = again; priced = price; }
+      const pricedRequests = batch({ ...exec, gas: exec.gas ?? roomFor(results[0].gasUsed), gasPrice: price?.gasPrice, baseFee: price?.baseFee,
+        ...(!opts.request && { stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: SUBMITTER_BALANCE } } }) });
+      const again = price && await sim.simulateBatch(pricedRequests);
+      if (price && again && again[0].status === 'success' && effectOf(again[0], safe) !== effectOf(results[0], safe)) { results = again; priced = price; requests = pricedRequests; }
     } catch { /* the node refused the priced run: the first stands */ }
   }
   const result = results[0];
   // execTransaction returns false (and emits ExecutionFailure) when the call fails with safeTxGas or gasPrice set.
   const executed = result.status === 'success' && (!result.returnData || result.returnData === '0x' || BigInt(result.returnData.slice(0, 66)) === 1n);
-  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }) };
+  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), requests };
 }
 
 const SAFE_FACTORY = parseAbi([

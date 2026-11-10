@@ -9,6 +9,8 @@ import { netChanges } from '../evm/effects.ts';
 import type { AssetChange } from '../types.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
 import { entryPointDeposit, simulateExecution, simulateOperation, type ExecutionInput, type OperationRun } from '../erc4337-sim.ts';
+import { pinLatest } from '../block.ts';
+import { tracePreviews } from '../evm/trace.ts';
 import { tokenInfo } from '../evm/common.ts';
 
 /** EntryPoints that sign UserOperations as EIP-712 typed data, at the same address on every chain (checked on Ethereum, Arbitrum One and HyperEVM). */
@@ -267,9 +269,17 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
     const onChainInit = lead && mine && !deploys && !initCode.startsWith(EIP7702_MARKER) && u.entryPointName && !u.entryPointName.endsWith('v0.6') && !u.entryPointName.endsWith('v0.7')
       ? `${EIP7702_MARKER}${initCode.slice(42)}` as Hex : initCode;
     try {
+      // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
+      const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
       const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData, callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
-        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
+        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }) }, env.deps);
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
+      // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment.
+      if (whole && env.context.trace && run?.requests) {
+        const traces = await tracePreviews(run.requests, [run.result], { chainId, account: sender, deps: env.deps });
+        if (traces?.[0]) b.trace = traces[0];
+        else b.note("No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
+      }
     } catch { whole = null; }
     if (whole && (whole.length || !assetChanges.length)) assetChanges = whole;
   }

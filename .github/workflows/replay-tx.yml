@@ -34,7 +34,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ethereum also runs the fork simulator (the local EVM HyperEVM previews use) on the same transactions.
+          # Each chain's transactions run in both simulators: the node's eth_simulateV1 and the fork simulator (the
+          # local EVM that HyperEVM previews use, and that records call traces everywhere).
           - { name: 'Ethereum', chain: '1' }
           - { name: 'Arbitrum One', chain: '42161' }
           - { name: 'Base', chain: '8453' }
@@ -65,7 +66,7 @@ jobs:
           set -o pipefail
           [[ "$MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
           npm run accuracy -- --chain "$CHAIN" --follow $((MINUTES * 60)) --per-block 3 --max-index 8 --max 600 \
-            --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee replay.log
+            --simulators eth_simulateV1,fork --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee replay.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

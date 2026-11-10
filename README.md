@@ -298,6 +298,7 @@ Simulation runs the call; the network also checks the transaction itself before 
   decoding: { status: 'full' | 'partial' | 'opaque', decoder, notes },
   simulation?: { status, source, gasUsed?, revertReason? },
   calls?: Preview[],                    // batches
+  trace?: { source, agrees?, note?, calls: TraceEntry[], truncated?, totalCalls?, stateChanges? },   // with context.trace
 }
 ```
 
@@ -317,6 +318,37 @@ NFT changes carry `standard` (`erc721`/`erc1155`) and the full `tokenId`. `symbo
 
 Events alone can be stale: USDC, OpenZeppelin 5 tokens and Permit2 lower an allowance without an event when it's spent, and older OpenZeppelin tokens emit one on every spend. So `RpcSimulator` reads the real values back with a second simulation pass (`allowance`, Permit2 `allowance`, `isApprovedForAll`, `getApproved`) after each call, and `basis` is then `simulated_state`. A token without these view functions keeps the event value (`simulated_events`). Permit2 events are only accepted from the canonical Permit2 contract.
 
+### The call trace
+
+With `context: { trace: true }`, a preview also carries what the transaction does inside: every call it makes, in order, and the state it changes.
+
+```ts
+trace: {
+  source: "a local EVM over Ethereum's state at block 26385887",
+  agrees: true,                         // the traced run did what the simulation shown did
+  calls: [{
+    depth,                              // 0 for the transaction's own call; a call's own calls follow it, one deeper
+    type: 'call' | 'staticcall' | 'delegatecall' | 'callcode' | 'create' | 'create2',
+    from, to, label?, fromLabel?,       // "you", a known token's symbol, a verified contract's name, a precompile's
+    text,                               // the call in a line: "USDC.transfer(0x0000000a…, 12711206443)"
+    function?, args?, returns?,         // [{ name?, type, value }], decoded
+    named?: 'verified' | 'standard' | 'signature',
+    selector?, input?, output?,         // raw, when not decoded (cut when long)
+    value?, gasUsed, error?,            // why a call failed; what it did is undone, the calls under it included
+    events?: [{ index, address, label?, name?, args?, named?, topics, data }],
+  }],
+  stateChanges: [{ address, label?, balance?: { before, after, change }, nonce?, code?, storage?: [{ slot, before, after }] }],
+}
+```
+
+- **Where it runs.** No public RPC of the seven chains offers a tracing method (`debug_traceCall`, `trace_call`), so the trace is recorded in the local EVM (`ForkSimulator`: the chain's own rules over state fetched from the RPC as the call reads it). On chains with `eth_simulateV1` the simulation shown is still the node's; the trace is a second run of the same call. Both run in a named block: the chain's latest by number, and a header for the block after it (its time a block later, the same fee recipient and base fee), given to the node as block overrides and to the local EVM as its block, so that the two see the same state and the same block. `agrees` says whether the traced run had the same outcome and emitted the same events, in order, as the simulation shown; when it didn't, `note` says how, and the trace is a guide rather than a record. Checked on live traffic (2026-11-10, recent transactions re-sent from their senders at the latest block on Ethereum, Base, OP Mainnet, Polygon and BNB Chain): of 114 traced previews, 114 agreed. A trace took a median 1.1–2.2 s on the public RPCs, and up to 15 s, its budget, after which the preview comes without one.
+  - A node that can't serve the named block (one that keeps seconds of state, or a backend a block behind) is asked again for its latest: asking for a trace never costs the simulation itself. The trace is then of a block a little earlier than the simulation shown, and its `note` says so. Arbitrum One's public RPC, which keeps about 30 seconds of state and rate-limits hard, is where this happens: of 24 previews there, all 24 were simulated and 23 traced (a median 11 s), 18 agreeing; the other five were transactions that had since been mined, failing on the node's latest block and succeeding on the earlier one traced. An RPC that keeps state longer doesn't have this.
+- **Names.** In order of trust: the contract's verified source (Sourcify, then Etherscan if configured; asked for the twelve contracts called most, the code that runs, so a proxy's implementation); a built-in list of standard functions and events (ERC-20, ERC-721, ERC-1155, WETH, Uniswap v2 and v3 pools, Permit2); and the signature databases by selector alone (`named: 'signature'`: a guess, since different functions can share a selector; only spam-filtered candidates are used). What nothing names keeps its selector and raw data. Tokens are named from the built-in list and the token registry.
+- **Events** are listed under the call whose code emitted them and numbered across the transaction. A delegatecall runs as its caller, so its events come from the caller's address. Events of a call that failed, or of calls under one, aren't listed: the chain undoes them.
+- **State changes** are what the call left different, account by account: native balance, nonce, code (a contract created, an EIP-7702 delegation) and storage slots, each before and after. What a failed inner call wrote isn't among them. The gas payment isn't either: it is the network fee, shown apart.
+- It covers transactions, each call of a batch (`calls[i].trace`), a UserOperation's whole run through the EntryPoint (validation, the calls, the paymaster) and a Safe's `execTransaction`. A trace has at most 400 calls listed (`truncated`, `totalCalls`).
+- The demo page has a "trace" switch; in mock mode the unknown router's swap sample carries a canned trace.
+
 ## Mock and live data
 
 `npm start` uses mock data. To use real data:
@@ -325,7 +357,7 @@ Events alone can be stale: USDC, OpenZeppelin 5 tokens and Permit2 lower an allo
 SIGNING_PREVIEW_MODE=live ETHEREUM_RPC_URL=… ARBITRUM_RPC_URL=… HYPEREVM_RPC_URL=… BASE_RPC_URL=… npm start
 ```
 
-Live mode reads Hyperliquid's public `/info` API and simulates on any chain that has an RPC URL configured: with `eth_simulateV1`, or, where the RPC lacks it, with `eth_call` and a state override (HyperEVM). Chains without one are previewed from the decoded request only. The RPC URLs also enable on-chain token metadata and proxy detection.
+Live mode reads Hyperliquid's public `/info` API and simulates on any chain that has an RPC URL configured: with `eth_simulateV1`, or, where the RPC lacks it, in a local EVM over the chain's state (every supported chain; what HyperEVM, whose public RPC has no `eth_simulateV1`, uses), with `eth_call` and a state override answering if that takes too long. Chains without one are previewed from the decoded request only. The RPC URLs also enable on-chain token metadata and proxy detection.
 
 | Variable | Effect |
 |---|---|
@@ -518,7 +550,13 @@ Run on 2026-11-05:
 - Unsigned authorizations (a request the wallet has yet to sign) can't be applied by a node, so the code override stands in for their effect, and for their gas, an authorization signed by a throwaway account set up the same way (it exists, its nonce matches) goes in the call's list: the node charges and refunds it as the chain will the wallet's own. Replaying the sender's own authorizations as unsigned (`--unsigned-7702`), gas was exact in all 8 transactions the node answered; an earlier estimate (adding 25,000 less 12,500) was 7,500 short in 2 of 5, where the refund cap depended on the call's own refunds.
 - `ForkSimulator` applies authorizations as the chain does: the sender's nonce first, then each one for this chain whose authority has no code (or a delegation) and whose nonce matches sets the code, bumps the nonce, and earns the refund. It was exact on the type-4 transactions replayed with it, signed and unsigned (few: its replays include every earlier transaction of the block, so only those early in a block were run).
 - A self-sponsored type-4 transaction (DAI −1,000, USDC +1,000 through the account's own batch) showed no balance changes: a call to the account itself gave its changes the account as counterparty, so they cancelled out. All three simulation paths now give such changes an unknown counterparty.
-- On Arbitrum, ArbOS's own transactions are skipped; the fork simulator, which doesn't model ArbOS, isn't used there. Arbitrum's public RPC keeps about 30 seconds of state and rate-limits hard, so looking back only reaches a few blocks (two of 23 transactions were rate-limited in that run; the simulator now retries); following the chain replays each block within seconds. Given a base fee, as replays give it (the block's own), the node's `eth_simulateV1` now also charges the L1 data part, estimated for the unsigned transaction at a moving price: gas matches when it is the receipt's L2 part plus an L1 charge between none and twice the receipt's. In the 7-minute run that charge was 86–133% of the receipt's (median 111%); the one difference is a swap whose L2 gas came out 2,525 lower with its token movements exact. A preview doesn't give the simulated block a base fee, so its gas has no L1 part, and the network fee adds `gasEstimateL1Component`'s once.
+- **The local EVM on every chain.** `ForkSimulator` now has each chain's rules, measured on its node with code overrides (2026-11-10): Arbitrum One, Base, OP Mainnet, Polygon and BNB Chain all run Osaka's opcodes and precompiles (CLZ, the BLS precompiles, P256VERIFY at 6,900 gas), as Ethereum does. What each adds:
+  - Arbitrum: `NUMBER` is the L1 block the chain last saw (the header's `l1BlockNumber`) and opcode 0x44 is 1; ArbOS's precompiles (ArbSys at 0x64 and the rest) are answered by the chain itself, as HyperCore's reads are, `ArbSys.arbBlockNumber()` with the simulated block's own number. The L1 data charge is outside the EVM: the local run's gas is the receipt's L2 part. Stylus (WASM) contracts can't run in it.
+  - BNB Chain and Polygon: opcode 0x44 is the block's difficulty. BNB Chain's own precompiles (0x64 to 0x69) are answered by the chain.
+  - Polygon prices storage its own way: a cold `SLOAD` costs 5,460 gas (2,100 on Ethereum); a cold `SSTORE` adds 2,940 (setting an empty slot 22,940, changing a set one 5,000 as on Ethereum, writing back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and creation cost what they do on Ethereum. With Ethereum's prices, every Polygon transaction that touched storage came out low by a multiple of 840; with these, the local EVM reproduces eleven measured operations to the unit.
+  - Replayed beside the node's `eth_simulateV1` on each chain as blocks arrived (`npm run accuracy -- --chain <id> --simulators eth_simulateV1,fork`), the local EVM matched every receipt: Base 51 of 51 (outcome, native change and gas exact), OP Mainnet 32 of 32, Arbitrum One 23 of 23 (5 of 5 token movements, where the node's had 4), BNB Chain 40 of 40 (gas exact for all 40: it runs a block in its parent's second, which BNB Chain's node refuses), Polygon 68 of 68 (42 of 42 token movements, 6 of 6 approvals, gas exact). It takes longer than the node, a median 0.7–4 s against 0.15–0.2 s, as it fetches the state the call reads.
+  - So an RPC without `eth_simulateV1` no longer leaves these chains to `eth_call`: the local EVM simulates there, as on HyperEVM. And it is what records [the call trace](#the-call-trace).
+- On Arbitrum, ArbOS's own transactions are skipped. Arbitrum's public RPC keeps about 30 seconds of state and rate-limits hard, so looking back only reaches a few blocks (two of 23 transactions were rate-limited in that run; the simulator now retries); following the chain replays each block within seconds. Given a base fee, as replays give it (the block's own), the node's `eth_simulateV1` now also charges the L1 data part, estimated for the unsigned transaction at a moving price: gas matches when it is the receipt's L2 part plus an L1 charge between none and twice the receipt's. In the 7-minute run that charge was 86–133% of the receipt's (median 111%); the one difference is a swap whose L2 gas came out 2,525 lower with its token movements exact. A preview doesn't give the simulated block a base fee, so its gas has no L1 part, and the network fee adds `gasEstimateL1Component`'s once.
 - What a replay can't show: anything that happens between the preview and inclusion. A price, balance or nonce that moves in between moves the result too.
 
 Run on 2026-11-10, each chain followed for 20 minutes (up to 600 transactions from senders not seen earlier in the run), with `--strict`:
@@ -746,6 +784,7 @@ src/typed-data/           EIP-712: Hyperliquid user-signed + L1, Permit/Permit2 
 src/userop-hash.ts        v0.6/v0.7 UserOperations signed as their hash (personal_sign), checked against a supplied operation
 src/hyperliquid/          /info client, asset resolution, L1 action hash
 src/simulation.ts         eth_simulateV1 simulator + mock; src/fork-simulator.ts local EVM over fetched state; src/simulation-probe.ts the eth_call + state-override simulator
+src/block.ts              the block a simulation runs in (each chain's next block; a named one); src/evm/trace.ts the call trace, decoded
 contracts/                SimulationProbe.sol (compiled into src/probe-code.ts by npm run build:probe)
 src/interceptor.ts        dependency-free EIP-1193 wrapper
 src/server.ts             HTTP API + demo server (src/cli.ts starts it: npm start / npx signing-preview)
