@@ -195,11 +195,17 @@ const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
 const BUNDLER = '0x0000000000000000000000000000000000004337';
 
 /**
- * Bundlers that recently submitted operations this paymaster paid for (the latest first, at most three): paymasters
- * that only accept certain bundlers (tx.origin) refuse any other, which says nothing about the operation itself.
- * Looks back 1,000 blocks, then 20,000 (minutes on Arbitrum) if that finds none.
+ * Bundlers that recently submitted operations this paymaster paid for (at most five): paymasters that only accept
+ * certain bundlers (tx.origin) refuse any other, which says nothing about the operation itself. A paymaster can take
+ * any bundler for some of its operations and only its own for others, by a setting in its data: bundlers whose
+ * operations had the same first byte of paymaster data as this one come first, the busiest first. Looks back 1,000
+ * blocks, then 20,000 (minutes on Arbitrum) if that finds none.
  */
-async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: string, paymaster: string): Promise<string[]> {
+async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: string, paymasterAndData: Hex): Promise<string[]> {
+  const paymaster = paymasterAndData.slice(0, 42).toLowerCase();
+  // The paymaster's own data starts after its address, and from v0.7 on its two gas limits.
+  const at = SIMULATIONS[entryPoint]?.version === '0.6' ? 20 : 52;
+  const config = paymasterAndData.length > 2 + at * 2 ? paymasterAndData.slice(2 + at * 2, 4 + at * 2).toLowerCase() : undefined;
   const rpc = deps.rpc;
   if (!rpc?.has(chainId)) return [];
   try {
@@ -207,10 +213,19 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
     for (const span of [1000n, 20_000n]) {
       let logs: { transactionHash: string }[];
       try { logs = await rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as { transactionHash: string }[]; } catch { continue; }
-      const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 6);
+      const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
       if (!hashes.length) continue;
-      const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string } | null>));
-      return [...new Set(txs.map(t => t?.from?.toLowerCase()).filter((f): f is string => !!f))].slice(0, 3);
+      const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
+      const score = new Map<string, number>();
+      for (const t of txs) {
+        const from = t?.from?.toLowerCase();
+        if (!from) continue;
+        // The paymaster's data in the bundle's calldata: its address, then (at the same offset) its first byte.
+        const input = (t?.input ?? '').toLowerCase(), i = input.indexOf(paymaster.slice(2));
+        const same = config !== undefined && i >= 0 && input.slice(i + at * 2, i + at * 2 + 2) === config;
+        score.set(from, (score.get(from) ?? 0) + (same ? 100 : 1));
+      }
+      return [...score].sort((a, b) => b[1] - a[1]).map(([f]) => f).slice(0, 5);
     }
   } catch { /* none */ }
   return [];
@@ -665,7 +680,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     // The paymaster refused: once more as a bundler it accepted lately, in case it only refused this one.
     const paymaster = op.paymasterAndData.length >= 42 ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
     if (paymaster && first?.rejected?.startsWith('AA33')) {
-      for (const bundler of await recentBundlers(deps, op.chainId, entryPoint, paymaster)) {
+      for (const bundler of await recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData)) {
         const again = await run(bundler, recover);
         if (again && !again.rejected?.startsWith('AA33')) return again;
       }
