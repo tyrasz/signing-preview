@@ -218,15 +218,20 @@ async function replay(item: string): Promise<void> {
   // The same, each at the price it paid (its receipt's), with a gas limit a little over what it used (its own limits
   // would add up to more than a node's cap for a simulated block): what an earlier transaction does can depend on its
   // price (a bot sizing its trade by it), and three Ethereum swaps came out 0.01-0.02% off after ones run at no price.
+  // A bundle keeps its own gas limit: the EntryPoint refuses one whose gas left is under an operation's limits (AA95),
+  // whatever the operation goes on to use. Given a little over what they used, earlier bundles reverted in the
+  // replay, and what they did was missing: on Arbitrum One a keeper's operation then showed fulfilling a request
+  // that another keeper's bundle, four transactions earlier in its block, had fulfilled (six of 150 operations).
   let pricedBefore: SimulationRequest[] | undefined;
   if (earlier.length) {
     try {
       const receipts = new Map((await blockReceipts(r.blockNumber)).map(x => [x.transactionHash.toLowerCase(), x]));
+      const bundle = (t: { to: string | null; input: string }) => Object.values(ENTRY_POINTS).includes(t.to?.toLowerCase() ?? '') || /^0x(1fad948c|765e827f)/.test(t.input);
       pricedBefore = earlier.map((t, i) => {
         const rc = receipts.get(t.hash.toLowerCase());
         if (!rc?.gasUsed || !rc.effectiveGasPrice || SYSTEM.has(t.type)) return before[i];
         const roomy = BigInt(rc.gasUsed) * 13n / 10n + 30_000n;
-        return { ...before[i], gas: roomy < BigInt(t.gas) ? roomy : BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice) };
+        return { ...before[i], gas: roomy < BigInt(t.gas) && !bundle(t) ? roomy : BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice) };
       });
     } catch { pricedBefore = undefined; }
   }
@@ -248,6 +253,16 @@ async function replay(item: string): Promise<void> {
     }
   }
   if (index > 0) essential.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [ops.slice(0, index) as never, beneficiary] }) });
+  // What to keep of the earlier transactions when the node won't run them all (a full block's are too much for a
+  // public node's simulated block): the account's own and the other bundles, which most often change what the
+  // operation meets. On Arbitrum One three keepers' operations failed (Ostium's NotInitiated) where another
+  // keeper's bundle, four transactions earlier in the block, had fulfilled the same request; on Ethereum a deposit
+  // failed for tokens gone by its turn. Replayed without any of the block, each had shown succeeding.
+  const bundles = tx.input.slice(0, 10);
+  const related: SimulationRequest[] = [...(pricedBefore ?? before).filter((_, i) => {
+    const t = earlier[i], to = t.to?.toLowerCase();
+    return to === EP || to === sender || t.from.toLowerCase() === sender || t.input.startsWith(bundles);
+  }), ...essential];
   before.push(...essential);
   pricedBefore?.push(...essential);
   // Reads on the parent block, and the block itself for its header (the base fee the operation's gas is priced at).
@@ -338,6 +353,21 @@ async function replay(item: string): Promise<void> {
       add(a);
     } catch { /* not ECDSA */ }
   }
+  // A SafeOp's first owner part, as Safe's checkNSignatures reads it after the validity window (r, s, v): a contract
+  // owner's (v 0, the owner in r: a passkey through Safe's WebAuthn shared signer signs so), an owner's on-chain
+  // approval (v 1, the owner in r), or a signature, over the SafeOp or (v above 30) its eth_sign form. That owner
+  // is who signs: a Safe with a passkey and an Ethereum key came out 43% low on Arbitrum One, replayed as the
+  // Ethereum key's signature where the passkey had signed (a P-256 check in Solidity, 230,000 gas).
+  if (module) {
+    const at = 2 + (module.signaturePrefix?.length ?? 0) + 24, part = op.signature.slice(at, at + 130);
+    if (part.length === 130) {
+      const v = parseInt(part.slice(128), 16);
+      try {
+        add(v <= 1 ? `0x${part.slice(24, 64)}`.toLowerCase()
+          : (await recoverAddress({ hash: v > 30 ? hashMessage({ raw: digest }) : digest, signature: `0x${part.slice(0, 128)}${(v > 30 ? v - 4 : v).toString(16).padStart(2, '0')}` })).toLowerCase());
+      } catch { /* not a signature */ }
+    }
+  }
   // OKX Wallet's account, signed by an Ethereum key: its hash, validUntil, then the signature over the account's
   // own digest of the operation's hash (src/erc4337-sim.ts, okxStubs); the key's hash is its address's.
   if (!module && op.signature.length === 2 + 206) {
@@ -361,12 +391,19 @@ async function replay(item: string): Promise<void> {
     tried++;
     p = await previewRequest(request(signer), ctx, deps);
     if (!ran(p) && prefix === pricedBefore) { prefix = before; p = await previewRequest(request(signer), ctx, deps); }
-    if (!ran(p) && prefix.length > essential.length) { prefix = essential; prefixDropped = 'the node refused the block with them'; p = await previewRequest(request(signer), ctx, deps); }
+    // Then with only the account's own and the other bundles among them, then with none.
+    const narrow = async (why: string) => {
+      if (related.length > essential.length && related.length < prefix.length) { prefix = related; prefixDropped = `${why}: only the account's own and the other bundles ran first`; p = await previewRequest(request(signer), ctx, deps); return; }
+      prefix = essential; prefixDropped = why; p = await previewRequest(request(signer), ctx, deps);
+    };
+    if (!ran(p) && prefix.length > essential.length) await narrow('the node refused the block with them');
+    if (!ran(p) && prefix.length > essential.length) await narrow('the node refused the block with them');
     // A full block's earlier transactions can use nearly all of the node's gas cap for a simulated block (publicnode's
     // 50M, under Ethereum's 60M blocks), leaving the operation too little: the EntryPoint runs out of gas (AA95),
     // which on-chain it didn't. Then without them.
     const outOfGas = (q: Preview) => q.warnings.some(w => w.code === 'userop_rejected' && /\bAA95\b/.test(w.message));
-    if (outOfGas(p) && prefix.length > essential.length) { prefix = essential; prefixDropped = "they left too little of the node's gas cap for the operation"; p = await previewRequest(request(signer), ctx, deps); }
+    if (outOfGas(p) && prefix.length > essential.length) await narrow("they left too little of the node's gas cap for the operation");
+    if (outOfGas(p) && prefix.length > essential.length) await narrow("they left too little of the node's gas cap for the operation");
     // The whole operation didn't run and nothing says why (no rejection, no validation revert): the node failed the
     // simulation, which a heavy block refused under load does (alone, the same operations ran whole). Once more.
     const unexplained = (q: Preview) => ran(q) && !q.decoding.notes.some(x => /whole operation was simulated|validation reverts on a stand-in/.test(x)) && !q.warnings.some(w => w.code === 'userop_rejected');
@@ -481,9 +518,11 @@ async function replay(item: string): Promise<void> {
   // what the operation met; a shape to add, not a wrong preview.
   const callsAlone = !row.whole && !row.notSimulated;
   const handedSignature = p.warnings.some(w => w.code === 'userop_execution_reverts' && /handed the whole operation, its signature included/.test(w.message));
-  const warned = !row.outcome && (timeBumped || callsAlone || handedSignature);
+  // And one replayed without its block's earlier transactions (the node refused them): it didn't meet what the
+  // operation met, and an earlier transaction can be what made the operation fail (another keeper's bundle, above).
+  const warned = !row.outcome && (timeBumped || callsAlone || handedSignature || !!row.prefix);
   // The preview's own warning first: on BNB Chain most such operations are also run a second late.
-  if (warned) row.warned = handedSignature ? 'outcome' : callsAlone ? 'outcome (its calls simulated alone)' : 'outcome (run a second after its block)';
+  if (warned) row.warned = handedSignature ? 'outcome' : callsAlone ? 'outcome (its calls simulated alone)' : row.prefix ? "outcome (replayed without its block's earlier transactions)" : 'outcome (run a second after its block)';
   const judged = row.whole === true && !row.prefix && !warned;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
