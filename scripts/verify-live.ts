@@ -564,21 +564,30 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
     const d = { ...deps, simulator };
     const sendWith = (from: string, to: string, data: Hex, value = 0n) => previewRequest({ method: 'eth_sendTransaction', params: [{ from, to, data, value: toHex(value), chainId: '0x3e7' }] }, {}, d);
     const by = (p: Awaited<ReturnType<typeof send>>) => sourcePattern.test(p.simulation?.source ?? '') ? '' : ` (simulated by ${p.simulation?.source})`;
+    // HyperEVM's public RPC allows an address about 100 requests a minute, which the checks before these can have
+    // used up: a simulation then waits on refused requests until its budget is gone (the scheduled run failed that
+    // way two days running, a transfer's fork simulation taking 49 seconds where it takes 3). One that this
+    // simulator didn't answer is tried again once the limit's minute has passed, twice at most.
+    const patient = async <T extends { simulation?: { source?: string } }>(run: () => Promise<T>): Promise<T> => {
+      let p = await run();
+      for (let i = 0; i < 2 && !sourcePattern.test(p.simulation?.source ?? ''); i++) { await new Promise(r => setTimeout(r, 65_000)); p = await run(); }
+      return p;
+    };
     if (hypeHolder) {
       const accountant = String(await readAt(hl, k.stakingManager as Address, 'function stakingAccountant() view returns (address)'));
       const quote = await readAt(hl, accountant as Address, 'function HYPEToKHYPE(uint256) view returns (uint256)', [10n * E]) as bigint;
-      const p = await sendWith(hypeHolder, k.stakingManager, '0x3a4b66f1', 10n * E);
+      const p = await patient(() => sendWith(hypeHolder!, k.stakingManager, '0x3a4b66f1', 10n * E));
       const kIn = p.assetChanges.find(c => c.asset === k.kHYPE && c.direction === 'in');
       check(!by(p) && p.simulation?.status === 'success' && p.assetChanges.some(c => c.asset === 'native' && c.direction === 'out' && c.raw === (10n * E).toString() && c.basis === 'simulated_state') && kIn?.raw === quote.toString(),
         `${name}: Kinetiq stake 10 HYPE`.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE${by(p)}`);
     } else console.log('skip stake: no recent EOA sender holding 12 HYPE');
     if (usdcHolder) {
-      const t = await sendWith(usdcHolder, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] }));
+      const t = await patient(() => sendWith(usdcHolder!, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] })));
       check(!by(t) && t.simulation?.status === 'success' && moved(t) === 'out 1 USDC (simulated_state)', `${name}: USDC transfer of 1`.padEnd(34), moved(t) + by(t));
-      const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: usdcHolder, atomicRequired: true, calls: [
+      const batch = await patient(() => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: usdcHolder, atomicRequired: true, calls: [
         { to: H.usdc, data: encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [m.pool as Address, 1_000_000n] }) },
         { to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function supply(address,uint256,address,uint16)']), functionName: 'supply', args: [H.usdc, 1_000_000n, usdcHolder as Address, 0] }) },
-      ] }] }, {}, d);
+      ] }] }, {}, d));
       const hIn = batch.assetChanges.find(c => c.direction === 'in');
       // The hUSDC isn't in the calldata: the fork simulator sees its mint event, the probe has HyperLend's decoder
       // watch it. Aave-style scaled balances round by a unit or two.
