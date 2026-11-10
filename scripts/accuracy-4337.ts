@@ -204,6 +204,13 @@ async function replay(item: string): Promise<void> {
   // the preview reading nothing: the operation is skipped rather than replayed on missing state.
   let code: string;
   try { code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest'])); } catch { return skip('its state is no longer served by the node'); }
+  // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
+  // validator or permission it installs, which signs the operation (a dApp's session key, mostly). No wallet signs
+  // the operation's hash.
+  if (BigInt(op.nonce) >> 248n === 1n && code.length > 2) {
+    const root = await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']).catch(() => '0x');
+    if (/^0x[0-9a-f]{64}$/i.test(String(root))) return skip("a Kernel operation in enable mode (signed by the key it installs, which its owner approves as typed data)");
+  }
 
   // The request the owner signed, and who might have signed it.
   // A Safe the operation deploys has no fallback handler yet: its setup (in the initCode) names it. A read that fails
