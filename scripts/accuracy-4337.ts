@@ -297,11 +297,12 @@ async function replay(item: string): Promise<void> {
   // operation alone in its bundle, above) or token movements beyond rounding. Calls simulated alone leave out the gas
   // payment and any paymaster's charge, as their preview says; without the block's earlier transactions, amounts can
   // move. The summary (scripts/replay-summary.ts) reads this.
-  const judged = row.whole === true && !row.prefix;
   // An outcome the preview got wrong while saying why it might (an account handed the stand-in signature while it
-  // runs its calls, see userop_execution_reverts) is counted apart, as warned.
+  // runs its calls, see userop_execution_reverts) is counted apart, as warned; with calls that didn't run as they
+  // did, its gas and token movements aren't compared either.
   const warned = !row.outcome && p.warnings.some(w => w.code === 'userop_execution_reverts' && /handed the whole operation, its signature included/.test(w.message));
   if (warned) row.warned = 'outcome';
+  const judged = row.whole === true && !row.prefix && !warned;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
     judged && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
