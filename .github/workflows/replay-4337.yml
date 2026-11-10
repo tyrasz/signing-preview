@@ -105,6 +105,16 @@ jobs:
     permissions:
       issues: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: reports
+          pattern: replay-*
       - name: Open or update an issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,9 +123,13 @@ jobs:
         run: |
           title="UserOperation replays differ from receipts"
           existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
-          body="The scheduled UserOperation replays found operations whose preview differs from what happened, or could not run: $RUN_URL. Each job's summary lists them; the reports (report.json, replay.log) are attached to the run as artifacts. A difference is an outcome the preview got wrong, gas 5% or more off, or token movements beyond a gas-priced fee's rounding. A public RPC being unavailable also fails a job."
+          {
+            echo "The scheduled UserOperation replays found operations whose preview differs from what happened, or could not run: $RUN_URL. A difference is an outcome the preview got wrong or, for an operation simulated whole on the state it met, gas 5% or more off or token movements beyond rounding. A public RPC being unavailable also fails a job. Each job's artifact has its report, log, and the row and preview of each differing operation (differing/)."
+            echo
+            node scripts/replay-summary.ts reports || echo "(No reports to summarize.)"
+          } > body.md
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            gh issue comment "$existing" --repo "$REPO" --body-file body.md
           else
-            gh issue create --repo "$REPO" --title "$title" --body "$body"
+            gh issue create --repo "$REPO" --title "$title" --body-file body.md
           fi
