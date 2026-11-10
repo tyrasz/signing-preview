@@ -128,6 +128,11 @@ const metaMaskAdapter: Adapter = async (tx, env) => {
 const SPOKE_POOLS: Record<string, number> = {
   '0x5c7bcd6e7de5423a257d81b442095a1a6ced35c5': 1,
   '0xe35e9842fceaca96570b734083f4a58e8f7c5f2a': 42161,
+  // Base, OP Mainnet and Polygon: ERC1967 proxies whose implementations are verified on Sourcify (OP_SpokePool,
+  // Polygon_SpokePool) and whose chainId() is the chain's own (BNB Chain's implementation isn't verified: left out).
+  '0x09aea4b2242abc8bb4bb78d537a67a245a7bec64': 8453,
+  '0x6f26bf09b1c792e3228e5467807a900a503c0281': 10,
+  '0x9295ee1d8c5b022be115a2ad3c30c72e34e7f096': 137,
   '0x35e63ea3eb0fb7a3bc543c71fb66412e1f6b0e04': 999,
 };
 const SPOKE_ABI = parseAbi([

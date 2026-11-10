@@ -9,7 +9,8 @@ import { CHAINS } from '../chains.ts';
 import { decoded, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
 import { chainLabel } from './universal-router.ts';
 
-const LIFI: Record<string, number[]> = { '0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae': [1, 42161] };
+// The same diamond on every chain here (verified on Sourcify as LiFiDiamond on Base, OP Mainnet, Polygon and BNB Chain).
+const LIFI: Record<string, number[]> = { '0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae': [1, 42161, 8453, 10, 137, 56] };
 const BRIDGE_DATA = { type: 'tuple', components: [
   { name: 'transactionId', type: 'bytes32' }, { name: 'bridge', type: 'string' }, { name: 'integrator', type: 'string' }, { name: 'referrer', type: 'address' },
   { name: 'sendingAssetId', type: 'address' }, { name: 'receiver', type: 'address' }, { name: 'minAmount', type: 'uint256' }, { name: 'destinationChainId', type: 'uint256' },

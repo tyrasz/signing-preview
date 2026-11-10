@@ -7,11 +7,20 @@ import { CHAINS } from '../chains.ts';
 import { decoded, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
 import { v3Path, wrappedNative } from './universal-router.ts';
 
+/**
+ * Base, OP Mainnet, Polygon and BNB Chain (checked 2026-11-10): each verified on Sourcify under its contract's name, its
+ * factory() one of the factories the chain's official Universal Router (deploy-addresses) has in its code, and its
+ * WETH9() the chain's wrapped native token.
+ */
 const ROUTERS: Record<string, { name: string; chains: number[]; kind: 'v2' | 'v3' | 'v3-02' }> = {
   '0x7a250d5630b4cf539739df2c5dacb4c659f2488d': { name: 'Uniswap V2 Router02', chains: [1], kind: 'v2' },
-  '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24': { name: 'Uniswap V2 Router02', chains: [42161], kind: 'v2' },
-  '0xe592427a0aece92de3edee1f18e0157c05861564': { name: 'Uniswap V3 SwapRouter', chains: [1, 42161], kind: 'v3' },
-  '0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45': { name: 'Uniswap SwapRouter02', chains: [1, 42161], kind: 'v3-02' },
+  '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24': { name: 'Uniswap V2 Router02', chains: [42161, 8453, 56], kind: 'v2' },
+  '0x4a7b5da61326a6379179b40d00f57e5bbdc962c2': { name: 'Uniswap V2 Router02', chains: [10], kind: 'v2' },
+  '0xedf6066a2b290c185783862c7f4776a2c8077ad1': { name: 'Uniswap V2 Router02', chains: [137], kind: 'v2' },
+  '0xe592427a0aece92de3edee1f18e0157c05861564': { name: 'Uniswap V3 SwapRouter', chains: [1, 42161, 10, 137], kind: 'v3' },
+  '0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45': { name: 'Uniswap SwapRouter02', chains: [1, 42161, 10, 137], kind: 'v3-02' },
+  '0x2626664c2603336e57b271c5c0b26f421741e481': { name: 'Uniswap SwapRouter02', chains: [8453], kind: 'v3-02' },
+  '0xb971ef87ede563556b2ed4b1c0b0019111dd85d2': { name: 'Uniswap SwapRouter02', chains: [56], kind: 'v3-02' },
 };
 const V2 = parseAbi([
   'function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)',
