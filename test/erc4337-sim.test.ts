@@ -73,6 +73,10 @@ test('A whole operation: validated as the owner will sign it, its calls run, and
   // At 1 gwei (the base fee is 0, the priority fee 1 gwei): the gas used, at least the 50,000 of pre-verification.
   assert.ok(paid > 50_000n * 10n ** 9n && paid < 450_000n * 10n ** 9n, String(paid));
   assert.match(String(detail(p, 'Gas cost (simulated)')), /paid by the account/);
+  // The gas the EntryPoint counts for it, which the cost is the price of.
+  const used = BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+  assert.ok(used > 50_000n && used < 500_000n, String(used));
+  assert.equal(paid % used, 0n);
   assert.ok(p.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.7 runs it/.test(n) && /attributes it to the signer\)/.test(n)), p.decoding.notes.join(' | '));
   assert.ok(!codes(p).includes('userop_execution_reverts'));
 });
@@ -342,4 +346,88 @@ test('Calls run through executeUserOp that fail: the warning says the account wa
   // An ordinary failing call carries no such caveat.
   const q = await preview(operation({ nonce: '0x0', callData: call('execute', [usdc, 0n, call('transfer', [BOB, 10n ** 12n])]) }));
   assert.doesNotMatch(q.warnings.find(x => x.code === 'userop_execution_reverts')?.message ?? '', /handed the whole operation/);
+});
+
+test('OKX Wallet’s account: the stand-in names a key, so validation runs its checks and the calls run with that key’s permissions', async () => {
+  const { OKX_IMPLEMENTATION, okxDigest } = await import('../src/erc4337-sim.ts');
+  const { compiled } = await import('./evm-chain.ts');
+  const { keccak256, encodeAbiParameters, getContractAddress } = await import('viem');
+  const O = parseAbi(['struct Call { address to; uint256 value; bytes data; }', 'struct Owner { bytes32 keyHash; address keyType; }', 'function init(address ep, bytes32[] hashes, uint256[] types, uint256[] settings)',
+    'function addOwner(bytes32 key, address keyType, uint256 settings)', 'function getOwnerKeys() view returns (bytes32[])', 'function createAccount(Owner[] owners, uint256 salt) returns (address)', 'function getAddress(Owner[] owners, uint256 salt) view returns (address)']);
+  const ADMIN = 1n << 200n;
+  // A passkey whose public key the previewer never sees (only its hash is in the account), and the owner's Ethereum key.
+  const passkey = keccak256(concatHex([`0x${'a1'.repeat(32)}`, `0x${'b2'.repeat(32)}`])), ownerKey = keccak256(OWNER as Hex), other = keccak256(BOB as Hex);
+  await chain.putCode(OKX_IMPLEMENTATION, `0x${compiled('OkxLike').evm.deployedBytecode.object}`);
+  const make = async (keys: [Hex, bigint, bigint][]) => {
+    const a = await chain.deploy('Proxy1967', 'address', [OKX_IMPLEMENTATION]);
+    await chain.exec(a, encodeFunctionData({ abi: O, functionName: 'init', args: [EP, keys.map(k => k[0]), keys.map(k => k[1]), keys.map(k => k[2])] }));
+    await chain.exec(usdc, call('mint', [a, 100_000_000n]));
+    await chain.setBalance(a, E);
+    return a;
+  };
+  // The operation pays Bob and adds a key: a call to the account itself, which only an admin key may make.
+  const calls = (a: string) => concatHex(['0x8dd7712f', encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'to', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }],
+    [[{ to: usdc as Hex, value: 0n, data: call('transfer', [BOB, 50_000_000n]) }, { to: a as Hex, value: 0n, data: encodeFunctionData({ abi: O, functionName: 'addOwner', args: [`0x${'c3'.repeat(32)}`, '0x0000000000000000000000000000000000000001', ADMIN] }) }]])]);
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? p.decoding.notes.join(' | ');
+
+  // A passkey account, asked to sign itself: a stand-in passkey registered for the run with the real one's settings.
+  const account = await make([[passkey, 2n, ADMIN], [ownerKey, 1n, ADMIN]]);
+  let p = await preview(operation({ sender: account, callData: calls(account) }), account);
+  assert.match(whole(p), /a passkey's assertion over the operation's hash/);
+  assert.doesNotMatch(whole(p), /doesn't accept/);
+  assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts'), []);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  // Its Ethereum key asked to sign: that key itself, which ecrecover's stand-in signs.
+  p = await preview(operation({ sender: account, callData: calls(account) }), OWNER);
+  assert.match(whole(p), /ecrecover attributes it to the signer/);
+  assert.doesNotMatch(whole(p), /doesn't accept/);
+  assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts'), []);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+
+  // An account whose only key isn't an admin: the stand-in key gets the same settings, so the call to itself fails as it will.
+  const limited = await make([[passkey, 2n, 0n]]);
+  p = await preview(operation({ sender: limited, callData: calls(limited) }), limited);
+  assert.doesNotMatch(whole(p), /doesn't accept/);
+  assert.match(p.warnings.find(w => w.code === 'userop_execution_reverts')?.message ?? '', /only lets an admin key make calls to itself/);
+  assert.deepEqual(usdcChange(p), []);
+
+  // An account whose Ethereum key is someone else's: a stand-in key for the signer, with that key's settings.
+  const others = await make([[other, 1n, ADMIN]]);
+  p = await preview(operation({ sender: others, callData: calls(others) }), OWNER);
+  assert.doesNotMatch(whole(p), /doesn't accept/);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+
+  // What the key signs: the operation's hash with validUntil and the implementation.
+  assert.equal(okxDigest(`0x${'ab'.repeat(32)}`, 5n), keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }], [`0x${'ab'.repeat(32)}`, 5n, OKX_IMPLEMENTATION])));
+
+  // An account the operation deploys through OKX's factory: its keys are createAccount's. Storage set for an account
+  // not yet created wouldn't last, so the stand-in key takes the passkey's place in what the factory hands the
+  // account's initializer (the implementation's address runs okxInitializing, its own code moved aside).
+  const FACTORY = '0x5c328f3b5f117ffc693378a2c5b16c4f80f86295';
+  await chain.putCode(FACTORY, `0x${compiled('OkxLikeFactory').evm.deployedBytecode.object}`);
+  await chain.putCode(getContractAddress({ from: EP as Hex, nonce: 1n }), `0x${compiled('SenderCreatorLike').evm.deployedBytecode.object}`);
+  const owners = [{ keyHash: passkey, keyType: '0x0000000000000000000000000000000000000002' as Hex }, { keyHash: other, keyType: '0x0000000000000000000000000000000000000001' as Hex }];
+  const fresh = `0x${(await chain.evm.runCall({ to: (await import('@ethereumjs/util')).createAddressFromString(FACTORY), data: (await import('@ethereumjs/util')).hexToBytes(encodeFunctionData({ abi: O, functionName: 'getAddress', args: [owners, 9n] })), gasLimit: 1_000_000n })).execResult.returnValue.slice(12).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '')}`;
+  await chain.exec(usdc, call('mint', [fresh, 100_000_000n]));
+  await chain.setBalance(fresh, E);
+  p = await preview(operation({ sender: fresh, callData: calls(fresh), factory: FACTORY, factoryData: encodeFunctionData({ abi: O, functionName: 'createAccount', args: [owners, 9n] }), verificationGasLimit: '0xf4240' }), fresh);
+  assert.match(whole(p), /deploying the account through its factory/);
+  assert.match(whole(p), /a passkey's assertion over the operation's hash/);
+  assert.doesNotMatch(whole(p), /doesn't accept/);
+  assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts'), []);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  // The code that stands at the implementation's address: initialize((bytes32,address)[]) gets the stand-in key
+  // where the word at its place is the real key's, and everything else goes on to the moved code unchanged.
+  const { okxInitializing } = await import('../src/erc4337-sim.ts');
+  const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');
+  const MOVED = '0x0000000000000000000000000000000000ec0c0d', WRAPPED = '0x0000000000000000000000000000000000ec0c0e';
+  await chain.putCode(MOVED, '0x366000600037366000f3' as Hex); // returns its calldata
+  await chain.putCode(WRAPPED, okxInitializing(passkey, `0x${'5e'.repeat(32)}`, 4 + 64));
+  const echo = async (data: Hex) => toHex((await chain.evm.runCall({ caller: at(OWNER), to: at(WRAPPED), data: toBytes(data), gasLimit: 200_000n })).execResult.returnValue);
+  const init = encodeFunctionData({ abi: parseAbi(['struct Owner { bytes32 keyHash; address keyType; }', 'function initialize(Owner[] owners)']), functionName: 'initialize', args: [owners] });
+  assert.equal(init.slice(0, 10), '0x466e5483');
+  assert.equal(await echo(init), init.replace(passkey.slice(2), '5e'.repeat(32)));
+  const otherCall = encodeFunctionData({ abi: O, functionName: 'createAccount', args: [owners, 9n] });
+  assert.equal(await echo(otherCall), otherCall);
+  assert.equal(await echo('0x'), '0x');
 });

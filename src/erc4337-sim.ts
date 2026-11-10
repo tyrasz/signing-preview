@@ -270,7 +270,13 @@ export const STUB_COSIGNATURE = stubSignature(1);
  * verifier contract taking the precompile's input that its check calls (stood in for the same way). `cosigners`:
  * other stand-in ECDSA signatures in it and whose they are (ecrecover recovers each as its signer).
  */
-interface Stub { signature: Hex; p256?: boolean | 'daimo'; verifier?: string; cosigners?: { signature: Hex; signer: string }[] }
+interface Stub {
+  signature: Hex; p256?: boolean | 'daimo'; verifier?: string; cosigners?: { signature: Hex; signer: string }[];
+  /** Storage slots of the account set for the run (a stand-in key registered as one of its own stands). */
+  storage?: Record<string, string>;
+  /** Code set at other addresses for the run, and the ones among them to start warm (code moved there: not an account the chain would touch). */
+  code?: Record<string, Hex>; warm?: string[];
+}
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
@@ -296,10 +302,14 @@ const base64url = (hex: Hex) => {
  * P256_STUB as the signature, which only the P256VERIFY stand-in accepts.
  */
 export function webAuthnStub(hash: Hex): Hex {
-  const clientDataJSON = `{"type":"webauthn.get","challenge":"${base64url(hash)}","origin":"https://keys.coinbase.com","crossOrigin":false}`;
-  const authenticatorData = concatHex([sha256(stringToHex('keys.coinbase.com')), '0x05', '0x00000000']);
-  return encodeAbiParameters([{ type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' }, { name: 'typeIndex', type: 'uint256' }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }],
-    [{ authenticatorData, clientDataJSON, challengeIndex: BigInt(clientDataJSON.indexOf('"challenge"')), typeIndex: BigInt(clientDataJSON.indexOf('"type"')), r: BigInt(P256_STUB.r), s: BigInt(P256_STUB.s) }]);
+  return encodeAbiParameters([WEBAUTHN_AUTH], [webAuthnAuth(hash, 'keys.coinbase.com', ',"crossOrigin":false')]);
+}
+/** webauthn-sol's WebAuthnAuth struct, and one for this challenge from a passkey of `rpId` (P256_STUB as its signature). */
+const WEBAUTHN_AUTH = { type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' }, { name: 'typeIndex', type: 'uint256' }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] } as const;
+function webAuthnAuth(challenge: Hex, rpId: string, more = '') {
+  const clientDataJSON = `{"type":"webauthn.get","challenge":"${base64url(challenge)}","origin":"https://${rpId}"${more}}`;
+  const authenticatorData = concatHex([sha256(stringToHex(rpId)), '0x05', '0x00000000']);
+  return { authenticatorData, clientDataJSON, challengeIndex: BigInt(clientDataJSON.indexOf('"challenge"')), typeIndex: BigInt(clientDataJSON.indexOf('"type"')), r: BigInt(P256_STUB.r), s: BigInt(P256_STUB.s) };
 }
 /** Daimo's P256 verifier contract (the same address on every chain here), which passkey accounts call without RIP-7212. */
 export const DAIMO_P256_VERIFIER = '0xc2b78104907f722dabac4c69f826a522b2754de4';
@@ -418,7 +428,7 @@ async function coinbaseDeployStub(c: StubContext, factoryData: Hex): Promise<Stu
   return coinbaseFor([...owners], c);
 }
 /** Stand-ins for accounts a factory is deploying in the operation, by factory (their code doesn't exist yet). */
-const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promise<Stub>> = {
+const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promise<Stub | Stub[]>> = {
   // Coinbase Smart Wallet's factories (v1 and v1.1).
   '0x0ba5ed0c6aa8c49038f819e587e2633c4a9f428a': coinbaseDeployStub, '0xba5ed110efdba3d005bfc882d75358acbbb85842': coinbaseDeployStub,
   // Alchemy's Modular Account v2 factory: createAccount (a ModularAccount with its single-signer validation) and
@@ -437,12 +447,126 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
     } catch { /* another call */ }
     return { signature: STUB_SIGNATURE };
   },
+  // OKX Wallet's account factory (see okxStubs).
+  '0x5c328f3b5f117ffc693378a2c5b16c4f80f86295': okxDeployStub,
 };
 const BICONOMY_FACTORY = parseAbi(['function deployCounterFactualAccount(address moduleSetupContract, bytes moduleSetupData, uint256 index)', 'function deployAccount(address moduleSetupContract, bytes moduleSetupData)']);
 /** Biconomy's ECDSA ownership module for Smart Account v2. */
 const BICONOMY_ECDSA_MODULE = '0x0000001c5b32f37f5bea87bdd5374eb2ac54ea8e';
 /** Biconomy Smart Account v2's form: abi.encode(the module's signature, the validation module). */
 const biconomyStub = (): Stub => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, BICONOMY_ECDSA_MODULE]) });
+
+// --- OKX Wallet's smart account ---
+// Unpublished; read from its behaviour on BNB Chain and Base (its function names from OpenChain, its checks from
+// running real operations' validateUserOp in a local EVM and watching what it hashes and calls). It keeps its keys
+// as Uniswap's Calibur does: by hash, each with settings (an admin flag, an expiry, a hook), and a non-admin key
+// can't make the account call itself. Unlike Calibur it stores only the hash and a type, 1 for an Ethereum key
+// (the hash of its address) and 2 for a passkey (the hash of its public key's x and y), and the signature carries
+// the rest:
+//   key hash (32 bytes) | validUntil (uint48) | r, s, v                                              (type 1)
+//   key hash (32 bytes) | validUntil (uint48) | x | y | abi.encode(WebAuthnAuth, bytes32[] proof)    (type 2)
+// What the key signs is keccak256(abi.encode(the operation's hash, validUntil, the implementation)), or, with a
+// proof, the root of a Merkle tree that hash is a leaf of (one signature for operations on several chains): an
+// Ethereum key signs it as it is, a passkey as its assertion's challenge, checked by P256VERIFY. validateUserOp
+// returns validUntil; for a signature it doesn't accept, not 1 (SIG_VALIDATION_FAILED) but a value the EntryPoint
+// reads as an aggregator, which it rejects as well (AA24).
+// The account runs its calls through executeUserOp, which reads the key's hash back out of the signature and
+// applies that key's settings: with the bare stand-in, an unknown key, an operation that adds an owner (a call to
+// the account itself, as most first operations make) failed with NonAdminSelfCall where the signed one succeeded.
+export const OKX_IMPLEMENTATION = '0x36d3cbd83961868398d056efbf50f5ce15528c0d';
+/** Its storage root (CUSTOM_STORAGE_ROOT()): a key's type is at keccak256(key hash, root + 1), its settings at keccak256(key hash, root + 2). */
+const OKX_STORAGE_ROOT = 0x653ff6dcbda533c3c7d8ffb646da3e510d0de40f237170c4da3f874472aecb00n;
+const okxSlot = (key: Hex, n: bigint) => keccak256(concatHex([key, `0x${(OKX_STORAGE_ROOT + n).toString(16).padStart(64, '0')}`]));
+/** Settings: an admin flag (bit 200), the expiry in seconds (uint40, 0 for none) and a hook's address below it. */
+const OKX_ADMIN = 1n << 200n;
+const OKX = parseAbi(['function getOwnerKeys() view returns (bytes32[])', 'function createAccount((bytes32 keyHash, address keyType)[] owners, uint256 salt)', 'function createAccountWithCall((bytes32 keyHash, address keyType)[] owners, uint256 salt, ((address to, uint256 value, bytes data)[] calls, uint256 nonce) batch, bytes signature)']);
+/** The stand-in passkey's public key: any two words, as only the P256VERIFY stand-in checks its signature. */
+const OKX_PASSKEY = { x: `0x${'51'.repeat(32)}` as Hex, y: `0x${'52'.repeat(32)}` as Hex };
+/** What an OKX account's key signs for this operation's hash (without a Merkle proof). */
+export const okxDigest = (userOpHash: Hex, validUntil: bigint): Hex =>
+  keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }], [userOpHash, validUntil, OKX_IMPLEMENTATION]));
+type OkxKey = { hash: Hex; type: bigint; settings: bigint };
+/**
+ * The stand-ins for an OKX account with these keys, in the order to try them:
+ * - the signer's own key, if its address is one: the Ethereum key's form, which ecrecover's stand-in signs;
+ * - else, for the key most likely to sign (a passkey before an Ethereum key, an admin before others, unexpired
+ *   before expired), a stand-in key registered in the account's storage for the run with that key's type and
+ *   settings: the real key can't stand, as a passkey's public key is only in its signatures and an Ethereum key's
+ *   address is known only by its hash. Validation then runs every check on it that it runs on the real one, and
+ *   the calls run with that key's permissions;
+ * - for an account the operation deploys, whose storage a node empties when it creates it (BNB Chain's did: the
+ *   stand-in key was gone by validation), the stand-in key is registered by the account's own initializer instead:
+ *   the implementation's code moves to another address and okxInitializing takes its place, which hands
+ *   initialize() the stand-in key's hash where the factory passed that key's, and every call on unchanged. The
+ *   factory has derived the account's address from the real keys by then, and the initializer writes what it would;
+ * - as the last resort, the real key's hash with a signature the account won't accept. Its signature check isn't
+ *   simulated then (2.3% of the gas of first operations on BNB Chain), but the calls run as that key.
+ */
+async function okxStubs(c: StubContext, keys: OkxKey[], deployed: boolean): Promise<Stub[]> {
+  const hash = await c.hash();
+  if (!hash || !keys.length) return [{ signature: STUB_SIGNATURE }];
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const validUntil = now + 365n * 86400n, until = `0x${validUntil.toString(16).padStart(12, '0')}` as Hex;
+  const ecdsa = (key: Hex) => concatHex([key, until, STUB_SIGNATURE]);
+  const passkey = (key: Hex) => concatHex([key, until, OKX_PASSKEY.x, OKX_PASSKEY.y, encodeAbiParameters([WEBAUTHN_AUTH, { type: 'bytes32[]' }], [webAuthnAuth(okxDigest(hash, validUntil), 'okx.com'), []])]);
+  const own = keccak256(c.signer as Hex);
+  if (keys.some(k => k.hash === own && k.type === 1n)) return [{ signature: ecdsa(own) }];
+  const expired = (k: OkxKey) => { const at = (k.settings >> 160n) & 0xffffffffffn; return at !== 0n && at <= now; };
+  const rank = (k: OkxKey) => (k.type === 2n ? 0 : 4) + (expired(k) ? 2 : 0) + (k.settings & OKX_ADMIN ? 0 : 1);
+  const key = keys.filter(k => k.type === 1n || k.type === 2n).sort((a, b) => rank(a) - rank(b))[0];
+  if (!key) return [{ signature: STUB_SIGNATURE }];
+  const standIn = key.type === 2n ? keccak256(concatHex([OKX_PASSKEY.x, OKX_PASSKEY.y])) : own;
+  const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}`;
+  const storage = { [okxSlot(standIn, 1n)]: word(key.type), [okxSlot(standIn, 2n)]: word(key.settings) };
+  // The key's place in initialize((bytes32 keyHash, address keyType)[])'s calldata: the selector, the array's offset
+  // and length, then two words a key.
+  let registered: Pick<Stub, 'storage' | 'code' | 'warm'> | undefined = { storage };
+  if (!deployed) {
+    let implementation: string | undefined;
+    try { implementation = String(await c.deps.rpc!.call(c.chainId, 'eth_getCode', [OKX_IMPLEMENTATION, 'latest'])); } catch { /* no code read */ }
+    registered = implementation && implementation.length > 2
+      ? { code: { [OKX_IMPLEMENTATION]: okxInitializing(key.hash, standIn, 4 + 64 + 64 * keys.indexOf(key)), [OKX_MOVED]: implementation as Hex }, warm: [OKX_MOVED] } : undefined;
+  }
+  const last: Stub = key.type === 2n ? { signature: passkey(key.hash), p256: true } : { signature: ecdsa(key.hash) };
+  if (!registered) return [last];
+  return [key.type === 2n ? { signature: passkey(standIn), p256: true, ...registered } : { signature: ecdsa(standIn), ...registered }, last];
+}
+/** Where OKX's implementation code moves while okxInitializing takes its address. */
+const OKX_MOVED = '0x0000000000000000000000000000000000ec0c0d';
+/**
+ * Code for OKX's implementation address while an operation deploys an account: every call goes on to the real code
+ * (at OKX_MOVED) by delegatecall, as the account's proxy made it, with the same calldata, except that
+ * initialize(...) is handed `standIn` where the word at `at` is `key`.
+ *   calldatacopy(0, 0, calldatasize)
+ *   if (selector == initialize && calldataload(at) == key) mstore(at, standIn)
+ *   ok = delegatecall(gas, OKX_MOVED, 0, calldatasize, 0, 0); returndatacopy(0, 0, returndatasize)
+ *   if (ok) return(0, returndatasize) else revert(0, returndatasize)
+ */
+export function okxInitializing(key: Hex, standIn: Hex, at: number): Hex {
+  const where = at.toString(16).padStart(4, '0'), jump = (to: number) => `61${to.toString(16).padStart(4, '0')}57`;
+  // calldatacopy(0, 0, calldatasize); calldataload(0) >> 224 == initialize's selector && calldataload(at) == key
+  const test = `366000600037` + `60003560e01c63466e548314` + `61${where}357f${key.slice(2)}14` + `1615`;
+  const swap = `7f${standIn.slice(2)}61${where}52`;                                   // mstore(at, standIn)
+  const call = `5b600060003660007${'3'}${OKX_MOVED.slice(2)}5af4` + `3d6000803e`;      // delegatecall(gas, moved, 0, calldatasize, 0, 0); returndatacopy(0, 0, returndatasize)
+  const skip = (test.length + 8 + swap.length) / 2, ok = skip + (call.length + 8 + 8) / 2;
+  return `0x${test}${jump(skip)}${swap}${call}${jump(ok)}3d6000fd5b3d6000f3` as Hex;
+}
+/** An existing OKX account: its keys (the first eight), their types and settings read from its storage. */
+async function okxStub(c: StubContext): Promise<Stub[]> {
+  try {
+    const out = String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: OKX, functionName: 'getOwnerKeys' }) }, 'latest'])) as Hex;
+    const hashes = decodeFunctionResult({ abi: OKX, functionName: 'getOwnerKeys', data: out }).slice(0, 8);
+    const slot = async (key: Hex, n: bigint) => BigInt(String(await c.deps.rpc!.call(c.chainId, 'eth_getStorageAt', [c.sender, okxSlot(key, n), 'latest'])));
+    return okxStubs(c, await Promise.all(hashes.map(async hash => ({ hash, type: await slot(hash, 1n), settings: await slot(hash, 2n) }))), true);
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
+/** An OKX account its factory is deploying: the keys createAccount sets, each an admin with no expiry or hook (as its initializer leaves them). */
+async function okxDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> {
+  try {
+    const owners = decodeFunctionData({ abi: OKX, data: factoryData }).args[0] as readonly { keyHash: Hex; keyType: string }[];
+    return okxStubs(c, owners.map(o => ({ hash: o.keyHash, type: BigInt(o.keyType), settings: OKX_ADMIN })), false);
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
 
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
 /**
@@ -482,6 +606,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // v3.1, and its root is the account's own key, the bare signature over the personal_sign form of the hash; a
   // permission's signer takes the 0xff form. kernelV3Stub gives both, in that order.
   '0xd6cedde84be40893d153be9d467cd6ad37875b28': kernelV3Stub,
+  // OKX Wallet's smart account (see okxStubs).
+  [OKX_IMPLEMENTATION]: okxStub,
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
@@ -509,7 +635,7 @@ async function implementationOf(deps: Dependencies, chainId: number, account: st
 /** The stand-in for this account: shaped for the code it runs (see STUB_SHAPES) or its factory's, or STUB_SIGNATURE. */
 async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promise<Stub[]> {
   const factory = initCode && initCode.length >= 42 ? `0x${initCode.slice(2, 42)}`.toLowerCase() : undefined;
-  if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)];
+  if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)].flat();
   const runs = delegate?.toLowerCase() ?? await implementationOf(c.deps, c.chainId, c.sender);
   const shape = runs ? STUB_SHAPES[runs] : undefined;
   return shape ? [await shape(c)].flat() : [{ signature: STUB_SIGNATURE }];
@@ -637,7 +763,9 @@ export interface OperationInput {
 
 /**
  * What validation returned: a signature failure, an aggregator, and the range it's valid in: seconds (0 = no end),
- * or from EntryPoint v0.9, block numbers when both bounds carry its flag (bit 47).
+ * or from EntryPoint v0.9, block numbers when both bounds carry its flag (bit 47). An aggregator counts as a
+ * failure too: handleOps takes operations without one, and rejects any other answer ("AA24 signature error", AA34
+ * for a paymaster). OKX Wallet's account answers a signature it doesn't accept that way, not with 1.
  */
 export interface Validity { signatureFailed: boolean; aggregator: string | null; validAfter: number; validUntil: number; blocks?: boolean }
 const BLOCK_RANGE_FLAG = 1n << 47n;
@@ -664,7 +792,7 @@ export function validity(data: bigint): Validity {
   const low = data & ((1n << 160n) - 1n);
   const until = (data >> 160n) & ((1n << 48n) - 1n), after = data >> 208n;
   const blocks = until >= BLOCK_RANGE_FLAG && after >= BLOCK_RANGE_FLAG;
-  return { signatureFailed: low === 1n, aggregator: low > 1n ? `0x${low.toString(16).padStart(40, '0')}` : null,
+  return { signatureFailed: low !== 0n, aggregator: low > 1n ? `0x${low.toString(16).padStart(40, '0')}` : null,
     validUntil: Number(blocks ? until - BLOCK_RANGE_FLAG : until), validAfter: Number(blocks ? after - BLOCK_RANGE_FLAG : after), ...(blocks && { blocks }) };
 }
 
@@ -768,12 +896,13 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(op.delegate ? [{ address: sender, storageKeys: [] }] : []),
       ...(stub.p256 === true ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []),
       // The verifier itself stays cold, as it is on-chain; only the call on to its moved code is warm.
-      ...(verifier ? [{ address: VERIFIER_MOVED, storageKeys: [] }] : [])],
+      ...(verifier ? [{ address: VERIFIER_MOVED, storageKeys: [] }] : []), ...(stub.warm ?? []).map(address => ({ address, storageKeys: [] }))],
     // The bundler can afford the priced call's gas, whoever stands in for it.
     stateOverrides: { ...op.stateOverrides, ...(price !== undefined && price > 0n && { [bundler]: { balance: BUNDLER_BALANCE } }), [entryPoint]: { ...entryPointOverride(entryPoint, op.chainId)!, ...(op.stateOverrides?.[entryPoint]?.stateDiff && { stateDiff: { ...entryPointOverride(entryPoint, op.chainId)!.stateDiff, ...op.stateOverrides[entryPoint].stateDiff } }) }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
       ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
       ...(verifier && { [verifierAt!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code: verifier } }),
-      ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);
+      ...Object.fromEntries(Object.entries(stub.code ?? {}).map(([address, code]) => [address, { code }])),
+      ...((op.delegate || stub.storage) && { [sender]: { ...op.stateOverrides?.[sender], ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: { ...op.stateOverrides?.[sender]?.stateDiff, ...stub.storage } }) } }) } }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
     const ran = await run(first, recover);

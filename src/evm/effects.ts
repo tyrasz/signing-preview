@@ -25,11 +25,23 @@ export async function netChanges(transfers: SimulatedTransfer[], account: Accoun
     const chain = CHAINS[account.chainId];
     const info = asset === 'native' ? { symbol: chain?.nativeSymbol ?? 'native', decimals: chain?.nativeDecimals ?? 18 } : await tokenInfo(env, account.chainId, asset);
     if (asset !== 'native') tokenSourceWarnings(b, account.chainId, info as TokenInfo | undefined);
+    // A token with nothing to read and no code yet: the transaction itself creates it. Where a contract lands can
+    // follow from who sends the transaction or when (an operation on Base minted a new token at one address in its
+    // bundle and at another in each simulation), so the address shown is this simulation's.
+    if (asset !== 'native' && !info && delta > 0n && await codeless(deps, account.chainId, asset)) {
+      b.warn('info', 'token_created_here', `The token at ${asset} doesn't exist yet: it is created as this runs, so its name and decimals can't be read beforehand, and it can land at another address than the simulation's (where a contract is created can depend on who sends the transaction, and when).`);
+    }
     const abs = delta < 0n ? -delta : delta;
     out.push({ direction: delta < 0n ? 'out' : 'in', account: account.from, amount: info ? formatUnits(abs, info.decimals) : abs.toString(), symbol: info?.symbol ?? asset, raw: abs.toString(), asset,
       standard: asset === 'native' ? 'native' : 'erc20', basis });
   }
   return out;
+}
+
+/** Whether the chain has no code at this address now (unknown counts as having some). */
+async function codeless(deps: Dependencies, chainId: number, address: string): Promise<boolean> {
+  if (!deps.rpc?.has(chainId)) return false;
+  try { return String(await deps.rpc.call(chainId, 'eth_getCode', [address, 'latest'])) === '0x'; } catch { return false; }
 }
 
 const shortId = (id: bigint) => { const s = id.toString(); return s.length > 12 ? `${s.slice(0, 6)}…${s.slice(-4)}` : s; };

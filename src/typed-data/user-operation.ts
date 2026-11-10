@@ -180,6 +180,9 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   else if (accountValidity && accountValidity.validAfter > now) b.warn('info', 'userop_not_yet_valid', `The account accepts this operation from ${new Date(accountValidity.validAfter * 1000).toISOString()}: bundlers will hold it until then.`);
 
   b.detail('Gas cost (simulated)', `${native(run.paid)}, paid by ${pm ? `the paymaster ${shortAddress(pm)} from its EntryPoint deposit` : 'the account (from its EntryPoint deposit, topped up from its balance)'}`, run.paid.toString());
+  // The gas the EntryPoint counts for the operation (UserOperationEvent's actualGasUsed): what a gasless operation,
+  // which pays nothing, still costs whoever sends it.
+  if (run.gasUsed !== undefined) b.detail('Gas used (simulated)', `${run.gasUsed.toLocaleString('en-US')} gas, preVerificationGas included`, run.gasUsed.toString());
   // A token paymaster's charge: what the account's tokens went to the paymaster, net (some refund in postOp).
   if (pm) {
     const charge = new Map<string, bigint>();

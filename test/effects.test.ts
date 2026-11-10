@@ -191,3 +191,16 @@ test('A wrap and an unwrap of the chain’s wrapped native token are transfers; 
   assert.equal(net(WETH), -5n);
   assert.ok(!transfers.some(t => t.asset === VAULT), 'a vault’s Deposit(address,uint256) is not a mint of its own token');
 });
+
+test('A token the transaction itself creates: no name to read, and a note that it can land at another address', async () => {
+  const NEW = '0xc9fa96c17f208acd4be3e5c28d939be85e4e8da8', OLD = '0x10be2b470410f83c4ff6b0c1b7c699dc8b963464';
+  // The chain has code at OLD (a token that answers nothing about itself) and none at NEW.
+  const rpc = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => method === 'eth_getCode' ? ((params[0] as string).toLowerCase() === OLD ? '0x6000' : '0x') : (() => { throw new Error('no such read'); })() };
+  const withRpc = (simulator: Simulator): Dependencies => ({ ...deps(simulator), rpc: rpc as unknown as Dependencies['rpc'] });
+  const p = await previewRequest(send(ROUTER), { now: NOW }, withRpc(fixed({ transfers: [{ asset: NEW, from: ROUTER, to: ALICE, raw: 10n ** 25n }], nftTransfers: [] })));
+  assert.deepEqual(p.assetChanges.map(c => [c.direction, c.raw, c.symbol]), [['in', (10n ** 25n).toString(), NEW]]);
+  assert.match(p.warnings.find(w => w.code === 'token_created_here')?.message ?? '', /doesn't exist yet.*another address/);
+  // A token that exists but can't be named, and one going out, get no such note.
+  const q = await previewRequest(send(ROUTER), { now: NOW }, withRpc(fixed({ transfers: [{ asset: OLD, from: ROUTER, to: ALICE, raw: 5n }, { asset: NEW, from: ALICE, to: ROUTER, raw: 5n }], nftTransfers: [] })));
+  assert.ok(!codes(q).includes('token_created_here'), codes(q).join(','));
+});

@@ -31,13 +31,14 @@
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeFunctionData, hashMessage, hashTypedData, keccak256, parseAbi, recoverAddress, type Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
+import { okxDigest } from '../src/erc4337-sim.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
@@ -62,10 +63,18 @@ const EP = ENTRY_POINTS[VERSION];
 if (!EP) throw new Error(`--entrypoint is one of ${Object.keys(ENTRY_POINTS).join(', ')}`);
 const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : OP_STACK.has(CHAIN) ? new Set(['0x7e']) : new Set<string>();
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 30_000, retries: 6, retryDelayMs: 800 });
-/** A read; a block or transaction the answering backend doesn't have yet (null) is asked for again, twice, a second apart. */
+/**
+ * A read; a block or transaction the answering backend doesn't have yet (null) is asked for again, four times, a
+ * second and more apart, and one still refused for the rate after the client's own retries (HTTP 429: the
+ * scheduled run lost 18 operations so) once more after ten seconds.
+ */
 const call = async <T>(method: string, params: unknown[]): Promise<T> => {
-  let out = await rpc.call(CHAIN, method, params) as T;
-  for (let i = 0; i < 2 && out === null && /^eth_get(Block|Transaction)/.test(method); i++) { await new Promise(r => setTimeout(r, 1000)); out = await rpc.call(CHAIN, method, params) as T; }
+  const ask = async () => {
+    try { return await rpc.call(CHAIN, method, params) as T; }
+    catch (e) { if (!/HTTP 429|rate limited/.test(String(e))) throw e; await new Promise(r => setTimeout(r, 10_000)); return await rpc.call(CHAIN, method, params) as T; }
+  };
+  let out = await ask();
+  for (let i = 0; i < 4 && out === null && /^eth_get(Block|Transaction)/.test(method); i++) { await new Promise(r => setTimeout(r, 1000 * (i + 1))); out = await ask(); }
   return out;
 };
 
@@ -329,6 +338,14 @@ async function replay(item: string): Promise<void> {
       add(a);
     } catch { /* not ECDSA */ }
   }
+  // OKX Wallet's account, signed by an Ethereum key: its hash, validUntil, then the signature over the account's
+  // own digest of the operation's hash (src/erc4337-sim.ts, okxStubs); the key's hash is its address's.
+  if (!module && op.signature.length === 2 + 206) {
+    try {
+      const a = (await recoverAddress({ hash: okxDigest(digest, BigInt(`0x${op.signature.slice(66, 78)}`)), signature: `0x${op.signature.slice(78)}` })).toLowerCase();
+      if (keccak256(a as Hex) === op.signature.slice(0, 66).toLowerCase()) { const i = signers.indexOf(a); if (i >= 0) signers.splice(i, 1); signers.unshift(a); }
+    } catch { /* not that form */ }
+  }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
   // First, a Kernel permission's recorded owner (whose signature recovers to someone else).
@@ -366,7 +383,7 @@ async function replay(item: string): Promise<void> {
   const event = r.logs.find(l => l.address.toLowerCase() === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender && BigInt(l.data.slice(0, 66)) === BigInt(op.nonce));
   // A relaying contract may have left it out of what it passed on (or the transaction's input wasn't the bundle).
   if (!event) return skip('no UserOperationEvent for it in its receipt');
-  const succeeded = BigInt(`0x${event.data.slice(66, 130)}`) === 1n, actualGasCost = BigInt(`0x${event.data.slice(130, 194)}`);
+  const succeeded = BigInt(`0x${event.data.slice(66, 130)}`) === 1n, actualGasCost = BigInt(`0x${event.data.slice(130, 194)}`), actualGasUsed = BigInt(`0x${event.data.slice(194, 258)}`);
   const whole = p.decoding.notes.some(x => /whole operation was simulated/.test(x));
   const reverts = p.warnings.some(w => ['userop_execution_reverts', 'userop_postop_reverts', 'safe_tx_reverts'].includes(w.code));
   const rejected = p.warnings.find(w => w.code === 'userop_rejected')?.message;
@@ -392,7 +409,10 @@ async function replay(item: string): Promise<void> {
   // A share-based token's balance can move a base unit or two from the amount its Transfer event logs: the preview reads
   // balances, the receipt side here reads events. A gas-priced fee moves with the gas: within 1% for its rounding, and
   // for an operation in a bundle of several (whose gas comes out higher, above) by its gas difference too.
-  const gasPercent = simCost !== undefined && actualGasCost > 0n ? Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 : undefined;
+  // What the operation paid for gas; for a gasless one (it paid nothing: its bundler bears the cost), the gas it used.
+  const simUsed = p.details.find(d => d.label === 'Gas used (simulated)')?.raw;
+  const gasCompared = actualGasCost > 0n ? (simCost !== undefined ? { simulated: simCost, actual: actualGasCost } : undefined) : simUsed !== undefined && actualGasUsed > 0n ? { simulated: simUsed, actual: actualGasUsed, gasless: true } : undefined;
+  const gasPercent = gasCompared ? Number((BigInt(gasCompared.simulated) - gasCompared.actual) * 100_000n / gasCompared.actual) / 1000 : undefined;
   // (and for one run a second after its block, BNB Chain, whose gas isn't judged either, see below)
   const feeSlack = BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? Math.abs(gasPercent) : 0)));
   const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack;
@@ -415,7 +435,7 @@ async function replay(item: string): Promise<void> {
   // A token whose events don't account for its balances (a tax token on Base took 1% of a sale with no Transfer for
   // it): where the events and the preview disagree, the account's balance across the block decides, if it is what
   // the preview has (the account's other operations in the block would move it too, so only an exact match counts).
-  let byBalance = 0;
+  let byBalance = 0, createdElsewhere = false;
   if (tokenMatch === 'other') {
     const balanceAt = async (token: string, tag: string) => { try { return BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: token, data: `0x70a08231${sender.slice(2).padStart(64, '0')}` }, tag]))); } catch { return undefined; } };
     for (const t of tokens.filter(x => x.actual !== x.simulated)) {
@@ -424,14 +444,26 @@ async function replay(item: string): Promise<void> {
     }
     if (byBalance) tokenMatch = matchOf();
   }
+  // A token the operation creates can land at another address in the simulation than it did on-chain (where a
+  // contract is created can follow from who sends the bundle: an operation on Base minted itself a new token at a
+  // different address in each replay). The preview says so; here the two count as one when neither token existed
+  // before the block and the amounts are the same.
+  if (tokenMatch === 'other') {
+    const absent = async (token: string) => { try { return String(await rpc.call(CHAIN, 'eth_getCode', [token, parent])) === '0x'; } catch { return false; } };
+    for (const a of tokens.filter(x => x.simulated === '0' && x.actual !== '0')) {
+      const b = tokens.find(x => x.actual === '0' && x.simulated === a.actual);
+      if (b && p.warnings.some(w => w.code === 'token_created_here') && await absent(a.token) && await absent(b.token)) { a.simulated = a.actual; tokens.splice(tokens.indexOf(b), 1); createdElsewhere = true; }
+    }
+    if (createdElsewhere) tokenMatch = matchOf();
+  }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
-    gas: simCost !== undefined && actualGasCost > 0n ? { simulated: simCost, actual: actualGasCost.toString(), percent: Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 } : undefined,
+    gas: gasCompared ? { simulated: gasCompared.simulated, actual: gasCompared.actual.toString(), percent: gasPercent, ...(gasCompared.gasless && { gasless: true }) } : undefined,
     // Without any simulation (the node refused it) there are no simulated movements to compare.
     ...(!ran(p) && { notSimulated: true }),
-    ...(byBalance && { tokensByBalance: byBalance }),
+    ...(byBalance && { tokensByBalance: byBalance }), ...(createdElsewhere && { tokenCreated: true }),
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
   const row = rows.at(-1)!;
@@ -527,7 +559,7 @@ console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
-say(`  gas paid, of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
+say(`  gas paid (for ${count(r => !!(g(r) as { gasless?: boolean } | undefined)?.gasless)} gasless operations, the gas used), of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
 if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's contract (${count(r => !!r.relayedBy)}), gas reported but not judged: of ${count(r => !!bg(r))}, within 0.5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) < 0.5)}, 5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 0.5 && Math.abs(bg(r)!.percent) < 5)}, more ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 5)}`);
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);

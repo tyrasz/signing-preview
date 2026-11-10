@@ -47,8 +47,9 @@ export class JsonRpcClient implements RpcClient {
   }
   has(chainId: number) { return !!this.urls[chainId]; }
   /**
-   * Public RPCs (HyperEVM's in particular) rate-limit; a throttled call is retried a few times, briefly. So is one
-   * answered by a load-balanced node a block behind the others ("invalid block height", "header not found").
+   * Public RPCs (HyperEVM's in particular) rate-limit; a throttled call is retried a few times, briefly (after
+   * the wait the node names, if it names one). So is one answered by a load-balanced node a block behind the others
+   * ("invalid block height", "header not found").
    */
   async call(chainId: number, method: string, params: unknown[]): Promise<unknown> {
     const url = this.urls[chainId];
@@ -59,7 +60,11 @@ export class JsonRpcClient implements RpcClient {
       const limited = res.status === 429;
       const body = limited ? undefined : res.ok ? await res.json() as { result?: unknown; error?: { code?: number; message?: string } } : undefined;
       if ((limited || /rate limit|too many requests|invalid block height|header not found/i.test(body?.error?.message ?? '')) && attempt < this.retries) {
-        await new Promise(r => setTimeout(r, this.retryDelayMs * 2 ** attempt));
+        // As long as the node asks (Retry-After, up to 30 seconds), else twice as long each time; spread by a
+        // quarter either way, so that callers refused together don't all come back together.
+        const asked = Number(res.headers?.get?.('retry-after'));
+        const wait = asked > 0 ? Math.min(asked * 1000, 30_000) : this.retryDelayMs * 2 ** attempt;
+        await new Promise(r => setTimeout(r, wait * (0.75 + Math.random() / 2)));
         continue;
       }
       if (!res.ok) throw new Error(`${method}: HTTP ${res.status}`);
