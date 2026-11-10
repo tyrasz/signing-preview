@@ -58,12 +58,29 @@ async function pool<T, R>(items: T[], size: number, fn: (t: T) => Promise<R>): P
 }
 const hexNum = (h: string) => Number(BigInt(h));
 
+/** A block; a load-balanced node can answer null for one a backend doesn't have yet, so it is asked again a few times. */
+async function blockOf(chainId: number, n: number, full: boolean): Promise<{ timestamp: string; transactions: RawTx[] }> {
+  for (let i = 0; ; i++) {
+    const b = await rpc.call(chainId, 'eth_getBlockByNumber', ['0x' + n.toString(16), full]) as { timestamp: string; transactions: RawTx[] } | null;
+    if (b) return b;
+    if (i >= 5) throw new Error(`block ${n} not returned by the node`);
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
 /**
  * First block at or after `ts` (unix seconds), by binary search on timestamps. The search starts from an estimate
  * (block rate over the last 1,000 blocks), since public nodes prune old history.
  */
 async function blockAt(chainId: number, ts: number, latest: number): Promise<number> {
-  const stamp = async (n: number) => hexNum((await rpc.call(chainId, 'eth_getBlockByNumber', ['0x' + n.toString(16), false]) as { timestamp: string }).timestamp);
+  // A load-balanced node can answer for a block one of its backends doesn't have yet (null): asked again, a few times.
+  const stamp = async (n: number) => {
+    for (let i = 0; ; i++) {
+      const b = await rpc.call(chainId, 'eth_getBlockByNumber', ['0x' + n.toString(16), false]) as { timestamp: string } | null;
+      if (b) return hexNum(b.timestamp);
+      if (i >= 5) throw new Error(`block ${n} not returned by the node`);
+      await new Promise(r => setTimeout(r, 500));
+    }
+  };
   const now = await stamp(latest), before = await stamp(latest - 1000);
   const perBlock = (now - before) / 1000;
   const guess = Math.max(0, latest - Math.ceil((now - ts) / perBlock));
@@ -109,13 +126,14 @@ async function openChainBatch(selectors: string[]): Promise<SignatureResolver> {
 const report: Record<string, unknown> = { generatedAt: new Date().toISOString(), hours: HOURS, chains: [] as unknown[] };
 for (const chain of CHAINS) {
   if (!chain.blocks) continue; // e.g. --arb 0 skips Arbitrum
-  const latest = hexNum(String(await rpc.call(chain.id, 'eth_blockNumber', [])));
-  const latestTs = hexNum((await rpc.call(chain.id, 'eth_getBlockByNumber', ['0x' + latest.toString(16), false]) as { timestamp: string }).timestamp);
+  // A few blocks behind the head, which every backend of a load-balanced node has.
+  const latest = hexNum(String(await rpc.call(chain.id, 'eth_blockNumber', []))) - 5;
+  const latestTs = hexNum((await blockOf(chain.id, latest, false)).timestamp);
   const start = await blockAt(chain.id, latestTs - HOURS * 3600, latest);
   const span = latest - start;
   const picks = Array.from({ length: chain.blocks }, (_, i) => start + Math.floor((i + 0.5) * span / chain.blocks));
   console.log(`\n# ${chain.name}: blocks ${start}-${latest} (${span} blocks in ${HOURS} h); sampling ${picks.length} evenly`);
-  const blocks = await pool(picks, 4, n => rpc.call(chain.id, 'eth_getBlockByNumber', ['0x' + n.toString(16), true]) as Promise<{ timestamp: string; transactions: RawTx[] }>);
+  const blocks = await pool(picks, 4, n => blockOf(chain.id, n, true));
   const all = blocks.flatMap((b, i) => b.transactions.map(t => ({ t, ts: hexNum(b.timestamp), block: picks[i] })));
   const system = all.filter(x => SYSTEM_TYPES[chain.id]?.has(x.t.type));
   const txs = all.filter(x => !SYSTEM_TYPES[chain.id]?.has(x.t.type));
