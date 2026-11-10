@@ -358,6 +358,8 @@ else {
 
 const out = arg('out', '');
 if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
+// Beside the report, why operations were skipped (scripts/replay-summary.ts counts them).
+if (out) writeFileSync(out.replace(/(\.json)?$/, '.skipped.json'), JSON.stringify(skipped, null, 1));
 const lines: string[] = [];
 const say = (line: string) => { lines.push(line); console.log(line); };
 const count = (f: (r: Row) => boolean) => rows.filter(f).length;

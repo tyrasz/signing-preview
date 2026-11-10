@@ -74,6 +74,7 @@ jobs:
           name: replay-${{ matrix.chain }}-v${{ matrix.entrypoint }}
           path: |
             report.json
+            report.skipped.json
             replay.log
             differing/
           if-no-files-found: ignore
