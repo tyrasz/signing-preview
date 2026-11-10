@@ -127,6 +127,10 @@ async function permissionOwner(call: (to: string, data: Hex) => Promise<string>,
   } catch { return undefined; }
 }
 
+const ERC1967_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+/** Alchemy's Modular Account v2: its implementations and its EIP-7702 delegate (as src/erc4337-sim.ts shapes them). */
+const MODULAR_ACCOUNTS_V2 = new Set(['0x000000000000c5a9089039570dd36455b5c07383', '0x00000000000002377b26b1eda7b0bc371c60dd4f', '0x69007702764179f14f51cdce752f4f775d74e139']);
+
 /** Rhinestone's SmartSession module (source verified on Sourcify, Arbitrum One). */
 const SESSION_VALIDATORS = ['0x00000000008bdaba73cd9815d79069c247eb4bda'];
 
@@ -210,6 +214,12 @@ async function replay(item: string): Promise<void> {
   if (BigInt(op.nonce) >> 248n === 1n && code.length > 2) {
     const root = await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']).catch(() => '0x');
     if (/^0x[0-9a-f]{64}$/i.test(String(root))) return skip("a Kernel operation in enable mode (signed by the key it installs, which its owner approves as typed data)");
+  }
+  // Modular Account v2's deferred actions (the nonce key's flag 0x02) are the same: the owner signs the action
+  // installing a validation, as typed data, and that validation signs the operation.
+  if ((BigInt(op.nonce) >> 64n) & 2n) {
+    const impl = code.startsWith('0xef0100') ? `0x${code.slice(8, 48)}` : `0x${String(await atParent.call(CHAIN, 'eth_getStorageAt', [sender, ERC1967_SLOT, 'latest']).catch(() => '0x')).slice(-40)}`;
+    if (MODULAR_ACCOUNTS_V2.has(impl.toLowerCase())) return skip('a Modular Account v2 operation with a deferred action (signed by the validation it installs, which its owner approves as typed data)');
   }
 
   // The request the owner signed, and who might have signed it.
