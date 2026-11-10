@@ -31,3 +31,25 @@ test('The replay summary: a row per chain and EntryPoint version, then what diff
   assert.match(out, /simulated alone[\s\S]*`0xa6`/);
   assert.doesNotMatch(out, /`0xa5`/);
 });
+
+test('The transaction replay summary: a row per chain and simulator, what differed, and gas reported but not failed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'replay-tx-summary-'));
+  const write = (name: string, rows: unknown[]) => { mkdirSync(join(dir, name)); writeFileSync(join(dir, name, 'report.json'), JSON.stringify(rows)); };
+  const sim = (x: Record<string, unknown> = {}) => ({ outcome: true, status: 'success', tokens: 1, tokenTotal: 1, tokenDiffs: [], native: true, approvals: 0, approvalTotal: 0, gas: true, ...x });
+  write('replay-tx-1', [
+    { hash: '0xa1', selector: '0xa9059cbb', receipt: 'success', eth_simulateV1: sim(), fork: sim() },
+    { hash: '0xa2', selector: '0x12345678', receipt: 'success', eth_simulateV1: sim({ outcome: false, status: 'reverted', revert: 'STF', differs: ['outcome'] }), fork: sim({ gas: false, gasPercent: 0.4 }) },
+    { hash: '0xa3', selector: '0x12345678', receipt: 'success', eth_simulateV1: { error: 'timeout' }, fork: sim() },
+  ]);
+  write('replay-tx-8453', [
+    { hash: '0xb1', selector: '0x', receipt: 'success', l1Fee: { percent: 0 }, eth_simulateV1: sim({ tokens: 0, tokenTotal: 0 }) },
+    { hash: '0xb2', selector: '0x', receipt: 'success', l1Fee: { percent: 6 }, eth_simulateV1: sim({ gas: false, gasPercent: 5.3 }) },
+  ]);
+  const out = execFileSync(process.execPath, [new URL('../scripts/replay-tx-summary.ts', import.meta.url).pathname, dir], { encoding: 'utf8' });
+  assert.match(out, /^## Transaction replays: 5 transactions, 1 differing from their receipts/);
+  assert.match(out, /\| Ethereum \| 3 \| 1\/2 \| 2\/2 \| 2\/2 \| – \| 2\/2 \| 2\/2 \| – \| 1 \| 1 \|/);
+  assert.match(out, /\| Ethereum \(fork simulator\) \| 3 \| 3\/3 \| 3\/3 \| 3\/3 \| – \| 2\/3 \| 3\/3 \| – \|  \|  \|/);
+  assert.match(out, /\| Base \| 2 \| 2\/2 \| 1\/1 \| 2\/2 \| – \| 1\/2 \| 1\/2 \| 1\/2 \|  \|  \|/);
+  assert.match(out, /Previews that differed[\s\S]*Ethereum: `0xa2` \(0x12345678\): outcome reverted \(STF\), the receipt success/);
+  assert.match(out, /reported, not failed[\s\S]*Base: `0xb2` \(0x\): gas \+5\.3%/);
+});

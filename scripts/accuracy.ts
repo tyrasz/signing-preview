@@ -1,4 +1,4 @@
-// npm run accuracy -- [--chain 1|42161|8453|10|137|56] [--blocks 30 | --follow 300] [--per-block 3] [--max-index 8] [--only-type 0x4] [--unsigned-7702] [--simulators eth_simulateV1,fork] [--out report.json]
+// npm run accuracy -- [--chain 1|42161|8453|10|137|56] [--blocks 30 | --follow 300] [--max 600] [--strict] [--summary-md file] [--per-block 3] [--max-index 8] [--only-type 0x4] [--unsigned-7702] [--simulators eth_simulateV1,fork] [--out report.json]
 //
 // How accurate simulation is, measured against what actually happened. Recent Ethereum transactions from one-off
 // senders are replayed at their exact pre-state: on top of the parent block, after the earlier transactions of their
@@ -19,9 +19,14 @@
 // also charges the L1 data part, which it estimates for the unsigned transaction at a price that moves: gas matches
 // when it is the receipt's L2 part (gasUsed less gasUsedForL1) plus an L1 charge between none and twice the
 // receipt's (the charge is reported). The fork simulator doesn't model ArbOS, so it runs on Ethereum only.
+// --strict exits with 1 when a transaction's preview differs from its receipt: its outcome, a token movement of the
+// sender beyond 2 base units (a share token's rounding), its native coin change or an approval it gave, or its gas by
+// 10% or more (smaller gas differences are listed, not failed: a node's eth_simulateV1 can differ from its own chain by
+// a few percent on some EIP-7702 transactions). --summary-md appends the results as Markdown; --max stops after that
+// many transactions.
 // --unsigned-7702 replays the sender's own EIP-7702 authorizations as if the wallet had yet to sign them (code
 // overrides and the request's unsignedAuthorizations), which is how a preview before signing sees them.
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
@@ -40,6 +45,7 @@ const isSystem = (t: T, b: B) => SYSTEM.has(t.type) || (CHAIN === 56 && t.from.t
 const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
 const GET_L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
 const FOLLOW = Number(arg('follow', '0'));
+const MAX = Number(arg('max', '0')) || Infinity, STRICT = process.argv.includes('--strict'), SUMMARY_MD = arg('summary-md', '');
 const BLOCKS = Number(arg('blocks', '30')), PER_BLOCK = Number(arg('per-block', '3')), MAX_INDEX = Number(arg('max-index', '8'));
 const UNSIGNED = process.argv.includes('--unsigned-7702');
 // The fork simulator doesn't model ArbOS or OP Stack fees: it runs on Ethereum only.
@@ -195,14 +201,14 @@ async function replay(b: B, seen?: Set<string>) {
   }
 }
 
-if (!FOLLOW) for (const b of blocks) await replay(b);
+if (!FOLLOW) for (const b of blocks) { if (rows.length >= MAX) break; await replay(b); }
 else {
   // Each new head block, as soon as it's there: its parent's state is then seconds old. A block that took too long
   // to get to is skipped (Arbitrum keeps about 30 seconds of state).
   const seen = new Set<string>();
   const deadline = Date.now() + FOLLOW * 1000;
   let last = head;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && rows.length < MAX) {
     const now = Number(await rpc.call(CHAIN, 'eth_blockNumber', []));
     if (now <= last) { await new Promise(r => setTimeout(r, 250)); continue; }
     // A node behind the one that answered eth_blockNumber may not have the block yet: try again.
@@ -219,21 +225,41 @@ else {
   }
 }
 
+// What the harness finds the preview got wrong, per simulator (see --strict above).
+const GAS_FAIL_PERCENT = 10;
+for (const row of rows) for (const name of SIMULATORS) {
+  const r = row[name] as Record<string, any> | undefined;
+  if (!r || r.error) continue;
+  const receiptGas = BigInt(CHAIN === 42161 ? row.receiptTotal as string : row.receiptGas as string);
+  r.gasPercent = receiptGas > 0n && r.gasUsed !== 'undefined' ? Number((BigInt(r.gasUsed) - receiptGas) * 100_000n / receiptGas) / 1000 : undefined;
+  const differs = [!r.outcome && 'outcome', r.tokenDiffs.some((d: { actual: string; simulated: string }) => { const x = BigInt(d.actual) - BigInt(d.simulated); return x > 2n || x < -2n; }) && 'tokens',
+    !r.native && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+  if (differs.length) r.differs = differs;
+}
 const out = arg('out', '');
 if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
 const pct = (a: number, b: number) => b ? `${(100 * a / b).toFixed(1)}%` : '-';
 const numbers = blocks.map(b => Number(b.number));
+const md: string[] = [];
+const say = (line: string) => { console.log(line); md.push(line); };
 console.log(`${rows.length} ${chainName(CHAIN)} transactions from ${FOLLOW ? 'senders not seen earlier in the run' : 'one-off senders'} (blocks ${Math.min(...numbers)}-${Math.max(...numbers)}${FOLLOW ? `, ${blocks.length} followed over ${FOLLOW} s` : ''}), replayed at their exact pre-state:`);
 for (const name of SIMULATORS) {
   const rs = rows.map(r => r[name] as Record<string, any>), ok = rs.filter(r => !r.error);
   const sum = (k: string) => ok.reduce((s, r) => s + r[k], 0);
   const l1 = ok.filter(r => r.gas && r.l1Charge !== undefined).map(r => r.l1Charge as number).sort((a, b) => a - b);
   if (CHAIN === 42161 && l1.length) console.log(`  ${name}: its L1 charge was ${Math.round(100 * l1[0])}–${Math.round(100 * l1[l1.length - 1])}% of the receipt's (median ${Math.round(100 * l1[l1.length >> 1])}%) where gas matches`);
+  const within1 = ok.filter(r => r.gas || (r.gasPercent !== undefined && Math.abs(r.gasPercent) < 1)).length;
+  say(`  ${name.padEnd(15)} outcome ${ok.filter(r => r.outcome).length}/${ok.length} | token movements ${sum('tokens')}/${sum('tokenTotal')} | native ${ok.filter(r => r.native).length}/${ok.length} | approvals ${sum('approvals')}/${sum('approvalTotal')} | gas exact ${ok.filter(r => r.gas).length}/${ok.length}, within 1% ${within1} | differing ${ok.filter(r => r.differs).length} | errors ${rs.length - ok.length}`);
   console.log(`  ${name.padEnd(15)} outcome ${pct(ok.filter(r => r.outcome).length, ok.length)} | token movements ${sum('tokens')}/${sum('tokenTotal')} (${pct(sum('tokens'), sum('tokenTotal'))}) | native ${pct(ok.filter(r => r.native).length, ok.length)} | approvals ${sum('approvals')}/${sum('approvalTotal')} | gas exact ${pct(ok.filter(r => r.gas).length, ok.length)} | errors ${rs.length - ok.length} | median ${ok.map(r => r.ms).sort((a, b) => a - b)[ok.length >> 1]} ms`);
   for (const [i, r] of rs.entries()) {
     if (r.error) { console.log(`    error ${rows[i].hash}: ${r.error}`); continue; }
     const issues = [!r.outcome && `outcome ${r.status} (${r.revert}) vs ${rows[i].receipt}`, r.tokenDiffs.length && `tokens ${JSON.stringify(r.tokenDiffs)}`, !r.native && `native ${r.nativeSimulated} vs ${r.nativeActual}`,
       r.approvals < r.approvalTotal && `approvals ${r.approvals}/${r.approvalTotal}`, !r.gas && `gas ${r.gasUsed} vs ${rows[i].receiptGas}`].filter(Boolean);
-    if (issues.length) console.log(`    ${rows[i].hash} ${rows[i].selector}: ${issues.join('; ')}`);
+    if (issues.length) (r.differs ? say : console.log)(`    ${rows[i].hash} ${rows[i].selector}: ${issues.join('; ')}${r.differs ? '' : ' (reported, not failed)'}`);
   }
 }
+const differing = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.differs)).length;
+const l1Rows = rows.map(r => r.l1Fee as { percent?: number } | undefined).filter(x => x?.percent !== undefined).map(x => x!.percent!);
+if (l1Rows.length) say(`  L1 data fee estimate, of ${l1Rows.length}: exact ${l1Rows.filter(x => x === 0).length}, within 1% ${l1Rows.filter(x => Math.abs(x) < 1).length}, within 5% ${l1Rows.filter(x => Math.abs(x) < 5).length}; never under the receipt's: ${l1Rows.every(x => x >= 0)}`);
+if (SUMMARY_MD) appendFileSync(SUMMARY_MD, `### ${chainName(CHAIN)}${differing ? ` — ${differing} differing from the receipts` : ''}\n\n${rows.length} transactions (blocks ${Math.min(...numbers)}-${Math.max(...numbers)}${FOLLOW ? `, ${blocks.length} followed` : ''}), replayed at their exact pre-state:\n\n\`\`\`\n${md.join('\n')}\n\`\`\`\n\n`);
+if (STRICT && differing) process.exitCode = 1;

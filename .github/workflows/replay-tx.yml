@@ -1,0 +1,134 @@
+name: Transaction replays
+
+# Replays recent transactions on each chain the previewer simulates (HyperEVM aside: its public RPC serves only the
+# latest state) as their blocks arrive, each at its exact pre-state (the block before, its header, its earlier
+# transactions), and compares the simulation with the receipt: npm run accuracy (README, Simulation accuracy).
+# Read-only: nothing is signed or sent. Public RPCs by default (EVM_RPCS in src/chains.ts); ETHEREUM_RPC_URL,
+# ARBITRUM_RPC_URL, BASE_RPC_URL, OPTIMISM_RPC_URL, POLYGON_RPC_URL and BSC_RPC_URL repository secrets replace them.
+# Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
+# its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
+# differences are listed in the summary.
+
+on:
+  schedule:
+    - cron: '37 3 * * *' # daily at 03:37 UTC
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: How long each replay follows new blocks (minutes)
+        default: '30'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: replay-tx
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ethereum also runs the fork simulator (the local EVM HyperEVM previews use) on the same transactions.
+          - { name: 'Ethereum', chain: '1' }
+          - { name: 'Arbitrum One', chain: '42161' }
+          - { name: 'Base', chain: '8453' }
+          - { name: 'OP Mainnet', chain: '10' }
+          - { name: 'Polygon', chain: '137' }
+          - { name: 'BNB Chain', chain: '56' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Replay and compare with the receipts
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          MINUTES: ${{ inputs.minutes || '30' }}
+          CHAIN: ${{ matrix.chain }}
+        run: |
+          set -o pipefail
+          [[ "$MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
+          npm run accuracy -- --chain "$CHAIN" --follow $((MINUTES * 60)) --per-block 3 --max-index 8 --max 600 \
+            --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee replay.log
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: replay-tx-${{ matrix.chain }}
+          path: |
+            report.json
+            replay.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  summary:
+    # One table across the chains, in the run's summary.
+    needs: replay
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: reports
+          pattern: replay-tx-*
+      - name: Summarize
+        run: node scripts/replay-tx-summary.ts reports >> "$GITHUB_STEP_SUMMARY"
+
+  report-failure:
+    needs: replay
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: reports
+          pattern: replay-tx-*
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Transaction replays differ from receipts"
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          {
+            echo "The scheduled transaction replays found transactions whose preview differs from what happened, or could not run: $RUN_URL. A difference is an outcome, a token movement beyond 2 base units, a native coin change or an approval the simulation got wrong, or gas 10% or more off. A public RPC being unavailable also fails a job. Each job's artifact has its report and log."
+            echo
+            node scripts/replay-tx-summary.ts reports || echo "(No reports to summarize.)"
+          } > body.md
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body-file body.md
+          else
+            gh issue create --repo "$REPO" --title "$title" --body-file body.md
+          fi
