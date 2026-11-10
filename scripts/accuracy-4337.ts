@@ -182,9 +182,13 @@ async function replay(item: string): Promise<void> {
   try { code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest'])); } catch { return skip('its state is no longer served by the node'); }
 
   // The request the owner signed, and who might have signed it.
-  // A Safe the operation deploys has no fallback handler yet: its setup (in the initCode) names it.
-  const fallback = code === '0x' && safeSetupOf(op.initCode) ? safeSetupOf(op.initCode)!.fallbackHandler
-    : `0x${String(await atParent.call(CHAIN, 'eth_getStorageAt', [sender, FALLBACK_SLOT, 'latest']).catch(() => '0x')).slice(-40)}`.toLowerCase();
+  // A Safe the operation deploys has no fallback handler yet: its setup (in the initCode) names it. A read that fails
+  // is tried once more, then the operation skipped: taken as no handler, a Safe's SafeOp was replayed as a hash-signed
+  // operation, which the Safe rejects.
+  const readFallback = () => atParent.call(CHAIN, 'eth_getStorageAt', [sender, FALLBACK_SLOT, 'latest']);
+  let slot: unknown;
+  try { slot = await readFallback().catch(async () => { await new Promise(r => setTimeout(r, 1000)); return readFallback(); }); } catch { return skip('a read of its state failed'); }
+  const fallback = code === '0x' && safeSetupOf(op.initCode) ? safeSetupOf(op.initCode)!.fallbackHandler : `0x${String(slot).slice(-40)}`.toLowerCase();
   const module = SAFE_EXECUTE.includes(op.callData.slice(0, 10)) && SAFE_4337_MODULES[fallback]?.entryPoint === EP ? SAFE_4337_MODULES[fallback] : undefined;
   let request: (signer: string) => { method: string; params: unknown[] }, digest: Hex, kind: string;
   let ctx: Record<string, unknown> = context;

@@ -422,12 +422,17 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // over the operation's hash (its verified source).
   '0x2c53d0bd33a60db8881c7b049df6fd762a1f059c': shaped('0x00'),
   '0x000100abaad02f1cfc8bbe32bd5a564817339e72': coinbaseStub, '0x00000110dcdedc9581cb5ecb8467282f2926534d': coinbaseStub,
+  // Biconomy Smart Account v2: abi.encode(the module's signature, the validation module), with its ECDSA ownership
+  // module, which recovers the owner over the personal_sign form of the hash (or the hash itself); seen so on
+  // Ethereum (EntryPoint v0.6). Accounts it has upgraded to Nexus keep the proxy and run Nexus's code instead.
+  '0x0000002512019dafb59528b82cb92d3c5d2423ac': () => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, '0x0000001c5b32F37F5beA87BDD5374eB2aC54eA8e']) }),
   // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,
 };
 
+const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
 /**
- * The code an account runs: the ERC-1967 implementation its proxy (or its EIP-7702 delegate, such as Coinbase's
+ * The code an account runs: the ERC-1967 implementation its proxy (or Biconomy Smart Account v2's proxy's) (or its EIP-7702 delegate, such as Coinbase's
  * EIP7702Proxy) runs, else its EIP-7702 delegate. Undefined if neither, or unreadable.
  */
 async function implementationOf(deps: Dependencies, chainId: number, account: string): Promise<string | undefined> {
@@ -436,7 +441,9 @@ async function implementationOf(deps: Dependencies, chainId: number, account: st
     const code = String(await deps.rpc.call(chainId, 'eth_getCode', [account, 'latest']));
     const delegate = /^0xef0100[0-9a-f]{40}$/i.test(code) ? `0x${code.slice(8)}`.toLowerCase() : undefined;
     if (code === '0x' || code.length > 400) return undefined;
-    const slot = String(await deps.rpc.call(chainId, 'eth_getStorageAt', [account, '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', 'latest']));
+    // Biconomy Smart Account v2's proxy keeps its implementation in the slot numbered by its own address.
+    const own = code.toLowerCase().startsWith(BICONOMY_PROXY);
+    const slot = String(await deps.rpc.call(chainId, 'eth_getStorageAt', [account, own ? `0x${account.slice(2).toLowerCase().padStart(64, '0')}` : '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', 'latest']));
     return /^0x0*[1-9a-f]/i.test(slot) ? `0x${slot.slice(-40)}`.toLowerCase() : delegate;
   } catch { return undefined; }
 }
