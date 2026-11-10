@@ -104,6 +104,34 @@ test('A signer the account doesn’t accept, failing calls, and a paymaster that
   assert.ok(ahead.decoding.notes.some(n => /5 other operations of this account must run before this one/.test(n)));
 });
 
+test('A paymaster that only pays for its own bundler: the operation runs as a bundler its recent operations came through', async () => {
+  const ALLOWED = '0xb0d1e70000000000000000000000000000004337';
+  const picky = await chain.deploy('BundlerPaymaster', 'address,address', [EP, ALLOWED]);
+  await chain.exec(EP, call('depositTo', [picky]), '0xde9100000000000000000000000000000000d001', E);
+  const op = operation(withPaymaster(picky));
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  const run = (d: Dependencies) => previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, d);
+  // This node has no logs to look in: the simulation's own address sends it, which the paymaster refuses.
+  const refused = await run(deps);
+  assert.match(refused.warnings.find(w => w.code === 'userop_rejected')?.message ?? '', /AA33/);
+  // A node with the paymaster's latest UserOperationEvent, in a bundle ALLOWED sent.
+  const lookups: unknown[] = [];
+  const rpc = { has: (c: number) => deps.rpc!.has(c), call: async (c: number, m: string, ps: unknown[]) => {
+    if (m === 'eth_blockNumber') return '0x100';
+    if (m === 'eth_getLogs') { lookups.push(ps[0]); return [{ transactionHash: `0x${'ab'.repeat(32)}` }]; }
+    if (m === 'eth_getTransactionByHash') return { from: ALLOWED, input: '0x' };
+    return deps.rpc!.call(c, m, ps);
+  } } as Dependencies['rpc'];
+  const accepted = await run({ ...deps, rpc });
+  assert.ok(!codes(accepted).includes('userop_rejected'), codes(accepted).join());
+  assert.ok(accepted.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.7 runs it/.test(n)), accepted.decoding.notes.join(' | '));
+  assert.deepEqual(usdcChange(accepted), ['out 50']);
+  // The lookup is the paymaster's UserOperationEvents, by its indexed address, and it is remembered.
+  assert.equal((lookups[0] as { topics: string[] }).topics[3], `0x${'00'.repeat(12)}${picky.slice(2)}`);
+  await run({ ...deps, rpc });
+  assert.equal(lookups.length, 1);
+});
+
 test('EntryPoint v0.6: the patched EntryPoint returns its simulateHandleOp result, so the operation’s logs and gas are kept', async () => {
   const p = await preview(operation({ sender: account6, paymasterAndData: '0x' }), OWNER, '0.6');
   assert.deepEqual(usdcChange(p), ['out 50']);

@@ -214,6 +214,19 @@ contract TokenPaymaster {
         token.transferFrom(abi.decode(context, (address)), address(this), actualGasCost / 1e9 + 1);
     }
 }
+/// A paymaster that only pays for operations its own bundler sends (tx.origin), refusing others as some do.
+contract BundlerPaymaster {
+    error BundlerNotAllowed(address bundler);
+    address public entryPoint;
+    address public bundler;
+    constructor(address ep, address b) { entryPoint = ep; bundler = b; }
+    function validatePaymasterUserOp(PackedUserOperation calldata, bytes32, uint256) external view returns (bytes memory, uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (tx.origin != bundler) revert BundlerNotAllowed(tx.origin);
+        return ("", 0);
+    }
+    function postOp(uint8, bytes calldata, uint256, uint256) external {}
+}
 /// The same account for EntryPoint v0.6, whose operations aren't packed.
 struct UserOperationV06 { address sender; uint256 nonce; bytes initCode; bytes callData; uint256 callGasLimit; uint256 verificationGasLimit; uint256 preVerificationGas; uint256 maxFeePerGas; uint256 maxPriorityFeePerGas; bytes paymasterAndData; bytes signature; }
 contract Account4337V06 {
