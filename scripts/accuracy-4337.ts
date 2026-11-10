@@ -10,6 +10,8 @@
 //
 // How accurate whole-operation simulation is (src/erc4337-sim.ts), measured against what happened. Recent
 // single-operation bundles of an EntryPoint are rebuilt as the request their owner signed:
+//   (an operation in a bundle of several, up to five of them, after the bundle's earlier operations as a handleOps of
+//   their own: gas reported apart, as warm state from the same transaction is cold in a replay);
 //   - a SafeOp, for a Safe whose fallback handler is one of the known 4337 modules (src/typed-data/safe.ts);
 //   - otherwise, for v0.6 and v0.7, personal_sign of the operation's hash with the operation as context.userOperation;
 //   - for v0.8 and v0.9, the PackedUserOperation typed data (an EIP-7702 account's delegate where its marker is).
@@ -26,7 +28,7 @@
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
 import { appendFileSync, writeFileSync } from 'node:fs';
-import { decodeAbiParameters, decodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, encodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
@@ -108,13 +110,25 @@ const skipped: Record<string, number> = {};
 const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
 const STAND_IN_REJECTED = /doesn't accept it as theirs/;
 
-async function replay(hash: string): Promise<void> {
+/** How many operations of one bundle are replayed (each after the bundle's earlier ones). */
+const BUNDLE_MAX = 5;
+async function replay(item: string): Promise<void> {
+  // An item is a bundle transaction's hash, or `hash#i` for its i-th operation.
+  const [hash, at] = item.split('#');
   const tx = await call<{ from: string; to: string | null; input: Hex; transactionIndex: Hex; blockNumber: Hex; authorizationList?: NonNullable<SimulationRequest['authorizationList']> }>('eth_getTransactionByHash', [hash]);
   if (tx.to?.toLowerCase() !== EP) return skip('not a handleOps transaction to the EntryPoint');
   let ops: readonly Op[];
-  try { ops = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0] as unknown as Op[]; } catch { return skip('not handleOps'); }
-  if (ops.length !== 1) return skip('a bundle of several operations');
-  const op = ops[0], sender = op.sender.toLowerCase();
+  let beneficiary: Hex;
+  try { const args = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args; ops = args[0] as unknown as Op[]; beneficiary = args[1] as Hex; } catch { return skip('not handleOps'); }
+  // A bundle of several operations: each (up to BUNDLE_MAX) is replayed after the bundle's earlier ones, which run
+  // first as a handleOps of their own (with their real signatures). The same account twice is left out: its
+  // operations' token movements can't be told apart in the receipt.
+  const index = at === undefined ? 0 : Number(at);
+  if (ops.length > 1 && at === undefined) {
+    if (new Set(ops.map(o => o.sender.toLowerCase())).size < ops.length) return skip('a bundle with the same account twice');
+    enqueue(Array.from({ length: Math.min(ops.length, BUNDLE_MAX) - 1 }, (_, i) => `${hash}#${i + 1}`));
+  }
+  const op = ops[index], sender = op.sender.toLowerCase();
   // A session key's operation (an ERC-7579 account validating through Rhinestone's SmartSession module, which its
   // nonce names): the dApp holding the key signs it, not the user's wallet, so nothing previews it.
   if (SESSION_VALIDATORS.some(v => BigInt(op.nonce).toString(16).padStart(64, '0').includes(v.slice(2)))) return skip("a session key's operation (signed by a dApp, not a wallet)");
@@ -131,8 +145,10 @@ async function replay(hash: string): Promise<void> {
   // The authorities are warm in the bundle transaction from its start (EIP-7702), so they are in the replay too.
   let delegation: string | undefined;
   const warm: string[] = [];
+  // What must run first whatever else is dropped: the bundle's authorizations and its earlier operations.
+  const essential: SimulationRequest[] = [];
   if (tx.authorizationList?.length) {
-    before.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: tx.from.toLowerCase(), data: '0x', value: 0n, authorizationList: tx.authorizationList });
+    essential.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: tx.from.toLowerCase(), data: '0x', value: 0n, authorizationList: tx.authorizationList });
     for (const a of tx.authorizationList) {
       try {
         const authority = (await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase();
@@ -141,6 +157,8 @@ async function replay(hash: string): Promise<void> {
       } catch { /* unreadable */ }
     }
   }
+  if (index > 0) essential.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [ops.slice(0, index) as never, beneficiary] }) });
+  before.push(...essential);
   // Reads on the parent block, and the block itself for its header (the base fee the operation's gas is priced at).
   const atParent = { has: (c: number) => c === CHAIN, call: (c: number, m: string, ps: unknown[]) => m === 'eth_getBlockByNumber' ? rpc.call(c, m, [r.blockNumber, false])
     : m === 'eth_getCode' && delegation && String(ps[0]).toLowerCase() === sender ? Promise.resolve(delegation) : rpc.call(c, m, ps.map(x => x === 'latest' ? parent : x)) };
@@ -200,7 +218,7 @@ async function replay(hash: string): Promise<void> {
   for (const signer of signers.slice(0, 3)) {
     tried++;
     p = await previewRequest(request(signer), ctx, deps);
-    if (!ran(p) && prefix.length) { prefix = tx.authorizationList?.length ? before.slice(-1) : []; prefixDropped = true; p = await previewRequest(request(signer), ctx, deps); }
+    if (!ran(p) && prefix.length > essential.length) { prefix = essential; prefixDropped = true; p = await previewRequest(request(signer), ctx, deps); }
     // A wrong guess shows as the account rejecting the stand-in, or as its validation reverting on a shape for
     // another key (a passkey account given an ECDSA stand-in for a non-owner): either way, the next candidate.
     if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x) || /validation reverts on a stand-in/.test(x))) break;
@@ -210,7 +228,7 @@ async function replay(hash: string): Promise<void> {
   if (arg('dump', '')) writeFileSync(arg('dump', ''), JSON.stringify(p, null, 1));
 
   // What happened, and what the preview says.
-  const event = r.logs.find(l => l.address.toLowerCase() === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender)!;
+  const event = r.logs.find(l => l.address.toLowerCase() === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender && BigInt(l.data.slice(0, 66)) === BigInt(op.nonce))!;
   const succeeded = BigInt(`0x${event.data.slice(66, 130)}`) === 1n, actualGasCost = BigInt(`0x${event.data.slice(130, 194)}`);
   const whole = p.decoding.notes.some(x => /whole operation was simulated/.test(x));
   const reverts = p.warnings.some(w => ['userop_execution_reverts', 'userop_postop_reverts', 'safe_tx_reverts'].includes(w.code));
@@ -235,12 +253,16 @@ async function replay(hash: string): Promise<void> {
   const abs = (x: bigint) => (x < 0n ? -x : x);
   // A gas-priced fee (a paymaster's, or a fee collector's) moves with the gas: within 1% of the smallest transfer out.
   // A share-based token's balance can move a base unit or two from the amount its Transfer event logs: the preview reads
-  // balances, the receipt side here reads events.
+  // balances, the receipt side here reads events. A gas-priced fee moves with the gas: within 1% for its rounding, and
+  // for an operation in a bundle of several (whose gas comes out higher, above) by its gas difference too.
+  const gasPercent = simCost !== undefined && actualGasCost > 0n ? Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 : undefined;
+  const feeSlack = BigInt(Math.ceil(1 + (ops.length > 1 && gasPercent !== undefined ? Math.abs(gasPercent) : 0)));
+  const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack;
   const tokenMatch = tokens.every(t => t.actual === t.simulated) ? 'exact'
-    : tokens.every(t => t.actual === t.simulated || (fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)!)) ? 'fee'
-    : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || (fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)!)) ? 'units' : 'other';
+    : tokens.every(t => t.actual === t.simulated || feeLike(t)) ? 'fee'
+    : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || feeLike(t)) ? 'units' : 'other';
   rows.push({
-    hash, block: n, kind, sender, signersTried: tried, ...(prefixDropped && { prefix: 'dropped: the node refused the block with its earlier transactions' }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: 'dropped: the node refused the block with its earlier transactions' }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
     gas: simCost !== undefined && actualGasCost > 0n ? { simulated: simCost, actual: actualGasCost.toString(), percent: Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 } : undefined,
@@ -291,14 +313,19 @@ if (out) writeFileSync(out, JSON.stringify(rows, null, 1));
 const lines: string[] = [];
 const say = (line: string) => { lines.push(line); console.log(line); };
 const count = (f: (r: Row) => boolean) => rows.filter(f).length;
-const g = (r: Row) => r.gas as { percent: number } | undefined;
+// Gas is compared for operations alone in their bundle: in a bundle of several, state the earlier operations warmed
+// in the same transaction is cold in a replay, so a later one's gas comes out a little higher.
+const bundled = (r: Row) => !!r.bundle;
+const g = (r: Row) => (bundled(r) ? undefined : r.gas as { percent: number } | undefined);
+const bg = (r: Row) => (bundled(r) ? r.gas as { percent: number } | undefined : undefined);
 const range = [...blocks].sort((a, b) => a - b);
 console.log('');
-say(`${rows.length} single-operation bundles of EntryPoint v${VERSION} on ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
+say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: the node refused the block with them)`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 say(`  gas paid, of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
+if (count(r => !!bg(r))) say(`  in bundles of several, gas reported but not judged: of ${count(r => !!bg(r))}, within 0.5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) < 0.5)}, 5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 0.5 && Math.abs(bg(r)!.percent) < 5)}, more ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 5)}`);
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
