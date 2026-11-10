@@ -100,11 +100,33 @@ test('A gas limit too low says how much the call needs; nodes’ refusals are an
 test('Pending transactions supplied by the wallet are simulated first, in order, and this one after them', async () => {
   calls.length = 0;
   const p = await send({}, deps(), { pendingTransactions: [{ to: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', data: '0xd0e30db0', value: '0x10' }] });
-  assert.equal(calls.length, 1);
+  // Twice: at no price, then at the price it would pay now (the base fee plus the node's tip), with room over its gas.
+  assert.equal(calls.length, 2);
   assert.equal(calls[0].length, 2);
   assert.equal(calls[0][0].data, '0xd0e30db0');
   assert.equal(calls[0][1].to, BOB.toLowerCase());
+  assert.equal(calls[0][1].gasPrice, undefined);
+  assert.deepEqual([calls[1][1].gasPrice, calls[1][1].baseFee, calls[1][1].gas], [GWEI + GWEI / 10n, GWEI, 150_000n]);
   assert.match(p.decoding.notes.join(' '), /Simulated after your 1 pending transaction/);
   // The two pending nonces are now partly accounted for, so the warning about unsimulated pending ones stays (1 of 2).
   assert.ok(codes(p).includes('pending_transactions'));
+});
+
+test('A transaction whose result depends on the fee it pays is shown as it runs at the price it would pay now', async () => {
+  // A pool taxing a swap by the priority fee: at no price 100 USDC comes back, at a price 90.
+  const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+  const seen: SimulationRequest[] = [];
+  const taxed = { simulate: async (r: SimulationRequest): Promise<SimulationResult> => { seen.push(r); return { status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: r.gasPrice ? 90_000_000n : 100_000_000n }] }; } };
+  const p = await send({ data: '0x12345678' }, { ...deps(), simulator: taxed });
+  assert.deepEqual(p.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), ['in 90']);
+  assert.match(p.decoding.notes.join(' '), /depends on the fee it pays[^.]*: it was simulated at the price it would pay now, 1\.1 gwei \(the base fee plus a 0\.1 gwei tip\)/);
+  assert.deepEqual([seen.length, seen[1].gasPrice, seen[1].baseFee], [2, GWEI + GWEI / 10n, GWEI]);
+  // The same result at both prices: nothing is said, and the request's own tip and cap are what it is priced at.
+  const flat = await send({ data: '0x12345678', maxPriorityFeePerGas: toHex(2n * GWEI), maxFeePerGas: toHex(5n * GWEI / 2n) });
+  assert.ok(!/depends on the fee/.test(flat.decoding.notes.join(' ')));
+  // A balance that can't cover the priced run's gas: the node refuses it, and the first run stands.
+  const refusing = { simulate: async (r: SimulationRequest): Promise<SimulationResult> => { if (r.gasPrice) throw new Error('insufficient funds for gas * price + value'); return { status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: 100_000_000n }] }; } };
+  const kept = await send({ data: '0x12345678' }, { ...deps(), simulator: refusing });
+  assert.deepEqual(kept.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), ['in 100']);
+  assert.equal(kept.simulation?.status, 'success');
 });

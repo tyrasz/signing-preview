@@ -4,7 +4,7 @@ import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationR
 import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
-import { transactionChecks } from './tx-checks.ts';
+import { expectedGasPrice, transactionChecks } from './tx-checks.ts';
 import { erc20Adapter, nativeAdapter, unknownCallAdapter } from './erc20.ts';
 import { abiAdapter } from './abi-adapter.ts';
 import { textCalldataAdapter } from './text.ts';
@@ -196,6 +196,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         b.note('Simulated with the EIP-7702 authorizations applied: the delegated accounts run their new code.');
       }
       const pending = pendingRequests(tx, context);
+      // What the transaction would pay now, read while the simulation runs (see the priced run below).
+      const pricing = expectedGasPrice(tx, deps).catch(() => undefined);
       if (pending.length && deps.simulator.simulateBatch) {
         // On top of the wallet's pending transactions, in order: this one is the last call of the batch.
         const results = await deps.simulator.simulateBatch([...pending, request]);
@@ -206,6 +208,23 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       } else {
         if (pending.length) b.note("Your pending transactions couldn't be simulated before this one on this chain, so the simulation runs on the latest state without them.");
         outcome = { result: await deps.simulator.simulate(request) };
+      }
+      // Contracts read the price the transaction pays (tx.gasprice, and the base fee): a pool taxing swaps by the
+      // priority fee, a refund paid at the gas price. The first run is at no price (a price needs a gas limit the
+      // sender can afford, which isn't known before it); the transaction then runs again at the price it would pay
+      // now, with room over the gas it used, and if that changes what it does, the priced run is the one shown.
+      const first = outcome.result;
+      const price = first?.status === 'success' && !first.limited && first.gasUsed !== undefined ? await pricing : undefined;
+      if (first && price) {
+        try {
+          const priced: SimulationRequest = { ...request, gas: tx.gas ?? (first.gasUsed! * 2n > first.gasUsed! + 100_000n ? first.gasUsed! * 2n : first.gasUsed! + 100_000n), gasPrice: price.gasPrice, baseFee: price.baseFee };
+          const again = pending.length && deps.simulator.simulateBatch ? (await deps.simulator.simulateBatch([...pending, priced]))?.at(-1) : await deps.simulator.simulate(priced);
+          if (again && effectOf(again, tx.from) !== effectOf(first, tx.from)) {
+            outcome = { result: again };
+            const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
+            b.note(`What this transaction does depends on the fee it pays (a contract it calls reads the gas price): it was simulated at the price it would pay now, ${gwei(price.gasPrice)}${price.tip ? ` (the base fee plus a ${gwei(price.tip)} tip)` : ''}. At another price the result can differ.`);
+          }
+        } catch { /* the node refused the priced run (the balance doesn't cover its gas, say): the first stands */ }
       }
     } catch (error) {
       outcome = { error: error instanceof Error ? error.message : String(error) };
@@ -256,6 +275,16 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     decoding: { status: d.status, decoder: d.decoder, notes: b.notes },
     ...(simulation && { simulation }),
   };
+}
+
+/** What a simulated call did for an account, to compare two runs: its outcome, the account's net of each asset, NFTs and approvals. */
+function effectOf(r: SimulationResult, account: string): string {
+  const net = new Map<string, bigint>();
+  for (const t of r.transfers) {
+    if (sameAddress(t.from, account)) net.set(t.asset, (net.get(t.asset) ?? 0n) - t.raw);
+    if (sameAddress(t.to, account)) net.set(t.asset, (net.get(t.asset) ?? 0n) + t.raw);
+  }
+  return JSON.stringify([r.status, [...net].filter(([, v]) => v !== 0n).sort(([a], [z]) => (a < z ? -1 : 1)), r.nftTransfers ?? [], r.approvals ?? []], (_, v) => (typeof v === 'bigint' ? v.toString() : v));
 }
 
 /** The simulation request for a call, with the tokens its decoder knows it changes (for state-reading simulators). */

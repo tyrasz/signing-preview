@@ -22,6 +22,30 @@ const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)'
  * `l1Gas`: Arbitrum's gas for the L1 data (part of `gas`); `l1Fee`: an OP Stack chain's L1 data fee in wei, charged on
  * top of the gas (in `estimate` and `maximum`).
  */
+/**
+ * The price a transaction would pay now (tx.gasprice), for simulating it as it will run: the latest base fee plus
+ * its tip (the request's, or the node's suggestion; none on Arbitrum), up to its fee cap. Undefined without an RPC or
+ * a base fee, when the cap is under the base fee (the transaction waits), or when the price is zero.
+ */
+export async function expectedGasPrice(tx: Tx, deps: Dependencies): Promise<{ gasPrice: bigint; baseFee: bigint; tip: bigint } | undefined> {
+  const rpc = deps.rpc;
+  if (!rpc?.has(tx.chainId)) return undefined;
+  const call = <T>(method: string, params: unknown[]) => rpc.call(tx.chainId, method, params).then(r => r as T, () => undefined);
+  const arbitrum = ARBITRUM.has(tx.chainId);
+  const [block, suggested] = await Promise.all([
+    call<{ baseFeePerGas?: string }>('eth_getBlockByNumber', ['latest', false]),
+    tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
+  ]);
+  if (block?.baseFeePerGas === undefined) return undefined;
+  try {
+    const baseFee = BigInt(block.baseFeePerGas);
+    const tip = arbitrum ? 0n : tx.maxPriorityFeePerGas ?? (tx.gasPrice !== undefined ? (tx.gasPrice > baseFee ? tx.gasPrice - baseFee : 0n) : suggested !== undefined ? BigInt(suggested) : 0n);
+    const cap = tx.maxFeePerGas ?? tx.gasPrice;
+    const gasPrice = cap !== undefined && baseFee + tip > cap ? cap : baseFee + tip;
+    return gasPrice > 0n && gasPrice >= baseFee ? { gasPrice, baseFee, tip: gasPrice - baseFee } : undefined;
+  } catch { return undefined; }
+}
+
 export interface NetworkFee { gas: bigint; l1Gas: bigint; l1Fee?: bigint; price: bigint; estimate: bigint; maximum?: bigint }
 
 /**
