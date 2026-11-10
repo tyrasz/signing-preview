@@ -428,6 +428,10 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   '0x0000002512019dafb59528b82cb92d3c5d2423ac': () => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, '0x0000001c5b32F37F5beA87BDD5374eB2aC54eA8e']) }),
   // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,
+  // ZeroDev's Kernel for EIP-7702 (an EIP-7702 delegate; its verified source): the nonce names what validates as in
+  // v3.1, and its root is the account's own key, the bare signature over the personal_sign form of the hash; a
+  // permission's signer takes the 0xff form. kernelV3Stub gives both, in that order.
+  '0xd6cedde84be40893d153be9d467cd6ad37875b28': kernelV3Stub,
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
