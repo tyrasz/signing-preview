@@ -1,9 +1,14 @@
 // Custom errors (Solidity >= 0.8.4) from verified sources, so a revert reads as its name, not "custom error 0x...".
 // From: OpenZeppelin 5 (ERC20, access control), Kinetiq's StakingManager facets and InstantUnstakePool, and
-// aave-v3-origin's Errors library as deployed by HyperLend (all verified on Sourcify, HyperEVM).
+// aave-v3-origin's Errors library as deployed by HyperLend (all verified on Sourcify, HyperEVM); and smart accounts'
+// and paymasters' errors met replaying ERC-4337 operations: ZeroDev Kernel, Alchemy's LightAccount and Modular
+// Account v2, Bleap's cosigning module (verified on Sourcify), Pimlico's paymaster and NonAdminSelfCall (OpenChain's
+// signature database, from verified contracts).
 import { decodeErrorResult, parseAbiItem, toFunctionSelector, type Abi, type Hex } from 'viem';
 
 export const KNOWN_ERRORS = [
+  'InvalidSignatureType()', 'BundlerNotAllowed(address)', 'NonAdminSelfCall()', 'UserOpValidationFunctionReverted(bytes24,bytes)', 'ValidationFunctionMissing(bytes4)',
+  'InvalidValidator()', 'InvalidNonce()', 'OnlyExecuteUserOp()', 'InvalidValidationType()', 'PermissionNotAlllowedForUserOp()', 'NotRootPermission()',
   'ERC20InsufficientAllowance(address,uint256,uint256)', 'ERC20InsufficientBalance(address,uint256,uint256)', 'ERC20InvalidReceiver(address)', 'ERC20InvalidSpender(address)',
   'ReentrancyGuardReentrantCall()', 'AccessControlUnauthorizedAccount(address,bytes32)', 'EnforcedPause()', 'AboveMaximum()',
   'BelowMinimum()', 'ContractPaused()', 'InsufficientTokenBalance()', 'InvalidAddress()',
@@ -38,6 +43,11 @@ export const KNOWN_ERRORS = [
 
 /** What the most common ones mean for the person signing. */
 const MEANING: Record<string, string> = {
+  InvalidSignatureType: "the signature isn't of a type the account takes",
+  BundlerNotAllowed: 'the paymaster only pays for operations its own bundlers submit',
+  NonAdminSelfCall: 'the account only lets an admin key make calls to itself',
+  ValidationFunctionMissing: 'the account has no validation installed for this call',
+  InvalidValidator: "the validator the operation names isn't installed for this call",
   ERC20InsufficientAllowance: 'the contract is not allowed to move that much of your token (approve it first)',
   ERC20InsufficientBalance: 'you do not hold enough of the token',
   BelowMinimum: 'the amount is below the minimum',
