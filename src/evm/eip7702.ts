@@ -74,8 +74,11 @@ export interface DelegationEffects {
   codeOverrides: Record<string, string>;
 }
 
-/** Chains whose EVM applies EIP-7702 (Prague and later). HyperEVM runs Cancun rules. */
-export const SUPPORTS_7702 = new Set([1, 11155111, 42161, 421614]);
+/**
+ * Chains whose EVM applies EIP-7702 (Prague and later; Base and OP Mainnet since Isthmus, Polygon since Bhilai, BNB
+ * Chain since Pascal: each had type-4 transactions in its latest blocks on 2026-11-10). HyperEVM runs Cancun rules.
+ */
+export const SUPPORTS_7702 = new Set([1, 11155111, 42161, 421614, 8453, 10, 137, 56]);
 
 /** Details and warnings for the authorization list; null when there is none. */
 export async function delegationEffects(tx: Tx, deps: Dependencies, b: PreviewBuilder): Promise<DelegationEffects | null> {

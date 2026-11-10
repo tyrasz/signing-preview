@@ -2,7 +2,7 @@
 // limit too low, and simulation on top of the wallet's pending transactions.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeAbiParameters, toHex, type Hex } from 'viem';
+import { decodeAbiParameters, encodeAbiParameters, toHex, type Hex } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { rejection } from '../src/simulation.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
@@ -11,6 +11,7 @@ import { ALICE, BOB } from '../mocks/data.ts';
 import { codes, detail, NOW } from './helpers.ts';
 
 const GWEI = 10n ** 9n;
+const l1Inputs: string[] = [];
 /** A node: nonces 5 mined and 7 pending, 1 gwei base fee, a 0.1 gwei tip, and (Arbitrum) 1,000 gas of L1 data. */
 const rpc = (balance: bigint) => ({ has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
   if (method === 'eth_getTransactionCount') return params[1] === 'pending' ? '0x7' : '0x5';
@@ -18,6 +19,8 @@ const rpc = (balance: bigint) => ({ has: () => true, call: async (_c: number, me
   if (method === 'eth_getBlockByNumber') return { baseFeePerGas: toHex(GWEI) };
   if (method === 'eth_maxPriorityFeePerGas') return toHex(GWEI / 10n);
   if (method === 'eth_call' && (params[0] as { to: string }).to === '0x00000000000000000000000000000000000000c8') return encodeAbiParameters([{ type: 'uint64' }, { type: 'uint256' }, { type: 'uint256' }], [1000n, GWEI, 0n]);
+  // OP Stack's GasPriceOracle: 0.00001 ETH of L1 data fee for whatever it is given, which it records.
+  if (method === 'eth_call' && (params[0] as { to: string }).to === '0x420000000000000000000000000000000000000f') { l1Inputs.push((params[0] as { data: string }).data); return encodeAbiParameters([{ type: 'uint256' }], [10n ** 13n]); }
   return '0x';
 } });
 /** Simulates a call that needs 50,000 gas: it fails under a lower limit. */
@@ -36,6 +39,24 @@ test('The network fee: gas used at the base fee plus tip, the most the request a
   assert.equal(detail(capped, 'Network fee'), '≈ 0.000055 ETH (50,000 gas at 1.1 gwei); at most 0.00012 ETH');
   const arb = await send({ chainId: '0xa4b1' });
   assert.equal(detail(arb, 'Network fee'), '≈ 0.000051 ETH (51,000 gas at 1 gwei, 1,000 of it for the data posted to Ethereum)');
+});
+
+test('OP Stack (Base, OP Mainnet): the L1 data fee is added to the gas, in the estimate, the maximum and the funds needed', async () => {
+  const base = await send({ chainId: '0x2105' });
+  assert.equal(detail(base, 'Network fee'), '≈ 0.000065 ETH (50,000 gas at 1.1 gwei, plus 0.00001 ETH for the data posted to Ethereum)');
+  // What the oracle was given: the transaction RLP-serialized and unsigned (an EIP-1559 one, type 2), at the
+  // account's next nonce, for the gas the call uses.
+  const input = decodeAbiParameters([{ type: 'bytes' }], `0x${l1Inputs.at(-1)!.slice(10)}`)[0];
+  assert.equal(input.slice(0, 4), '0x02');
+  const capped = await send({ chainId: '0xa', gas: toHex(60_000n), maxFeePerGas: toHex(2n * GWEI), maxPriorityFeePerGas: toHex(GWEI / 10n) });
+  assert.equal(detail(capped, 'Network fee'), '≈ 0.000065 ETH (50,000 gas at 1.1 gwei, plus 0.00001 ETH for the data posted to Ethereum); at most 0.00013 ETH');
+  // A balance that covers the gas but not the L1 data fee on top is short: the chain charges both up front.
+  const short = await send({ chainId: '0x2105', value: '0x0', gas: toHex(60_000n), maxFeePerGas: toHex(2n * GWEI) }, deps(125_000n * GWEI));
+  assert.equal(short.warnings.find(w => w.code === 'insufficient_funds_for_gas')?.severity, 'danger');
+  // Not an OP Stack chain: no oracle call.
+  const before = l1Inputs.length;
+  await send({ chainId: '0x89' });
+  assert.equal(l1Inputs.length, before);
 });
 
 test('Nonces: already used, replacing a pending transaction, waiting behind a gap, or queued behind pending ones', async () => {

@@ -5,7 +5,7 @@ import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { previewRequest } from './preview.ts';
 import { RequestError } from './evm/transaction.ts';
-import { StaticTokenRegistry } from './chains.ts';
+import { EVM_RPCS, StaticTokenRegistry } from './chains.ts';
 import { HttpHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
 import { RpcSimulator } from './simulation.ts';
 import { ForkSimulator } from './fork-simulator.ts';
@@ -158,9 +158,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
  */
 export function liveDependencies(env = process.env, options: { warmUp?: boolean } = {}): Dependencies {
   const rpcs: Record<number, string> = {};
-  if (env.ETHEREUM_RPC_URL) rpcs[1] = env.ETHEREUM_RPC_URL;
-  if (env.ARBITRUM_RPC_URL) rpcs[42161] = env.ARBITRUM_RPC_URL;
-  if (env.HYPEREVM_RPC_URL) rpcs[999] = env.HYPEREVM_RPC_URL;
+  for (const [chainId, { env: name }] of Object.entries(EVM_RPCS)) if (env[name]) rpcs[Number(chainId)] = env[name]!;
   const rpc = new JsonRpcClient(rpcs);
   const cacheFile = env.SIGNING_PREVIEW_FORK_CACHE && env.SIGNING_PREVIEW_FORK_CACHE !== 'off' ? env.SIGNING_PREVIEW_FORK_CACHE : undefined;
   const fork = new ForkSimulator(rpcs, { cacheFile });

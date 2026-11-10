@@ -238,7 +238,8 @@ test('Router 2.1: an Across deposit (0x40) bridges the output, and other recipie
   const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
   const plain = await send(UR21_ARB, exec([0x02, 0x40], [triple(USDC, ROUTER_SELF, 100_000_000n), acrossInput({ inputAmount: 100_000_000n, recipient: BOB, depositor: BOB, outputToken: BASE_USDC, chain: 8453n, message: '0x1234' })]));
   assert.equal(plain.title, 'Bridge 100 USDC to Base through Across');
-  assert.match(detail(plain, 'Step 2')!, new RegExp(`${BOB} receives at least 99500000 base units of token ${BASE_USDC}`));
+  // Base's USDC is a known token (the built-in list): named, in its own decimals.
+  assert.match(detail(plain, 'Step 2')!, new RegExp(`${BOB} receives at least 99\\.5 USDC there`));
   for (const c of ['recipient_not_sender', 'bridge_refund_other', 'bridge_message']) assert.ok(codes(plain).includes(c), c);
 });
 

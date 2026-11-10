@@ -2,10 +2,11 @@
 // the network checks before including a transaction (eth_simulateV1 runs with validation off): the nonce, the fee cap
 // against the base fee, and that the balance covers the value plus the most the gas can cost. Those are read here,
 // with the network fee: gas used (from the simulation) at the current price, plus, on Arbitrum One, the gas charged
-// for the L1 data, which ArbOS reports through NodeInterface.gasEstimateL1Component.
-import { decodeAbiParameters, encodeFunctionData, parseAbi, type Hex } from 'viem';
+// for the L1 data, which ArbOS reports through NodeInterface.gasEstimateL1Component, and on OP Stack chains (Base,
+// OP Mainnet) the L1 data fee charged on top of the gas, which the GasPriceOracle predeploy computes.
+import { decodeAbiParameters, encodeFunctionData, keccak256, parseAbi, serializeTransaction, toHex, type Hex } from 'viem';
 import { formatUnits, type PreviewBuilder } from '../format.ts';
-import { CHAINS } from '../chains.ts';
+import { CHAINS, OP_STACK } from '../chains.ts';
 import type { Dependencies, PreviewContext } from '../types.ts';
 import type { Tx } from './common.ts';
 
@@ -14,8 +15,30 @@ const L1_COMPONENT = parseAbi(['function gasEstimateL1Component(address to, bool
 /** Arbitrum chains: L2 gas is charged at the base fee (no tip), and the L1 data is charged as extra gas. */
 const ARBITRUM = new Set([42161, 421614]);
 const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
+const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
+const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
 
-export interface NetworkFee { gas: bigint; l1Gas: bigint; price: bigint; estimate: bigint; maximum?: bigint }
+/**
+ * `l1Gas`: Arbitrum's gas for the L1 data (part of `gas`); `l1Fee`: an OP Stack chain's L1 data fee in wei, charged on
+ * top of the gas (in `estimate` and `maximum`).
+ */
+export interface NetworkFee { gas: bigint; l1Gas: bigint; l1Fee?: bigint; price: bigint; estimate: bigint; maximum?: bigint }
+
+/**
+ * The transaction as an OP Stack chain's GasPriceOracle takes it for getL1Fee: RLP-serialized and unsigned (it adds
+ * the signature's size itself), with the request's fields or those the wallet will fill in. Authorizations not yet
+ * signed get stand-in signatures of the same size that don't compress (the fee is on the compressed size).
+ */
+export function l1FeeInput(tx: Tx, f: { nonce: bigint; gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Hex {
+  const to = (tx.to ?? undefined) as Hex | undefined;
+  const filler = (i: number, k: string) => keccak256(toHex(`${k}${i}`));
+  if (tx.authorizations?.length) {
+    return serializeTransaction({ type: 'eip7702', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas, to, value: tx.value, data: tx.data,
+      authorizationList: tx.authorizations.map((a, i) => ({ address: a.address as Hex, chainId: a.chainId ?? tx.chainId, nonce: Number(a.nonce ?? f.nonce + 1n + BigInt(i)), ...(a.signature ?? { r: filler(i, 'r'), s: filler(i, 's'), yParity: 1 }) })) } as never);
+  }
+  if (tx.gasPrice !== undefined && tx.maxFeePerGas === undefined) return serializeTransaction({ type: 'legacy', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, gasPrice: tx.gasPrice, to, value: tx.value, data: tx.data });
+  return serializeTransaction({ type: 'eip1559', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas, to, value: tx.value, data: tx.data });
+}
 
 /**
  * Adds nonce, fee-cap and balance checks and the network fee to a transaction preview. `gasUsed` is the simulated
@@ -60,14 +83,22 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
   const priority = arbitrum ? 0n : tx.maxPriorityFeePerGas ?? (tx.gasPrice !== undefined && baseFee !== undefined ? (tx.gasPrice > baseFee ? tx.gasPrice - baseFee : 0n) : tip !== undefined ? BigInt(tip) : 0n);
   let price = baseFee !== undefined ? baseFee + priority : tx.gasPrice;
   if (price !== undefined && cap !== undefined && price > cap) price = cap;
-  const maximum = tx.gas !== undefined && cap !== undefined ? tx.gas * cap : undefined;
+  // OP Stack: the L1 data fee, at the L1 prices the chain last took in, charged on top of the gas.
+  let l1Fee: bigint | undefined;
+  if (OP_STACK.has(tx.chainId) && (gasUsed !== undefined || tx.gas !== undefined)) {
+    const input = l1FeeInput(tx, { nonce: tx.nonce ?? (latestNonce !== undefined ? BigInt(latestNonce) : 0n), gas: tx.gas ?? gasUsed!, maxFeePerGas: cap ?? (price ?? 0n) * 2n, maxPriorityFeePerGas: priority });
+    const out = await call<string>('eth_call', [{ to: GAS_PRICE_ORACLE, data: encodeFunctionData({ abi: L1_FEE, functionName: 'getL1Fee', args: [input] }) }, 'latest']);
+    if (out && /^0x[0-9a-f]{64}$/i.test(out)) l1Fee = BigInt(out);
+  }
+  const maximum = tx.gas !== undefined && cap !== undefined ? tx.gas * cap + (l1Fee ?? 0n) : undefined;
+  const l1Part = l1Fee ? `, plus ${native(l1Fee)} for the data posted to Ethereum` : '';
   let fee: NetworkFee | undefined;
   if (gasUsed !== undefined && price !== undefined) {
     const gas = gasUsed + l1Gas;
-    fee = { gas, l1Gas, price, estimate: gas * price, ...(maximum !== undefined && { maximum }) };
-    b.detail('Network fee', `≈ ${native(fee.estimate)} (${gas.toLocaleString('en-US')} gas at ${gwei(price)}${l1Gas ? `, ${l1Gas.toLocaleString('en-US')} of it for the data posted to Ethereum` : ''})${maximum !== undefined ? `; at most ${native(maximum)}` : ''}`, fee.estimate.toString());
+    fee = { gas, l1Gas, ...(l1Fee !== undefined && { l1Fee }), price, estimate: gas * price + (l1Fee ?? 0n), ...(maximum !== undefined && { maximum }) };
+    b.detail('Network fee', `≈ ${native(fee.estimate)} (${gas.toLocaleString('en-US')} gas at ${gwei(price)}${l1Gas ? `, ${l1Gas.toLocaleString('en-US')} of it for the data posted to Ethereum` : ''}${l1Part})${maximum !== undefined ? `; at most ${native(maximum)}` : ''}`, fee.estimate.toString());
   } else if (maximum !== undefined) {
-    b.detail('Network fee', `at most ${native(maximum)} (gas limit ${tx.gas!.toLocaleString('en-US')} at up to ${gwei(cap!)})`, maximum.toString());
+    b.detail('Network fee', `at most ${native(maximum)} (gas limit ${tx.gas!.toLocaleString('en-US')} at up to ${gwei(cap!)}${l1Part})`, maximum.toString());
   }
 
   // Balance: the network only accepts a transaction whose sender can pay the value plus gas limit × fee cap.

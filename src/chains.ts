@@ -7,11 +7,34 @@ export const CHAINS: Record<number, { name: string; nativeSymbol: string; native
   1: { name: 'Ethereum', nativeSymbol: 'ETH', nativeDecimals: 18 },
   42161: { name: 'Arbitrum One', nativeSymbol: 'ETH', nativeDecimals: 18 },
   999: { name: 'HyperEVM', nativeSymbol: 'HYPE', nativeDecimals: 18 },
+  8453: { name: 'Base', nativeSymbol: 'ETH', nativeDecimals: 18 },
+  10: { name: 'OP Mainnet', nativeSymbol: 'ETH', nativeDecimals: 18 },
+  137: { name: 'Polygon', nativeSymbol: 'POL', nativeDecimals: 18 },
+  56: { name: 'BNB Chain', nativeSymbol: 'BNB', nativeDecimals: 18 },
   // Testnets (CCTP routes to HyperCore testnet).
   11155111: { name: 'Ethereum Sepolia', nativeSymbol: 'ETH', nativeDecimals: 18 },
   421614: { name: 'Arbitrum Sepolia', nativeSymbol: 'ETH', nativeDecimals: 18 },
   998: { name: 'HyperEVM Testnet', nativeSymbol: 'HYPE', nativeDecimals: 18 },
 };
+
+/**
+ * The EVM chains previews simulate on: the environment variable that names each one's RPC (live mode simulates on a
+ * chain only when it is set), and a public RPC the scripts and scheduled replays use when it isn't.
+ */
+export const EVM_RPCS: Record<number, { env: string; public: string }> = {
+  1: { env: 'ETHEREUM_RPC_URL', public: 'https://ethereum-rpc.publicnode.com' },
+  42161: { env: 'ARBITRUM_RPC_URL', public: 'https://arb1.arbitrum.io/rpc' },
+  999: { env: 'HYPEREVM_RPC_URL', public: 'https://rpc.hyperliquid.xyz/evm' },
+  8453: { env: 'BASE_RPC_URL', public: 'https://base-rpc.publicnode.com' },
+  10: { env: 'OPTIMISM_RPC_URL', public: 'https://optimism-rpc.publicnode.com' },
+  137: { env: 'POLYGON_RPC_URL', public: 'https://polygon-bor-rpc.publicnode.com' },
+  56: { env: 'BSC_RPC_URL', public: 'https://bsc-rpc.publicnode.com' },
+};
+/** The RPC for a chain: its environment variable's (empty counts as unset, as an unset CI secret is), else the public one. */
+export const rpcUrlFor = (chainId: number, env: Record<string, string | undefined>): string | undefined =>
+  EVM_RPCS[chainId] && (env[EVM_RPCS[chainId].env] || EVM_RPCS[chainId].public);
+/** OP Stack chains: each transaction also pays an L1 data fee, which the GasPriceOracle predeploy computes. */
+export const OP_STACK = new Set([8453, 10]);
 
 export function chainName(chainId: number): string {
   return CHAINS[chainId]?.name ?? `chain ${chainId}`;
@@ -158,6 +181,40 @@ const BUILTIN_TOKENS: Record<number, TokenInfo[]> = {
     { address: '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8', symbol: 'USDC.e', decimals: 6, name: 'Bridged USDC' },
     { address: '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', symbol: 'USDT', decimals: 6, name: 'Tether USD' },
     { address: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', symbol: 'WETH', decimals: 18, name: 'Wrapped Ether' },
+  ],
+  // Base, OP Mainnet, Polygon and BNB Chain: symbol and decimals read on-chain 2026-11-10 (bridged USDC listed as
+  // USDC.e, as on Arbitrum).
+  8453: [
+    { address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', decimals: 6, name: 'USD Coin' },
+    { address: '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', symbol: 'USDbC', decimals: 6, name: 'USD Base Coin' },
+    { address: '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2', symbol: 'USDT', decimals: 6, name: 'Tether USD' },
+    { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH', decimals: 18, name: 'Wrapped Ether' },
+    { address: '0x50c5725949a6f0c72e6c4a641f24049a917db0cb', symbol: 'DAI', decimals: 18, name: 'Dai Stablecoin' },
+    { address: '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf', symbol: 'cbBTC', decimals: 8, name: 'Coinbase Wrapped BTC' },
+  ],
+  10: [
+    { address: '0x0b2c639c533813f4aa9d7837caf62653d097ff85', symbol: 'USDC', decimals: 6, name: 'USD Coin' },
+    { address: '0x7f5c764cbc14f9669b88837ca1490cca17c31607', symbol: 'USDC.e', decimals: 6, name: 'Bridged USDC' },
+    { address: '0x94b008aa00579c1307b0ef2c499ad98a8ce58e58', symbol: 'USDT', decimals: 6, name: 'Tether USD' },
+    { address: '0x01bff41798a0bcf287b996046ca68b395dbc1071', symbol: 'USD₮0', decimals: 6, name: 'USD₮0' },
+    { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH', decimals: 18, name: 'Wrapped Ether' },
+    { address: '0xda10009cbd5d07dd0cecc66161fc93d7c9000da1', symbol: 'DAI', decimals: 18, name: 'Dai Stablecoin' },
+    { address: '0x4200000000000000000000000000000000000042', symbol: 'OP', decimals: 18, name: 'Optimism' },
+  ],
+  137: [
+    { address: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', symbol: 'USDC', decimals: 6, name: 'USD Coin' },
+    { address: '0x2791bca1f2de4661ed88a30c99a7a9449aa84174', symbol: 'USDC.e', decimals: 6, name: 'USD Coin (PoS)' },
+    { address: '0xc2132d05d31c914a87c6611c10748aeb04b58e8f', symbol: 'USDT0', decimals: 6, name: 'USDT0' },
+    { address: '0x7ceb23fd6bc0add59e62ac25578270cff1b9f619', symbol: 'WETH', decimals: 18, name: 'Wrapped Ether' },
+    { address: '0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270', symbol: 'WPOL', decimals: 18, name: 'Wrapped Polygon Ecosystem Token' },
+    { address: '0x8f3cf7ad23cd3cadbd9735aff958023239c6a063', symbol: 'DAI', decimals: 18, name: '(PoS) Dai Stablecoin' },
+  ],
+  56: [
+    { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT', decimals: 18, name: 'Tether USD' },
+    { address: '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d', symbol: 'USDC', decimals: 18, name: 'USD Coin' },
+    { address: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', symbol: 'WBNB', decimals: 18, name: 'Wrapped BNB' },
+    { address: '0x2170ed0880ac9a755fd29b2688956bd959f933f8', symbol: 'ETH', decimals: 18, name: 'Ethereum Token' },
+    { address: '0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c', symbol: 'BTCB', decimals: 18, name: 'BTCB Token' },
   ],
   999: [
     { address: '0xb88339cb7199b77e23db6e890353e22632ba630f', symbol: 'USDC', decimals: 6, name: 'USD Coin' },
