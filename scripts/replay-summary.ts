@@ -9,7 +9,7 @@ import { chainName } from '../src/chains.ts';
 
 type Row = {
   hash: string; kind: string; outcome: boolean; whole: boolean; standIn?: string; notSimulated?: boolean; prefix?: string;
-  bundle?: { size: number; index: number }; gas?: { percent: number }; timeBumped?: boolean; tokens?: string; callsOnlyBecause?: string; tokenDiffs?: unknown;
+  bundle?: { size: number; index: number }; gas?: { percent: number }; timeBumped?: boolean; relayedBy?: string; tokens?: string; callsOnlyBecause?: string; tokenDiffs?: unknown;
   /** What the harness found the preview got wrong (see scripts/accuracy-4337.ts): 'outcome', 'gas', 'tokens'. */
   differs?: string[];
   /** An outcome the preview got wrong while warning it might (see scripts/accuracy-4337.ts). */
@@ -38,7 +38,8 @@ for (const name of readdirSync(dir).sort()) {
   // Gas is judged for operations alone in their bundle (see scripts/accuracy-4337.ts).
   // Not one run a second after its block (BNB Chain): what writes once a second costs more there.
   // Nor one whose account rejected the stand-in (its signature check didn't run).
-  const gas = rows.filter(r => r.gas && !r.bundle && !r.timeBumped && r.standIn !== 'rejected' && judged(r));
+  // Nor one relayed by a bundler's contract (it warms state before the EntryPoint runs).
+  const gas = rows.filter(r => r.gas && !r.bundle && !r.relayedBy && !r.timeBumped && r.standIn !== 'rejected' && judged(r));
   const tokens = rows.filter(r => r.tokens);
   const wrong = rows.filter(r => r.differs?.length);
   total += rows.length; wrongTotal += wrong.length;
