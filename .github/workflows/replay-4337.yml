@@ -77,6 +77,26 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  summary:
+    # One table across the chains and EntryPoint versions, in the run's summary.
+    needs: replay
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: reports
+          pattern: replay-*
+      - name: Summarize
+        run: node scripts/replay-summary.ts reports >> "$GITHUB_STEP_SUMMARY"
+
   report-failure:
     needs: replay
     if: failure() && github.event_name == 'schedule'

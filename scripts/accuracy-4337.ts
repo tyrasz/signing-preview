@@ -8,8 +8,8 @@
 // differs from its receipt or, for one simulated whole on its block's state, its gas is 5% or more off or its token
 // movements differ beyond rounding.
 //
-// How accurate whole-operation simulation is (src/erc4337-sim.ts), measured against what happened. Recent
-// single-operation bundles of an EntryPoint are rebuilt as the request their owner signed:
+// How accurate whole-operation simulation is (src/erc4337-sim.ts), measured against what happened. Recent operations
+// of an EntryPoint are rebuilt as the request their owner signed:
 //   (an operation in a bundle of several, up to five of them, after the bundle's earlier operations as a handleOps of
 //   their own: gas reported apart, as warm state from the same transaction is cold in a replay);
 //   - a SafeOp, for a Safe whose fallback handler is one of the known 4337 modules (src/typed-data/safe.ts);
@@ -270,6 +270,19 @@ async function replay(item: string): Promise<void> {
     ...(!ran(p) && { notSimulated: true }),
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
+  const row = rows.at(-1)!;
+  // Where the preview was wrong (not a shape the stand-in doesn't take, or a node refusing): an outcome it got
+  // wrong; and, where it simulated the whole operation on the state the operation met, gas 5% or more off (for an
+  // operation alone in its bundle, above) or token movements beyond rounding. Calls simulated alone leave out the gas
+  // payment and any paymaster's charge, as their preview says; without the block's earlier transactions, amounts can
+  // move. The summary (scripts/replay-summary.ts) reads this.
+  const judged = row.whole === true && !row.prefix;
+  const differs = row.notSimulated ? [] : [
+    !row.outcome && 'outcome',
+    judged && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
+    judged && row.tokens === 'other' && 'tokens',
+  ].filter((x): x is string => !!x);
+  if (differs.length) row.differs = differs;
   process.stdout.write('.');
 }
 
@@ -333,12 +346,8 @@ for (const r of rows) {
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 
-// Differences that mean the preview was wrong (not a shape the stand-in doesn't take, or a node refusing): an outcome
-// it got wrong; and, where it simulated the whole operation on the state the operation met, gas 5% or more off or
-// token movements beyond rounding. (Calls simulated alone leave out the gas payment and any paymaster's charge, as
-// their preview says; without the block's earlier transactions, amounts can move.)
-const judged = (r: Row) => r.whole === true && !r.prefix;
-const wrong = rows.filter(r => !r.notSimulated && (!r.outcome || (judged(r) && ((g(r) && Math.abs(g(r)!.percent) >= 5) || r.tokens === 'other'))));
+// The operations whose preview was wrong (each row's `differs`, set where it was replayed).
+const wrong = rows.filter(r => (r.differs as string[] | undefined)?.length);
 const md = arg('summary-md', '');
 if (md) {
   const chain = CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum';
