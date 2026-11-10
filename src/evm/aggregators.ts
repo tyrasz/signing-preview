@@ -4,6 +4,7 @@
 import { decodeFunctionData, parseAbi, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { builtinTokens, CHAINS } from '../chains.ts';
+import { wrappedNative } from './universal-router.ts';
 import { decoded, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
 import { chainLabel } from './universal-router.ts';
 
@@ -83,10 +84,10 @@ const oneInchAdapter: Adapter = async (tx, env) => {
     minReturn = eth ? rest[0] : rest[2];
     const dexes = (eth ? rest.slice(1) : rest.slice(3)).map(BigInt);
     // An ETH swap starts from WETH in the first pool.
-    const start = eth ? builtinTokens(tx.chainId).find(t => t.symbol === 'WETH')?.address ?? src : src;
+    const start = eth ? wrappedNative(tx.chainId) ?? src : src;
     dst = await unoswapOutput(env, tx.chainId, start, dexes);
     // Bit 252 of the last pool word: unwrap the WETH out of it, so the swap pays out ETH (checked against receipts).
-    if (dst && sameAddress(dst, builtinTokens(tx.chainId).find(t => t.symbol === 'WETH')?.address ?? '') && (dexes[dexes.length - 1] >> 252n) & 1n) dst = NATIVE_ALIASES[0];
+    if (dst && sameAddress(dst, wrappedNative(tx.chainId) ?? '') && (dexes[dexes.length - 1] >> 252n) & 1n) dst = NATIVE_ALIASES[0];
     receiver = to === undefined ? tx.from : addressOf(to);
     b.detail('Pools', dexes.map(d => `${['Uniswap v2', 'Uniswap v3', 'Curve'][Number(d >> 253n)] ?? 'unknown'} ${shortAddress(addressOf(d))}`).join(' → '));
   }
@@ -192,7 +193,7 @@ const okxAdapter: Adapter = async (tx, env) => {
   try { call = decodeFunctionData({ abi: OKX_ABI, data: tx.data }); } catch { return null; }
   const b = new PreviewBuilder().detail('Contract', `OKX DEX router (${tx.to})`, tx.to!);
   let src: string, dst: string | null, amount: bigint, minReturn: bigint, receiver = tx.from;
-  const weth = builtinTokens(tx.chainId).find(t => t.symbol === 'WETH')?.address ?? NATIVE_ALIASES[0];
+  const weth = wrappedNative(tx.chainId) ?? NATIVE_ALIASES[0];
   const req = (call.args as readonly unknown[]).find(a => !!a && typeof a === 'object' && !Array.isArray(a) && 'toToken' in a) as { fromToken: bigint; toToken: string; fromTokenAmount: bigint; minReturnAmount: bigint } | undefined;
   if (req) {
     const args = call.args as readonly unknown[];

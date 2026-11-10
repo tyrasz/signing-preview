@@ -431,7 +431,7 @@ console.log('\n7. Simulated NFT transfers and approvals set along the way');
 console.log('\n8. Recent real Uniswap Universal Router transactions on Ethereum');
 {
   const tokens = new ChainedTokenRegistry([new StaticTokenRegistry(), new OnchainTokenRegistry(live)]);
-  const routers = Object.entries(UNIVERSAL_ROUTERS).filter(([, v]) => v.chainId === 1).map(([a]) => a);
+  const routers = Object.entries(UNIVERSAL_ROUTERS).filter(([, v]) => v.chains.includes(1)).map(([a]) => a);
   const sym = async (a: string) => a === 'native' ? 'ETH' : (await tokens.get(1, a))?.symbol ?? a;
   let n = BigInt(String(await live.call(1, 'eth_blockNumber', []))) - 2n;
   const txs: { hash: string; from: string; to: string; input: Hex; value: string; ts: number }[] = [];

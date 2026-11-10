@@ -1,4 +1,6 @@
-// npm run coverage -- [--hours 24] [--eth 300] [--arb 1500] [--hyperevm 1500] [--offline] [--out report.json]
+// npm run coverage -- [--hours 24] [--eth 300] [--arb 1500] [--hyperevm 1500] [--chains 1,42161,999] [--offline] [--out report.json]
+//   --chains also takes 8453 (Base, --base 1500), 10 (OP Mainnet, --op 1500), 137 (Polygon, --polygon 1500) and 56
+//   (BNB Chain, --bsc 1500).
 //
 // How much real on-chain traffic the previewer can read. Samples blocks evenly across the last `hours` on Ethereum,
 // Arbitrum One and HyperEVM, previews every transaction in them as an eth_sendTransaction request, and reports:
@@ -11,7 +13,7 @@
 // opaque remainder online: verified ABIs on Sourcify for the busiest contracts, and function names on OpenChain.
 import { writeFileSync } from 'node:fs';
 import { previewRequest } from '../src/preview.ts';
-import { StaticTokenRegistry } from '../src/chains.ts';
+import { rpcUrlFor, StaticTokenRegistry } from '../src/chains.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { ChainedSignatures, ContractAbiResolver, SourcifyAbiSource } from '../src/abi.ts';
 import type { AbiResolver, ContractAbi, Dependencies, Preview, SignatureCandidate, SignatureResolver } from '../src/types.ts';
@@ -19,11 +21,16 @@ import type { AbiResolver, ContractAbi, Dependencies, Preview, SignatureCandidat
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const HOURS = Number(arg('hours', '24'));
 const OFFLINE = process.argv.includes('--offline');
+const WANTED = arg('chains', '1,42161,999').split(',').map(Number);
 const CHAINS = [
-  { id: 1, name: 'Ethereum', url: process.env.ETHEREUM_RPC_URL ?? 'https://ethereum-rpc.publicnode.com', blocks: Number(arg('eth', '300')) },
-  { id: 42161, name: 'Arbitrum One', url: process.env.ARBITRUM_RPC_URL ?? 'https://arb1.arbitrum.io/rpc', blocks: Number(arg('arb', '1500')) },
-  { id: 999, name: 'HyperEVM', url: process.env.HYPEREVM_RPC_URL ?? 'https://rpc.hyperliquid.xyz/evm', blocks: Number(arg('hyperevm', '1500')) },
-];
+  { id: 1, name: 'Ethereum', blocks: Number(arg('eth', '300')) },
+  { id: 42161, name: 'Arbitrum One', blocks: Number(arg('arb', '1500')) },
+  { id: 999, name: 'HyperEVM', blocks: Number(arg('hyperevm', '1500')) },
+  { id: 8453, name: 'Base', blocks: Number(arg('base', '1500')) },
+  { id: 10, name: 'OP Mainnet', blocks: Number(arg('op', '1500')) },
+  { id: 137, name: 'Polygon', blocks: Number(arg('polygon', '1500')) },
+  { id: 56, name: 'BNB Chain', blocks: Number(arg('bsc', '1500')) },
+].filter(c => WANTED.includes(c.id)).map(c => ({ ...c, url: rpcUrlFor(c.id, process.env)! }));
 const TOP_CONTRACTS = Number(arg('top', '150')); // opaque contracts looked up on Sourcify per chain
 const rpc = new JsonRpcClient(Object.fromEntries(CHAINS.map(c => [c.id, c.url])), { timeoutMs: 30_000, retries: 6, retryDelayMs: 500 });
 
@@ -40,8 +47,8 @@ const shapeOf = (data: string): Shape => {
   if (bytes < 4 || (bytes - 4) % 32 !== 0) return 'packed';
   return data.startsWith('0x0000') ? 'vanity' : 'abi';
 };
-/** Arbitrum's own transaction types (deposits, retryables, ArbOS internal): nobody signs these in a wallet. */
-const SYSTEM_TYPES: Record<number, Set<string>> = { 42161: new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) };
+/** Chains' own transaction types (Arbitrum's deposits, retryables and ArbOS internals; OP Stack deposits). */
+const SYSTEM_TYPES: Record<number, Set<string>> = { 42161: new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']), 8453: new Set(['0x7e']), 10: new Set(['0x7e']) };
 
 async function pool<T, R>(items: T[], size: number, fn: (t: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length);

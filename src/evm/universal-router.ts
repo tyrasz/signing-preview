@@ -15,23 +15,42 @@ import { decoded, selectorOf, tokenInfo, tokenSourceWarnings, type Adapter, type
 type Version = 'v2.1' | 'v2' | 'v1.2' | 'v1.0';
 /**
  * Official deployments (github.com/Uniswap/universal-router deploy-addresses), each verified on Sourcify as
- * UniversalRouter. `release` is shown to the user.
+ * UniversalRouter on every chain it is listed for (Base, OP Mainnet, Polygon and BNB Chain checked 2026-11-10; the
+ * same release's code has the same size on each). Some addresses are the same deployment on several chains.
+ * `release` is shown to the user.
  */
-export const UNIVERSAL_ROUTERS: Record<string, { chainId: number; version: Version; release: string }> = {
-  '0x23617e59a5925b2a4bf75d73ff6711cd0b29de85': { chainId: 1, version: 'v2.1', release: '2.1.2' },
-  '0x4c82d1fbfe28c977cbb58d8c7ff8fcf9f70a2cca': { chainId: 1, version: 'v2.1', release: '2.1.1' },
-  '0x66a9893cc07d91d95644aedd05d03f95e1dba8af': { chainId: 1, version: 'v2', release: '2.0' },
-  '0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad': { chainId: 1, version: 'v1.2', release: '1.2' },
+export const UNIVERSAL_ROUTERS: Record<string, { chains: number[]; version: Version; release: string }> = {
+  '0x23617e59a5925b2a4bf75d73ff6711cd0b29de85': { chains: [1], version: 'v2.1', release: '2.1.2' },
+  '0x4c82d1fbfe28c977cbb58d8c7ff8fcf9f70a2cca': { chains: [1], version: 'v2.1', release: '2.1.1' },
+  '0x66a9893cc07d91d95644aedd05d03f95e1dba8af': { chains: [1], version: 'v2', release: '2.0' },
+  '0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad': { chains: [1, 8453], version: 'v1.2', release: '1.2' },
   // The original release (Nov 2022), with its NFT-era command table; little used since 1.2.
-  '0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b': { chainId: 1, version: 'v1.0', release: '1.0' },
-  '0x2d01411773c8c24805306e89a41f7855c3c4fe65': { chainId: 42161, version: 'v2.1', release: '2.1.2' },
-  '0x8b844f885672f333bc0042cb669255f93a4c1e6b': { chainId: 42161, version: 'v2.1', release: '2.1.1' },
-  '0xa51afafe0263b40edaef0df8781ea9aa03e381a3': { chainId: 42161, version: 'v2', release: '2.0' },
-  '0x5e325eda8064b456f4781070c0738d849c824258': { chainId: 42161, version: 'v1.2', release: '1.2' },
-  '0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4': { chainId: 42161, version: 'v1.2', release: '1.2' }, // the build without Uniswap v2
-  '0x4c60051384bd2d3c01bfc845cf5f4b44bcbe9de5': { chainId: 42161, version: 'v1.0', release: '1.0' },
-  '0x9afe3c497e19501db228f28cdbdd29bc98f65dba': { chainId: 999, version: 'v2.1', release: '2.2.0' },
-  '0xed270a1bcdc63cf1356d695e7f40961d4819d6bf': { chainId: 999, version: 'v2.1', release: '2.1.2' },
+  '0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b': { chains: [1], version: 'v1.0', release: '1.0' },
+  '0x2d01411773c8c24805306e89a41f7855c3c4fe65': { chains: [42161], version: 'v2.1', release: '2.1.2' },
+  '0x8b844f885672f333bc0042cb669255f93a4c1e6b': { chains: [42161, 10, 137, 56], version: 'v2.1', release: '2.1.1' },
+  '0xa51afafe0263b40edaef0df8781ea9aa03e381a3': { chains: [42161], version: 'v2', release: '2.0' },
+  '0x5e325eda8064b456f4781070c0738d849c824258': { chains: [42161], version: 'v1.2', release: '1.2' },
+  '0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4': { chains: [42161, 8453, 10, 56], version: 'v1.2', release: '1.2' }, // the build without Uniswap v2
+  '0x4c60051384bd2d3c01bfc845cf5f4b44bcbe9de5': { chains: [42161, 137], version: 'v1.0', release: '1.0' },
+  '0x9afe3c497e19501db228f28cdbdd29bc98f65dba': { chains: [999], version: 'v2.1', release: '2.2.0' },
+  '0xed270a1bcdc63cf1356d695e7f40961d4819d6bf': { chains: [999], version: 'v2.1', release: '2.1.2' },
+  // Base
+  '0xd6145b2d3f379919e8cdeda7b97e37c4b2ca9c40': { chains: [8453], version: 'v2.1', release: '2.1.2' },
+  '0xfdf682f51fe81aa4898f0ae2163d8a55c127fbc7': { chains: [8453], version: 'v2.1', release: '2.1.1' },
+  '0x6ff5693b99212da76ad316178a184ab56d299b43': { chains: [8453], version: 'v2', release: '2.0' },
+  // OP Mainnet
+  '0xc09255d86db563cbc11c2fcf4a0c512e160111b4': { chains: [10], version: 'v2.1', release: '2.1.2' },
+  '0x851116d9223fabed8e56c0e6b8ad0c31d98b3507': { chains: [10], version: 'v2', release: '2.0' },
+  '0xcb1355ff08ab38bbce60111f1bb2b784be25d7e8': { chains: [10], version: 'v1.2', release: '1.2' },
+  '0xb555edf5dcf85f42ceef1f3630a52a108e55a654': { chains: [10], version: 'v1.0', release: '1.0' },
+  // Polygon and BNB Chain (2.1.2 at the same address on both)
+  '0xdc264714f68d84cf29bc605589405e78bdbe7c9f': { chains: [137, 56], version: 'v2.1', release: '2.1.2' },
+  '0x1095692a6237d83c6a72f3f5efedb9a670c49223': { chains: [137], version: 'v2', release: '2.0' },
+  '0xec7be89e9d109e7e3fec59c222cf297125fefda2': { chains: [137], version: 'v1.2', release: '1.2' },
+  '0x643770e279d5d0733f21d6dc03a8efbabf3255b4': { chains: [137], version: 'v1.2', release: '1.2' }, // the build without Uniswap v2
+  '0x1906c1d672b88cd1b9ac7593301ca990f94eae07': { chains: [56], version: 'v2', release: '2.0' },
+  '0x4dae2f939acf50408e13d58534ff8c2776d45265': { chains: [56], version: 'v1.2', release: '1.2' },
+  '0x5dc88340e1c5c6366864ee415d6034cadd1a9897': { chains: [56], version: 'v1.0', release: '1.0' },
 };
 
 const EXECUTE = parseAbi([
@@ -578,7 +597,7 @@ async function routeSignature(c: Ctx, args: readonly unknown[]): Promise<string>
 
 export const universalRouterAdapter: Adapter = async (tx, env) => {
   const deployment = tx.to ? UNIVERSAL_ROUTERS[tx.to] : undefined;
-  if (!deployment || deployment.chainId !== tx.chainId) return null;
+  if (!deployment || !deployment.chains.includes(tx.chainId)) return null;
   let decodedCall;
   try { decodedCall = decodeFunctionData({ abi: EXECUTE, data: tx.data }); } catch { return null; }
   const signed = decodedCall.functionName === 'executeSigned';
