@@ -121,8 +121,11 @@ export function normalizeTransaction(raw: unknown, context: PreviewContext, fall
   // Optional fields the wallet may already have filled in: kept only when present.
   const optional = (field: string) => t[field] === undefined || t[field] === null || t[field] === '' ? undefined : quantity(t[field], field);
   const fees = { gas: optional('gas') ?? optional('gasLimit'), gasPrice: optional('gasPrice'), maxFeePerGas: optional('maxFeePerGas'), maxPriorityFeePerGas: optional('maxPriorityFeePerGas'), nonce: optional('nonce') };
+  // An access list in the standard shape ({ address, storageKeys }[]); anything else is left out.
+  const accessList = Array.isArray(t.accessList) && t.accessList.length && t.accessList.every(a => a && typeof a === 'object' && ADDRESS.test(String((a as { address?: unknown }).address)) && Array.isArray((a as { storageKeys?: unknown }).storageKeys) && ((a as { storageKeys: unknown[] }).storageKeys).every(k => typeof k === 'string' && /^0x[0-9a-fA-F]{64}$/.test(k)))
+    ? (t.accessList as { address: string; storageKeys: string[] }[]).map(a => ({ address: a.address.toLowerCase(), storageKeys: a.storageKeys.map(k => k.toLowerCase()) })) : undefined;
   return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value'), ...(authorizations?.length && { authorizations }),
-    ...Object.fromEntries(Object.entries(fees).filter(([, v]) => v !== undefined)) };
+    ...Object.fromEntries(Object.entries(fees).filter(([, v]) => v !== undefined)), ...(accessList && { accessList }) };
 }
 
 /**
@@ -261,7 +264,7 @@ export function simulationRequest(tx: Tx, d?: Decoded): SimulationRequest {
   for (const c of d?.assetChanges ?? []) if (/^0x[0-9a-fA-F]{40}$/.test(c.asset ?? '')) watch.add(c.asset!.toLowerCase());
   for (const a of d?.declaredApprovals ?? []) { watch.add(a.token.toLowerCase()); watch.add(a.spender.toLowerCase()); }
   // The request's gas limit, so a limit too low for the call shows as running out of gas.
-  return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }), ...(tx.gas !== undefined && { gas: tx.gas }) };
+  return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }), ...(tx.gas !== undefined && { gas: tx.gas }), ...(tx.accessList && { accessList: tx.accessList }) };
 }
 
 /** The wallet's own transactions still waiting to be mined, as simulation requests run before this one. */

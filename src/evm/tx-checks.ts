@@ -31,13 +31,18 @@ export interface NetworkFee { gas: bigint; l1Gas: bigint; l1Fee?: bigint; price:
  */
 export function l1FeeInput(tx: Tx, f: { nonce: bigint; gas: bigint; maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }): Hex {
   const to = (tx.to ?? undefined) as Hex | undefined;
+  // The access list is part of what's posted (a long one more than doubled a Base transaction's L1 fee).
+  const accessList = tx.accessList?.map(a => ({ address: a.address as Hex, storageKeys: a.storageKeys as Hex[] }));
   const filler = (i: number, k: string) => keccak256(toHex(`${k}${i}`));
   if (tx.authorizations?.length) {
-    return serializeTransaction({ type: 'eip7702', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas, to, value: tx.value, data: tx.data,
+    return serializeTransaction({ type: 'eip7702', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas, to, value: tx.value, data: tx.data, ...(accessList && { accessList }),
       authorizationList: tx.authorizations.map((a, i) => ({ address: a.address as Hex, chainId: a.chainId ?? tx.chainId, nonce: Number(a.nonce ?? f.nonce + 1n + BigInt(i)), ...(a.signature ?? { r: filler(i, 'r'), s: filler(i, 's'), yParity: 1 }) })) } as never);
   }
-  if (tx.gasPrice !== undefined && tx.maxFeePerGas === undefined) return serializeTransaction({ type: 'legacy', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, gasPrice: tx.gasPrice, to, value: tx.value, data: tx.data });
-  return serializeTransaction({ type: 'eip1559', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas, to, value: tx.value, data: tx.data });
+  if (tx.gasPrice !== undefined && tx.maxFeePerGas === undefined) {
+    return accessList ? serializeTransaction({ type: 'eip2930', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, gasPrice: tx.gasPrice, to, value: tx.value, data: tx.data, accessList })
+      : serializeTransaction({ type: 'legacy', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, gasPrice: tx.gasPrice, to, value: tx.value, data: tx.data });
+  }
+  return serializeTransaction({ type: 'eip1559', chainId: tx.chainId, nonce: Number(f.nonce), gas: f.gas, maxFeePerGas: f.maxFeePerGas, maxPriorityFeePerGas: f.maxPriorityFeePerGas, to, value: tx.value, data: tx.data, ...(accessList && { accessList }) });
 }
 
 /**

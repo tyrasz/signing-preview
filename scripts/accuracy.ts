@@ -44,6 +44,7 @@ const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69'
 /** BNB Chain's system transactions: the block's validator, at no gas price, to its system contracts. */
 const isSystem = (t: T, b: B) => SYSTEM.has(t.type) || (CHAIN === 56 && t.from.toLowerCase() === b.miner.toLowerCase() && BigInt(t.gasPrice) === 0n);
 const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
+const L1_INFO_DEPOSITOR = '0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001';
 const GET_L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
 const FOLLOW = Number(arg('follow', '0'));
 const MAX = Number(arg('max', '0')) || Infinity, STRICT = process.argv.includes('--strict'), SUMMARY_MD = arg('summary-md', '');
@@ -157,12 +158,15 @@ async function replay(b: B, seen?: Set<string>) {
     const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice) + extraFee(r) - paidIn;
     const approvals = logs.approvals.filter(a => a.owner === from && !(a.kind === 'erc721' && /^0x0{40}$/.test(a.spender))).map(a => `${a.kind}:${a.token}:${a.spender}`);
     const row: Record<string, unknown> = { hash: t.hash, block: n, index, to: t.to, selector: t.input.slice(0, 10), receipt: r.status === '0x1' ? 'success' : 'reverted', receiptGas: (BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0)).toString(), receiptTotal: BigInt(r.gasUsed).toString(), receiptL1: BigInt(r.gasUsedForL1 ?? 0).toString() };
-    const before = await Promise.all(b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type)).map(x => reqOf(x, parent)));
+    // The block's earlier transactions, the chain's own left out, except an OP Stack block's L1 info deposit (its
+    // first transaction, from the L1 attributes depositor to the L1Block predeploy): the L1 values it sets for the
+    // block are what a contract pricing L1 data (a paymaster, a bridge) reads, and as a plain call it runs as on-chain.
+    const before = await Promise.all(b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type) || x.from.toLowerCase() === L1_INFO_DEPOSITOR).map(x => reqOf(x, parent)));
     // OP Stack: the preview's L1 data fee for this transaction, at the block's L1 prices (set by its first, deposit
     // transaction, so read after the block), against the receipt's.
     if (OP_STACK.has(CHAIN) && r.l1Fee) {
       try {
-        const input = l1FeeInput({ chainId: CHAIN, from, to: t.to, data: t.input, value: BigInt(t.value), ...(t.maxFeePerGas === undefined && { gasPrice: BigInt(t.gasPrice) }),
+        const input = l1FeeInput({ chainId: CHAIN, from, to: t.to, data: t.input, value: BigInt(t.value), ...(t.maxFeePerGas === undefined && { gasPrice: BigInt(t.gasPrice) }), ...(t.accessList?.length && { accessList: t.accessList }),
           ...(t.authorizationList?.length && { authorizations: t.authorizationList.map(a => ({ address: a.address, chainId: Number(a.chainId), nonce: BigInt(a.nonce), signature: { r: a.r, s: a.s, yParity: Number(a.yParity) } })) }) },
           { nonce: BigInt(t.nonce), gas: BigInt(t.gas), maxFeePerGas: BigInt(t.maxFeePerGas ?? t.gasPrice), maxPriorityFeePerGas: BigInt(t.maxPriorityFeePerGas ?? 0) });
         const est = BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: GAS_PRICE_ORACLE, data: encodeFunctionData({ abi: GET_L1_FEE, functionName: 'getL1Fee', args: [input] }) }, b.number])));
@@ -211,6 +215,10 @@ async function replay(b: B, seen?: Set<string>) {
         // calls moved for the sender (traceTransfers, their own values included, so not paidIn as well) is left out of
         // the actual change.
         const cell = row[name] as Record<string, any>;
+        // OP Stack: the receipt names an L1 data fee the sender's balance didn't pay (two swaps through one contract
+        // on Base, 2026-11-10: the balance moved by the payout less the L2 gas, to the wei). The simulation is then
+        // right, and the harness's adding of the fee back is what's off.
+        if (!cell.native && OP_STACK.has(CHAIN) && r.l1Fee && res.status === 'success' && nativeGot === nativeActual - BigInt(r.l1Fee)) { cell.native = true; cell.l1FeeNotCharged = true; }
         if (!cell.native && name === 'eth_simulateV1' && res.status === 'success') {
           const earlier = out.slice(0, -1).reduce((sum, x) => sum + (net(x.transfers, from).get('native') ?? 0n), 0n);
           if (earlier !== 0n) { cell.nativeEarlier = earlier.toString(); cell.native = nativeGot === nativeActual + paidIn - earlier; }
@@ -320,6 +328,8 @@ for (const name of SIMULATORS) {
   }
 }
 const differing = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.differs)).length;
+const notCharged = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.l1FeeNotCharged)).length;
+if (notCharged) say(`  ${notCharged} whose receipt names an L1 data fee their sender's balance didn't pay`);
 const bumped = rows.filter(r => r.timeBumped).length;
 if (bumped) say(`  ${bumped} run a second after their block, which shared its parent's second (the node refuses that): gas not judged for them`);
 const l1Rows = rows.map(r => r.l1Fee as { percent?: number } | undefined).filter(x => x?.percent !== undefined).map(x => x!.percent!);

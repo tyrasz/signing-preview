@@ -59,6 +59,21 @@ test('OP Stack (Base, OP Mainnet): the L1 data fee is added to the gas, in the e
   assert.equal(l1Inputs.length, before);
 });
 
+test('A request’s access list goes to the simulation (it costs gas and warms what it names) and into the OP Stack L1 fee', async () => {
+  const accessList = [{ address: BOB, storageKeys: [`0x${'11'.repeat(32)}`, `0x${'22'.repeat(32)}`] }];
+  const seen: SimulationRequest[] = [];
+  const d = { ...deps(), simulator: { ...simulator, simulate: async (r: SimulationRequest) => { seen.push(r); return simulator.simulate(r); } } };
+  await send({ chainId: '0x2105' }, d);
+  const plain = decodeAbiParameters([{ type: 'bytes' }], `0x${l1Inputs.at(-1)!.slice(10)}`)[0];
+  await send({ chainId: '0x2105', accessList }, d);
+  const listed = decodeAbiParameters([{ type: 'bytes' }], `0x${l1Inputs.at(-1)!.slice(10)}`)[0];
+  assert.deepEqual(seen.at(-1)!.accessList, [{ address: BOB.toLowerCase(), storageKeys: accessList[0].storageKeys }]);
+  assert.ok(listed.length > plain.length + 2 * 64 && listed.includes('11'.repeat(32)), 'the access list is serialized');
+  // A malformed one is left out rather than guessed at.
+  await send({ chainId: '0x2105', accessList: [{ address: 'nope', storageKeys: [] }] }, d);
+  assert.equal(seen.at(-1)!.accessList, undefined);
+});
+
 test('Nonces: already used, replacing a pending transaction, waiting behind a gap, or queued behind pending ones', async () => {
   assert.ok(codes(await send({ nonce: '0x3' })).includes('nonce_used'));
   assert.equal((await send({ nonce: '0x3' })).attention, 'danger');

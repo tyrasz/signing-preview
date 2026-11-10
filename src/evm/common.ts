@@ -20,6 +20,8 @@ export interface Tx {
   maxFeePerGas?: bigint;
   maxPriorityFeePerGas?: bigint;
   nonce?: bigint;
+  /** The request's EIP-2930 access list: it costs gas up front and warms what it names, and adds to an OP Stack L1 fee. */
+  accessList?: { address: string; storageKeys: string[] }[];
 }
 
 /** One EIP-7702 authorization, as requested: unsigned (the wallet signs it for the sender) or already signed. */
