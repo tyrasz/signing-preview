@@ -191,17 +191,18 @@ const USER_OPERATION_EVENT = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344
 const USER_OPERATION_REVERT_REASON = '0x1c4fada7374c0a9ee8841fc38afe82932dc0f8e69012e927f061a8bae611a201';
 const POST_OP_REVERT_REASON = '0xf62676f440ff169a3a9afdbf812e89e7f95975ee8e5c31214ffdef631c5f4792';
 const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
-/** The simulated bundler (simulateHandleOp doesn't check its caller; some paymasters check tx.origin, see recentBundler). */
+/** The simulated bundler when no other is known (simulateHandleOp doesn't check its caller; paymasters can check tx.origin, see recentBundlers). */
 const BUNDLER = '0x0000000000000000000000000000000000004337';
 
 /**
- * Bundlers that recently submitted operations this paymaster paid for (at most five): paymasters that only accept
- * certain bundlers (tx.origin) refuse any other, which says nothing about the operation itself. A paymaster can take
- * any bundler for some of its operations and only its own for others, by a setting in its data: bundlers whose
- * operations had the same first byte of paymaster data as this one come first, the busiest first. Looks back 200
- * blocks, then 2,000, then 20,000 (minutes on Arbitrum) while that finds none, and remembers what it found for ten
- * minutes: a busy paymaster's logs over many blocks are a heavy read that nodes refuse under load, and an empty
- * answer left the refusal standing.
+ * Bundlers that recently submitted operations this paymaster paid for (at most five), which its operations are
+ * simulated as: paymasters that only accept certain bundlers (tx.origin) refuse any other, which says nothing about
+ * the operation itself, and some charge another bundler different gas. A paymaster can take any bundler for some of
+ * its operations and only its own for others, by a setting in its data: bundlers whose operations had the same first
+ * byte of paymaster data as this one come first, the busiest first. Looks back 200 blocks, then 2,000, then 20,000
+ * (minutes on Arbitrum) while that finds none, and remembers what it found for ten minutes, none included when every
+ * read was answered: a busy paymaster's logs over many blocks are a heavy read that nodes refuse under load, and an
+ * empty answer left the refusal standing.
  */
 const RECENT_BUNDLERS = new Map<string, { at: number; bundlers: string[] }>();
 async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: string, paymasterAndData: Hex): Promise<string[]> {
@@ -214,13 +215,14 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
   if (known && Date.now() - known.at < 600_000) return known.bundlers;
   const rpc = deps.rpc;
   if (!rpc?.has(chainId)) return [];
+  let refused = false;
   try {
     const head = BigInt(String(await rpc.call(chainId, 'eth_blockNumber', [])));
     for (const span of [200n, 2000n, 20_000n]) {
       let logs: { transactionHash: string }[];
       // A refused read is tried once more before a wider (heavier) one.
       const read = () => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
-      try { logs = await read().catch(async () => { await new Promise(r => setTimeout(r, 500)); return read(); }); } catch { continue; }
+      try { logs = await read().catch(async () => { await new Promise(r => setTimeout(r, 500)); return read(); }); } catch { refused = true; continue; }
       const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
       if (!hashes.length) continue;
       const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
@@ -237,6 +239,7 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
       if (bundlers.length) RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers });
       return bundlers;
     }
+    if (!refused) RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers: [] });
   } catch { /* none */ }
   return [];
 }
@@ -405,7 +408,21 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
   // Alchemy's LightAccountFactory v2.0.0 and MultiOwnerLightAccountFactory v2.0.0: accounts that sign with the 0x00
   // type byte (above), as one deployed in an operation on Ethereum did.
   '0x0000000000400cdfef5e2714e63d8040b700bc24': async () => shaped('0x00')(), '0x000000000019d2ee9f2729a65afe20bb0020aefc': async () => shaped('0x00')(),
+  // Biconomy's SmartAccountFactory v2 (deployCounterFactualAccount, deployAccount): a Smart Account v2 (its
+  // basicImplementation, the same on both chains here) set up with the ECDSA ownership module signs in its form.
+  '0x000000a56aaca3e9a4c479ea6b6cd0dbcb6634f5': async (_c, factoryData) => {
+    try {
+      const [module] = decodeFunctionData({ abi: BICONOMY_FACTORY, data: factoryData }).args;
+      if (module.toLowerCase() === BICONOMY_ECDSA_MODULE) return biconomyStub();
+    } catch { /* another call */ }
+    return { signature: STUB_SIGNATURE };
+  },
 };
+const BICONOMY_FACTORY = parseAbi(['function deployCounterFactualAccount(address moduleSetupContract, bytes moduleSetupData, uint256 index)', 'function deployAccount(address moduleSetupContract, bytes moduleSetupData)']);
+/** Biconomy's ECDSA ownership module for Smart Account v2. */
+const BICONOMY_ECDSA_MODULE = '0x0000001c5b32f37f5bea87bdd5374eb2ac54ea8e';
+/** Biconomy Smart Account v2's form: abi.encode(the module's signature, the validation module). */
+const biconomyStub = (): Stub => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, BICONOMY_ECDSA_MODULE]) });
 
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
 /**
@@ -438,7 +455,7 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // Biconomy Smart Account v2: abi.encode(the module's signature, the validation module), with its ECDSA ownership
   // module, which recovers the owner over the personal_sign form of the hash (or the hash itself); seen so on
   // Ethereum (EntryPoint v0.6). Accounts it has upgraded to Nexus keep the proxy and run Nexus's code instead.
-  '0x0000002512019dafb59528b82cb92d3c5d2423ac': () => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, '0x0000001c5b32F37F5beA87BDD5374eB2aC54eA8e']) }),
+  '0x0000002512019dafb59528b82cb92d3c5d2423ac': biconomyStub,
   // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,
   // ZeroDev's Kernel for EIP-7702 (an EIP-7702 delegate; its verified source): the nonce names what validates as in
@@ -670,8 +687,14 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       return /^0x[0-9a-f]{64}$/i.test(out) ? out as Hex : undefined;
     } catch { return undefined; }
   };
+  // A paymaster's operation runs as a bundler that paymaster's operations came through lately (BUNDLER when none is
+  // found): a paymaster can check, or work differently for, the bundler sending it (tx.origin). One on Arbitrum One
+  // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
+  const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
+  const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
   const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
+  const candidates = (await bundlers).length ? await bundlers : [BUNDLER];
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   let result: OperationRun | null = null;
   for (const stub of stubs) {
@@ -704,11 +727,10 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
-    const first = await run(BUNDLER, recover);
-    // The paymaster refused: once more as a bundler it accepted lately, in case it only refused this one.
-    const paymaster = op.paymasterAndData.length >= 42 ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
+    const first = await run(candidates[0], recover);
+    // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one.
     if (paymaster && first?.rejected?.startsWith('AA33')) {
-      for (const bundler of await recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData)) {
+      for (const bundler of candidates.slice(1)) {
         const again = await run(bundler, recover);
         if (again && !again.rejected?.startsWith('AA33')) return again;
       }

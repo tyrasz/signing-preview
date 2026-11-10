@@ -30,7 +30,7 @@
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { decodeAbiParameters, decodeFunctionData, encodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
@@ -96,11 +96,35 @@ function safeOpTyped(op: Op, module: string, prefixBytes: number) {
     message: { safe: op.sender, nonce: op.nonce.toString(), initCode: op.initCode, callData: op.callData, ...Object.fromEntries(fields.map(([name]) => [name, gas[name]])), paymasterAndData: op.paymasterAndData,
       validAfter: BigInt(`0x${op.signature.slice(at, at + 12)}`).toString(), validUntil: BigInt(`0x${op.signature.slice(at + 12, at + 24)}`).toString(), entryPoint: EP } };
 }
-/** The ECDSA signature inside the operation's: a Coinbase Smart Wallet's SignatureWrapper, or its last 65 bytes. */
-/** The ECDSA signatures an account's signature may carry its owner's in: a wrapper's, its last 65 bytes, or (a prefix byte and two signatures, the owner's then a cosigner's) its first after the prefix. */
+/**
+ * The ECDSA signatures an account's signature may carry its owner's in: a wrapper's (Coinbase's SignatureWrapper,
+ * Biconomy Smart Account v2's abi.encode(signature, module)), its last 65 bytes, or (a prefix byte and two
+ * signatures, the owner's then a cosigner's) its first after the prefix.
+ */
 function innerSignatures(sig: Hex): Hex[] {
   try { const [w] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], sig); if (w.signatureData.length === 132) return [w.signatureData]; } catch { /* not a wrapper */ }
+  try { const [inner] = decodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], sig); if (inner.length === 132 && sig.length === 2 + 192 * 2) return [inner]; } catch { /* not Biconomy's */ }
   return [...(sig.length === 2 + 131 * 2 ? [`0x${sig.slice(4, 4 + 130)}` as Hex] : []), ...(sig.length >= 132 ? [`0x${sig.slice(-130)}` as Hex] : [])];
+}
+
+const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)', 'struct PermissionConfig { bytes1 permissionFlag; address signer; bytes22[] policyData; }', 'function permissionConfig(bytes4 pId) view returns (PermissionConfig)', 'function signers(address account, bytes32 id) view returns (address)']);
+/**
+ * The owner a Kernel v3 account's permission signer records for it, when its operation validates through a
+ * permission (its nonce's, or its root's) whose signer keeps one per account (Bleap's CosigningModuleV2:
+ * signers(account, permission id)). Such owners sign over another hash than the operation's, so recovering their
+ * signature names someone else.
+ */
+async function permissionOwner(call: (to: string, data: Hex) => Promise<string>, sender: string, nonce: bigint): Promise<string | undefined> {
+  try {
+    let id = nonce.toString(16).padStart(64, '0').slice(2, 44);
+    if (id.startsWith('00')) id = String(await call(sender, encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }))).slice(2, 44);
+    if (!id.startsWith('02')) return undefined;
+    const pId = `0x${id.slice(2, 10)}` as Hex;
+    const out = await call(sender, encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [pId] }));
+    const { signer } = decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out as Hex });
+    const owner = String(await call(signer, encodeFunctionData({ abi: KERNEL, functionName: 'signers', args: [sender as Hex, `${pId}${'00'.repeat(28)}`] })));
+    return /^0x0{24}[0-9a-f]{40}$/i.test(owner) && !/^0x0+$/.test(owner) ? `0x${owner.slice(26)}`.toLowerCase() : undefined;
+  } catch { return undefined; }
 }
 
 /** Rhinestone's SmartSession module (source verified on Sourcify, Arbitrum One). */
@@ -226,6 +250,9 @@ async function replay(item: string): Promise<void> {
   }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
+  // First, a Kernel permission's recorded owner (whose signature recovers to someone else).
+  const recorded = code.length > 2 && !module ? await permissionOwner((to, data) => atParent.call(CHAIN, 'eth_call', [{ to, data }, 'latest']) as Promise<string>, sender, BigInt(op.nonce)) : undefined;
+  if (recorded) { const i = signers.indexOf(recorded); if (i >= 0) signers.splice(i, 1); signers.unshift(recorded); }
   add(sender);
   let p!: Preview, tried = 0;
   // Public nodes refuse heavy simulations: with the block's earlier transactions, a full block can be one. The
