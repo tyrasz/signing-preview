@@ -292,3 +292,15 @@ test('A Safe being deployed: its owners, threshold and fallback handler from its
     assert.equal(r.execResult.executionGasUsed, 3000n);
   }
 });
+
+test('Calls run through executeUserOp that fail: the warning says the account was handed a stand-in signature', async () => {
+  // The EntryPoint runs executeUserOp(op, hash) on the account, which here has none: the calls fail.
+  const executeUserOp = `0x8dd7712f${'00'.repeat(64)}` as Hex;
+  const p = await preview(operation({ nonce: '0x0', callData: executeUserOp }));
+  const w = p.warnings.find(x => x.code === 'userop_execution_reverts');
+  assert.ok(w, p.warnings.map(x => x.code).join(','));
+  assert.match(w!.message, /handed the whole operation, its signature included/);
+  // An ordinary failing call carries no such caveat.
+  const q = await preview(operation({ nonce: '0x0', callData: call('execute', [usdc, 0n, call('transfer', [BOB, 10n ** 12n])]) }));
+  assert.doesNotMatch(q.warnings.find(x => x.code === 'userop_execution_reverts')?.message ?? '', /handed the whole operation/);
+});

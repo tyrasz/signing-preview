@@ -11,6 +11,8 @@ type Row = {
   bundle?: { size: number; index: number }; gas?: { percent: number }; tokens?: string; callsOnlyBecause?: string; tokenDiffs?: unknown;
   /** What the harness found the preview got wrong (see scripts/accuracy-4337.ts): 'outcome', 'gas', 'tokens'. */
   differs?: string[];
+  /** An outcome the preview got wrong while warning it might (see scripts/accuracy-4337.ts). */
+  warned?: string;
 };
 
 const dir = process.argv[2];
@@ -18,7 +20,7 @@ if (!dir) throw new Error('usage: node scripts/replay-summary.ts <dir>');
 const CHAINS: Record<string, string> = { '1': 'Ethereum', '42161': 'Arbitrum One' };
 const pct = (n: number, d: number) => (d ? `${n}/${d}` : '–');
 const lines = ['| Chain | EntryPoint | Operations | Outcome matches | Ran whole | Stand-in validated | Gas within 0.5% | Gas within 0.05% | Token movements matched | Differing |', '|---|---|---|---|---|---|---|---|---|---|'];
-const differing: string[] = [], fallbacks: string[] = [];
+const differing: string[] = [], fallbacks: string[] = [], warned: string[] = [];
 let total = 0, wrongTotal = 0;
 for (const name of readdirSync(dir).sort()) {
   const m = /^replay-(\d+)-v([\d.]+)$/.exec(name);
@@ -33,9 +35,11 @@ for (const name of readdirSync(dir).sort()) {
   total += rows.length; wrongTotal += wrong.length;
   lines.push(`| ${CHAINS[m[1]] ?? m[1]} | v${m[2]} | ${rows.length} | ${pct(rows.filter(r => r.outcome).length, rows.length)} | ${pct(rows.filter(r => r.whole).length, rows.length)} | ${pct(rows.filter(r => r.standIn === 'validated').length, rows.filter(r => r.whole).length)} | ${pct(gas.filter(r => Math.abs(r.gas!.percent) < 0.5).length, gas.length)} | ${pct(gas.filter(r => Math.abs(r.gas!.percent) < 0.05).length, gas.length)} | ${pct(tokens.filter(r => r.tokens !== 'other').length, tokens.length)} | ${wrong.length || ''} |`);
   for (const r of wrong) differing.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`${r.bundle ? ` (operation ${r.bundle.index + 1} of ${r.bundle.size})` : ''}: ${r.differs!.map(d => d === 'outcome' ? 'outcome differs' : d === 'gas' ? `gas ${r.gas?.percent}%` : `tokens ${JSON.stringify(r.tokenDiffs)}`).join('; ')}`);
+  for (const r of rows.filter(x => x.warned)) warned.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\``);
   for (const r of rows.filter(x => !x.whole && !x.notSimulated)) fallbacks.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`: ${(r.callsOnlyBecause ?? '').slice(0, 160)}`);
 }
 console.log(`## UserOperation replays: ${total} operations${wrongTotal ? `, ${wrongTotal} differing from their receipts` : ', none differing from their receipts'}\n`);
 console.log(lines.join('\n'));
 if (differing.length) console.log(`\n### Previews that differed from what happened\n\n${differing.join('\n')}`);
+if (warned.length) console.log(`\n### Outcomes that differed where the preview warned they might (an account reading its stand-in signature while running its calls)\n\n${warned.join('\n')}`);
 if (fallbacks.length) console.log(`\n### Operations whose calls were simulated alone (a signature shape the stand-in doesn't take, or a paymaster refusing)\n\n${fallbacks.slice(0, 40).join('\n')}${fallbacks.length > 40 ? `\n- … and ${fallbacks.length - 40} more` : ''}`);

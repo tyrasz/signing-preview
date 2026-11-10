@@ -150,7 +150,7 @@ const REJECTION_COVERED: Record<string, string> = { AA21: 'userop_cannot_prefund
  * operation's calls should be simulated on their own instead: the simulation didn't run, or the account's
  * validation reverted on the stand-in signature.
  */
-export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'sender' | 'paymaster' | 'entryPointName' | 'signature'>, chainId: number, env: TypedEnv, b: PreviewBuilder,
+export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'sender' | 'paymaster' | 'entryPointName' | 'signature'> & { callData?: Hex | null }, chainId: number, env: TypedEnv, b: PreviewBuilder,
   how: { deploys: boolean; delegate?: string; /** How validation was run, in place of the stand-in signature's wording. */ validation?: string }): Promise<AssetChange[] | null> {
   if (!run) return null;
   const sender = u.sender.toLowerCase();
@@ -193,7 +193,13 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
     if (parts.length) b.detail('Paymaster charge', `${parts.join(' and ')}, from the account (included in the balance changes)`);
   }
   if (run.postOpReverted) b.warn('caution', 'userop_postop_reverts', `The paymaster's charge after the calls (postOp) fails: ${run.postOpReverted}. The EntryPoint then undoes the calls, and the operation still pays ${native(run.paid)} for gas.`);
-  else if (!run.executed) b.warn('caution', 'userop_execution_reverts', `The operation's calls fail when the EntryPoint runs them${run.revertReason ? `: ${run.revertReason}` : ''}. It can still be included, and ${pm ? 'the paymaster' : 'the account'} pays ${native(run.paid)} for the gas.`);
+  else if (!run.executed) {
+    // An account run through executeUserOp (IAccountExecute) is handed the whole operation, signature included: one
+    // that reads data from its signature while running the calls fails on a stand-in where the signed one needn't
+    // (seen on Ethereum: accounts with 700-byte signatures whose calls failed only in the simulation).
+    const readsSignature = u.callData?.startsWith('0x8dd7712f') && run.standIn !== 'wallet';
+    b.warn('caution', 'userop_execution_reverts', `The operation's calls fail when the EntryPoint runs them${run.revertReason ? `: ${run.revertReason}` : ''}. It can still be included, and ${pm ? 'the paymaster' : 'the account'} pays ${native(run.paid)} for the gas.${readsSignature ? " The account runs them through executeUserOp, which is handed the whole operation, its signature included: here a stand-in, so if the account reads data from its signature while running them, the signed operation can fare differently." : ''}`);
+  }
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
   b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : u.signature ? ` (with the wallet's stand-in signature${run.account?.signatureFailed ? ", which the account doesn't accept as signed, as gas-estimation stubs often aren't" : ''})` : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? ", but the account doesn't accept it as theirs, so its own signature check isn't simulated" : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
