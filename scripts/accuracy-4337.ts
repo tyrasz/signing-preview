@@ -158,6 +158,12 @@ const STAND_IN_REJECTED = /doesn't accept it as theirs/;
 
 /** How many operations of one bundle are replayed (each after the bundle's earlier ones). */
 const BUNDLE_MAX = 5;
+/** A block's receipts, read once for the operations replayed from it. */
+const BLOCK_RECEIPTS = new Map<string, Promise<{ transactionHash: string; gasUsed?: Hex; effectiveGasPrice?: Hex }[]>>();
+const blockReceipts = (number: Hex) => {
+  if (!BLOCK_RECEIPTS.has(number)) { BLOCK_RECEIPTS.set(number, call('eth_getBlockReceipts', [number])); if (BLOCK_RECEIPTS.size > 64) BLOCK_RECEIPTS.delete(BLOCK_RECEIPTS.keys().next().value!); }
+  return BLOCK_RECEIPTS.get(number)!;
+};
 async function replay(item: string): Promise<void> {
   // An item is a bundle transaction's hash, or `hash#i` for its i-th operation.
   const [hash, at] = item.split('#');
@@ -183,7 +189,7 @@ async function replay(item: string): Promise<void> {
   if (SESSION_VALIDATORS.some(v => BigInt(op.nonce).toString(16).padStart(64, '0').includes(v.slice(2)))) return skip("a session key's operation (signed by a dApp, not a wallet)");
   // A transaction's receipt; OP Mainnet's public node refuses receipts by hash ("archive requests") but serves its
   // block's receipts.
-  type Receipt = { transactionHash: string; blockNumber: Hex; effectiveGasPrice?: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
+  type Receipt = { transactionHash: string; blockNumber: Hex; effectiveGasPrice?: Hex; gasUsed?: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
   const r = await call<Receipt>('eth_getTransactionReceipt', [hash]).catch(async () => (await call<Receipt[]>('eth_getBlockReceipts', [tx.blockNumber])).find(x => x.transactionHash.toLowerCase() === hash.toLowerCase())!);
   if (!r) return skip('its receipt could not be read');
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
@@ -197,8 +203,24 @@ async function replay(item: string): Promise<void> {
   // the simulated block's gas limit holds them as it held the real ones.
   // An OP Stack block's L1 info deposit (its first transaction) stays: the L1 values it sets are what a paymaster
   // pricing L1 data reads (a bundle on OP Mainnet came out 0.47% low on the parent block's).
-  const before: SimulationRequest[] = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR).slice(-400)
-    .map(t => ({ chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), ...(t.authorizationList?.length && { authorizationList: t.authorizationList as SimulationRequest['authorizationList'] }) })) : [];
+  const earlier = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR).slice(-400) : [];
+  const before: SimulationRequest[] = earlier
+    .map(t => ({ chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), ...(t.authorizationList?.length && { authorizationList: t.authorizationList as SimulationRequest['authorizationList'] }) }));
+  // The same, each at the price it paid (its receipt's), with a gas limit a little over what it used (its own limits
+  // would add up to more than a node's cap for a simulated block): what an earlier transaction does can depend on its
+  // price (a bot sizing its trade by it), and three Ethereum swaps came out 0.01-0.02% off after ones run at no price.
+  let pricedBefore: SimulationRequest[] | undefined;
+  if (earlier.length) {
+    try {
+      const receipts = new Map((await blockReceipts(r.blockNumber)).map(x => [x.transactionHash.toLowerCase(), x]));
+      pricedBefore = earlier.map((t, i) => {
+        const rc = receipts.get(t.hash.toLowerCase());
+        if (!rc?.gasUsed || !rc.effectiveGasPrice || SYSTEM.has(t.type)) return before[i];
+        const roomy = BigInt(rc.gasUsed) * 13n / 10n + 30_000n;
+        return { ...before[i], gas: roomy < BigInt(t.gas) ? roomy : BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice) };
+      });
+    } catch { pricedBefore = undefined; }
+  }
   // An account the bundle itself delegates (EIP-7702, in the bundle transaction's own authorizations): the
   // authorizations apply first, as they do on-chain, and the account's code reads as the delegation.
   // The authorities are warm in the bundle transaction from its start (EIP-7702), so they are in the replay too.
@@ -218,12 +240,13 @@ async function replay(item: string): Promise<void> {
   }
   if (index > 0) essential.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [ops.slice(0, index) as never, beneficiary] }) });
   before.push(...essential);
+  pricedBefore?.push(...essential);
   // Reads on the parent block, and the block itself for its header (the base fee the operation's gas is priced at).
   const atParent = { has: (c: number) => c === CHAIN, call: (c: number, m: string, ps: unknown[]) => m === 'eth_getBlockByNumber' ? rpc.call(c, m, [r.blockNumber, false])
     : m === 'eth_getCode' && delegation && String(ps[0]).toLowerCase() === sender ? Promise.resolve(delegation) : rpc.call(c, m, ps.map(x => x === 'latest' ? parent : x)) };
   // The block's header, but not its gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on
   // publicnode, below Ethereum's 60M), and the parent's limit, the node's default, is all but the same.
-  let prefix = before; // dropped if the node refuses the block with it (see below)
+  let prefix = pricedBefore ?? before; // at no price, then dropped, if the node refuses the block with it (see below)
   // The block's own time; BNB Chain's node refuses a simulated block in its parent's second (its blocks come faster
   // than one a second), which then runs a second later, and its gas isn't judged (what writes once a second costs
   // more). The block's DIFFICULTY as each node takes it: BNB Chain's from prevRandao (the block's difficulty there, 2
@@ -320,6 +343,7 @@ async function replay(item: string): Promise<void> {
   for (const signer of signers.slice(0, 3)) {
     tried++;
     p = await previewRequest(request(signer), ctx, deps);
+    if (!ran(p) && prefix === pricedBefore) { prefix = before; p = await previewRequest(request(signer), ctx, deps); }
     if (!ran(p) && prefix.length > essential.length) { prefix = essential; prefixDropped = 'the node refused the block with them'; p = await previewRequest(request(signer), ctx, deps); }
     // A full block's earlier transactions can use nearly all of the node's gas cap for a simulated block (publicnode's
     // 50M, under Ethereum's 60M blocks), leaving the operation too little: the EntryPoint runs out of gas (AA95),
@@ -375,8 +399,17 @@ async function replay(item: string): Promise<void> {
   // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
   // ten-thousandth (as scripts/accuracy.ts allows).
   const secondLate = (t: { actual: string; simulated: string }) => timeBumped && abs(BigInt(t.simulated) - BigInt(t.actual)) * 10_000n <= abs(BigInt(t.actual));
+  // A gas-priced fee taken inside an amount (a relayer keeping its fee from a swap's output before it reaches the
+  // account, so no transfer of the account's shows it): the amount is off by less, in proportion, than the gas is,
+  // and against the account when the simulated gas is higher. Three Ethereum swaps were 0.006-0.022% off so, their
+  // gas 0.02-0.16% high.
+  const feeInside = (t: { actual: string; simulated: string }) => {
+    if (gasPercent === undefined || gasPercent === 0 || Math.abs(gasPercent) >= 5) return false;
+    const d = BigInt(t.simulated) - BigInt(t.actual);
+    return (d < 0n) === (gasPercent > 0) && abs(d) * 100_000n <= abs(BigInt(t.actual)) * BigInt(Math.ceil(Math.abs(gasPercent) * 1000));
+  };
   const matchOf = () => tokens.every(t => t.actual === t.simulated) ? 'exact'
-    : tokens.every(t => t.actual === t.simulated || feeLike(t)) ? 'fee'
+    : tokens.every(t => t.actual === t.simulated || feeLike(t) || feeInside(t)) ? 'fee'
     : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || feeLike(t) || secondLate(t)) ? 'units' : 'other';
   let tokenMatch = matchOf();
   // A token whose events don't account for its balances (a tax token on Base took 1% of a sale with no Transfer for

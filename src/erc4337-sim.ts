@@ -691,6 +691,11 @@ async function baseFee(deps: Dependencies, chainId: number): Promise<bigint | un
   } catch { return undefined; }
 }
 
+/** The node's suggested priority fee (eth_maxPriorityFeePerGas), or none when it can't be read. */
+async function suggestedTip(deps: Dependencies, chainId: number): Promise<bigint> {
+  try { return deps.rpc?.has(chainId) ? BigInt(String(await deps.rpc.call(chainId, 'eth_maxPriorityFeePerGas', []))) : 0n; } catch { return 0n; }
+}
+
 /**
  * The whole operation, simulated as the EntryPoint runs it (see the top of the file). Null when it can't be: no
  * simulator or no simulation code for this EntryPoint, a simulator that doesn't report logs (eth_call only), or a
@@ -730,10 +735,12 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // The price the bundle's transaction pays (tx.gasprice), taken as what the operation pays its bundler: the base fee
   // plus its priority fee, up to its fee cap (the base fee alone on Arbitrum, which takes no tips). Contracts read it:
   // a Base DEX's pools add a "MEV tax" to a swap's fee by the transaction's priority fee, and an operation simulated
-  // at no price showed a swap that on-chain, taxed, missed its minimum and reverted. Left out when the fee cap is
-  // under the base fee (the operation waits), or the base fee isn't known.
+  // at no price showed a swap that on-chain, taxed, missed its minimum and reverted. An operation paying less than
+  // the base fee (a gasless one, its fee cap zero: its bundler pays) still rides in a transaction that pays the
+  // market's price: the base fee plus the node's suggested tip. Left out when the base fee isn't known.
   const tip = NO_TIPS.has(op.chainId) ? 0n : op.maxPriorityFeePerGas;
-  const price = fee !== undefined && op.maxFeePerGas >= fee ? (op.maxFeePerGas < fee + tip ? op.maxFeePerGas : fee + tip) : undefined;
+  const price = fee === undefined ? undefined : op.maxFeePerGas >= fee ? (op.maxFeePerGas < fee + tip ? op.maxFeePerGas : fee + tip)
+    : fee + (NO_TIPS.has(op.chainId) ? 0n : await suggestedTip(deps, op.chainId));
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   let result: OperationRun | null = null;
   for (const stub of stubs) {
