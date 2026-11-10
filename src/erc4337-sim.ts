@@ -221,8 +221,13 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
  * some address and an account's check fails rather than reverting. Bundlers use the same one to estimate gas.
  */
 export const STUB_SIGNATURE = '0xfffffffffffffffffffffffffffffff0000000000000000000000000000000007aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1c' as Hex;
+/**
+ * The k-th stand-in signature (k from 1 to 15), for an account that needs other keys' signatures too (a cosigner's,
+ * or further owners'): STUB_SIGNATURE with k as r's last digit, so each is told apart (see ecrecoverAs).
+ */
+export const stubSignature = (k: number): Hex => k === 0 ? STUB_SIGNATURE : `0x${STUB_SIGNATURE.slice(2, 65)}${k.toString(16)}${STUB_SIGNATURE.slice(66)}` as Hex;
 /** A second stand-in signature, for an account that needs another key's signature too (a cosigner's). */
-export const STUB_COSIGNATURE = `0x${STUB_SIGNATURE.slice(2, 65)}1${STUB_SIGNATURE.slice(66)}` as Hex;
+export const STUB_COSIGNATURE = stubSignature(1);
 
 /**
  * A stand-in signature; `p256` when it is a passkey's, which P256VERIFY (0x100) must accept too (see standIn), or
@@ -521,6 +526,8 @@ export interface OperationInput {
   paymasterAndData: Hex;
   /** What to validate with: a stand-in shaped for the account (its wallet's stub signature), else STUB_SIGNATURE. */
   signature?: Hex;
+  /** Other stand-in signatures in `signature` (stubSignature(k)), and whose ecrecover is to recover them as. */
+  cosigners?: { signature: Hex; signer: string }[];
   /**
    * Who signs: ecrecover recovers STUB_SIGNATURE as this address (see ecrecoverAs), so an account whose owner it is
    * validates the operation as it will once signed. Defaults to the account itself (an EIP-7702 account signs for itself).
@@ -620,7 +627,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       return /^0x[0-9a-f]{64}$/i.test(out) ? out as Hex : undefined;
     } catch { return undefined; }
   };
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   let result: OperationRun | null = null;

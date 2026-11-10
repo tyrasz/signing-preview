@@ -6,7 +6,7 @@
 // In the same simulated block, the Safe's configuration is read again (owners, threshold, singleton, guard,
 // fallback handler, modules) and compared with now: what a delegatecall did to the Safe shows even when its
 // calldata looks harmless, as in the 2025 Bybit theft (a delegatecall that replaced the Safe's singleton).
-import { concatHex, decodeAbiParameters, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
 import { ecdsaStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
@@ -132,6 +132,26 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   // execTransaction returns false (and emits ExecutionFailure) when the call fails with safeTxGas or gasPrice set.
   const executed = result.status === 'success' && (!result.returnData || result.returnData === '0x' || BigInt(result.returnData.slice(0, 66)) === 1n);
   return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined };
+}
+
+const SAFE_FACTORY = parseAbi([
+  'function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce)',
+  'function createChainSpecificProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce)',
+  'function createProxyWithCallback(address singleton, bytes initializer, uint256 saltNonce, address callback)',
+]);
+const SAFE_SETUP = parseAbi(['function setup(address[] owners, uint256 threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)']);
+/**
+ * A Safe its factory is deploying (an operation's initCode: the factory and its call): the owners, threshold and
+ * fallback handler its setup gives it. Null if the initCode isn't a Safe proxy factory's call with a setup.
+ */
+export function safeSetupOf(initCode: string): { owners: string[]; threshold: bigint; fallbackHandler: string } | null {
+  if (initCode.length < 42 + 8) return null;
+  try {
+    const call = decodeFunctionData({ abi: SAFE_FACTORY, data: `0x${initCode.slice(42)}` as Hex });
+    const setup = decodeFunctionData({ abi: SAFE_SETUP, data: call.args[1] });
+    const [owners, threshold, , , fallbackHandler] = setup.args;
+    return { owners: owners.map(o => o.toLowerCase()), threshold, fallbackHandler: fallbackHandler.toLowerCase() };
+  } catch { return null; }
 }
 
 export interface ConfigChange { severity: 'danger' | 'caution' | 'info'; code: string; message: string }

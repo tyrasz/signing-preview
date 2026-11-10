@@ -266,3 +266,29 @@ test('The EntryPoint override hashes operations as the deployed EntryPoint does,
   const created = await deps.rpc!.call(999, 'eth_call', [{ to: EP8, data: enc({ abi: abi(['function senderCreator() view returns (address)']), functionName: 'senderCreator' }) }, 'latest', { [EP8]: entryPointOverride(EP8, 999) }]);
   assert.equal(`0x${String(created).slice(26)}`, getContractAddress({ from: EP8 as Hex, nonce: 1n }).toLowerCase());
 });
+
+test('A Safe being deployed: its owners, threshold and fallback handler from its setup, and a stand-in for each owner', async () => {
+  const { safeSetupOf } = await import('../src/safe-sim.ts');
+  const { ecrecoverAs, stubSignature } = await import('../src/erc4337-sim.ts');
+  const { encodeFunctionData: enc, parseAbi: abi } = await import('viem');
+  const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');
+  const owners = ['0x3000000000000000000000000000000000000003', '0x1000000000000000000000000000000000000001', '0x2000000000000000000000000000000000000002'] as Hex[];
+  const module = '0x75cf11467937ce3f2f357ce24ffc3dbf8fd5c226' as Hex;
+  const setup = enc({ abi: abi(['function setup(address[] owners, uint256 threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)']), functionName: 'setup',
+    args: [owners, 2n, '0x2dd68b007b46fbe91b9a7c3eda5a7a1063cb5b47', '0x', module, '0x0000000000000000000000000000000000000000', 0n, '0x0000000000000000000000000000000000000000'] });
+  const factory = '0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67';
+  const initCode = concatHex([factory, enc({ abi: abi(['function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce)']), functionName: 'createProxyWithNonce', args: ['0x29fcb43b46531bca003ddc8fcb67ffe91900c762', setup, 7n] })]);
+  assert.deepEqual(safeSetupOf(initCode), { owners: owners.map(o => o.toLowerCase()), threshold: 2n, fallbackHandler: module });
+  assert.equal(safeSetupOf(`${factory}deadbeef`), null);
+  // Up to 15 stand-ins, each told apart by its r, each recovered as its own signer for exactly 3,000 gas.
+  const sigs = [0, 1, 2].map(stubSignature);
+  assert.equal(new Set(sigs.map(x => x.slice(2, 66))).size, 3);
+  const where = '0x0000000000000000000000000000000000ec0bae';
+  await chain.putCode(where, ecrecoverAs(owners[0], undefined, [{ signature: sigs[1], signer: owners[1] }, { signature: sigs[2], signer: owners[2] }]));
+  for (const [k, sig] of sigs.entries()) {
+    const input = concatHex([`0x${'77'.repeat(32)}`, `0x${sig.slice(130).padStart(64, '0')}`, `0x${sig.slice(2, 66)}`, `0x${sig.slice(66, 130)}`]);
+    const r = await chain.evm.runCall({ caller: at(OWNER), to: at(where), data: toBytes(input), gasLimit: 100_000n });
+    assert.equal(`0x${toHex(r.execResult.returnValue).slice(-40)}`, owners[k].toLowerCase());
+    assert.equal(r.execResult.executionGasUsed, 3000n);
+  }
+});

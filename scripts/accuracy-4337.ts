@@ -36,6 +36,7 @@ import { RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
+import { safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
@@ -171,7 +172,9 @@ async function replay(item: string): Promise<void> {
   const code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest']).catch(() => '0x'));
 
   // The request the owner signed, and who might have signed it.
-  const fallback = `0x${String(await atParent.call(CHAIN, 'eth_getStorageAt', [sender, FALLBACK_SLOT, 'latest']).catch(() => '0x')).slice(-40)}`.toLowerCase();
+  // A Safe the operation deploys has no fallback handler yet: its setup (in the initCode) names it.
+  const fallback = code === '0x' && safeSetupOf(op.initCode) ? safeSetupOf(op.initCode)!.fallbackHandler
+    : `0x${String(await atParent.call(CHAIN, 'eth_getStorageAt', [sender, FALLBACK_SLOT, 'latest']).catch(() => '0x')).slice(-40)}`.toLowerCase();
   const module = SAFE_EXECUTE.includes(op.callData.slice(0, 10)) && SAFE_4337_MODULES[fallback]?.entryPoint === EP ? SAFE_4337_MODULES[fallback] : undefined;
   let request: (signer: string) => { method: string; params: unknown[] }, digest: Hex, kind: string;
   let ctx: Record<string, unknown> = context;
