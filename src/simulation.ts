@@ -1,7 +1,7 @@
 import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, keccak256, parseAbi, stringToBytes, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { builtinTokens, PERMIT2 } from './chains.ts';
+import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
 import { calldataCandidates, ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
 import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
@@ -9,6 +9,15 @@ import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, Simula
 // Event topics (keccak256 of the signature).
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'; // Transfer(address,address,uint256), ERC-20 and ERC-721
 const APPROVAL_TOPIC = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'; // Approval(address,address,uint256), ERC-20 and ERC-721
+// WETH9's Deposit(address indexed dst, uint wad) and Withdrawal(address indexed src, uint wad): a wrap mints the
+// wrapped token to dst and an unwrap burns it from src, with no Transfer event.
+const DEPOSIT_TOPIC = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
+const WITHDRAWAL_TOPIC = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65';
+/**
+ * Each chain's wrapped native token (WETH, WBNB, WPOL, WHYPE: WETH9 or its clones). Only theirs count: many other
+ * contracts emit an event of the same signature (a vault's Deposit(address,uint256)) for something else.
+ */
+const WRAPPED_NATIVE = new Set(Object.entries(CHAINS).map(([id, c]) => builtinTokens(Number(id)).find(t => t.symbol === `W${c.nativeSymbol}`)?.address).filter((a): a is string => !!a));
 const APPROVAL_FOR_ALL_TOPIC = '0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31'; // ApprovalForAll(address,address,bool)
 const TRANSFER_SINGLE_TOPIC = '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62'; // ERC-1155 TransferSingle
 const TRANSFER_BATCH_TOPIC = '0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb'; // ERC-1155 TransferBatch
@@ -433,6 +442,9 @@ export function parseLogs(logs: Log[]): { transfers: SimulatedTransfer[]; nftTra
         const [ids, values] = decodeAbiParameters([{ type: 'uint256[]' }, { type: 'uint256[]' }], log.data as Hex);
         if (ids.length === values.length) ids.forEach((id, i) => nftTransfers.push({ standard: 'erc1155', collection: address, from: topicAddress(t2), to: topicAddress(t3), tokenId: id, amount: values[i] }));
       } catch { /* malformed */ }
+    } else if ((topic0 === DEPOSIT_TOPIC || topic0 === WITHDRAWAL_TOPIC) && n === 2 && isWords(log.data, 1) && WRAPPED_NATIVE.has(address)) {
+      // A wrap (the token minted to dst) or an unwrap (burnt from src); the native coin moves as a transfer of its own.
+      transfers.push(topic0 === DEPOSIT_TOPIC ? { asset: address, from: ZERO_ADDRESS, to: topicAddress(t1), raw: BigInt(log.data) } : { asset: address, from: topicAddress(t1), to: ZERO_ADDRESS, raw: BigInt(log.data) });
     } else if (topic0 === APPROVAL_TOPIC) {
       if (n === 3 && isWords(log.data, 1)) approvals.push({ kind: 'erc20', emitter: address, token: address, owner: topicAddress(t1), spender: topicAddress(t2), amount: BigInt(log.data) });
       else if (n === 4 && isEmpty(log.data)) approvals.push({ kind: 'erc721', emitter: address, token: address, owner: topicAddress(t1), spender: topicAddress(t2), tokenId: BigInt(t3) });

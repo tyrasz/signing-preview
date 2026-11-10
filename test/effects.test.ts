@@ -171,3 +171,23 @@ test('Demo sample: a router call that buys an NFT and sets a Permit2 allowance a
   assert.deepEqual(p.approvals?.map(a => [a.kind, a.allowance, a.direct]), [['permit2', 'unlimited', false]]);
   assert.match(p.warnings.find(x => x.code === 'hidden_unlimited_approval')!.message, /through Permit2 until 2027-01-01/);
 });
+
+test('A wrap and an unwrap of the chain’s wrapped native token are transfers; another contract’s same-shaped Deposit is not', async () => {
+  const { parseLogs } = await import('../src/simulation.ts');
+  const WBNB = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', WETH = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', VAULT = '0x1111111111111111111111111111111111111111';
+  const account = '0x67c64820762477c4b289ff555e613431ff1e9e32', pool = '0x0729e2a471000000000000000000000000000000';
+  const word = (v: bigint | string) => `0x${(typeof v === 'bigint' ? v.toString(16) : v.slice(2)).padStart(64, '0')}`;
+  const DEPOSIT = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c', WITHDRAWAL = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65', TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const amount = 6_000_000_000_000_000n;
+  // A UserOperation on BNB Chain wrapping 0.006 BNB and passing the WBNB on: the account's WBNB nets to zero.
+  const { transfers } = parseLogs([
+    { address: WBNB, topics: [DEPOSIT, word(account)], data: word(amount) },
+    { address: WBNB, topics: [TRANSFER, word(account), word(pool)], data: word(amount) },
+    { address: WETH, topics: [WITHDRAWAL, word(account)], data: word(5n) },
+    { address: VAULT, topics: [DEPOSIT, word(account)], data: word(99n) },
+  ]);
+  const net = (asset: string) => transfers.filter(t => t.asset === asset).reduce((s, t) => s + (t.to === account ? t.raw : 0n) - (t.from === account ? t.raw : 0n), 0n);
+  assert.equal(net(WBNB), 0n);
+  assert.equal(net(WETH), -5n);
+  assert.ok(!transfers.some(t => t.asset === VAULT), 'a vault’s Deposit(address,uint256) is not a mint of its own token');
+});
