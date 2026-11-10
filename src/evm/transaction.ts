@@ -1,7 +1,7 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
 import type { ApprovalChange, Dependencies, Preview, PreviewContext, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
-import { approvalChanges, approvalWarnings, netChanges, nftChanges } from './effects.ts';
+import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
 import { expectedGasPrice, transactionChecks } from './tx-checks.ts';
@@ -217,12 +217,11 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       const price = first?.status === 'success' && !first.limited && first.gasUsed !== undefined ? await pricing : undefined;
       if (first && price) {
         try {
-          const priced: SimulationRequest = { ...request, gas: tx.gas ?? (first.gasUsed! * 2n > first.gasUsed! + 100_000n ? first.gasUsed! * 2n : first.gasUsed! + 100_000n), gasPrice: price.gasPrice, baseFee: price.baseFee };
+          const priced: SimulationRequest = { ...request, gas: tx.gas ?? roomFor(first.gasUsed!), gasPrice: price.gasPrice, baseFee: price.baseFee };
           const again = pending.length && deps.simulator.simulateBatch ? (await deps.simulator.simulateBatch([...pending, priced]))?.at(-1) : await deps.simulator.simulate(priced);
           if (again && effectOf(again, tx.from) !== effectOf(first, tx.from)) {
             outcome = { result: again };
-            const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
-            b.note(`What this transaction does depends on the fee it pays (a contract it calls reads the gas price): it was simulated at the price it would pay now, ${gwei(price.gasPrice)}${price.tip ? ` (the base fee plus a ${gwei(price.tip)} tip)` : ''}. At another price the result can differ.`);
+            b.note(pricedNote('transaction', price));
           }
         } catch { /* the node refused the priced run (the balance doesn't cover its gas, say): the first stands */ }
       }
@@ -275,16 +274,6 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     decoding: { status: d.status, decoder: d.decoder, notes: b.notes },
     ...(simulation && { simulation }),
   };
-}
-
-/** What a simulated call did for an account, to compare two runs: its outcome, the account's net of each asset, NFTs and approvals. */
-function effectOf(r: SimulationResult, account: string): string {
-  const net = new Map<string, bigint>();
-  for (const t of r.transfers) {
-    if (sameAddress(t.from, account)) net.set(t.asset, (net.get(t.asset) ?? 0n) - t.raw);
-    if (sameAddress(t.to, account)) net.set(t.asset, (net.get(t.asset) ?? 0n) + t.raw);
-  }
-  return JSON.stringify([r.status, [...net].filter(([, v]) => v !== 0n).sort(([a], [z]) => (a < z ? -1 : 1)), r.nftTransfers ?? [], r.approvals ?? []], (_, v) => (typeof v === 'bigint' ? v.toString() : v));
 }
 
 /** The simulation request for a call, with the tokens its decoder knows it changes (for state-reading simulators). */

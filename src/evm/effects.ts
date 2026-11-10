@@ -2,7 +2,7 @@
 // leaves in place. Shared by single transactions and EIP-5792 batches.
 import { formatUnits, isUnlimited, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { CHAINS } from '../chains.ts';
-import type { ApprovalChange, AssetChange, Dependencies, SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, TokenInfo } from '../types.ts';
+import type { ApprovalChange, AssetChange, Dependencies, SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationResult, TokenInfo } from '../types.ts';
 import { tokenInfo, tokenSourceWarnings } from './common.ts';
 import { approvalKey } from '../simulation.ts';
 
@@ -152,4 +152,22 @@ export function approvalWarnings(b: PreviewBuilder, approvals: ApprovalChange[],
     const tail = code === 'hidden_approval_for_all' ? ' This is the most common NFT drain pattern; only allow it for marketplaces you trust.' : '';
     b.warn(g.severity, code, `Set by this transaction along the way: after it, ${list(g.parts)}.${tail}`);
   }
+}
+
+/** A gas limit for a priced run of a call that used this much at no price: twice it, or 100,000 more if that is more. */
+export const roomFor = (gasUsed: bigint): bigint => (gasUsed * 2n > gasUsed + 100_000n ? gasUsed * 2n : gasUsed + 100_000n);
+/** The note on a run shown at a gas price because the price changes what it does. */
+export const pricedNote = (what: 'transaction' | 'calls', price: { gasPrice: bigint; tip: bigint }): string => {
+  const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
+  const [does, pays, calls, was] = what === 'calls' ? ['these calls do', 'they pay', 'they call', 'they were'] : ['this transaction does', 'it pays', 'it calls', 'it was'];
+  return `What ${does} depends on the fee ${pays} (a contract ${calls} reads the gas price): ${was} simulated at the price ${what === 'calls' ? 'they' : 'it'} would pay now, ${gwei(price.gasPrice)}${price.tip ? ` (the base fee plus a ${gwei(price.tip)} tip)` : ''}. At another price the result can differ.`;
+};
+/** What a simulated call did for an account, to compare two runs: its outcome, the account's net of each asset, NFTs and approvals. */
+export function effectOf(r: SimulationResult, account: string): string {
+  const net = new Map<string, bigint>();
+  for (const t of r.transfers) {
+    if (sameAddress(t.from, account)) net.set(t.asset, (net.get(t.asset) ?? 0n) - t.raw);
+    if (sameAddress(t.to, account)) net.set(t.asset, (net.get(t.asset) ?? 0n) + t.raw);
+  }
+  return JSON.stringify([r.status, [...net].filter(([, v]) => v !== 0n).sort(([a], [z]) => (a < z ? -1 : 1)), r.nftTransfers ?? [], r.approvals ?? []], (_, v) => (typeof v === 'bigint' ? v.toString() : v));
 }

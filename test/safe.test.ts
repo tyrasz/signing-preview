@@ -201,6 +201,22 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   // Moving to an official singleton is an upgrade, a caution.
   const upgrade = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xff51a5898e281db6dfc7855790607438df2ca44b'));
   assert.ok(codes(upgrade).includes('safe_upgrade') && !codes(upgrade).includes('safe_code_replaced'));
+
+  // A refund in the native token is paid at the lower of the SafeTx's gas price and the transaction's: nothing at no
+  // price. With a base fee to read, the execution runs again at the price a transaction would pay now (1 gwei and a
+  // 0.1 gwei tip), whoever submits it able to pay for its gas, and that run is the one shown.
+  const runs: SimulationRequest[][] = [];
+  const refunding: Dependencies = { ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? view()((p[0] as { data: string }).data) : m === 'eth_getBlockByNumber' ? { baseFeePerGas: '0x3b9aca00' } : m === 'eth_maxPriorityFeePerGas' ? '0x5f5e100' : '0x' },
+    simulator: { simulate: async () => null, simulateBatch: async rs => { runs.push(rs); return rs.map((r, i) => ({ status: 'success' as const, source: 'mock', gasUsed: 80_000n,
+      transfers: i === 0 && r.gasPrice ? [{ asset: 'native', from: SAFE, to: BOB.toLowerCase(), raw: 130_000n * r.gasPrice }] : [], returnData: i === 0 ? word(1n) : view()(r.data) })); } } };
+  const refund = await sign({ gasPrice: '2000000000', baseGas: '50000', refundReceiver: BOB }, refunding);
+  assert.equal(runs.length, 2);
+  assert.equal(runs[0][0].gasPrice, undefined);
+  assert.deepEqual([runs[1][0].gasPrice, runs[1][0].baseFee, runs[1][0].gas], [1_100_000_000n, 1_000_000_000n, 180_000n]);
+  assert.ok(runs[1][0].stateOverrides![OWNERS[0]]?.balance);
+  assert.deepEqual(refund.assetChanges.filter(c => c.asset === 'native').map(c => [c.direction, c.raw]), [['out', (130_000n * 1_100_000_000n).toString()]]);
+  assert.match(refund.decoding.notes.join(' '), /depends on the gas price of the transaction that runs it \(its gas refund is paid at the lower of its own gas price and the transaction's\): it was simulated at the price a transaction would pay now, 1\.1 gwei/);
 });
 
 test('Safe4337MultiChainSignatureModule (EntryPoint v0.9): its SafeOps, and a Merkle root signature that names no operations', async () => {

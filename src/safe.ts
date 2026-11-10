@@ -231,6 +231,12 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     if (!run) return null;
     if (run.after) reportConfigChanges(run.before, run.after, b);
     if (!run.executed) return { reverted: run.result.status === 'reverted' ? run.result.revertReason ?? '' : 'the Safe reports that the call failed (ExecutionFailure)' };
+    // The price changes what the Safe ends up with: a refund in the native token is paid at the lower of its
+    // gasPrice and the transaction's, and a contract the calls reach can read the price too.
+    if (run.priced) {
+      const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
+      b.note(`What this does for the Safe depends on the gas price of the transaction that runs it${t.gasPrice > 0n && /^0x0{40}$/.test(t.gasToken) ? " (its gas refund is paid at the lower of its own gas price and the transaction's)" : ''}: it was simulated at the price a transaction would pay now, ${gwei(run.priced.gasPrice)}${run.priced.tip ? ` (the base fee plus a ${gwei(run.priced.tip)} tip)` : ''}. At another price the result can differ.`);
+    }
     return safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, opts.request
       ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'
       : "Simulated as the Safe runs it: execTransaction itself, with the transaction approved by enough owners (the Safe's approvedHashes standing in for their signatures), so guards, the gas refund and delegatecalls run as they will.");

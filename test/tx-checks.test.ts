@@ -130,3 +130,26 @@ test('A transaction whose result depends on the fee it pays is shown as it runs 
   assert.deepEqual(kept.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), ['in 100']);
   assert.equal(kept.simulation?.status, 'success');
 });
+
+test('A batch runs again at the price it would pay, and that run is shown when it changes what a call does', async () => {
+  const USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+  const runs: SimulationRequest[][] = [];
+  // The second call's pool taxes its swap by the priority fee: 100 USDC back at no price, 90 at a price.
+  const taxed = {
+    simulate: async (): Promise<SimulationResult> => ({ status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [] }),
+    simulateBatch: async (rs: SimulationRequest[]): Promise<SimulationResult[]> => { runs.push(rs); return rs.map((r, i) => ({ status: 'success' as const, source: 'mock', gasUsed: 60_000n, transfers: i === 1 ? [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: r.gasPrice ? 90_000_000n : 100_000_000n }] : [] })); },
+  };
+  const batch = (d: Dependencies) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, atomicRequired: true, calls: [{ to: BOB, data: '0x12345678' }, { to: BOB, data: '0x87654321' }] }] }, { now: NOW }, d);
+  const p = await batch({ ...deps(), simulator: taxed });
+  assert.deepEqual(p.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), ['in 90']);
+  assert.match(p.decoding.notes.join(' '), /What these calls do depends on the fee they pay[^.]*: they were simulated at the price they would pay now, 1\.1 gwei/);
+  // Each call at the price, with room over the gas it used.
+  assert.equal(runs.length, 2);
+  assert.deepEqual(runs[1].map(r => [r.gasPrice, r.baseFee, r.gas]), [[GWEI + GWEI / 10n, GWEI, 160_000n], [GWEI + GWEI / 10n, GWEI, 160_000n]]);
+  // The same at both prices: the first run stands and nothing is said.
+  runs.length = 0;
+  const flat = { ...taxed, simulateBatch: async (rs: SimulationRequest[]): Promise<SimulationResult[]> => { runs.push(rs); return rs.map(() => ({ status: 'success' as const, source: 'mock', gasUsed: 60_000n, transfers: [] })); } };
+  const q = await batch({ ...deps(), simulator: flat });
+  assert.equal(runs.length, 2);
+  assert.ok(!/depends on the fee/.test(q.decoding.notes.join(' ')));
+});

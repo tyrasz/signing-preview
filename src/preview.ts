@@ -2,8 +2,9 @@ import { attentionOf, PreviewBuilder } from './format.ts';
 import { chainName } from './chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
 import { decodeTransaction, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
+import { expectedGasPrice } from './evm/tx-checks.ts';
 import type { Decoded } from './evm/common.ts';
-import { approvalChanges, netChanges, nftChanges } from './evm/effects.ts';
+import { approvalChanges, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './evm/effects.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
@@ -96,12 +97,23 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   // Simulate the whole batch in order when the simulator can; otherwise only the first call is independent.
   let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);
   let results: SimulationResult[] | null = null;
+  let priced: { gasPrice: bigint; tip: bigint } | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
     if (deps.simulator.simulateBatch && sameChain) {
       try {
-        results = await deps.simulator.simulateBatch(txs.map((tx, i) => simulationRequest(tx, decoded[i])));
+        const requests = txs.map((tx, i) => simulationRequest(tx, decoded[i]));
+        results = await deps.simulator.simulateBatch(requests);
         if (results && results.length !== txs.length) throw new Error(`the simulator returned ${results.length} results for ${txs.length} calls`);
+        // Once more at the price the batch would pay now, as a single transaction is (src/evm/transaction.ts): if
+        // that changes what a call does, the priced run is the one shown.
+        if (results?.every(r => r.status === 'success' && !r.limited && r.gasUsed !== undefined)) {
+          try {
+            const price = await expectedGasPrice(txs[0], deps);
+            const again = price && await deps.simulator.simulateBatch(requests.map((q, i) => ({ ...q, gas: txs[i].gas ?? roomFor(results![i].gasUsed!), gasPrice: price.gasPrice, baseFee: price.baseFee })));
+            if (price && again && again.length === txs.length && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; }
+          } catch { /* the node refused the priced run: the first stands */ }
+        }
         presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));
       } catch (error) {
         results = null;
@@ -126,6 +138,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (priced) b.note(pricedNote('calls', priced));
     if (results[0].basis === 'state' || results[0].basis === 'fork' || results.some(r => r.balancesRead)) b.note(simulationNote({ basis: results[0].basis, tokensRead: Math.max(...results.map(r => r.tokensRead ?? 0)), balancesRead: results.some(r => r.balancesRead) }));
     if (failed === -1) {
       // Net across the batch: an intermediate token received by one call and spent by the next nets out, and an
