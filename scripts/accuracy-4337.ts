@@ -1,10 +1,11 @@
-// npm run accuracy:4337 -- [--chain 1|42161] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 [--backfill 100] | --blocks 100 | --tx 0x…]
+// npm run accuracy:4337 -- [--chain 1|42161|8453|10|137|56] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 [--backfill 100] | --blocks 100 | --tx 0x…]
 //   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict] [--dump preview.json]
 //   [--differing dir/] (the row and preview of each operation whose preview differed, to look at once its state is gone)
 //
-// --concurrency replays that many operations at once (each on its own state; oldest first on Ethereum, newest first on
-// Arbitrum, whose state goes first), while --follow keeps
-// watching for new blocks: on Arbitrum an operation must be replayed within about 30 seconds of its block. --backfill
+// --concurrency replays that many operations at once (each on its own state; oldest first where the node keeps state
+// longer, newest first on Arbitrum, OP Mainnet and Polygon, whose public nodes keep the least), while --follow keeps
+// watching for new blocks: on Arbitrum an operation must be replayed within about 30 seconds of its block, on OP
+// Mainnet and Polygon within about two minutes (their public nodes keep 64 blocks). --backfill
 // first takes the operations of the blocks already behind the head (Ethereum keeps about 128 blocks of state).
 // --summary-md appends the results as Markdown (a CI job summary). --strict exits with 1 when an operation's outcome
 // differs from its receipt or, for one simulated whole on its block's state, its gas is 5% or more off or its token
@@ -40,17 +41,26 @@ import { readOperation, userOpHash } from '../src/userop-hash.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
+import { chainName, EVM_RPCS, OP_STACK, rpcUrlFor } from '../src/chains.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
 const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.includes('--strict');
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '1'))), BACKFILL = Number(arg('backfill', '0'));
-// ARBITRUM_RPC_URL / ETHEREUM_RPC_URL replace the public RPCs (empty counts as unset, as an unset CI secret is).
-const URL_ = CHAIN === 42161 ? process.env.ARBITRUM_RPC_URL || 'https://arb1.arbitrum.io/rpc' : process.env.ETHEREUM_RPC_URL || 'https://ethereum-rpc.publicnode.com';
+// The chain's *_RPC_URL replaces its public RPC (empty counts as unset, as an unset CI secret is; EVM_RPCS).
+const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
+/**
+ * How long the chain's public node keeps a block's state, in seconds, where that is short: an operation whose block is
+ * older by its turn is skipped (its state would go partway through the replay), and the queue runs newest first.
+ */
+const STATE_SECONDS: Record<number, number> = { 42161: 25, 10: 100, 137: 100 };
+const NEWEST_FIRST = CHAIN in STATE_SECONDS;
+/** An OP Stack block's L1 info deposit comes from this depositor: kept among the block's earlier transactions (see below). */
+const L1_INFO_DEPOSITOR = '0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001';
 const ENTRY_POINTS: Record<string, string> = { '0.6': '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789', '0.7': '0x0000000071727de22e5e9d8baf0edac6f37da032', '0.8': '0x4337084d9e255ff0702461cf8895ce9e3b5ff108', '0.9': '0x433709009b8330fda32311df1c2afa402ed8d009' };
 const EP = ENTRY_POINTS[VERSION];
 if (!EP) throw new Error(`--entrypoint is one of ${Object.keys(ENTRY_POINTS).join(', ')}`);
-const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : new Set<string>();
+const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : OP_STACK.has(CHAIN) ? new Set(['0x7e']) : new Set<string>();
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 30_000, retries: 6, retryDelayMs: 800 });
 const call = <T>(method: string, params: unknown[]) => rpc.call(CHAIN, method, params) as Promise<T>;
 
@@ -164,17 +174,23 @@ async function replay(item: string): Promise<void> {
   // A session key's operation (an ERC-7579 account validating through Rhinestone's SmartSession module, which its
   // nonce names): the dApp holding the key signs it, not the user's wallet, so nothing previews it.
   if (SESSION_VALIDATORS.some(v => BigInt(op.nonce).toString(16).padStart(64, '0').includes(v.slice(2)))) return skip("a session key's operation (signed by a dApp, not a wallet)");
-  const r = await call<{ blockNumber: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] }>('eth_getTransactionReceipt', [hash]);
+  // A transaction's receipt; OP Mainnet's public node refuses receipts by hash ("archive requests") but serves its
+  // block's receipts.
+  type Receipt = { transactionHash: string; blockNumber: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
+  const r = await call<Receipt>('eth_getTransactionReceipt', [hash]).catch(async () => (await call<Receipt[]>('eth_getBlockReceipts', [tx.blockNumber])).find(x => x.transactionHash.toLowerCase() === hash.toLowerCase())!);
+  if (!r) return skip('its receipt could not be read');
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
-  const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
-  // Arbitrum's public RPC keeps about 30 seconds of state: an operation whose block is older by the time its turn
-  // comes would lose its state partway through the replay (the stand-in's shape, the operation's hash, the
-  // simulation itself), and is skipped rather than replayed on part of it.
-  if (CHAIN === 42161 && !ONE && Date.now() / 1000 - Number(block.timestamp) > 25) return skip('its block was too old for the node by its turn (Arbitrum keeps about 30 seconds)');
+  const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; difficulty?: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
+  // Arbitrum's public RPC keeps about 30 seconds of state, OP Mainnet's and Polygon's about two minutes: an operation
+  // whose block is older by the time its turn comes would lose its state partway through the replay (the stand-in's
+  // shape, the operation's hash, the simulation itself), and is skipped rather than replayed on part of it.
+  if (STATE_SECONDS[CHAIN] && !ONE && Date.now() / 1000 - Number(block.timestamp) > STATE_SECONDS[CHAIN]) return skip(`its block was too old for the node by its turn (${chainName(CHAIN)}'s public node keeps about ${CHAIN === 42161 ? '30 seconds' : 'two minutes'})`);
   blocks.add(n);
   // The block's earlier transactions (--prefix), without their gas limits: the node charges each what it uses, and
   // the simulated block's gas limit holds them as it held the real ones.
-  const before: SimulationRequest[] = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type)).slice(-400)
+  // An OP Stack block's L1 info deposit (its first transaction) stays: the L1 values it sets are what a paymaster
+  // pricing L1 data reads (a bundle on OP Mainnet came out 0.47% low on the parent block's).
+  const before: SimulationRequest[] = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR).slice(-400)
     .map(t => ({ chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), ...(t.authorizationList?.length && { authorizationList: t.authorizationList as SimulationRequest['authorizationList'] }) })) : [];
   // An account the bundle itself delegates (EIP-7702, in the bundle transaction's own authorizations): the
   // authorizations apply first, as they do on-chain, and the account's code reads as the delegation.
@@ -201,8 +217,20 @@ async function replay(item: string): Promise<void> {
   // The block's header, but not its gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on
   // publicnode, below Ethereum's 60M), and the parent's limit, the node's default, is all but the same.
   let prefix = before; // dropped if the node refuses the block with it (see below)
-  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time: block.timestamp, feeRecipient: block.miner, prevRandao: block.mixHash, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
-  const deps = { ...liveDependencies({ [CHAIN === 42161 ? 'ARBITRUM_RPC_URL' : 'ETHEREUM_RPC_URL']: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
+  // The block's own time; BNB Chain's node refuses a simulated block in its parent's second (its blocks come faster
+  // than one a second), which then runs a second later, and its gas isn't judged (what writes once a second costs
+  // more). The block's DIFFICULTY as each node takes it: BNB Chain's from prevRandao (the block's difficulty there, 2
+  // when its validator was in turn; mixHash holds milliseconds), Polygon's from a difficulty override (see
+  // scripts/accuracy.ts).
+  let time: string = block.timestamp, timeBumped = false;
+  if (CHAIN === 56) {
+    const parentTime = BigInt((await call<{ timestamp: Hex }>('eth_getBlockByNumber', [parent, false])).timestamp);
+    if (BigInt(block.timestamp) <= parentTime) { time = hex(parentTime + 1n); timeBumped = true; }
+  }
+  const difficulty = block.difficulty ?? '0x0';
+  const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: block.mixHash, difficulty } : { prevRandao: block.mixHash };
+  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time, feeRecipient: block.miner, ...randomness, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
+  const deps = { ...liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
   // A node that no longer serves the parent block's state (Ethereum's public RPC keeps about 128 blocks) would leave
   // the preview reading nothing: the operation is skipped rather than replayed on missing state.
@@ -326,7 +354,8 @@ async function replay(item: string): Promise<void> {
   // balances, the receipt side here reads events. A gas-priced fee moves with the gas: within 1% for its rounding, and
   // for an operation in a bundle of several (whose gas comes out higher, above) by its gas difference too.
   const gasPercent = simCost !== undefined && actualGasCost > 0n ? Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 : undefined;
-  const feeSlack = BigInt(Math.ceil(1 + (ops.length > 1 && gasPercent !== undefined ? Math.abs(gasPercent) : 0)));
+  // (and for one run a second after its block, BNB Chain, whose gas isn't judged either, see below)
+  const feeSlack = BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped) && gasPercent !== undefined ? Math.abs(gasPercent) : 0)));
   const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack;
   const tokenMatch = tokens.every(t => t.actual === t.simulated) ? 'exact'
     : tokens.every(t => t.actual === t.simulated || feeLike(t)) ? 'fee'
@@ -341,6 +370,8 @@ async function replay(item: string): Promise<void> {
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
   const row = rows.at(-1)!;
+  // Run a second after its block (BNB Chain, above): its gas isn't judged, and an outcome that differs is reported.
+  if (timeBumped) row.timeBumped = true;
   // Where the preview was wrong (not a shape the stand-in doesn't take, or a node refusing): an outcome it got
   // wrong; and, where it simulated the whole operation on the state the operation met, gas 5% or more off (for an
   // operation alone in its bundle, above) or token movements beyond rounding. Calls simulated alone leave out the gas
@@ -349,12 +380,17 @@ async function replay(item: string): Promise<void> {
   // An outcome the preview got wrong while saying why it might (an account handed the stand-in signature while it
   // runs its calls, see userop_execution_reverts) is counted apart, as warned; with calls that didn't run as they
   // did, its gas and token movements aren't compared either.
-  const warned = !row.outcome && p.warnings.some(w => w.code === 'userop_execution_reverts' && /handed the whole operation, its signature included/.test(w.message));
-  if (warned) row.warned = 'outcome';
+  // So is one whose calls were simulated alone (validation reverted on the stand-in): what they meet without it isn't
+  // what the operation met; a shape to add, not a wrong preview.
+  const callsAlone = !row.whole && !row.notSimulated;
+  const warned = !row.outcome && (timeBumped || callsAlone || p.warnings.some(w => w.code === 'userop_execution_reverts' && /handed the whole operation, its signature included/.test(w.message)));
+  if (warned) row.warned = timeBumped ? 'outcome (run a second after its block)' : callsAlone ? 'outcome (its calls simulated alone)' : 'outcome';
   const judged = row.whole === true && !row.prefix && !warned;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
-    judged && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
+    // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas
+    // (a post-quantum SPHINCS+ wallet on Base, 40%); a shape to add, not a wrong preview, as for calls simulated alone.
+    judged && !timeBumped && row.standIn !== 'rejected' && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
     judged && row.tokens === 'other' && 'tokens',
   ].filter((x): x is string => !!x);
   if (differs.length) row.differs = differs;
@@ -376,14 +412,14 @@ let active = 0;
 const idle: (() => void)[] = [];
 const pump = () => {
   while (active < CONCURRENCY && queue.length && rows.length + active < MAX) {
-    const h = (CHAIN === 42161 ? queue.pop() : queue.shift())!;
+    const h = (NEWEST_FIRST ? queue.pop() : queue.shift())!;
     active++;
     replay(h).catch(e => skip(`error: ${(e as Error).message.slice(0, 80)}`)).finally(() => { active--; pump(); if (!active && (!queue.length || rows.length >= MAX)) idle.splice(0).forEach(f => f()); });
   }
 };
 const enqueue = (hashes: string[]) => { queue.push(...hashes); pump(); };
 /** Next in line whichever way the queue runs: a bundle's later operations, while its block's state is there. */
-const enqueueNext = (items: string[]) => { if (CHAIN === 42161) queue.push(...items); else queue.unshift(...items); pump(); };
+const enqueueNext = (items: string[]) => { if (NEWEST_FIRST) queue.push(...items); else queue.unshift(...items); pump(); };
 const drained = () => new Promise<void>(r => (active || (queue.length && rows.length < MAX) ? idle.push(r) : r()));
 const ONE = arg('tx', '');
 if (ONE) { enqueue([ONE]); await drained(); }
@@ -419,7 +455,7 @@ const g = (r: Row) => (bundled(r) ? undefined : r.gas as { percent: number } | u
 const bg = (r: Row) => (bundled(r) ? r.gas as { percent: number } | undefined : undefined);
 const range = [...blocks].sort((a, b) => a - b);
 console.log('');
-say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum'}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
+say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 say(`  gas paid, of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
@@ -436,7 +472,7 @@ for (const r of rows) {
 const wrong = rows.filter(r => (r.differs as string[] | undefined)?.length);
 const md = arg('summary-md', '');
 if (md) {
-  const chain = CHAIN === 42161 ? 'Arbitrum One' : 'Ethereum';
+  const chain = chainName(CHAIN);
   const [title, ...rest] = lines;
   appendFileSync(md, `### ${chain}, EntryPoint v${VERSION}${wrong.length ? ` — ${wrong.length} differing from the receipts` : ''}\n\n${title}\n\n\`\`\`\n${rest.join('\n')}\n\`\`\`\n\n`);
 }
