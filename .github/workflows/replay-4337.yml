@@ -32,14 +32,15 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      # Three at a time: the Ethereum ones share one public RPC.
-      max-parallel: 3
+      # Four at a time, in this order: two on each chain's public RPC.
+      max-parallel: 4
       matrix:
         include:
           # Ethereum keeps about 128 blocks of state: start with the operations already in it.
           - { name: 'Ethereum, EntryPoint v0.7', chain: '1', entrypoint: '0.7', backfill: '100' }
           - { name: 'Arbitrum One, EntryPoint v0.7', chain: '42161', entrypoint: '0.7', backfill: '0' }
           - { name: 'Ethereum, EntryPoint v0.8', chain: '1', entrypoint: '0.8', backfill: '100' }
+          - { name: 'Arbitrum One, EntryPoint v0.8', chain: '42161', entrypoint: '0.8', backfill: '0' }
           - { name: 'Ethereum, EntryPoint v0.6', chain: '1', entrypoint: '0.6', backfill: '100' }
           - { name: 'Arbitrum One, EntryPoint v0.6', chain: '42161', entrypoint: '0.6', backfill: '0' }
           - { name: 'Arbitrum One, EntryPoint v0.9', chain: '42161', entrypoint: '0.9', backfill: '0' }
