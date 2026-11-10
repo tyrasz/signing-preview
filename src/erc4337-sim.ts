@@ -454,6 +454,10 @@ async function implementationOf(deps: Dependencies, chainId: number, account: st
   try {
     const code = String(await deps.rpc.call(chainId, 'eth_getCode', [account, 'latest']));
     const delegate = /^0xef0100[0-9a-f]{40}$/i.test(code) ? `0x${code.slice(8)}`.toLowerCase() : undefined;
+    // An EIP-7702 delegate with a shape of its own runs its own code: an ERC-1967 slot the account still has from an
+    // earlier delegation (Coinbase's EIP7702Proxy writes one) isn't what it runs now. Only a delegate that is itself
+    // a proxy is followed to the implementation in the slot.
+    if (delegate && STUB_SHAPES[delegate]) return delegate;
     if (code === '0x' || code.length > 400) return undefined;
     // Biconomy Smart Account v2's proxy keeps its implementation in the slot numbered by its own address.
     const own = code.toLowerCase().startsWith(BICONOMY_PROXY);
