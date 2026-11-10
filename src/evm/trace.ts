@@ -8,7 +8,7 @@
 // What can't be named keeps its selector and raw data.
 import { decodeEventLog, decodeFunctionData, decodeFunctionResult, parseAbi, parseAbiItem, toEventSelector, toFunctionSelector, toFunctionSignature, type Abi, type AbiEvent, type AbiFunction, type AbiParameter, type Hex } from 'viem';
 import { builtinTokens, CHAINS } from '../chains.ts';
-import type { ContractAbi, Dependencies, PreviewTrace, SimulationRequest, SimulationResult, StateChange, TraceCall, TraceEntry, TraceEvent, TraceValue } from '../types.ts';
+import type { ContractAbi, Dependencies, PreviewTrace, ReplayContext, SimulationRequest, SimulationResult, StateChange, TraceCall, TraceEntry, TraceEvent, TraceValue } from '../types.ts';
 import { COMMON_SIGNATURES } from '../abi.ts';
 
 /** How much of a trace is described: calls beyond this are counted, not listed. */
@@ -105,7 +105,7 @@ const values = (params: readonly AbiParameter[], decoded: readonly unknown[]): T
 
 type Named = { fn: AbiFunction; from: 'verified' | 'standard' | 'signature'; contract?: string };
 /** Whose preview the trace is for: `account` is named `accountLabel` in it ("you" unless said: a Safe, a smart account). */
-export interface TraceEnv { chainId: number; account?: string; accountLabel?: string; deps: Dependencies }
+export interface TraceEnv { chainId: number; account?: string; accountLabel?: string; deps: Dependencies; /** Set by tracePreviews when the calls reach something a local EVM can't run: why. */ unsupported?: string; /** How long the tracing run may take, over the simulator's default (a replay's runs its block's earlier transactions first). */ budgetMs?: number }
 
 /** The function `data` calls among these, if its arguments decode as that function's. */
 function match(fns: readonly AbiFunction[], data: Hex): { fn: AbiFunction; args: readonly unknown[] } | null {
@@ -265,11 +265,25 @@ function nativeText(chainId: number, v: bigint): string {
   return `${whole}${frac ? `.${frac}` : ''} ${symbol}`;
 }
 
+/**
+ * Logs a chain writes itself, outside the EVM: Polygon's node logs every native transfer and every fee payment
+ * from its 0x…1010 contract (LogTransfer, LogFeeTransfer). A local EVM run has none, and they say nothing a
+ * balance change doesn't, so runs are compared without them.
+ */
+export function chainsOwnLog(l: { address: string; topics: string[] }): boolean {
+  return l.address.toLowerCase() === '0x0000000000000000000000000000000000001010' && (l.topics[0] === '0xe6497e3ee548a3372136af2fcb0696db31fc6cf20260707645068bd3fe97f3c4' || l.topics[0] === '0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63');
+}
+
+/** Why a preview asked for a trace has none, for its notes (after tracePreviews returned null). */
+export function noTrace(env: TraceEnv): string {
+  return env.unsupported ? `No trace: ${env.unsupported}.` : "No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.";
+}
+
 /** Whether two simulations of the same call did the same thing: the same outcome and the same events, in order. */
 export function sameRun(a: { status: string; logs?: { address: string; topics: string[]; data: string }[] }, b: { status: string; logs?: { address: string; topics: string[]; data: string }[] }): boolean {
   if (a.status !== b.status) return false;
   const key = (l: { address: string; topics: string[]; data: string }) => `${l.address.toLowerCase()}|${l.topics.join(',').toLowerCase()}|${l.data.toLowerCase()}`;
-  const x = (a.logs ?? []).map(key), y = (b.logs ?? []).map(key);
+  const x = (a.logs ?? []).filter(l => !chainsOwnLog(l)).map(key), y = (b.logs ?? []).filter(l => !chainsOwnLog(l)).map(key);
   return x.length === y.length && x.every((k, i) => k === y[i]);
 }
 
@@ -282,7 +296,10 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
   const sim = env.deps.simulator;
   if (!sim?.trace || !requests.length) return null;
   let traced: SimulationResult[] | null;
-  try { traced = await sim.trace(requests); } catch { traced = null; }
+  try { traced = await sim.trace(requests, env.budgetMs !== undefined ? { budgetMs: env.budgetMs } : undefined); } catch (e) {
+    if (e instanceof Error && e.name === 'ForkUnsupported') env.unsupported = e.message;
+    traced = null;
+  }
   if (!traced) return null;
   const at = requests[0].at;
   const where = `a local EVM over ${CHAINS[env.chainId]?.name ?? `chain ${env.chainId}`}'s state${at && /^0x[0-9a-f]+$/i.test(at.block) ? ` at block ${BigInt(at.block)}` : ''}`;
@@ -296,4 +313,30 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
     const note = [s?.traceNote, differs].filter(Boolean).join(' ');
     return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(note && { note }) });
   }));
+}
+
+/**
+ * How a replay's run compares with the receipt: the outcome; then, when that is the same, the events in order and
+ * the gas. On Arbitrum the node adds its own charge for L1 data to the gas, between none and twice the receipt's.
+ */
+export function compareWithReceipt(sim: SimulationResult, r: ReplayContext['receipt']): { matches: boolean; differences?: string[] } {
+  const differences: string[] = [];
+  const said = (s: 'success' | 'reverted') => (s === 'success' ? 'succeeded' : 'reverted');
+  if (sim.status !== r.status) {
+    differences.push(`the run ${said(sim.status)}${sim.status === 'reverted' && sim.revertReason ? ` (${sim.revertReason})` : ''} where the receipt says it ${said(r.status)}`);
+  } else {
+    const logs = (sim.logs ?? (sim.status === 'reverted' ? [] : undefined))?.filter(l => !chainsOwnLog(l));
+    const theirs = r.logs.filter(l => !chainsOwnLog(l));
+    if (!logs) differences.push('the run\'s events couldn\'t be read back to compare');
+    else {
+      const same = (a: { address: string; topics: string[]; data: string }, b: typeof a) => a.address.toLowerCase() === b.address.toLowerCase() && a.data.toLowerCase() === b.data.toLowerCase() && a.topics.length === b.topics.length && a.topics.every((t, i) => t.toLowerCase() === b.topics[i].toLowerCase());
+      const first = theirs.findIndex((l, i) => !logs[i] || !same(l, logs[i]));
+      if (logs.length !== theirs.length) differences.push(`the run emitted ${logs.length} event${logs.length === 1 ? '' : 's'} where the receipt has ${theirs.length}`);
+      else if (first !== -1) differences.push(`event ${first + 1} of ${theirs.length} differs from the receipt's`);
+    }
+    const gas = sim.gasUsed;
+    const inBand = gas !== undefined && (gas === r.gasUsed || (r.gasForL1 !== undefined && gas >= r.gasUsed && gas - r.gasUsed <= 2n * r.gasForL1));
+    if (!inBand) differences.push(gas === undefined ? 'the run reported no gas to compare' : `the run used ${gas.toLocaleString('en-US')} gas where the receipt says ${r.gasUsed.toLocaleString('en-US')}`);
+  }
+  return differences.length ? { matches: false, differences } : { matches: true };
 }

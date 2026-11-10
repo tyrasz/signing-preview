@@ -3,9 +3,9 @@ import { chainName } from './chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
 import { decodeTransaction, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
-import { pinLatest } from './block.ts';
+import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
 import { addUsdValues } from './prices.ts';
-import { tracePreviews } from './evm/trace.ts';
+import { noTrace, tracePreviews, type TraceEnv } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
 import { approvalChanges, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './evm/effects.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
@@ -32,8 +32,23 @@ const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
  * Throws RequestError (code INVALID_REQUEST) when the request is malformed.
  */
 export async function previewRequest(request: SigningRequest, context: PreviewContext = {}, deps: Dependencies = {}): Promise<Preview> {
-  // What the balance changes are worth now, where the dependencies have prices (src/prices.ts).
-  return addUsdValues(await previewOf(request, context, deps), deps);
+  // A past block named for the simulation (PreviewContext.block) is read once, by whichever simulation needs it first.
+  let ctx = context;
+  if (context.block !== undefined && !context.replay) {
+    try { parseBlock(context.block); } catch (e) { throw new RequestError(`context: ${(e as Error).message}`); }
+    ctx = { ...context, pinned: new Map<number, Promise<Pinned>>() };
+  }
+  const preview = await previewOf(request, ctx, deps);
+  // Prices as of then: a replay's block, or the block named.
+  let when = context.replay?.when;
+  if (ctx.pinned) {
+    const pinned = preview.network?.kind === 'evm' ? await ctx.pinned.get(preview.network.chainId)?.catch(() => undefined) : undefined;
+    if (pinned) when = { block: pinned.at.block, time: pinned.time };
+    // Only transactions and batches are simulated on a named block.
+    else if (preview.kind === 'typed_data' || preview.kind === 'message') preview.decoding.notes.push('A past block (context.block) applies to transactions and batches: this request was previewed against the latest block.');
+  }
+  // What the balance changes are worth (now, or then), where the dependencies have prices (src/prices.ts).
+  return addUsdValues(preview, deps, when);
 }
 
 async function previewOf(request: SigningRequest, context: PreviewContext, deps: Dependencies): Promise<Preview> {
@@ -109,12 +124,14 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   let priced: { gasPrice: bigint; tip: bigint } | undefined;
   // What was simulated for the results shown, for tracing them.
   let ran: SimulationRequest[] | undefined;
+  let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
     if (deps.simulator.simulateBatch && sameChain) {
       try {
         // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
-        const at = context.trace ? await pinLatest(deps.rpc, txs[0].chainId) : undefined;
+        named = await namedBlock(context, deps.rpc, txs[0].chainId);
+        const at = named?.at ?? (context.trace ? await pinLatest(deps.rpc, txs[0].chainId) : undefined);
         const requests = txs.map((tx, i) => ({ ...simulationRequest(tx, decoded[i]), ...(at && { at }) }));
         ran = requests;
         results = await deps.simulator.simulateBatch(requests);
@@ -123,7 +140,7 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
         // that changes what a call does, the priced run is the one shown.
         if (results?.every(r => r.status === 'success' && !r.limited && r.gasUsed !== undefined)) {
           try {
-            const price = await expectedGasPrice(txs[0], deps);
+            const price = await expectedGasPrice(txs[0], deps, named?.at.header.baseFeePerGas);
             const pricedRequests = requests.map((q, i) => ({ ...q, gas: txs[i].gas ?? roomFor(results![i].gasUsed!), gasPrice: price?.gasPrice, baseFee: price?.baseFee }));
             const again = price && await deps.simulator.simulateBatch(pricedRequests);
             if (price && again && again.length === txs.length && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
@@ -145,9 +162,10 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
   // Each call's trace (PreviewContext.trace), from the calls run in order where they can be traced.
   let untraced: string | undefined;
   if (context.trace && results && ran) {
-    const traces = await tracePreviews(ran, results, { chainId: txs[0].chainId, account: txs[0].from, deps });
+    const env: TraceEnv = { chainId: txs[0].chainId, account: txs[0].from, deps };
+    const traces = await tracePreviews(ran, results, env);
     for (const [i, t] of (traces ?? []).entries()) if (t) calls[i].trace = t;
-    if (!traces) untraced = "No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.";
+    if (!traces) untraced = noTrace(env);
   }
 
   const b = new PreviewBuilder();
@@ -158,8 +176,9 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     const failed = results.findIndex(r => r.status === 'reverted');
     const gasUsed = results.reduce((sum, r) => sum + (r.gasUsed ?? 0n), 0n);
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
-      ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }) };
+      ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }), ...(named && { block: named.number.toString() }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (named) b.note(`Simulated on the state after ${blockText(named.number, named.time)}, in the block that followed: what the calls would have done then, not now.`);
     if (untraced) b.note(untraced);
     if (priced) b.note(pricedNote('calls', priced));
     if (results[0].basis === 'state' || results[0].basis === 'fork' || results.some(r => r.balancesRead)) b.note(simulationNote({ basis: results[0].basis, tokensRead: Math.max(...results.map(r => r.tokensRead ?? 0)), balancesRead: results.some(r => r.balancesRead) }));

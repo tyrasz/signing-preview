@@ -114,6 +114,28 @@ async function init() {
     send(s.request, s.chainId, s.context);
   });
   $('custom').value = JSON.stringify(samples[0].request, null, 2);
+  // A mined transaction run again where it ran (POST /v1/replay): what it did, and whether the run matches its receipt.
+  $('replay').onclick = async () => {
+    if (pendingConfirm) settle(false);
+    const hash = $('hash').value.trim(), chainId = Number($('chain').value);
+    $('preview').className = 'empty';
+    $('preview').textContent = 'Replaying…';
+    try {
+      const res = await fetch('/v1/replay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chainId, hash, trace: $('trace').checked }) });
+      const body = await res.json();
+      if (!res.ok) { $('preview').textContent = body.error?.message ?? 'The transaction could not be replayed.'; return log(`replay → ${body.error?.code ?? res.status}`); }
+      const r = body.replay;
+      $('preview').className = 'wallet';
+      $('preview').innerHTML = `<div class="network"><span class="chip">block ${esc(r.block)}, position ${esc(r.index)}</span><span class="chip">${esc(r.time.replace('T', ' ').slice(0, 19))} UTC</span><span class="badge ${r.matches ? 'none' : 'caution'}">${r.matches ? 'matches its receipt' : r.matches === false ? 'differs from its receipt' : 'not simulated'}</span></div>${renderBody(body)}
+        <details><summary>Preview JSON</summary><pre>${esc(JSON.stringify(body, null, 2))}</pre></details>`;
+      // The box is at the foot of the request column: bring the result into view.
+      $('preview').scrollIntoView({ block: 'nearest' });
+      log(`replay ${hash.slice(0, 12)}… → ${r.matches ? 'matches its receipt' : 'see the preview'}`);
+    } catch (error) {
+      $('preview').textContent = 'The transaction could not be replayed.';
+      log(`replay → error: ${error.message}`);
+    }
+  };
   $('send').onclick = () => {
     let request;
     try { request = JSON.parse($('custom').value); } catch { return log('custom request is not valid JSON'); }

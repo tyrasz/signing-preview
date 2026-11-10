@@ -27,13 +27,14 @@ const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)'
  * its tip (the request's, or the node's suggestion; none on Arbitrum), up to its fee cap. Undefined without an RPC or
  * a base fee, when the cap is under the base fee (the transaction waits), or when the price is zero.
  */
-export async function expectedGasPrice(tx: Tx, deps: Dependencies): Promise<{ gasPrice: bigint; baseFee: bigint; tip: bigint } | undefined> {
+export async function expectedGasPrice(tx: Tx, deps: Dependencies, baseFeeOf?: bigint): Promise<{ gasPrice: bigint; baseFee: bigint; tip: bigint } | undefined> {
   const rpc = deps.rpc;
   if (!rpc?.has(tx.chainId)) return undefined;
   const call = <T>(method: string, params: unknown[]) => rpc.call(tx.chainId, method, params).then(r => r as T, () => undefined);
   const arbitrum = ARBITRUM.has(tx.chainId);
   const [block, suggested] = await Promise.all([
-    call<{ baseFeePerGas?: string }>('eth_getBlockByNumber', ['latest', false]),
+    // `baseFeeOf`: the base fee of a block named for the simulation (a past one), in place of the latest block's.
+    baseFeeOf !== undefined ? Promise.resolve({ baseFeePerGas: `0x${baseFeeOf.toString(16)}` }) : call<{ baseFeePerGas?: string }>('eth_getBlockByNumber', ['latest', false]),
     tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
   ]);
   if (block?.baseFeePerGas === undefined) return undefined;

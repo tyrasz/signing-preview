@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { previewRequest } from './preview.ts';
+import { ReplayError, replayTransaction } from './replay.ts';
 import { RequestError } from './evm/transaction.ts';
 import { EVM_RPCS, StaticTokenRegistry } from './chains.ts';
 import { HttpHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
@@ -54,6 +55,7 @@ export function createPreviewServer(options: ServerOptions) {
       if (req.method === 'GET' && url.pathname === '/v1/health') return json(res, 200, { status: 'ok' });
       if (req.method === 'GET' && url.pathname === '/v1/openapi.json') return json(res, 200, openApiDocument());
       if (req.method === 'POST' && url.pathname === '/v1/preview') return await handlePreview(req, res, options.deps);
+      if (req.method === 'POST' && url.pathname === '/v1/replay') return await handleReplay(req, res, options.deps);
       if (req.method === 'GET' && url.pathname === '/v1/samples' && options.samples) return json(res, 200, options.samples());
       if (req.method === 'GET' && options.serveDemo && url.pathname === '/demo/config.json') return json(res, 200, { data: options.demoData ?? 'mock' });
       if (req.method === 'GET' && options.serveDemo) return await serveStatic(url.pathname, res);
@@ -82,6 +84,24 @@ async function handlePreview(req: IncomingMessage, res: ServerResponse, deps: De
   }
 }
 
+/** POST /v1/replay { chainId, hash, trace? }: a mined transaction run again where it ran, as a preview (src/replay.ts). */
+async function handleReplay(req: IncomingMessage, res: ServerResponse, deps: Dependencies) {
+  if (!(req.headers['content-type'] ?? '').includes('application/json')) return json(res, 415, { error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Send application/json' } });
+  let body: { chainId?: unknown; hash?: unknown; trace?: unknown };
+  try { body = JSON.parse(await readBody(req)); } catch (error) {
+    if (error instanceof BodyTooLarge) res.setHeader('connection', 'close');
+    return json(res, error instanceof BodyTooLarge ? 413 : 400, { error: { code: 'INVALID_JSON', message: error instanceof Error ? error.message : 'Invalid JSON' } });
+  }
+  if (!body || typeof body !== 'object') return json(res, 400, { error: { code: 'INVALID_REQUEST', message: 'Body must be { chainId, hash, trace? }' } });
+  try {
+    return json(res, 200, await replayTransaction({ chainId: body.chainId as number, hash: body.hash as string }, { ...(body.trace === true && { trace: true }) }, deps));
+  } catch (error) {
+    if (error instanceof ReplayError) return json(res, REPLAY_STATUS[error.code], { error: { code: error.code, message: error.message } });
+    throw error;
+  }
+}
+const REPLAY_STATUS = { INVALID_REQUEST: 400, NOT_FOUND: 404, PENDING: 409, UNSUPPORTED: 422, UNAVAILABLE: 503 } as const;
+
 function sanitizeContext(raw: unknown): PreviewContext {
   if (!raw || typeof raw !== 'object') return {};
   const c = raw as Record<string, unknown>;
@@ -90,6 +110,7 @@ function sanitizeContext(raw: unknown): PreviewContext {
   if (typeof c.origin === 'string') out.origin = c.origin.slice(0, 256);
   if (typeof c.account === 'string' && /^0x[0-9a-fA-F]{40}$/.test(c.account)) out.account = c.account;
   if (c.trace === true) out.trace = true;
+  if ((typeof c.block === 'number' && Number.isSafeInteger(c.block) && c.block >= 0) || (typeof c.block === 'string' && /^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$/.test(c.block))) out.block = c.block;
   const hl = c.hyperliquid as Record<string, unknown> | undefined;
   if (hl && typeof hl === 'object' && hl.action && typeof hl.action === 'object' && typeof hl.nonce === 'number') {
     out.hyperliquid = {

@@ -48,17 +48,18 @@ export class ChainlinkPrices implements PriceSource {
   private cache = new TtlCache<Promise<Price | undefined>>();
   private now: () => number;
   constructor(rpc: RpcClient, options: { now?: () => number } = {}) { this.rpc = rpc; this.now = options.now ?? Date.now; }
-  price(chainId: number, asset: string): Promise<Price | undefined> {
+  price(chainId: number, asset: string, at?: { block: string; time: number }): Promise<Price | undefined> {
     const pair = pairOf(chainId, asset), feed = pair && CHAINLINK_FEEDS[chainId]?.[pair];
     if (!pair || !feed || !this.rpc.has(chainId)) return Promise.resolve(undefined);
-    const key = `${chainId}:${feed}`, hit = this.cache.get(key);
+    // As of a past block: the feed's answer in that block's state, and its age measured from that block's time.
+    const key = `${chainId}:${feed}:${at?.block ?? ''}`, hit = this.cache.get(key);
     if (hit) return hit;
     const value = (async (): Promise<Price | undefined> => {
       try {
         // latestRoundData(): (roundId, answer, startedAt, updatedAt, answeredInRound); every feed here has 8 decimals.
-        const out = String(await this.rpc.call(chainId, 'eth_call', [{ to: feed, data: '0xfeaf968c' }, 'latest'])) as Hex;
+        const out = String(await this.rpc.call(chainId, 'eth_call', [{ to: feed, data: '0xfeaf968c' }, at?.block ?? 'latest'])) as Hex;
         const [, answer, , updatedAt] = decodeAbiParameters([{ type: 'uint80' }, { type: 'int256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint80' }], out);
-        if (answer <= 0n || this.now() / 1000 - Number(updatedAt) > MAX_AGE_SECONDS) return undefined;
+        if (answer <= 0n || (at?.time ?? this.now() / 1000) - Number(updatedAt) > MAX_AGE_SECONDS) return undefined;
         return { usd: Number(answer) / 1e8, source: `Chainlink ${pair}`, updatedAt: Number(updatedAt) };
       } catch { return undefined; }
     })();
@@ -74,8 +75,9 @@ export class HyperliquidPrices implements PriceSource {
   private info: HyperliquidInfo;
   private cache = new TtlCache<Promise<Record<string, string>>>();
   constructor(info: HyperliquidInfo) { this.info = info; }
-  async price(chainId: number, asset: string): Promise<Price | undefined> {
-    if (chainId !== 999) return undefined;
+  async price(chainId: number, asset: string, at?: { block: string; time: number }): Promise<Price | undefined> {
+    // Mid prices are the market's now: there is none here for a past block.
+    if (chainId !== 999 || at) return undefined;
     const symbol = asset === 'native' ? 'native' : builtinTokens(chainId).find(t => t.address.toLowerCase() === asset.toLowerCase())?.symbol;
     if (symbol === 'USDC') return { usd: 1, source: 'USDC, taken as a dollar' };
     const coin = symbol && HYPERLIQUID_COINS[symbol];
@@ -104,9 +106,9 @@ export class StaticPrices implements PriceSource {
 export class ChainedPrices implements PriceSource {
   private sources: PriceSource[];
   constructor(sources: PriceSource[]) { this.sources = sources; }
-  async price(chainId: number, asset: string): Promise<Price | undefined> {
+  async price(chainId: number, asset: string, at?: { block: string; time: number }): Promise<Price | undefined> {
     for (const s of this.sources) {
-      try { const p = await s.price(chainId, asset); if (p) return p; } catch { /* the next */ }
+      try { const p = await s.price(chainId, asset, at); if (p) return p; } catch { /* the next */ }
     }
     return undefined;
   }
@@ -124,10 +126,11 @@ const PRICE_BUDGET_MS = 2500;
 
 /**
  * Adds what each fungible balance change is worth (AssetChange.usd, from its formatted amount and the asset's
- * price) to a preview and its batch calls, and a "Value now" line when something was priced. A preview on a chain
+ * price) to a preview and its batch calls, and a "Value now" line when something was priced; with `when`, a past
+ * block's prices and a "Value then" line. A preview on a chain
  * without prices, or of assets that have none, is left as it is; so is one whose prices don't come in time.
  */
-export async function addUsdValues(preview: Preview, deps: Dependencies): Promise<Preview> {
+export async function addUsdValues(preview: Preview, deps: Dependencies, when?: { block: string; time: number }): Promise<Preview> {
   const prices = deps.prices, network = preview.network;
   if (!prices || !network || network.kind !== 'evm') return preview;
   const chainId = network.chainId;
@@ -135,7 +138,7 @@ export async function addUsdValues(preview: Preview, deps: Dependencies): Promis
     if (!c.asset || c.standard === 'erc721' || c.standard === 'erc1155') return;
     const amount = Number(c.amount.replace(/,/g, ''));
     if (!Number.isFinite(amount) || amount <= 0) return;
-    const p = await prices.price(chainId, c.asset);
+    const p = await prices.price(chainId, c.asset, when);
     if (!p || closed) return; // a price that comes after the wait isn't added: the sum below wouldn't count it
     worth.set(c, amount * p.usd);
     c.usd = usdText(amount * p.usd);
@@ -156,7 +159,7 @@ export async function addUsdValues(preview: Preview, deps: Dependencies): Promis
     const out = total('out'), inn = total('in');
     const parts = [out > 0 && `out ≈ $${usdText(out)}`, inn > 0 && `in ≈ $${usdText(inn)}`].filter(Boolean);
     const unpriced = fungible.length - withPrice.length;
-    p.details.push({ label: 'Value now', value: `${parts.join(', ')}${unpriced ? ` (${unpriced} asset${unpriced === 1 ? '' : 's'} without a price not counted)` : ''}` });
+    p.details.push({ label: when ? 'Value then' : 'Value now', value: `${parts.join(', ')}${unpriced ? ` (${unpriced} asset${unpriced === 1 ? '' : 's'} without a price not counted)` : ''}` });
   }
   return preview;
 }

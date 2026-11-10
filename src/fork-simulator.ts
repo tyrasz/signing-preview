@@ -19,7 +19,7 @@ import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft
 import { keccak256 } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
-import { headerAfter, NEXT_BLOCK } from './block.ts';
+import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
 import { approvalKey, decodeRevert, decodeState, ELSEWHERE, namedApproval, parseLogs, stateCall } from './simulation.ts';
@@ -119,7 +119,7 @@ export interface ForkSimulatorOptions {
    * The simulated block's header. By default, the next block after `block`: its number + 1, its timestamp plus the
    * chain's block time, and its fee recipient, randomness and base fee. Replays pass the real block's header.
    */
-  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint } | undefined;
+  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint; /** The block's blob base fee (BLOBBASEFEE). */ blobBaseFee?: bigint } | undefined;
   profiles?: Record<number, ChainProfile>;
   /**
    * A file to keep the caches shared by all simulations in (contract code and the last value seen of each slot), so
@@ -245,6 +245,19 @@ export function saveForkCache(file: string): void {
 const ZERO = '0x0000000000000000000000000000000000000000';
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
+
+/**
+ * The readers fetchAfter places: each takes 32-byte words of calldata and returns a word for each (the balance of
+ * the address, or the value of the storage slot), or the code of the one address given.
+ *   PUSH1 0 [JUMPDEST DUP1 CALLDATASIZE GT ISZERO PUSH1 0x15 JUMPI DUP1 CALLDATALOAD <BALANCE|SLOAD> DUP2 MSTORE
+ *   PUSH1 0x20 ADD PUSH1 0x02 JUMP] JUMPDEST CALLDATASIZE PUSH1 0 RETURN
+ *   PUSH1 0 CALLDATALOAD DUP1 EXTCODESIZE DUP1 PUSH1 0 PUSH1 0 DUP5 EXTCODECOPY PUSH1 0 RETURN
+ * (No PUSH0: a block from before Shanghai has none.)
+ */
+const BALANCE_READER = '0x00000000000000000000000000000000ba1a9ce5', CODE_READER = '0x00000000000000000000000000000000c0de9ead';
+const BALANCE_READER_CODE = '0x60005b8036111560155780353181526020016002565b366000f3', SLOT_READER_CODE = '0x60005b8036111560155780355481526020016002565b366000f3';
+const CODE_READER_CODE = '0x600035803b8060006000843c6000f3';
+
 /** Fetches accounts, storage and forwarded calls from the RPC, in batches, and keeps them for the simulation. */
 class StateSource {
   accounts = new Map<string, AccountData>();
@@ -268,19 +281,85 @@ class StateSource {
     return h as { number: Hex; timestamp: Hex; miner: Hex; mixHash?: Hex; gasLimit: Hex; baseFeePerGas?: Hex; difficulty?: Hex; l1BlockNumber?: Hex };
   }
 
+  /**
+   * A block that was asked for (a past block, a replay): what the caches hold of other blocks isn't taken for its
+   * state (code an account has now, it may not have had then), and what is read of it isn't kept as the latest seen.
+   */
+  historic = false;
+  /**
+   * Reads are of the state after these calls (the transactions before a replayed one in its block), which the node
+   * runs first, in a simulated block of their own (see fetchAfter). `sent`: how many of them each address sent.
+   */
+  after?: { calls: unknown[]; blockOverrides: Record<string, string>; sent: Map<string, bigint> };
+
   async fetch(m: Misses): Promise<void> {
+    if (!this.after) return this.fetchAt(m);
+    await Promise.all([this.fetchAfter(m), this.fetchAt({ accounts: new Set(), storage: new Set(), calls: m.calls, blocks: m.blocks })]);
+  }
+
+  /**
+   * Accounts and storage as they were after `after.calls`: one eth_simulateV1 of three blocks on the parent's state.
+   * The first runs those calls. The second reads balances and code through two small contracts placed at unused
+   * addresses. The third reads storage: each contract's code is replaced by a reader that returns the slots asked
+   * for (an override in a later block doesn't touch the calls of the first). Nonces have no opcode: the parent
+   * block's, plus the earlier transactions the address sent.
+   */
+  private async fetchAfter(m: Misses): Promise<void> {
+    const after = this.after!;
+    const accounts = [...m.accounts];
+    const word = (h: string) => h.slice(2).padStart(64, '0');
+    const nonces = new Map<string, bigint>();
+    const nonceJobs = accounts.map(a => ({ method: 'eth_getTransactionCount', params: [a, this.block], done: (r: unknown) => { nonces.set(a, BigInt(r as string) + (after.sent.get(a) ?? 0n)); } }));
+    const slots = new Map<string, string[]>();
+    const want = (a: string, slot: string) => { const l = slots.get(a) ?? []; if (!l.includes(slot)) l.push(slot); slots.set(a, l); };
+    for (const a of accounts) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`)) want(a, slot);
+    for (const k of m.storage) { const [a, slot] = k.split('_'); want(a, slot); }
+    const needCode = accounts.filter(a => !this.codeOverrides.has(a));
+    const accountCalls = [...(accounts.length ? [{ to: BALANCE_READER, data: `0x${accounts.map(word).join('')}` }] : []), ...needCode.map(a => ({ to: CODE_READER, data: `0x${word(a)}` }))];
+    const contracts = [...slots.keys()];
+    const blocks: unknown[] = [{ calls: after.calls, blockOverrides: after.blockOverrides }];
+    if (accountCalls.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE }, [CODE_READER]: { code: CODE_READER_CODE } }, calls: accountCalls });
+    if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}` })) });
+    let out: { calls: { status: string; returnData: Hex }[] }[] | undefined;
+    await Promise.all([
+      this.sendAll(nonceJobs),
+      this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]),
+    ]);
+    const failed = new Error('reading the state after the block\'s earlier transactions failed');
+    if (!out || out.length !== blocks.length) throw failed;
+    const words = (data: Hex, n: number) => Array.from({ length: n }, (_, i) => `0x${data.slice(2 + 64 * i, 66 + 64 * i).padEnd(64, '0')}` as Hex);
+    let at = 1;
+    if (accountCalls.length) {
+      const r = out[at++].calls;
+      if (r.some(c => c.status !== '0x1')) throw failed;
+      const balances = words(r[0].returnData, accounts.length);
+      const code = new Map(needCode.map((a, i) => [a, hexToBytes(r[1 + i].returnData)]));
+      accounts.forEach((a, i) => this.accounts.set(a, { balance: BigInt(balances[i]), nonce: nonces.get(a) ?? 0n, code: this.codeOverrides.get(a) ?? code.get(a) ?? new Uint8Array(0) }));
+    }
+    if (contracts.length) {
+      const r = out[at].calls;
+      contracts.forEach((a, i) => {
+        // A contract the node runs itself keeps its own code whatever the override says, so its storage can't be
+        // read this way: left unread, and running it is refused (LazyState.load).
+        if (r[i].status !== '0x1') { if (isNative(this.accounts.get(a)?.code ?? new Uint8Array(0))) return; throw failed; }
+        words(r[i].returnData, slots.get(a)!.length).forEach((v, j) => this.storage.set(`${a}_${slots.get(a)![j]}`, unpadBytes(hexToBytes(v))));
+      });
+    }
+  }
+
+  private async fetchAt(m: Misses): Promise<void> {
     type Job = { method: string; params: unknown[]; done: (result: unknown, error?: { message?: string; data?: Hex }) => void };
     const jobs: Job[] = [];
     const pending: [string, AccountData][] = [];
     for (const a of m.accounts) {
-      const cached = this.codeOverrides.get(a) ?? CODE_CACHE.get(`${this.chainId}:${a}`);
+      const cached = this.codeOverrides.get(a) ?? (this.historic ? undefined : CODE_CACHE.get(`${this.chainId}:${a}`));
       const acc: AccountData = { balance: 0n, nonce: 0n, code: cached ?? new Uint8Array(0) };
       pending.push([a, acc]);
       jobs.push({ method: 'eth_getBalance', params: [a, this.block], done: r => { acc.balance = BigInt(r as string); } });
       jobs.push({ method: 'eth_getTransactionCount', params: [a, this.block], done: r => { acc.nonce = BigInt(r as string); } });
       if (!cached) jobs.push({ method: 'eth_getCode', params: [a, this.block], done: r => {
         acc.code = hexToBytes(r as Hex);
-        if (acc.code.length && !isDelegation(acc.code) && CODE_CACHE.size < CODE_CACHE_MAX) CODE_CACHE.set(`${this.chainId}:${a}`, acc.code);
+        if (acc.code.length && !isDelegation(acc.code) && CODE_CACHE.size < CODE_CACHE_MAX && !this.historic) CODE_CACHE.set(`${this.chainId}:${a}`, acc.code);
       } });
       // Most contracts are proxies: their implementation is the next thing a call reads. Only for an account not seen
       // before: one seen before is known to have no code, or its slots are guessed and fetched only if read.
@@ -309,28 +388,34 @@ class StateSource {
         GUESS_CALLS.set(`${this.chainId}:${k}`, v);
       } });
     }
-    const batches: Job[][] = [];
+    await this.sendAll(jobs);
+    for (const [a, acc] of pending) {
+      this.accounts.set(a, acc);
+      if (!this.historic) GUESS_ACCOUNTS.set(`${this.chainId}:${a}`, { balance: acc.balance, nonce: acc.nonce, hasCode: acc.code.length > 0 });
+    }
+  }
+
+  /** The jobs in batches of the source's size, a few at a time. */
+  private async sendAll(jobs: { method: string; params: unknown[]; done: (r: unknown, e?: { message?: string; data?: Hex }) => void }[]) {
+    const batches: (typeof jobs)[] = [];
     for (let i = 0; i < jobs.length; i += this.batchSize) batches.push(jobs.slice(i, i + this.batchSize));
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(this.concurrency, batches.length) }, async () => {
       while (next < batches.length) await this.send(batches[next++]);
     }));
-    for (const [a, acc] of pending) {
-      this.accounts.set(a, acc);
-      GUESS_ACCOUNTS.set(`${this.chainId}:${a}`, { balance: acc.balance, nonce: acc.nonce, hasCode: acc.code.length > 0 });
-    }
   }
 
   private setStorage(k: string, v: Uint8Array) {
     this.storage.set(k, v);
-    GUESS_STORAGE.set(`${this.chainId}:${k}`, v);
+    if (!this.historic) GUESS_STORAGE.set(`${this.chainId}:${k}`, v);
   }
 
   /** A previously seen value, as a guess (accounts with code only when their code is cached). */
   guessAccount(a: string): AccountData | undefined {
     const g = GUESS_ACCOUNTS.get(`${this.chainId}:${a}`);
     if (!g) return undefined;
-    const code = this.codeOverrides.get(a) ?? (g.hasCode ? CODE_CACHE.get(`${this.chainId}:${a}`) : new Uint8Array(0));
+    // For a block asked for, code kept from another block isn't a guess worth running: the account is fetched first.
+    const code = this.codeOverrides.get(a) ?? (g.hasCode ? (this.historic ? undefined : CODE_CACHE.get(`${this.chainId}:${a}`)) : new Uint8Array(0));
     return code ? { balance: g.balance, nonce: g.nonce, code } : undefined;
   }
   guessStorage(k: string) { return GUESS_STORAGE.get(`${this.chainId}:${k}`); }
@@ -409,6 +494,9 @@ class LazyState extends SimpleStateManager {
     if (!a) return undefined;
     // Arbitrum's Stylus contracts are WASM behind a 0xEFF000 prefix, which no EVM runs: better no answer than a wrong one.
     if (NEXT_BLOCK[this.source.chainId]?.arbitrum && a.code.length > 3 && a.code[0] === 0xef && a.code[1] === 0xf0 && a.code[2] === 0x00) throw new ForkUnsupported(`${key} is a Stylus (WASM) contract, which the local EVM can't run`);
+    // Any other code that starts with 0xEF and isn't an EIP-7702 delegation is a marker, not EVM code (none can be
+    // deployed since London): a contract the chain's node runs itself, as Base does at 0xb200…10c5.
+    if (isNative(a.code)) throw new ForkUnsupported(`${key} is a contract this chain's node runs itself (its code is a marker, not EVM code), which the local EVM can't run`);
     const exists = a.balance > 0n || a.nonce > 0n || a.code.length > 0;
     const make = () => exists ? new Account(a.nonce, a.balance, undefined, hexToBytes(keccak256(a.code))) : undefined;
     for (const layer of this.accountStack) if (!layer.has(key)) layer.set(key, make());
@@ -474,6 +562,8 @@ function storagePricing(profile: ChainProfile) {
 }
 
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
+/** Code that is a marker for something the chain's node runs itself: it starts with 0xEF and is no delegation. */
+const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
 
 /** An EIP-7702 authorization: signed (its authority recovered, null if the signature can't be read), or for the sender, to be signed by the wallet (no nonce to check). */
 interface Authorization { authority: string | null; address: string; chainId: bigint; nonce?: bigint }
@@ -519,6 +609,8 @@ const hexOf = (a: string) => a.toLowerCase();
 
 export class ForkSimulator implements Simulator {
   private urls: Record<number, string>;
+  /** Chains whose node has no eth_simulateV1: a replay's earlier transactions are run here instead. */
+  private noSimulate = new Set<number>();
   private opts: Required<Omit<ForkSimulatorOptions, 'profiles' | 'block' | 'header' | 'onRound'>> & Pick<ForkSimulatorOptions, 'block' | 'header' | 'onRound'> & { profiles: Record<number, ChainProfile> };
   /** Counters from the last simulation, for tuning and tests. */
   last?: { rounds: number; requests: number; ms: number; trace?: StorageStep[] };
@@ -566,21 +658,44 @@ export class ForkSimulator implements Simulator {
   }
 
   /** The calls with their traces and state changes (Simulator.trace). */
-  trace(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
-    return this.simulateBatch(reqs.map(r => ({ ...r, trace: true })));
+  trace(reqs: SimulationRequest[], options?: { budgetMs?: number }): Promise<SimulationResult[] | null> {
+    return this.simulateBatch(reqs.map(r => ({ ...r, trace: true })), options?.budgetMs !== undefined ? { timeoutMs: options.budgetMs } : undefined);
   }
 
-  async simulateBatch(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
+  async simulateBatch(reqs: SimulationRequest[], options?: { /** How long this run may take, over the simulator's own limit. */ timeoutMs?: number; /** Calls the node runs first, for the state these start from (set here, for a replay). */ after?: SimulationRequest[] }): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
     const url = this.urls[chainId], profile = this.opts.profiles[chainId];
     if (!url || !profile) return null;
-    const started = Date.now(), deadline = started + this.opts.timeoutMs;
+    // Calls that run first in the block (SimulationRequest.at.before: the transactions before a replayed one). The
+    // chain's node runs them, and this EVM starts from the state they leave (StateSource.after): running hundreds of
+    // transactions here would mean fetching all the state they touch. Where the node has no eth_simulateV1, they are
+    // run here with the rest, their results left out.
+    const earlier = reqs[0].at?.before;
+    if (earlier?.length) {
+      const at = { ...reqs[0].at!, before: undefined };
+      if (!this.noSimulate.has(chainId)) {
+        try { return await this.simulateBatch(reqs.map(r => ({ ...r, at })), { ...options, after: earlier }); } catch (e) {
+          if (!/method not found|does not exist|not supported|not available|-32601/i.test(e instanceof Error ? e.message : String(e))) throw e;
+          this.noSimulate.add(chainId);
+        }
+      }
+      const all = await this.simulateBatch([...earlier.map(r => ({ ...r, at, trace: false })), ...reqs.map(r => ({ ...r, at }))], { timeoutMs: options?.timeoutMs });
+      return all && all.slice(earlier.length);
+    }
+    const started = Date.now(), deadline = started + Math.max(this.opts.timeoutMs, options?.timeoutMs ?? 0);
     // The requests' own block (SimulationRequest.at), else this simulator's (a replay's), else the latest.
     const at = reqs[0].at;
     const tag = at?.block ?? this.opts.block?.(chainId) ?? 'latest';
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
+    source.historic = !!at?.required;
+    if (options?.after?.length && at) {
+      const hex = (v: bigint) => `0x${v.toString(16)}`, sent = new Map<string, bigint>();
+      for (const r of options.after) sent.set(hexOf(r.from), (sent.get(hexOf(r.from)) ?? 0n) + 1n);
+      source.after = { sent, blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
+        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: r.authorizationList }) })) };
+    }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.
     const auths = await Promise.all(reqs.map(authorizationsOf));
@@ -595,7 +710,7 @@ export class ForkSimulator implements Simulator {
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
     const prefetch = source.fetch(first);
     const fixed = at?.header ?? this.opts.header?.(chainId);
-    const [block] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number }
+    const [block] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number }
       : this.blockContext(source, tag, profile), prefetch]);
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never });
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
@@ -847,7 +962,7 @@ export class ForkSimulator implements Simulator {
       recording = true;
       if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
-        data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block });
+        data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;

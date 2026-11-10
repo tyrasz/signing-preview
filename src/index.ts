@@ -1,4 +1,5 @@
 export { previewRequest, SIGNING_METHODS, TYPED_DATA_ADAPTERS } from './preview.ts';
+export { replayTransaction, ReplayError } from './replay.ts';
 export { ADAPTERS, RequestError } from './evm/transaction.ts';
 export { StaticTokenRegistry, CHAINS, HYPERLIQUID, CCTP, PERMIT2, spotSystemAddress } from './chains.ts';
 export { HttpHyperliquidInfo, StaticHyperliquidInfo, INFO_URLS } from './hyperliquid/info.ts';
@@ -13,3 +14,5 @@ export { HYPERLEND } from './evm/hyperlend.ts';
 export { UNIVERSAL_ROUTERS } from './evm/universal-router.ts';
 export { KNOWN_ERRORS, knownError } from './errors.ts';
 export { BatchSimulationUnsupported } from './simulation.ts';
+export { ChainlinkPrices, HyperliquidPrices, StaticPrices, ChainedPrices, CHAINLINK_FEEDS } from './prices.ts';
+export { pinBlock, pinLatest, type BlockAt } from './block.ts';

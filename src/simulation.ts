@@ -3,7 +3,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
-import { nodeOverrides } from './block.ts';
+import { nodeOverrides, priceFields } from './block.ts';
 import { calldataCandidates, ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
 import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
@@ -77,7 +77,7 @@ const simulationFields = async (req: SimulationRequest) => {
   const authorizationList = [...(req.authorizationList ?? []), ...await standIns(req)];
   return {
     ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
-    ...(req.gasPrice !== undefined && { gasPrice: '0x' + req.gasPrice.toString(16) }),
+    ...priceFields(req),
     ...(req.accessList && { accessList: req.accessList }),
     ...(authorizationList.length && { authorizationList }),
   };
@@ -140,10 +140,19 @@ export class BatchSimulationUnsupported extends Error {
 export interface FallbackSimulator extends Simulator {
   covers(chainId: number): boolean;
   /** The calls with their traces (ForkSimulator's): what RpcSimulator.trace runs. */
-  trace?(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
+  trace?(requests: SimulationRequest[], options?: { budgetMs?: number }): Promise<SimulationResult[] | null>;
   simulateBatch(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
   /** Tokens a simulation still running has seen so far: passed on to the probe if it has to answer instead. */
   discovered?(requests: SimulationRequest[]): string[];
+}
+
+/** A simulation that failed on a block asked for: says so when the node no longer has that block's state. */
+function unavailableState(error: unknown, block: string): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const number = /^0x[0-9a-f]+$/i.test(block) ? BigInt(block).toLocaleString('en-US') : block;
+  return /missing trie node|historical state|state .*(unavailable|not available|pruned)|is not available|pruned|header not found|unknown block|block not found|old data not available|distance to target block|archive/i.test(message)
+    ? new Error(`This chain's node doesn't keep the state of block ${number} (most keep only recent blocks; an archive node keeps them all): ${message}`)
+    : error instanceof Error ? error : new Error(message);
 }
 
 export class RpcSimulator implements Simulator {
@@ -181,12 +190,16 @@ export class RpcSimulator implements Simulator {
    * The calls traced in the local EVM (Simulator.trace), within the budget given to it on chains it answers for;
    * null without one that covers the chain, or when it fails or runs out of time.
    */
-  async trace(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
+  async trace(reqs: SimulationRequest[], options?: { budgetMs?: number }): Promise<SimulationResult[] | null> {
     if (!reqs.length || !this.fork?.covers(reqs[0].chainId) || !this.fork.trace) return null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await Promise.race([this.fork.trace(reqs), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), this.traceBudgetMs); (timer as { unref?: () => void }).unref?.(); })]);
-    } catch { return null; } finally { clearTimeout(timer); }
+      return await Promise.race([this.fork.trace(reqs, options), new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), options?.budgetMs ?? this.traceBudgetMs); (timer as { unref?: () => void }).unref?.(); })]);
+    } catch (e) {
+      // Something a local EVM can't run (a contract the chain's node runs itself): the caller says so.
+      if (e instanceof Error && e.name === 'ForkUnsupported') throw e;
+      return null;
+    } finally { clearTimeout(timer); }
   }
   /** The requests with a replay's warm addresses in their access lists (see RpcSimulatorOptions.replay). */
   private warmed(reqs: SimulationRequest[]): SimulationRequest[] {
@@ -194,8 +207,8 @@ export class RpcSimulator implements Simulator {
     return warm?.length ? reqs.map(r => ({ ...r, accessList: [...(r.accessList ?? []), ...warm.map(address => ({ address, storageKeys: [] }))] })) : reqs;
   }
   /** A replay's earlier calls (see RpcSimulatorOptions.replay), as eth_simulateV1 calls. */
-  private async before(chainId: number): Promise<unknown[]> {
-    const before = this.replay?.(chainId)?.before ?? [];
+  private async before(chainId: number, reqs?: SimulationRequest[]): Promise<unknown[]> {
+    const before = this.replay?.(chainId)?.before ?? reqs?.[0]?.at?.before ?? [];
     return Promise.all(before.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
   }
   /** eth_simulateV1's blockOverrides: the replayed block's header, and a base fee the calls ask for (see SimulationRequest.baseFee). */
@@ -213,6 +226,10 @@ export class RpcSimulator implements Simulator {
     // of state, a backend a block behind): the simulation runs on the latest block instead, as it would unasked.
     // Naming a block is for a second run to match this one; it mustn't cost the first.
     if (reqs[0]?.at && !this.replay?.(reqs[0].chainId)) {
+      // A block that was asked for is the point: without its state there is no answer.
+      if (reqs[0].at.required) {
+        try { return await this.simulateAt(reqs); } catch (error) { throw unavailableState(error, reqs[0].at.block); }
+      }
       try { return await this.simulateAt(reqs); } catch {
         const latest = await this.simulateAt(reqs.map(({ at: _at, ...r }) => r));
         return latest && latest.map(r => ({ ...r, traceNote: "The chain's node no longer served the block named for the trace, so the simulation shown ran on its latest block and the trace on the one named, a little earlier." }));
@@ -230,7 +247,7 @@ export class RpcSimulator implements Simulator {
     const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
     const stateOverrides = await simulateV1Overrides(reqs);
     const blockOverrides = this.blockOverrides(reqs);
-    const before = await this.before(chainId);
+    const before = await this.before(chainId, reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
@@ -263,7 +280,11 @@ export class RpcSimulator implements Simulator {
       const res = await this.fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(20_000), body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
       const retry = () => attempt < 4 && new Promise(r => setTimeout(r, 500 * 2 ** attempt)).then(() => true);
       if ((res.status === 429 || res.status >= 500) && await retry()) continue;
-      if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+      if (!res.ok) {
+        // A node that refuses says why in the body (a public node asked for a block it counts as archive answers 403).
+        const why = await res.json().then(b => (b as { error?: { message?: string } })?.error?.message, () => undefined);
+        throw new Error(`RPC HTTP ${res.status}${typeof why === 'string' ? `: ${why}` : ''}`);
+      }
       const body = await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
       if (body.error && (body.error.code === -32005 || body.error.code === 429 || /rate limit|too many requests|adjustable limit/i.test(body.error.message ?? '')) && await retry()) continue;
       return body;
@@ -271,6 +292,8 @@ export class RpcSimulator implements Simulator {
   }
 
   private async withoutSimulateV1(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {
+    // Calls that must run first (a replay's earlier transactions) need a simulator that runs several in one block.
+    if (reqs[0]?.at?.before?.length && !this.fork?.covers(chainId)) throw new Error("This chain's node has no eth_simulateV1 and no local EVM is set up for it, so the block's earlier transactions can't be run before this one.");
     if (!this.fork?.covers(chainId)) return this.probeOrCall(url, chainId, reqs);
     const forked = this.fork.simulateBatch(reqs);
     forked.catch(() => { /* a late failure only means the probe's answer stood */ });
@@ -372,7 +395,7 @@ export class RpcSimulator implements Simulator {
     });
     const stateOverrides = await simulateV1Overrides(reqs);
     const blockOverrides = this.blockOverrides(reqs);
-    const before = await this.before(reqs[0].chainId);
+    const before = await this.before(reqs[0].chainId, reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     if (!out || out.length !== calls.length) return;

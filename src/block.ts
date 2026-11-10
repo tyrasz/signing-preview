@@ -16,7 +16,19 @@ export interface BlockAt {
     difficulty?: bigint;
     /** Arbitrum: the chain's own block number (`number` is then the L1 block the chain last saw, which NUMBER returns). */
     arbBlockNumber?: bigint;
+    /** The block's blob base fee (BLOBBASEFEE), on chains with blobs: a rollup's batch poster reads it. */
+    blobBaseFee?: bigint;
   };
+  /**
+   * The block was asked for (a past block, a replay), not named only so that two runs match: a node that can't serve
+   * it is an error, never a reason to simulate on the latest block instead.
+   */
+  required?: boolean;
+  /**
+   * Calls that run first in the simulated block, in order, whose results aren't reported: the transactions before
+   * a replayed one in its block. (The calls of a request's own batch are all reported.)
+   */
+  before?: import('./types.ts').SimulationRequest[];
 }
 
 /**
@@ -25,8 +37,8 @@ export interface BlockAt {
  * returns, the block's mixHash unless said (its difficulty on BNB Chain and Polygon, 1 on Arbitrum); and Arbitrum's
  * two block numbers.
  */
-export const NEXT_BLOCK: Record<number, { blockTime: number; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon); BNB Chain's read it from prevRandao. */ difficultyOverride?: boolean }> = {
-  1: { blockTime: 12 }, 11155111: { blockTime: 12 },
+export const NEXT_BLOCK: Record<number, { blockTime: number; /** The chain carries blobs (EIP-4844), so its blocks have a blob base fee. */ blobs?: boolean; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon); BNB Chain's read it from prevRandao. */ difficultyOverride?: boolean }> = {
+  1: { blockTime: 12, blobs: true }, 11155111: { blockTime: 12, blobs: true },
   42161: { blockTime: 0, randomness: 'one', arbitrum: true }, 421614: { blockTime: 0, randomness: 'one', arbitrum: true },
   8453: { blockTime: 2 }, 10: { blockTime: 2 },
   137: { blockTime: 2, randomness: 'difficulty', difficultyOverride: true },
@@ -70,23 +82,94 @@ export function headerOf(chainId: number, h: RpcHeader): BlockAt['header'] {
   };
 }
 
+/**
+ * The blob base fee of the block after `block` (a number in hex), on chains with blobs: eth_feeHistory gives it,
+ * whatever the fork's formula. Undefined elsewhere, or when the node doesn't say.
+ */
+export async function blobBaseFeeAfter(rpc: RpcClient, chainId: number, block: string): Promise<bigint | undefined> {
+  if (!NEXT_BLOCK[chainId]?.blobs) return undefined;
+  try {
+    const fees = await rpc.call(chainId, 'eth_feeHistory', ['0x1', block, []]) as { baseFeePerBlobGas?: string[] } | null;
+    const next = fees?.baseFeePerBlobGas?.[1];
+    return typeof next === 'string' && /^0x[0-9a-f]+$/i.test(next) ? BigInt(next) : undefined;
+  } catch { return undefined; }
+}
+
 /** The chain's latest block by number, and the block after it to simulate in. Undefined when it can't be read. */
 export async function pinLatest(rpc: RpcClient | undefined, chainId: number): Promise<BlockAt | undefined> {
   if (!rpc?.has(chainId)) return undefined;
   try {
     const h = await rpc.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as RpcHeader | null;
-    return h?.number ? { block: h.number, header: headerAfter(chainId, h) } : undefined;
+    if (!h?.number) return undefined;
+    const blobBaseFee = await blobBaseFeeAfter(rpc, chainId, h.number);
+    return { block: h.number, header: { ...headerAfter(chainId, h), ...(blobBaseFee !== undefined && { blobBaseFee }) } };
   } catch { return undefined; }
+}
+
+/**
+ * A past block to simulate on: the state after block `number`, in the block that followed it (its real header), or
+ * for the chain's latest block the one that would. Throws when the chain can't be read or has no such block yet.
+ * `time` is when the state's block was made, in seconds.
+ */
+export async function pinBlock(rpc: RpcClient | undefined, chainId: number, number: bigint): Promise<{ at: BlockAt; time: number }> {
+  if (!rpc?.has(chainId)) throw new Error('No RPC is configured for this chain, so a past block can\'t be read.');
+  const tag = (n: bigint) => `0x${n.toString(16)}`;
+  const [h, next, blobBaseFee] = await Promise.all([...[number, number + 1n].map(n => rpc.call(chainId, 'eth_getBlockByNumber', [tag(n), false]).then(r => r as RpcHeader | null, () => null)), blobBaseFeeAfter(rpc, chainId, tag(number))]) as [RpcHeader | null, RpcHeader | null, bigint | undefined];
+  if (!h?.number) throw new Error(`Block ${number.toLocaleString('en-US')} isn't on this chain (yet), or its node doesn't serve it.`);
+  return { at: { block: tag(number), header: { ...(next?.number ? headerOf(chainId, next) : headerAfter(chainId, h)), ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true }, time: Number(BigInt(h.timestamp)) };
+}
+
+/** A block number as PreviewContext.block gives it: a number, or one in decimal or hex. Throws when it is neither. */
+export function parseBlock(v: unknown): bigint {
+  if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
+  if (typeof v === 'string' && /^(0x[0-9a-fA-F]+|[0-9]+)$/.test(v)) return BigInt(v);
+  throw new Error('"block" must be a block number');
+}
+
+/** A past block named for a preview, as read from the chain. */
+export interface Pinned { at: BlockAt; number: bigint; time: number }
+
+/**
+ * The block a preview's context names (PreviewContext.block), read once per preview and chain: `context.pinned`
+ * keeps the read for the preview's other simulations and for prices as of that block. Undefined when none is named.
+ */
+export function namedBlock(context: { block?: number | string; pinned?: Map<number, Promise<Pinned>> }, rpc: RpcClient | undefined, chainId: number): Promise<Pinned> | undefined {
+  if (context.block === undefined) return undefined;
+  let pinned = context.pinned?.get(chainId);
+  if (!pinned) {
+    const number = parseBlock(context.block);
+    pinned = pinBlock(rpc, chainId, number).then(r => ({ ...r, number }));
+    pinned.catch(() => { /* whoever awaits it reports it */ });
+    context.pinned?.set(chainId, pinned);
+  }
+  return pinned;
+}
+
+/** "block 23,456,789 (2026-11-10 08:12:35 UTC)". */
+export function blockText(number: bigint, time: number): string {
+  return `block ${number.toLocaleString('en-US')} (${new Date(time * 1000).toISOString().slice(0, 19).replace('T', ' ')} UTC)`;
+}
+
+/**
+ * A request's price as eth_simulateV1 call fields: its gas price, or for a blob transaction (whose blob hashes nodes
+ * take only with EIP-1559 fees and a blob fee cap) that price as both fee cap and tip, which comes to the same.
+ */
+export function priceFields(req: { gasPrice?: bigint; blobVersionedHashes?: string[]; maxFeePerBlobGas?: bigint }): Record<string, unknown> {
+  const hex = (v: bigint) => `0x${v.toString(16)}`;
+  if (!req.blobVersionedHashes?.length) return req.gasPrice !== undefined ? { gasPrice: hex(req.gasPrice) } : {};
+  return { blobVersionedHashes: req.blobVersionedHashes, maxFeePerBlobGas: hex(req.maxFeePerBlobGas ?? 1n), ...(req.gasPrice !== undefined && { maxFeePerGas: hex(req.gasPrice), maxPriorityFeePerGas: hex(req.gasPrice) }) };
 }
 
 /**
  * eth_simulateV1's blockOverrides for this header. The number is left to the node (the block after the one it starts
  * from; on Arbitrum the node maps it to the L1 block itself), and the gas limit too: public nodes refuse a simulated
  * block above their own cap. BNB Chain's node takes opcode 0x44 from prevRandao; Polygon's takes a difficulty.
+ * Arbitrum's is left alone: its headers keep the ArbOS version in that field (overridden, the node runs the block by
+ * the first version's rules, without PUSH0), and opcode 0x44 is 1 there whatever it holds.
  */
 export function nodeOverrides(h: BlockAt['header']): Record<string, string> {
   return {
-    time: `0x${h.timestamp.toString(16)}`, feeRecipient: h.coinbase, prevRandao: h.prevRandao, baseFeePerGas: `0x${h.baseFeePerGas.toString(16)}`,
+    time: `0x${h.timestamp.toString(16)}`, feeRecipient: h.coinbase, ...(h.arbBlockNumber === undefined && { prevRandao: h.prevRandao }), baseFeePerGas: `0x${h.baseFeePerGas.toString(16)}`,
     ...(h.difficulty !== undefined && { difficulty: `0x${h.difficulty.toString(16)}` }),
   };
 }

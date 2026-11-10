@@ -10,7 +10,7 @@ import type { AssetChange } from '../types.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
 import { entryPointDeposit, simulateExecution, simulateOperation, type ExecutionInput, type OperationRun } from '../erc4337-sim.ts';
 import { pinLatest } from '../block.ts';
-import { tracePreviews } from '../evm/trace.ts';
+import { tracePreviews, noTrace, type TraceEnv } from '../evm/trace.ts';
 import { tokenInfo } from '../evm/common.ts';
 
 /** EntryPoints that sign UserOperations as EIP-712 typed data, at the same address on every chain (checked on Ethereum, Arbitrum One and HyperEVM). */
@@ -276,9 +276,10 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
       // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment.
       if (whole && env.context.trace && run?.requests) {
-        const traces = await tracePreviews(run.requests, [run.result], { chainId, account: sender, accountLabel: mine ? 'you' : 'the account', deps: env.deps });
+        const traceEnv: TraceEnv = { chainId, account: sender, accountLabel: mine ? 'you' : 'the account', deps: env.deps };
+        const traces = await tracePreviews(run.requests, [run.result], traceEnv);
         if (traces?.[0]) b.trace = traces[0];
-        else b.note("No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
+        else b.note(noTrace(traceEnv));
       }
     } catch { whole = null; }
     if (whole && (whole.length || !assetChanges.length)) assetChanges = whole;

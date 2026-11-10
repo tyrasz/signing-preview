@@ -11,7 +11,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CHAIN_PROFILES, clearForkCaches, ForkSimulator, ForkTimeout } from '../src/fork-simulator.ts';
-import type { Dependencies, Preview } from '../src/types.ts';
+import type { Dependencies, Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
 import { codes, NOW } from './helpers.ts';
 import { compiled, PRECOMPILE, testChain } from './evm-chain.ts';
 
@@ -370,6 +370,41 @@ test('Chains with their own rules: Polygon’s storage prices, Arbitrum’s two 
   // The request's block wins over the simulator's own: the same code on another header sees that one.
   const again = await arbitrum.simulate({ chainId: 999, from: FROM, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: reads } }, at: { block: 'latest', header: { ...header, number: 5n, arbBlockNumber: 9n } } });
   assert.deepEqual(again!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`)).filter((_, i) => i !== 1), [5n, 9n, 1n]);
+});
+
+test('Calls that run first in the block: the node runs them and the local EVM starts from the state they leave', async () => {
+  // Bob holds no USDC: his transfer of 30 only works after the user's transfer of 50 to him, earlier in the block.
+  const CAROL = '0xca401000000000000000000000000000000000c3';
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest = { chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 50_000_000n]), value: 0n };
+  const target: SimulationRequest = { chainId: 999, from: BOB, to: usdc, data: call('transfer', [CAROL, 30_000_000n]), value: 0n };
+  await chain.setBalance(BOB, E);
+  // What left Bob (balances read before and after: the token, the account, the amount).
+  const net = (r: SimulationResult) => r.transfers.map(t => [t.asset, t.from, t.raw]);
+  // Alone, it fails.
+  const [alone] = (await fork().simulateBatch([{ ...target, at: { block: '0x10', header } }]))!;
+  assert.equal(alone.status, 'reverted');
+  // This chain's node has no eth_simulateV1: the earlier call is run here too, and only the target is reported.
+  const local = fork();
+  const [here] = (await local.simulateBatch([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
+  assert.deepEqual([here.status, net(here)], ['success', [[usdc, BOB, 30_000_000n]]]);
+  // A node with eth_simulateV1 runs it, and answers every read from the state it leaves: balances and code through
+  // readers at unused addresses, storage through a reader put in each contract's place.
+  chain.simulateV1 = true;
+  try {
+    const before = chain.stats.calls.eth_simulateV1 ?? 0;
+    const viaNode = fork();
+    const [there] = (await viaNode.trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.deepEqual([there.status, net(there), there.gasUsed], ['success', [[usdc, BOB, 30_000_000n]], here.gasUsed]);
+    assert.ok((chain.stats.calls.eth_simulateV1 ?? 0) > before);
+    // The trace and the state changes are the target's alone, from where the earlier call left things: Bob had 50.
+    assert.equal(there.trace!.to, usdc);
+    const slots = there.stateChanges!.find(c => c.address === usdc)!.storage!;
+    assert.deepEqual(slots.map(s => [BigInt(s.before), BigInt(s.after)]).sort((a, b) => Number(b[0] - a[0])), [[50_000_000n, 20_000_000n], [0n, 30_000_000n]]);
+    // The chain itself is untouched.
+    const balance = await chain.fetchImpl(URL_, { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: usdc, data: encodeFunctionData({ abi: parseAbi(['function balanceOf(address) view returns (uint256)']), functionName: 'balanceOf', args: [BOB as Hex] }) }, 'latest'] }) }).then(r => r.json()) as { result: Hex };
+    assert.equal(BigInt(balance.result), 0n);
+  } finally { chain.simulateV1 = false; }
 });
 
 test('A traced preview, sent through the HTTP server, matches the API’s schema', async () => {

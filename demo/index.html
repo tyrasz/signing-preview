@@ -86,6 +86,13 @@
         <button class="primary" id="send">Send to wallet</button>
       </div>
     </div>
+    <div class="group">
+      <h3>Replay a mined transaction</h3>
+      <div class="row">
+        <input id="hash" type="text" spellcheck="false" placeholder="0x… transaction hash, on the chain chosen above" aria-label="Transaction hash" style="flex: 1; min-width: 220px; font: 12px/1.4 ui-monospace, Menlo, monospace; background: var(--code); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 7px 8px;">
+        <button class="secondary" id="replay">Replay</button>
+      </div>
+    </div>
   </section>
   <section class="panel wallet" aria-label="Wallet" aria-live="polite">
     <h2>Wallet confirmation</h2>

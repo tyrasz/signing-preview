@@ -1,8 +1,8 @@
 import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
-import type { ApprovalChange, Dependencies, Preview, PreviewContext, PreviewTrace, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
-import { pinLatest } from '../block.ts';
-import { tracePreviews } from './trace.ts';
+import type { ApprovalChange, Dependencies, Preview, PreviewContext, PreviewTrace, ReplayInfo, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
+import { blockText, namedBlock, pinLatest, type BlockAt, type Pinned } from '../block.ts';
+import { compareWithReceipt, noTrace, tracePreviews, type TraceEnv } from './trace.ts';
 import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
@@ -183,10 +183,18 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   // What was simulated for the result shown (the wallet's pending transactions, then this one), for tracing it.
   let ran: SimulationRequest[] | undefined;
   let trace: PreviewTrace | undefined;
+  // A mined transaction replayed where it ran (src/replay.ts), or a past block named for the simulation
+  // (PreviewContext.block); else the latest block, named only when a trace has to run on the same one.
+  const replay = context.replay;
+  let named: Pinned | undefined;
+  let at: BlockAt | undefined;
+  let replayed: ReplayInfo | undefined;
   // Simulating without the delegation would run the call against the account's old code, so it would show nothing
   // about what the delegate does.
   // With the delegations applied as code overrides, the simulation runs the transaction as it will be: calls to the
   // account run the delegate's code. Only on chains that apply EIP-7702.
+  // A batch's call, simulated with the batch on the block its context names: the same block, read once.
+  if (outcome && 'result' in outcome && !replay && context.block !== undefined) named = await namedBlock(context, deps.rpc, tx.chainId)?.catch(() => undefined);
   if (!outcome && delegation && deps.simulator && !SUPPORTS_7702.has(tx.chainId)) outcome = { skipped: "This chain doesn't apply EIP-7702 authorizations, so the transaction was not simulated." };
   if (!outcome && deps.simulator) {
     try {
@@ -202,12 +210,16 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       }
       // A trace is run apart, in a local EVM: the block is named (the latest, and the header of the one after it), so
       // that both simulations run in the same one.
-      const at = context.trace ? await pinLatest(deps.rpc, tx.chainId) : undefined;
+      named = replay ? undefined : await namedBlock(context, deps.rpc, tx.chainId);
+      at = replay?.at ?? named?.at ?? (context.trace ? await pinLatest(deps.rpc, tx.chainId) : undefined);
       if (at) request.at = at;
-      const pending = pendingRequests(tx, context).map(p => (at ? { ...p, at } : p));
+      // A replay runs at the price the transaction paid, after the transactions before it in its block (named with
+      // the block: they run first, and only this one is reported).
+      if (replay) { request.gasPrice = replay.gasPrice; request.at = { ...replay.at, before: replay.before }; if (replay.blobVersionedHashes) { request.blobVersionedHashes = replay.blobVersionedHashes; request.maxFeePerBlobGas = replay.maxFeePerBlobGas; } }
+      const pending = replay ? [] : pendingRequests(tx, context).map(p => (at ? { ...p, at } : p));
       ran = [...pending, request];
-      // What the transaction would pay now, read while the simulation runs (see the priced run below).
-      const pricing = expectedGasPrice(tx, deps).catch(() => undefined);
+      // What the transaction would pay now (or in the block named), read while the simulation runs (see the priced run below).
+      const pricing = replay ? Promise.resolve(undefined) : expectedGasPrice(tx, deps, named?.at.header.baseFeePerGas).catch(() => undefined);
       if (pending.length && deps.simulator.simulateBatch) {
         // On top of the wallet's pending transactions, in order: this one is the last call of the batch.
         const results = await deps.simulator.simulateBatch([...pending, request]);
@@ -250,15 +262,16 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     // A null result means this simulator does not cover the call: show the decoded request only.
     let sim = outcome.result;
     // A revert under the request's own gas limit: run it again without the limit to see whether the limit is why.
-    if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length) {
+    if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length && !replay) {
       try {
-        const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined });
+        const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined, ...(at && { at }) });
         if (unlimited?.status === 'success') sim = { ...sim, revertReason: `out of gas: the gas limit (${tx.gas.toLocaleString('en-US')}) is below the ${unlimited.gasUsed !== undefined ? `${unlimited.gasUsed.toLocaleString('en-US')} gas` : 'gas'} this call needs` };
       } catch { /* keep the first answer */ }
     }
-    simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }) };
+    const stateBlock = replay ? BigInt(replay.at.block) : named?.number;
+    simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }), ...(stateBlock !== undefined && { block: stateBlock.toString() }) };
     if (sim.status === 'reverted') {
-      b.warn('danger', 'simulation_reverted', `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
+      b.warn('danger', 'simulation_reverted', replay ? `The transaction failed${sim.revertReason ? `: ${sim.revertReason}` : ''}. Its sender still paid the network fee.` : `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
     } else if (sim.limited) {
       b.note(sim.note ?? "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
     } else {
@@ -270,17 +283,35 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       for (const a of approvals) if (d.declaredApprovals?.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender))) a.direct = true;
       approvalWarnings(b, approvals, context.now);
       if (sim.coreActions?.length && !sameAddress(tx.to ?? '', HYPERLIQUID.coreWriter)) await simulatedCoreActions(sim.coreActions, tx.from, b, { deps, context });
-      b.note(simulationNote(sim));
+      // A batch's call leaves the block to the batch's own note.
+      b.note(replay || named ? pastNote(sim, preset ? undefined : named) : simulationNote(sim));
+    }
+    // A replay against its receipt: the same outcome, events and gas say the run shown is what happened.
+    if (replay) {
+      const compared = compareWithReceipt(sim, replay.receipt);
+      replayed = { ...replay.info, ...compared };
+      const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.before.length ? `after the ${replay.before.length} transaction${replay.before.length === 1 ? '' : 's'} before it in the block` : 'first in the block'}, at the price it paid.`;
+      if (compared.matches) b.note(`${where} The run has the same outcome, events and gas as its receipt.`);
+      else {
+        b.note(where);
+        b.warn('caution', 'replay_differs', `The replay doesn't match the transaction's receipt (${compared.differences!.join('; ')}), so what is shown here may not be what happened.`);
+      }
     }
   }
+  if (replay && !replayed) replayed = replay.info;
   // The trace of what was shown (PreviewContext.trace): the calls the transaction makes and the state it changes.
   if (context.trace && ran && outcome && 'result' in outcome && outcome.result && !outcome.result.limited) {
-    const traced = await tracePreviews(ran, [...ran.slice(0, -1).map(() => null), outcome.result], { chainId: tx.chainId, account: tx.from, deps });
+    // A replay's trace runs the block's earlier transactions first, in the local EVM: it is given longer.
+    const env: TraceEnv = { chainId: tx.chainId, account: tx.from, deps, ...(replay && { budgetMs: REPLAY_TRACE_MS }) };
+    const traced = await tracePreviews(ran, [...ran.slice(0, -1).map(() => null), outcome.result], env);
     trace = traced?.at(-1);
-    if (!trace) b.note(traced ? "No trace: the run that would trace this transaction didn't produce one." : "No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
+    if (!trace) b.note(traced ? "No trace: the run that would trace this transaction didn't produce one." : noTrace(env));
   }
   // What the network checks before including it, and the fee. A batch call's fee belongs to the whole batch.
-  if (method !== 'wallet_sendCalls') {
+  // A replay shows what was paid instead; a past block's preview has nothing to say about inclusion now.
+  if (replay) {
+    if (replay.info.receipt.fee) b.detail('Network fee paid', `${replay.info.receipt.fee} (${BigInt(replay.info.receipt.gasUsed).toLocaleString('en-US')} gas)`);
+  } else if (method !== 'wallet_sendCalls' && context.block === undefined) {
     const gasUsed = outcome && 'result' in outcome && outcome.result ? outcome.result.gasUsed : undefined;
     try { await transactionChecks(tx, gasUsed, deps, context, b); } catch { /* no checks */ }
   }
@@ -291,7 +322,19 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     decoding: { status: d.status, decoder: d.decoder, notes: b.notes },
     ...(simulation && { simulation }),
     ...((trace ?? b.trace) && { trace: trace ?? b.trace }),
+    ...(replayed && { replay: replayed }),
   };
+}
+
+/** How long a replay's tracing run may take: it runs the block's earlier transactions too. */
+const REPLAY_TRACE_MS = 60_000;
+
+/** The note for a simulation on a past block's state: a block the context names, or (without one) a replay's. */
+function pastNote(sim: Pick<SimulationResult, 'basis' | 'balancesRead'>, named: Pinned | undefined): string {
+  const how = sim.basis === 'state' || sim.basis === 'fork' || sim.balancesRead ? 'Balance changes were read from the state before and after.' : 'Balance changes are derived from transfer events.';
+  return named
+    ? `Simulated on the state after ${blockText(named.number, named.time)}, as the first transaction of the block that followed: what it would have done then, not now. ${how} The decoder's own lookups (names, balances and positions it describes) are of the latest block.`
+    : how;
 }
 
 /** The simulation request for a call, with the tokens its decoder knows it changes (for state-reading simulators). */

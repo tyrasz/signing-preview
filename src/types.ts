@@ -42,7 +42,10 @@ export interface AssetChange {
   /** Set for simulated changes. NFTs (erc721/erc1155) also carry the token ID; `symbol` then reads e.g. "BAYC #42". */
   standard?: 'native' | 'erc20' | 'erc721' | 'erc1155';
   tokenId?: string;
-  /** What the amount is worth in dollars now ("1,234.56"), when the asset has a price (Dependencies.prices), and where the price is from. */
+  /**
+   * What the amount is worth in dollars ("1,234.56"), when the asset has a price (Dependencies.prices), and where the
+   * price is from: now, or for a past block or a replay (PreviewContext.block, Preview.replay) at that block.
+   */
   usd?: string;
   usdSource?: string;
 }
@@ -51,7 +54,8 @@ export interface AssetChange {
 export interface Price { usd: number; source: string; updatedAt?: number }
 /** Prices for a chain's native token ('native') and tokens (by address). See src/prices.ts. */
 export interface PriceSource {
-  price(chainId: number, asset: string): Promise<Price | undefined>;
+  /** `at`: the price as of a past block (its number in hex, and its time in seconds); a source that only knows the price now gives none. */
+  price(chainId: number, asset: string, at?: { block: string; time: number }): Promise<Price | undefined>;
 }
 
 /** A permission the transaction leaves in place (or removes), from simulated approval events. */
@@ -89,6 +93,21 @@ export interface SimulationSummary {
   gasUsed?: string;
   revertReason?: string;
   error?: string;
+  /** The block whose state it ran on, when one was named (PreviewContext.block) or the transaction is a replay: a decimal number. */
+  block?: string;
+}
+
+/** A mined transaction run again where it ran (replayTransaction), and how the run compares with its receipt. */
+export interface ReplayInfo {
+  hash: string;
+  /** The block it was mined in (decimal), its position there, and the block's time (ISO 8601). */
+  block: string;
+  index: number;
+  time: string;
+  receipt: { status: 'success' | 'reverted'; gasUsed: string; /** What its sender paid for it, in the native token ("0.000123 ETH"). */ fee?: string };
+  /** Whether the run came out as the receipt says: the same outcome, the same events in order, the same gas. Absent when it couldn't be run. */
+  matches?: boolean;
+  differences?: string[];
 }
 
 export interface Preview {
@@ -118,6 +137,8 @@ export interface Preview {
   calls?: Preview[];
   /** The simulated call's trace and state changes, when the context asked for them (PreviewContext.trace) and the simulator could. */
   trace?: PreviewTrace;
+  /** A mined transaction replayed (replayTransaction): where it ran, and whether the run matches its receipt. */
+  replay?: ReplayInfo;
 }
 
 /** A decoded argument, return value or event field. */
@@ -209,6 +230,16 @@ export interface PreviewContext {
    */
   trace?: boolean;
   /**
+   * Simulate on the state after this block (a number, or one in hex) instead of the latest: what the request would
+   * have done then, as the first transaction of the block that followed. For transactions and batches. The chain's
+   * node has to keep that block's state (most keep recent blocks only; an archive node keeps all).
+   */
+  block?: number | string;
+  /** Set by replayTransaction (src/replay.ts), never taken from a caller over HTTP: where a mined transaction ran. */
+  replay?: ReplayContext;
+  /** Set by previewRequest: the block `block` names, read once per chain (src/block.ts). */
+  pinned?: Map<number, Promise<import('./block.ts').Pinned>>;
+  /**
    * Hyperliquid L1 actions are signed as an opaque hash. To decode one, the
    * caller must supply the original action. It is checked against the hash.
    */
@@ -265,6 +296,21 @@ export interface TokenRegistry {
   collection?(chainId: number, address: string): Promise<{ symbol?: string; name?: string } | undefined>;
 }
 
+/** A mined transaction's place: its block's header on its parent's state, the block's earlier transactions, the price it paid and its receipt. */
+export interface ReplayContext {
+  at: import('./block.ts').BlockAt;
+  before: SimulationRequest[];
+  gasPrice: bigint;
+  /** A blob transaction's blob hashes, and the most it would pay for blob gas. */
+  blobVersionedHashes?: string[];
+  maxFeePerBlobGas?: bigint;
+  /** `gasUsed` is the execution's (on Arbitrum, without the part charged for L1 data, `gasForL1`). */
+  receipt: { status: 'success' | 'reverted'; gasUsed: bigint; gasForL1?: bigint; logs: { address: string; topics: string[]; data: string }[] };
+  info: Omit<ReplayInfo, 'matches' | 'differences'>;
+  /** The transaction's block (hex) and its time, for prices as of then. */
+  when: { block: string; time: number };
+}
+
 export interface SimulationRequest {
   chainId: number;
   from: string;
@@ -290,6 +336,9 @@ export interface SimulationRequest {
    */
   baseFee?: bigint;
   accessList?: { address: string; storageKeys: string[] }[];
+  /** A blob transaction's blob hashes (EIP-4844), which its call can read (BLOBHASH): a replayed rollup batch checks them. */
+  blobVersionedHashes?: string[];
+  maxFeePerBlobGas?: bigint;
   /** Code to give accounts for the simulation (EIP-7702 authorizations: the delegation designator, or none). */
   stateOverrides?: Record<string, {
     code?: string;
@@ -444,7 +493,7 @@ export interface Simulator {
    * changed. Null when nothing here can trace calls on that chain. A caller compares the outcome with its own
    * simulation's (same block: SimulationRequest.at) before trusting the trace to be of it.
    */
-  trace?(requests: SimulationRequest[]): Promise<SimulationResult[] | null>;
+  trace?(requests: SimulationRequest[], options?: { /** How long the tracing run may take, over the simulator's own default. */ budgetMs?: number }): Promise<SimulationResult[] | null>;
   /**
    * Simulates calls in order in one block, each seeing the state the previous ones left (EIP-5792 batches, e.g.
    * approve then swap). Resolves one result per call, or null when this simulator does not cover the chain.

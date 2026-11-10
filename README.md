@@ -67,6 +67,7 @@ curl -s localhost:8787/v1/preview -H 'content-type: application/json' -d '{
 |---|---|
 | `POST /v1/preview` | Body `{ request, context? }` returns a `Preview`. Malformed requests return `400 INVALID_REQUEST`. |
 | `GET /v1/openapi.json` | The OpenAPI 3.1 document for this API. |
+| `POST /v1/replay` | Body `{ chainId, hash, trace? }` returns a `Preview` of a mined transaction, run again where it ran (see [Replaying a mined transaction](#replaying-a-mined-transaction)). `404 NOT_FOUND`, `409 PENDING`, `422 UNSUPPORTED` (the chain's own transactions), `503 UNAVAILABLE` (no RPC for the chain). |
 | `GET /v1/health` | Liveness check. |
 | `GET /v1/samples` | The demo's mock requests. |
 
@@ -296,9 +297,10 @@ Simulation runs the call; the network also checks the transaction itself before 
   warnings: [{ severity: 'info' | 'caution' | 'danger', code, message }],
   attention: 'none' | 'info' | 'caution' | 'danger',   // display hint, not a security verdict
   decoding: { status: 'full' | 'partial' | 'opaque', decoder, notes },
-  simulation?: { status, source, gasUsed?, revertReason? },
+  simulation?: { status, source, gasUsed?, revertReason?, block? },   // block: the state it ran on, when one was named
   calls?: Preview[],                    // batches
   trace?: { source, agrees?, note?, calls: TraceEntry[], truncated?, totalCalls?, stateChanges? },   // with context.trace
+  replay?: { hash, block, index, time, receipt: { status, gasUsed, fee? }, matches?, differences? },   // from POST /v1/replay
 }
 ```
 
@@ -355,6 +357,34 @@ trace: {
 - **State changes** are what the call left different, account by account: native balance, nonce, code (a contract created, an EIP-7702 delegation) and storage slots, each before and after. What a failed inner call wrote isn't among them. The gas payment isn't either: it is the network fee, shown apart.
 - It covers transactions, each call of a batch (`calls[i].trace`), a UserOperation's whole run through the EntryPoint (validation, the calls, the paymaster) and a Safe's `execTransaction`. A trace has at most 400 calls listed (`truncated`, `totalCalls`).
 - The demo page has a "trace" switch; in mock mode the unknown router's swap sample carries a canned trace.
+
+### Replaying a mined transaction
+
+`POST /v1/replay` with `{ chainId, hash, trace? }` (or `replayTransaction({ chainId, hash }, { trace }, deps)`) runs a mined transaction again **where it ran** and returns a preview of what it did: the decoded call, what moved, the approvals it left, its trace when asked for.
+
+```bash
+curl -s localhost:8787/v1/replay -H 'content-type: application/json' -d '{ "chainId": 1, "hash": "0x…", "trace": true }'
+```
+
+- **Where it ran** means: on its parent block's state, after the transactions before it in its block (each with its own gas limit, price, access list, authorizations and blob hashes), in a block with its own header (time, fee recipient, base fee, randomness, blob base fee), at the price it paid. The chain's node runs the earlier transactions in the same `eth_simulateV1` request, and only the replayed one is reported.
+- **Checked against its receipt.** `replay.matches` is true when the run has the same outcome, the same events in order and the same gas; otherwise `replay.differences` says what differs and a caution warns that what is shown may not be what happened. The fee shown is the one paid (the gas at its price, an OP Stack chain's L1 data fee, a blob transaction's blob gas), and nothing is said about inclusion.
+- **Dollar values are as of its block** ("Value then"): the Chainlink feeds are read in that block's state. On HyperEVM, whose prices are the market's now, a replay has none.
+- **The trace** is recorded in the local EVM, which starts from the state the earlier transactions leave rather than running them: each round of reads is one `eth_simulateV1` of three simulated blocks on the parent's state. The first runs the earlier transactions; the second reads balances and code through two small readers placed at unused addresses; the third reads storage, by putting a reader in each contract's place (an override in a later block doesn't touch the calls of the first). Nonces have no opcode, so they are the parent block's plus the earlier transactions each address sent. Without this the local EVM had to run the whole block: a transaction 66th in its block took over a minute; wherever it is, it now takes a second or two, ten at most in the runs below.
+- The demo page has a "Replay a mined transaction" box (live mode): a hash on the chain chosen, with the trace switch.
+- **What isn't replayed:** the chain's own transactions (OP Stack deposits, ArbOS's, a BNB Chain validator's system calls, Polygon's state syncs), and a pending transaction (preview it as a request).
+- **The node has to keep the parent block's state.** Most keep recent blocks only: PublicNode's endpoints answer `403 Archive requests require a personal token` after a few minutes, Arbitrum's public RPC after seconds. The preview then has no simulation, and says why. An archive node replays any transaction. The readers use no `PUSH0`, so blocks from before Shanghai work too.
+- **Checked live** (2026-11-10, public RPCs, transactions spread over a block a few blocks old, each with its trace): Ethereum 40 of 40 match their receipts, with 40 traces agreeing with the node's run (median 1.4 s, in blocks of 240–350 transactions); Base 38 of 38 (median 3.0 s); Polygon 40 of 40 (3.2 s); BNB Chain 40 of 40 (2.4 s); OP Mainnet 39 of 39 (2.5 s), 36 traced before the node stopped serving the block. In all, 197 of 197 replays matched their receipts and all 194 traces agreed. Arbitrum's blocks hold a transaction or two and its node keeps seconds of state: 3 of 3. A whole Ethereum block run as one batch (337 transactions) had every outcome, gas figure and event count equal to its receipts.
+- What the runs found, and fixed: a **blob transaction** reads its blob hashes and the blob base fee (a rollup's batch poster checks both), so they are passed to the node (with EIP-1559 fees, the only way nodes take them) and to the local EVM, with the block's real blob base fee from `eth_feeHistory`. **Arbitrum's** header keeps the ArbOS version in the field other chains use for randomness: overriding it made the node run the block by the first version's rules, without `PUSH0`, so it is left alone there. **Polygon's** node logs every native transfer and fee payment from `0x…1010`, which no EVM run has: runs are compared without them. **Base** runs a contract natively behind the one-byte code `0xef` (`0xb200…10c5`): code starting with `0xEF` that isn't an EIP-7702 delegation can't be run locally, and the missing trace says so.
+
+### Simulating on a past block
+
+`context.block` (a number, or one in hex) simulates a transaction or a batch on the state after that block, as the first transaction of the block that followed (its real header; for the chain's latest block, the one that would follow): what it would have done then, not now.
+
+- `simulation.block` names the state's block, the notes say when it was, and the dollar values are as of that block.
+- Whether it could be included now isn't the question, so the nonce, balance and fee checks aren't run. The priced second run uses that block's base fee.
+- The decoder's own lookups (token names, a lending position it describes, a Safe's owners) still read the latest block. Signatures (typed data, messages, UserOperations, SafeTx) are previewed against the latest block, and say so.
+- A node that no longer has the block's state is an error ("This chain's node doesn't keep the state of block N…"), never a simulation on the latest block instead. (A block named only so that a trace matches the simulation still falls back, as before.)
+- The local EVM's caches of contract code and last-seen values are of the latest state: for a block that was asked for they are neither used nor written.
 
 ## Mock and live data
 
@@ -794,6 +824,7 @@ src/hyperliquid/          /info client, asset resolution, L1 action hash
 src/simulation.ts         eth_simulateV1 simulator + mock; src/fork-simulator.ts local EVM over fetched state; src/simulation-probe.ts the eth_call + state-override simulator
 src/block.ts              the block a simulation runs in (each chain's next block; a named one); src/evm/trace.ts the call trace, decoded
 src/prices.ts             dollar values for balance changes: Chainlink feeds through the chain's RPC, Hyperliquid mids on HyperEVM
+src/replay.ts             a mined transaction run again where it ran, compared with its receipt
 contracts/                SimulationProbe.sol (compiled into src/probe-code.ts by npm run build:probe)
 src/interceptor.ts        dependency-free EIP-1193 wrapper
 src/server.ts             HTTP API + demo server (src/cli.ts starts it: npm start / npx signing-preview)

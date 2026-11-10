@@ -274,6 +274,98 @@
         }
       }
     },
+    "/v1/replay": {
+      "post": {
+        "tags": [
+          "preview"
+        ],
+        "operationId": "replay",
+        "summary": "Replay a mined transaction",
+        "description": "Runs a mined transaction again where it ran (on its parent block's state, after the transactions before it in its block, in a block with its own header, at the price it paid) and returns a preview of what it did, with `replay` saying whether the run matches its receipt. Dollar values are as of its block. The chain's node has to keep the parent block's state: most keep recent blocks only, an archive node keeps all.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplayRequest"
+              },
+              "examples": {
+                "transfer": {
+                  "summary": "A transaction on Ethereum, with its trace",
+                  "value": {
+                    "chainId": 1,
+                    "hash": "0xabababababababababababababababababababababababababababababababab",
+                    "trace": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The preview of what the transaction did.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Preview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed JSON, or a body without a chain and a transaction hash.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such transaction on that chain (`NOT_FOUND`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The transaction isn't mined yet (`PENDING`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "One of the chain's own transactions (a deposit, a system call), which isn't replayed (`UNSUPPORTED`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No RPC is configured for the chain, or its node didn't answer (`UNAVAILABLE`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "tags": [
@@ -526,6 +618,19 @@
           "trace": {
             "type": "boolean",
             "description": "Also return the simulated call's trace (the calls it makes, decoded, with their events) and the state it changes, as `trace` in the preview. It takes a second run, in a local EVM over the chain's state, so it is off unless asked for."
+          },
+          "block": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "string",
+                "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+              }
+            ],
+            "description": "Simulate on the state after this block (a number, or one in decimal or hex) instead of the latest: what the request would have done then, as the first transaction of the block that followed. For transactions and batches. The chain's node has to keep that block's state: most keep recent blocks only, an archive node keeps all."
           }
         }
       },
@@ -628,6 +733,9 @@
           },
           "trace": {
             "$ref": "#/components/schemas/PreviewTrace"
+          },
+          "replay": {
+            "$ref": "#/components/schemas/ReplayInfo"
           }
         }
       },
@@ -757,7 +865,7 @@
           },
           "usd": {
             "type": "string",
-            "description": "What the amount is worth in dollars now, e.g. \"1,234.56\", when the asset has a price: the native token and the built-in tokens, from Chainlink's feeds through the chain's RPC (Hyperliquid's mid prices on HyperEVM)."
+            "description": "What the amount is worth in dollars, e.g. \"1,234.56\", when the asset has a price: now, or for a past block (`context.block`) or a replay at that block."
           },
           "usdSource": {
             "type": "string",
@@ -916,6 +1024,11 @@
           },
           "error": {
             "type": "string"
+          },
+          "block": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "The block whose state the simulation ran on, when one was named (`context.block`) or the transaction is a replay."
           }
         }
       },
@@ -1267,6 +1380,9 @@
                   "INVALID_REQUEST",
                   "UNSUPPORTED_MEDIA_TYPE",
                   "NOT_FOUND",
+                  "PENDING",
+                  "UNSUPPORTED",
+                  "UNAVAILABLE",
                   "INTERNAL"
                 ]
               },
@@ -1274,6 +1390,95 @@
                 "type": "string"
               }
             }
+          }
+        }
+      },
+      "ReplayInfo": {
+        "type": "object",
+        "required": [
+          "hash",
+          "block",
+          "index",
+          "time",
+          "receipt"
+        ],
+        "additionalProperties": false,
+        "description": "A mined transaction run again where it ran (POST /v1/replay), and how the run compares with its receipt.",
+        "properties": {
+          "hash": {
+            "type": "string",
+            "pattern": "^0x[0-9a-f]{64}$"
+          },
+          "block": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "The block it was mined in."
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Its position in the block."
+          },
+          "time": {
+            "type": "string",
+            "description": "The block's time (ISO 8601)."
+          },
+          "receipt": {
+            "type": "object",
+            "required": [
+              "status",
+              "gasUsed"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "enum": [
+                  "success",
+                  "reverted"
+                ]
+              },
+              "gasUsed": {
+                "type": "string",
+                "pattern": "^[0-9]+$"
+              },
+              "fee": {
+                "type": "string",
+                "description": "What its sender paid for it, in the native token, e.g. \"0.000123 ETH\"."
+              }
+            }
+          },
+          "matches": {
+            "type": "boolean",
+            "description": "Whether the run came out as the receipt says: the same outcome, the same events in order, the same gas. Absent when it couldn't be run."
+          },
+          "differences": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ReplayRequest": {
+        "type": "object",
+        "required": [
+          "chainId",
+          "hash"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "chainId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "hash": {
+            "type": "string",
+            "pattern": "^0x[0-9a-fA-F]{64}$",
+            "description": "The hash of a mined transaction."
+          },
+          "trace": {
+            "type": "boolean",
+            "description": "Also return its call trace and the state it changed."
           }
         }
       }

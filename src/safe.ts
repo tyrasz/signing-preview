@@ -13,7 +13,7 @@ import type { AdapterEnv, Decoded } from './evm/common.ts';
 import type { AssetChange, SimulationRequest, SimulationResult } from './types.ts';
 import { configChanges, simulateSafeExecution, type SafeConfig } from './safe-sim.ts';
 import { pinLatest } from './block.ts';
-import { tracePreviews } from './evm/trace.ts';
+import { tracePreviews, noTrace, type TraceEnv } from './evm/trace.ts';
 
 /** Safe's libraries (safe-global/safe-deployments v1.3.0 canonical and EIP-155, v1.4.1, v1.5.0), deployed on every chain here. */
 export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 'multisend_call_only' | 'sign_message' | 'create_call' | 'migration' }> = {
@@ -234,9 +234,10 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(at && { at }) });
     if (!run) return null;
     if (env.context.trace && run.requests) {
-      const traces = await tracePreviews(run.requests.slice(0, 1), [run.result], { chainId, account: t.safe.toLowerCase(), accountLabel: 'the Safe', deps: env.deps });
+      const traceEnv: TraceEnv = { chainId, account: t.safe.toLowerCase(), accountLabel: 'the Safe', deps: env.deps };
+      const traces = await tracePreviews(run.requests.slice(0, 1), [run.result], traceEnv);
       if (traces?.[0]) b.trace = traces[0];
-      else b.note("No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
+      else b.note(noTrace(traceEnv));
     }
     if (run.after) reportConfigChanges(run.before, run.after, b);
     if (!run.executed) return { reverted: run.result.status === 'reverted' ? run.result.revertReason ?? '' : 'the Safe reports that the call failed (ExecutionFailure)' };

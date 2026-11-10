@@ -37,6 +37,11 @@ export interface TestChain {
   delayMs: number;
   /** HTTP requests and JSON-RPC calls served, by method. */
   stats: { http: number; calls: Record<string, number> };
+  /**
+   * Answer eth_simulateV1 too (off by default: the chain stands for one without it): blocks of calls run in order
+   * on the chain's state, each block's code overrides applied before its calls, nothing kept afterwards.
+   */
+  simulateV1?: boolean;
 }
 
 export async function testChain(): Promise<TestChain> {
@@ -94,6 +99,27 @@ export async function testChain(): Promise<TestChain> {
           const res = await evm.runCall({ caller: at(from), origin: at(from), to: at(tx.to), data: hexToBytes(tx.data as Hex), value, gasLimit: BigInt(tx.gas ?? 30_000_000) });
           const ret = bytesToHex(res.execResult.returnValue);
           return res.execResult.exceptionError ? { error: { code: 3, message: 'execution reverted', data: ret } } : { result: ret };
+        } finally {
+          await sm.revert();
+        }
+      }
+      case 'eth_simulateV1': {
+        if (!chain.simulateV1) return { error: { code: -32601, message: 'Method not found' } };
+        const [{ blockStateCalls }] = params as [{ blockStateCalls: { calls?: { from?: string; to?: string; data?: Hex; value?: string; gas?: string }[]; stateOverrides?: Record<string, { code?: Hex }> }[] }];
+        await sm.checkpoint();
+        try {
+          const blocks = [];
+          for (const b of blockStateCalls) {
+            for (const [a, o] of Object.entries(b.stateOverrides ?? {})) if (o.code) await sm.putCode(at(a), hexToBytes(o.code));
+            const calls = [];
+            for (const c of b.calls ?? []) {
+              const from = c.from ?? '0x0000000000000000000000000000000000000000';
+              const res = await evm.runCall({ caller: at(from), origin: at(from), ...(c.to && { to: at(c.to) }), data: hexToBytes(c.data ?? '0x'), value: BigInt(c.value ?? 0), gasLimit: BigInt(c.gas ?? 30_000_000) });
+              calls.push({ status: res.execResult.exceptionError ? '0x0' : '0x1', returnData: bytesToHex(res.execResult.returnValue), gasUsed: `0x${res.execResult.executionGasUsed.toString(16)}`, logs: [] });
+            }
+            blocks.push({ calls });
+          }
+          return { result: blocks };
         } finally {
           await sm.revert();
         }
