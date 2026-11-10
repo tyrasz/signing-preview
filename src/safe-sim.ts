@@ -6,10 +6,10 @@
 // In the same simulated block, the Safe's configuration is read again (owners, threshold, singleton, guard,
 // fallback handler, modules) and compared with now: what a delegatecall did to the Safe shows even when its
 // calldata looks harmless, as in the 2025 Bybit theft (a delegatecall that replaced the Safe's singleton).
-import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
-import { ecdsaStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
+import { ecdsaStandIn, P256_STUB, STUB_SIGNATURE } from './erc4337-sim.ts';
 
 const ABI = parseAbi([
   'function getOwners() view returns (address[])',
@@ -84,7 +84,7 @@ export async function readConfig(deps: Dependencies, chainId: number, safe: stri
  * signature instead (a stand-in that a replaced ecrecover attributes to them, so validation costs what it will), and
  * the lowest other owners approve. Null if the Safe has fewer owners than its threshold.
  */
-export function approvalsFor(before: SafeConfig, hash: Hex, ecdsa?: { owner: string; signature: Hex }): { stateDiff: Record<string, string>; signatures: Hex } | null {
+export function approvalsFor(before: SafeConfig, hash: Hex, ecdsa?: { owner: string; signature: Hex; contract?: Hex }): { stateDiff: Record<string, string>; signatures: Hex } | null {
   const ascending = [...before.owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
   const own = ecdsa && ascending.includes(ecdsa.owner.toLowerCase()) ? ecdsa.owner.toLowerCase() : undefined;
   const signers = (own ? [own, ...ascending.filter(o => o !== own).slice(0, Number(before.threshold) - 1)] : ascending.slice(0, Number(before.threshold)))
@@ -93,8 +93,61 @@ export function approvalsFor(before: SafeConfig, hash: Hex, ecdsa?: { owner: str
   const approving = signers.filter(o => o !== own);
   return {
     stateDiff: Object.fromEntries(approving.map(o => [keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [hash, keccak256(`0x${word(o)}${word(APPROVED_HASHES_SLOT)}` as Hex)])), `0x${word(1n)}`])),
-    signatures: concatHex(signers.map(o => o === own ? ecdsa!.signature : `0x${word(o)}${word(0n)}01` as Hex)),
+    signatures: safeSignatures(signers.map(o => o === own ? { owner: o, signature: ecdsa!.signature, ...(ecdsa!.contract && { contract: ecdsa!.contract }) } : { owner: o, signature: `0x${word(o)}${word(0n)}01` as Hex })),
   };
+}
+
+/**
+ * A Safe's signatures, owners in ascending order: 65 bytes each, and for an owner signing as a contract (`contract`:
+ * what its isValidSignature takes), the owner, the offset of its data and type 0, with the data after all of them.
+ */
+export function safeSignatures(parts: { owner: string; signature?: Hex; contract?: Hex }[]): Hex {
+  let tail = '';
+  const heads = parts.map(p => {
+    if (!p.contract) return p.signature!.slice(2);
+    const head = `${word(p.owner)}${word(BigInt(parts.length * 65 + tail.length / 2))}00`;
+    tail += `${word(BigInt((p.contract.length - 2) / 2))}${p.contract.slice(2)}`;
+    return head;
+  });
+  return `0x${heads.join('')}${tail}` as Hex;
+}
+
+/**
+ * Safe's WebAuthn shared signer (safe-modules; source verified on Sourcify, the same address on every chain here): a
+ * Safe owner checking a passkey the Safe keeps in its own storage (its configure, delegatecalled at setup), with the
+ * P-256 verifiers it names: a precompile, then a fallback verifier contract.
+ */
+export const SAFE_WEBAUTHN_SHARED_SIGNER = '0x94a4f6affbd8975951142c3999aeab7ecee555c2';
+const SHARED_SIGNER = parseAbi(['function getConfiguration(address account) view returns ((uint256 x, uint256 y, uint176 verifiers))']);
+const CONFIGURE = toFunctionSelector('configure((uint256,uint256,uint176))').slice(2);
+/**
+ * The verifiers a Safe's passkey is checked with through the shared signer (each address 0 if unset): from the Safe's
+ * storage, or for a Safe its operation deploys, from the configure call in its setup. Null when it has no passkey.
+ */
+export async function sharedSignerVerifiers(deps: Dependencies, chainId: number, safe: string, initCode?: string): Promise<{ precompile: string; fallback: string } | null> {
+  let verifiers = 0n;
+  if (initCode && initCode.length > 2) {
+    const i = initCode.toLowerCase().indexOf(CONFIGURE);
+    if (i >= 0 && initCode.length >= i + 8 + 192) verifiers = BigInt(`0x${initCode.slice(i + 8 + 128, i + 8 + 192)}`);
+  } else if (deps.rpc?.has(chainId)) {
+    try {
+      const out = String(await deps.rpc.call(chainId, 'eth_call', [{ to: SAFE_WEBAUTHN_SHARED_SIGNER, data: encodeFunctionData({ abi: SHARED_SIGNER, functionName: 'getConfiguration', args: [safe as Hex] }) }, 'latest']));
+      if (/^0x[0-9a-f]{192}$/i.test(out)) verifiers = BigInt(`0x${out.slice(130)}`);
+    } catch { /* unreadable */ }
+  }
+  if (!verifiers) return null;
+  const address = (v: bigint) => `0x${v.toString(16).padStart(40, '0')}`;
+  return { precompile: address((verifiers >> 160n) & 0xffffn), fallback: address(verifiers & ((1n << 160n) - 1n)) };
+}
+/**
+ * A passkey's assertion as Safe's WebAuthn library decodes it: abi.encode(authenticatorData, clientDataFields, r, s)
+ * (it adds the type and the challenge to clientDataFields itself), user present and verified, with P256_STUB, which
+ * the replaced verifier accepts.
+ */
+export function safeWebAuthnStub(): Hex {
+  const authenticatorData = concatHex([sha256(stringToHex('app.safe.global')), '0x05', '0x00000000']);
+  return encodeAbiParameters([{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }],
+    [authenticatorData, '"origin":"https://app.safe.global","crossOrigin":false', BigInt(P256_STUB.r), BigInt(P256_STUB.s)]);
 }
 
 /**

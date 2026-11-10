@@ -5,7 +5,7 @@ import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../f
 import { chainName } from '../chains.ts';
 import { describeSafeTx, reportConfigChanges, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
 import { simulateExecution, simulateOperation, STUB_SIGNATURE, stubSignature } from '../erc4337-sim.ts';
-import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf } from '../safe-sim.ts';
+import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf, safeSignatures, safeWebAuthnStub, SAFE_WEBAUTHN_SHARED_SIGNER, sharedSignerVerifiers } from '../safe-sim.ts';
 import { decodeTransaction } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
@@ -137,25 +137,32 @@ const safeOp: TypedAdapter = async (data, env) => {
         // The signing owner (or, if the signer isn't one, the first) signs with the ECDSA stand-in, which the replaced
         // ecrecover attributes to them, so the Safe's check costs what it will; any others the threshold needs approve.
         const owner = before && (env.signer && before.owners.includes(env.signer.toLowerCase()) ? env.signer.toLowerCase() : [...before.owners].sort((a, z) => (BigInt(a) < BigInt(z) ? -1 : 1))[0]);
-        const approvals = before && digest ? approvalsFor(before, digest as Hex, owner ? { owner, signature: STUB_SIGNATURE } : undefined) : null;
         // A Safe the operation deploys has no approvals to set (no storage can be put where it will be created): its
         // owners and threshold come from its setup, and each owner the threshold needs signs with a stand-in of its
         // own (the signing owner's first), which the replaced ecrecover attributes to them.
         const setup = deploys ? safeSetupOf(initCode) : null;
         const asc = (a: string, z: string) => (BigInt(a) < BigInt(z) ? -1 : 1);
         const primary = setup && (env.signer && setup.owners.includes(env.signer.toLowerCase()) ? env.signer.toLowerCase() : [...setup.owners].sort(asc)[0]);
+        // A passkey owner through Safe's WebAuthn shared signer signs as a contract: a WebAuthn assertion, which the
+        // P-256 verifier its passkey names accepts after running its real check (so the check costs what it will).
+        const verifiers = (owner ?? primary) === SAFE_WEBAUTHN_SHARED_SIGNER ? await sharedSignerVerifiers(env.deps, chainId, safe, deploys ? initCode : undefined) : null;
+        const passkey = verifiers ? safeWebAuthnStub() : undefined;
+        const approvals = before && digest ? approvalsFor(before, digest as Hex, owner ? { owner, signature: STUB_SIGNATURE, ...(passkey && { contract: passkey }) } : undefined) : null;
         const signing = setup && primary && setup.threshold <= 16n ? [primary, ...[...setup.owners].sort(asc).filter(o => o !== primary)].slice(0, Number(setup.threshold)).sort(asc) : null;
         const cosigners = signing ? signing.filter(o => o !== primary).map((o, i) => ({ signature: stubSignature(i + 1), signer: o })) : [];
-        const deploySignatures = signing ? concatHex(signing.map(o => o === primary ? STUB_SIGNATURE : cosigners.find(c => c.signer === o)!.signature)) : null;
+        const deploySignatures = signing ? safeSignatures(signing.map(o => o === primary ? { owner: o, signature: STUB_SIGNATURE, ...(passkey && { contract: passkey }) } : { owner: o, signature: cosigners.find(c => c.signer === o)!.signature })) : null;
+        const zero = (a?: string) => !a || /^0x0{40}$/.test(a);
         // The module's signature: validAfter and validUntil (6 bytes each), then the owners' signatures.
         const window = `${validAfter.toString(16).padStart(12, '0')}${validUntil.toString(16).padStart(12, '0')}`;
         const signature = `0x${known.signaturePrefix ?? ''}${window}${(approvals?.signatures ?? deploySignatures ?? STUB_SIGNATURE).slice(2)}` as Hex;
         const signer = owner ?? primary ?? env.signer;
         const run = await simulateOperation({ chainId, entryPoint, sender: safe, nonce, initCode: initCode as Hex, callData, callGasLimit: call, verificationGasLimit: verification, preVerificationGas: preVerification,
           maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...(signer && { signer }), ...(cosigners.length && { cosigners }), watch,
+          ...(verifiers && BigInt(verifiers.precompile) === 0x100n && { p256: true }), ...(verifiers && !zero(verifiers.fallback) && { verifier: verifiers.fallback }),
           ...(approvals && Object.keys(approvals.stateDiff).length && { stateOverrides: { [safe]: { stateDiff: approvals.stateDiff } } }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
         const changes = await reportRun(run, { sender: safe, paymaster: pm.paymaster, entryPointName: known.entryPointName, signature }, chainId, env, b,
-          { deploys, validation: approvals ? `with a stand-in for ${owner === env.signer?.toLowerCase() ? 'your' : 'an owner\'s'} signature, which ecrecover attributes to ${owner === env.signer?.toLowerCase() ? 'you' : 'that owner'}${before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : ''}`
+          { deploys, validation: passkey ? `with a stand-in for the owner's passkey signature (a WebAuthn assertion, which the P-256 verifier its passkey is checked with accepts, after running its real check)${approvals && before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : cosigners.length ? ` and ${cosigners.length} other owner${cosigners.length === 1 ? '\'s' : 's\''}, which ecrecover attributes to each` : ''}`
+            : approvals ? `with a stand-in for ${owner === env.signer?.toLowerCase() ? 'your' : 'an owner\'s'} signature, which ecrecover attributes to ${owner === env.signer?.toLowerCase() ? 'you' : 'that owner'}${before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : ''}`
             : signing ? `with a stand-in for ${primary === env.signer?.toLowerCase() ? 'your' : 'an owner\'s'} signature${cosigners.length ? ` and ${cosigners.length} other owner${cosigners.length === 1 ? '\'s' : 's\''}, as the threshold of the Safe being created needs` : ''}, which ecrecover attributes to each`
             : "with a stand-in for the owner's signature, which ecrecover attributes to the signer" });
         if (changes) {

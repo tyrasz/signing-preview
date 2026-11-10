@@ -240,3 +240,36 @@ test('A multi-chain Safe root, with the operations the wallet built it from: sho
   // A single operation's root is its own digest.
   assert.ok(codes(await sign(leaves[0], [ops.find(o => hashTypedData({ domain: { chainId: o.chainId, verifyingContract: MC }, types, primaryType: 'SafeOp', message: o.operation as never }) === leaves[0])!])).includes('safe_multichain_root_verified'));
 });
+
+test('A passkey owner through Safe’s WebAuthn shared signer: a contract signature in Safe’s layout, decoded as its WebAuthn library requires', async () => {
+  const { safeSignatures, safeWebAuthnStub, sharedSignerVerifiers, SAFE_WEBAUTHN_SHARED_SIGNER } = await import('../src/safe-sim.ts');
+  const { P256_STUB, STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
+  const passkey = safeWebAuthnStub();
+  // WebAuthn.castSignature: abi.encode(authenticatorData, clientDataFields, r, s), canonically (offsets 0x80 and
+  // 0x80 + 32 + the padded authenticator data, nothing after the client data fields).
+  const w = (i: number) => BigInt(`0x${passkey.slice(2 + i * 64, 66 + i * 64)}`);
+  const authLength = Number(w(4)), fieldsAt = 0x80 + 32 + Math.ceil(authLength / 32) * 32;
+  assert.equal(w(0), 0x80n);
+  assert.equal(w(1), BigInt(fieldsAt));
+  assert.equal(`0x${w(2).toString(16)}`, P256_STUB.r);
+  assert.equal(`0x${w(3).toString(16)}`, P256_STUB.s);
+  assert.equal(authLength, 37);
+  assert.equal(passkey.slice(2 + 160 * 2 + 64, 2 + 160 * 2 + 66), '05', 'user present and verified');
+  const fieldsLength = Number(BigInt(`0x${passkey.slice(2 + fieldsAt * 2, 2 + fieldsAt * 2 + 64)}`));
+  assert.equal(size(passkey), fieldsAt + 32 + Math.ceil(fieldsLength / 32) * 32);
+  // In a Safe's signatures, owners ascending: the passkey owner's part names it, the offset of its data, type 0; the
+  // data (its length, then it) after every 65-byte part.
+  const other = '0xffffffffffffffffffffffffffffffffffffffff';
+  const sigs = safeSignatures([{ owner: SAFE_WEBAUTHN_SHARED_SIGNER, contract: passkey }, { owner: other, signature: STUB_SIGNATURE }]);
+  assert.equal(sigs.slice(2, 66), SAFE_WEBAUTHN_SHARED_SIGNER.slice(2).padStart(64, '0'));
+  assert.equal(BigInt(`0x${sigs.slice(66, 130)}`), 130n);
+  assert.equal(sigs.slice(130, 132), '00');
+  assert.equal(`0x${sigs.slice(132, 262)}`, STUB_SIGNATURE);
+  assert.equal(BigInt(`0x${sigs.slice(262, 326)}`), BigInt(size(passkey)));
+  assert.equal(`0x${sigs.slice(326)}`, passkey);
+  // The verifiers, from the configure call a deploying Safe's setup makes: the precompile's address in bits 160-175,
+  // the fallback verifier's below.
+  const configure = encodeFunctionData({ abi: parseAbi(['function configure((uint256 x, uint256 y, uint176 verifiers) signer)']), functionName: 'configure', args: [{ x: 1n, y: 2n, verifiers: (0x100n << 160n) | 0xa86e0054c51e4894d88762a017ecc5e5235f5dban }] });
+  assert.deepEqual(await sharedSignerVerifiers({} as Dependencies, 42161, ALICE, `0x${'ab'.repeat(40)}${configure.slice(2)}${'cd'.repeat(20)}`),
+    { precompile: '0x0000000000000000000000000000000000000100', fallback: '0xa86e0054c51e4894d88762a017ecc5e5235f5dba' });
+});

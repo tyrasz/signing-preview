@@ -263,10 +263,11 @@ export const STUB_COSIGNATURE = stubSignature(1);
 
 /**
  * A stand-in signature; `p256` when it is a passkey's, which P256VERIFY (0x100) must accept too (see standIn), or
- * `'daimo'` when the account verifies it with Daimo's P256 verifier contract instead. `cosigners`: other stand-in
- * ECDSA signatures in it and whose they are (ecrecover recovers each as its signer).
+ * `'daimo'` when the account verifies it with Daimo's P256 verifier contract instead; `verifier`, another P-256
+ * verifier contract taking the precompile's input that its check calls (stood in for the same way). `cosigners`:
+ * other stand-in ECDSA signatures in it and whose they are (ecrecover recovers each as its signer).
  */
-interface Stub { signature: Hex; p256?: boolean | 'daimo'; cosigners?: { signature: Hex; signer: string }[] }
+interface Stub { signature: Hex; p256?: boolean | 'daimo'; verifier?: string; cosigners?: { signature: Hex; signer: string }[] }
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
@@ -500,7 +501,7 @@ async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promi
 }
 
 /** Where the real ecrecover and P256VERIFY move while their stand-ins take their addresses. */
-const ECRECOVER_MOVED = '0x0000000000000000000000000000000000ec0001', P256_MOVED = '0x0000000000000000000000000000000000ec0100', DAIMO_MOVED = '0x0000000000000000000000000000000000ec0da1';
+const ECRECOVER_MOVED = '0x0000000000000000000000000000000000ec0001', P256_MOVED = '0x0000000000000000000000000000000000ec0100', VERIFIER_MOVED = '0x0000000000000000000000000000000000ec0da1';
 /**
  * Code for a signature precompile that answers `answer` (EVM code leaving one word on the stack) for the stand-in
  * signature (r and s at calldata offsets rAt and rAt + 32), and anything else as the real precompile does (moved to
@@ -576,11 +577,14 @@ export function ecdsaStandIn(signer: string, digest?: Hex): Pick<SimulationReque
 /** P256VERIFY (0x100, RIP-7212 / EIP-7951) accepting P256_STUB: a passkey's assertion (see webAuthnStub) verifies. */
 export const p256Accepting = (): Hex => standIn(P256_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
 /**
- * Daimo's verifier accepting P256_STUB: its code moves to DAIMO_MOVED and this takes its address. Every input still
- * runs through the real code first (the stub's verification costs what a real one does, and fails), then the stub
- * is answered 1; anything else gets the real answer.
+ * A P-256 verifier contract taking the precompile's input (hash, r, s, x, y), Daimo's or another, accepting
+ * P256_STUB: its code moves to VERIFIER_MOVED and this takes its address. Every input still runs through the real
+ * code first (the stub's verification costs what a real one does, and fails), then the stub is answered 1; anything
+ * else gets the real answer.
  */
-export const daimoAccepting = (): Hex => standIn(DAIMO_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
+export const verifierAccepting = (): Hex => standIn(VERIFIER_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
+/** Daimo's verifier accepting P256_STUB (see verifierAccepting). */
+export const daimoAccepting = verifierAccepting;
 
 export interface OperationInput {
   chainId: number; entryPoint: string; sender: string; nonce: bigint;
@@ -592,6 +596,11 @@ export interface OperationInput {
   signature?: Hex;
   /** Other stand-in signatures in `signature` (stubSignature(k)), and whose ecrecover is to recover them as. */
   cosigners?: { signature: Hex; signer: string }[];
+  /**
+   * A passkey's stand-in in `signature` (with P256_STUB): `p256`, P256VERIFY (0x100) checks it; `verifier`, a P-256
+   * verifier contract taking the precompile's input does. Each accepts it, after running the real check on it.
+   */
+  p256?: boolean; verifier?: string;
   /**
    * Who signs: ecrecover recovers STUB_SIGNATURE as this address (see ecrecoverAs), so an account whose owner it is
    * validates the operation as it will once signed. Defaults to the account itself (an EIP-7702 account signs for itself).
@@ -696,7 +705,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
   const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -712,11 +721,13 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   return result;
 
   async function withStub(stub: Stub): Promise<OperationRun | null> {
-  // Daimo's verifier, moved to make room for its stand-in: its code is the chain's own.
-  let daimo: Hex | undefined;
-  if (stub.p256 === 'daimo') {
-    try { daimo = deps.rpc?.has(op.chainId) ? String(await deps.rpc.call(op.chainId, 'eth_getCode', [DAIMO_P256_VERIFIER, 'latest'])) as Hex : undefined; } catch { daimo = undefined; }
-    if (!daimo || daimo === '0x') return null;
+  // A P-256 verifier contract (Daimo's, or the one a supplied signature names), moved to make room for its
+  // stand-in: its code is the chain's own.
+  const verifierAt = stub.p256 === 'daimo' ? DAIMO_P256_VERIFIER : stub.verifier;
+  let verifier: Hex | undefined;
+  if (verifierAt) {
+    try { verifier = deps.rpc?.has(op.chainId) ? String(await deps.rpc.call(op.chainId, 'eth_getCode', [verifierAt, 'latest'])) as Hex : undefined; } catch { verifier = undefined; }
+    if (!verifier || verifier === '0x') return null;
   }
   const data = ep!.version === '0.6'
     ? encodeFunctionData({ abi: HANDLE_V06, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] })
@@ -728,10 +739,10 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(op.delegate ? [{ address: sender, storageKeys: [] }] : []),
       ...(stub.p256 === true ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []),
       // The verifier itself stays cold, as it is on-chain; only the call on to its moved code is warm.
-      ...(daimo ? [{ address: DAIMO_MOVED, storageKeys: [] }] : [])],
+      ...(verifier ? [{ address: VERIFIER_MOVED, storageKeys: [] }] : [])],
     stateOverrides: { ...op.stateOverrides, [entryPoint]: { ...entryPointOverride(entryPoint, op.chainId)!, ...(op.stateOverrides?.[entryPoint]?.stateDiff && { stateDiff: { ...entryPointOverride(entryPoint, op.chainId)!.stateDiff, ...op.stateOverrides[entryPoint].stateDiff } }) }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
       ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
-      ...(daimo && { [DAIMO_P256_VERIFIER]: { code: daimoAccepting() }, [DAIMO_MOVED]: { code: daimo } }),
+      ...(verifier && { [verifierAt!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code: verifier } }),
       ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
