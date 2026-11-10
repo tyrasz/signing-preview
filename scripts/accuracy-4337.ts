@@ -130,7 +130,7 @@ async function replay(item: string): Promise<void> {
   const index = at === undefined ? 0 : Number(at);
   if (ops.length > 1 && at === undefined) {
     if (new Set(ops.map(o => o.sender.toLowerCase())).size < ops.length) return skip('a bundle with the same account twice');
-    enqueue(Array.from({ length: Math.min(ops.length, BUNDLE_MAX) - 1 }, (_, i) => `${hash}#${i + 1}`));
+    enqueueNext(Array.from({ length: Math.min(ops.length, BUNDLE_MAX) - 1 }, (_, i) => `${hash}#${i + 1}`));
   }
   const op = ops[index], sender = op.sender.toLowerCase();
   // A session key's operation (an ERC-7579 account validating through Rhinestone's SmartSession module, which its
@@ -333,6 +333,8 @@ const pump = () => {
   }
 };
 const enqueue = (hashes: string[]) => { queue.push(...hashes); pump(); };
+/** Next in line whichever way the queue runs: a bundle's later operations, while its block's state is there. */
+const enqueueNext = (items: string[]) => { if (CHAIN === 42161) queue.push(...items); else queue.unshift(...items); pump(); };
 const drained = () => new Promise<void>(r => (active || (queue.length && rows.length < MAX) ? idle.push(r) : r()));
 const ONE = arg('tx', '');
 if (ONE) { enqueue([ONE]); await drained(); }
