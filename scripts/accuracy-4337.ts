@@ -119,6 +119,7 @@ async function replay(item: string): Promise<void> {
   // An item is a bundle transaction's hash, or `hash#i` for its i-th operation.
   const [hash, at] = item.split('#');
   const tx = await call<{ from: string; to: string | null; input: Hex; transactionIndex: Hex; blockNumber: Hex; authorizationList?: NonNullable<SimulationRequest['authorizationList']> }>('eth_getTransactionByHash', [hash]);
+  if (!tx) return skip("the node didn't return the transaction");
   if (tx.to?.toLowerCase() !== EP) return skip('not a handleOps transaction to the EntryPoint');
   let ops: readonly Op[];
   let beneficiary: Hex;
@@ -138,6 +139,10 @@ async function replay(item: string): Promise<void> {
   const r = await call<{ blockNumber: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] }>('eth_getTransactionReceipt', [hash]);
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
   const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
+  // Arbitrum's public RPC keeps about 30 seconds of state: an operation whose block is older by the time its turn
+  // comes would lose its state partway through the replay (the stand-in's shape, the operation's hash, the
+  // simulation itself), and is skipped rather than replayed on part of it.
+  if (CHAIN === 42161 && !ONE && Date.now() / 1000 - Number(block.timestamp) > 25) return skip('its block was too old for the node by its turn (Arbitrum keeps about 30 seconds)');
   blocks.add(n);
   // The block's earlier transactions (--prefix), without their gas limits: the node charges each what it uses, and
   // the simulated block's gas limit holds them as it held the real ones.
