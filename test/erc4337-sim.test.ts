@@ -431,3 +431,25 @@ test('OKX Wallet’s account: the stand-in names a key, so validation runs its c
   assert.equal(await echo(otherCall), otherCall);
   assert.equal(await echo('0x'), '0x');
 });
+
+test('A whole operation’s trace: the EntryPoint’s run of it, from validation to the calls and the gas payment', async () => {
+  const hash = userOpHash(readOperation(operation(), '0.7')!, EP, 999, '0.7');
+  const p = await previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, trace: true, userOperation: { entryPoint: EP, operation: operation() } }, deps);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  const t = p.trace!;
+  assert.equal(t.agrees, true);
+  // The EntryPoint's simulation call first, the account under it: its validation, then its execute, which transfers.
+  assert.equal(t.calls[0].to, EP);
+  const to = (a: string, selector: string) => t.calls.filter(c => c.to === a && c.selector === selector);
+  assert.equal(to(account, '0x19822f7c').length, 1, 'validateUserOp');
+  const transfer = t.calls.find(c => c.to === usdc && c.function === 'transfer(address,uint256)')!;
+  assert.deepEqual([transfer.from, transfer.label, transfer.args!.map(a => a.value)], [account, 'USDC', [BOB, '50000000']]);
+  assert.deepEqual(transfer.events!.map(e => e.name), ['Transfer']);
+  // The stand-in for the signature shows as the call it is: ecrecover, asked by the account during validation.
+  assert.ok(t.calls.some(c => c.to === '0x0000000000000000000000000000000000000001' && c.from === account));
+  // The token's balances and the EntryPoint's books are among the state changed.
+  assert.ok(t.stateChanges!.some(s => s.address === usdc && s.storage!.length === 2));
+  assert.ok(t.stateChanges!.some(s => s.address === EP));
+  // Not asked for: none.
+  assert.equal((await preview(operation())).trace, undefined);
+});

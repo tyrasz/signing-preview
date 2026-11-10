@@ -13,6 +13,7 @@ import type { Dependencies, PreviewContext, SimulationRequest, TokenRegistry } f
 import { KINETIQ } from './evm/kinetiq.ts';
 import { HYPERLEND } from './evm/hyperlend.ts';
 import { JsonRpcClient } from './rpc.ts';
+import { ChainedPrices, ChainlinkPrices, HyperliquidPrices } from './prices.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry, TokenListRegistry } from './tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource, type AbiSource } from './abi.ts';
 
@@ -161,6 +162,7 @@ export function liveDependencies(env = process.env, options: { warmUp?: boolean 
   const rpcs: Record<number, string> = {};
   for (const [chainId, { env: name }] of Object.entries(EVM_RPCS)) if (env[name]) rpcs[Number(chainId)] = env[name]!;
   const rpc = new JsonRpcClient(rpcs);
+  const mainnet = new HttpHyperliquidInfo(INFO_URLS.mainnet);
   const cacheFile = env.SIGNING_PREVIEW_FORK_CACHE && env.SIGNING_PREVIEW_FORK_CACHE !== 'off' ? env.SIGNING_PREVIEW_FORK_CACHE : undefined;
   const fork = new ForkSimulator(rpcs, { cacheFile });
   if (options.warmUp && rpcs[999]) setTimeout(() => warmHyperEvm(rpcs, fork, rpc).catch(() => { /* only warming */ }), 0).unref?.();
@@ -174,7 +176,9 @@ export function liveDependencies(env = process.env, options: { warmUp?: boolean 
     tokens: new ChainedTokenRegistry(tokenSources),
     abis: new ContractAbiResolver({ sources: abiSources, rpc }),
     signatures: new ChainedSignatures(online ? [new OpenChainSignatures(), new FourByteSignatures()] : []),
-    hyperliquid: { mainnet: new HttpHyperliquidInfo(INFO_URLS.mainnet), testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
+    hyperliquid: { mainnet, testnet: new HttpHyperliquidInfo(INFO_URLS.testnet) },
+    // Dollar values: Chainlink's feeds through the same RPCs, Hyperliquid's mids on HyperEVM (SIGNING_PREVIEW_PRICES=off for none).
+    ...(env.SIGNING_PREVIEW_PRICES !== 'off' && { prices: new ChainedPrices([new ChainlinkPrices(rpc), new HyperliquidPrices(mainnet)]) }),
     ...(Object.keys(rpcs).length && { simulator: new RpcSimulator(rpcs, { fork }) }),
   };
 }

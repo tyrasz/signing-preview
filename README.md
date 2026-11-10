@@ -291,7 +291,7 @@ Simulation runs the call; the network also checks the transaction itself before 
   network: { kind: 'evm', chainId, name } | { kind: 'hypercore', name, testnet } | null,
   title, summary,                       // plain-language headline and sentence
   details: [{ label, value, raw? }],    // raw = exact integer/hex when value is formatted
-  assetChanges: [{ direction, account, amount, symbol, raw?, asset?, basis, standard?, tokenId? }],
+  assetChanges: [{ direction, account, amount, symbol, raw?, asset?, basis, standard?, tokenId?, usd?, usdSource? }],
   approvals?: [{ kind, owner, spender, token, symbol?, allowance, raw?, tokenId?, expiration?, revoked, direct, basis }],
   warnings: [{ severity: 'info' | 'caution' | 'danger', code, message }],
   attention: 'none' | 'info' | 'caution' | 'danger',   // display hint, not a security verdict
@@ -308,6 +308,13 @@ Simulation runs the call; the network also checks the transaction itself before 
 - `simulated_events`: transfer events from `eth_simulateV1`, when the balances couldn't be read back.
 
 None is a measured final balance. Fee-on-transfer or rebasing tokens, and state changes before inclusion, can differ.
+
+**Dollar values.** In live mode a change in the chain's native token or a built-in token carries `usd`, what that amount is worth now ("23,962.78"), and `usdSource`, where the price came from ("Chainlink ETH / USD"). A "Value now" detail sums them per direction: "out ≈ $7.54 (1 asset without a price not counted)".
+- Prices are Chainlink's USD feeds, read with `eth_call` on the chain's own RPC (`latestRoundData()`), so no price service learns what is being previewed. On HyperEVM, which has no Chainlink feeds, they are Hyperliquid's mid prices (`allMids`) for HYPE, BTC, ETH and SOL, and USDC is taken as a dollar.
+- Tokens are priced by address, never by the symbol a contract reports: a token calling itself USDC at another address gets no value. Wrapped and bridged forms take their asset's feed (WETH as ETH, cbBTC, WBTC and BTCB as BTC, USDC.e and USDbC as USDC, POL by the feed still named MATIC), so a depeg of the wrapper wouldn't show.
+- A feed with no answer, or not updated for two days, gives no value (stablecoin feeds update daily unless the price moves). NFTs and every other token have none, and the sum says how many assets it left out.
+- A reverted call's changes are the requested ones, valued the same way. Prices are kept for a minute and a preview waits at most 2.5 s for them; `SIGNING_PREVIEW_PRICES=off` turns them off, and `Dependencies.prices` takes any `PriceSource`.
+- The 33 feed addresses (`CHAINLINK_FEEDS` in `src/prices.ts`) were each read on-chain on 2026-11-10: description, 8 decimals and a plausible answer. Live previews that day on Ethereum, Base, Polygon, BNB Chain and HyperEVM valued ETH, USDC, USDT, POL, BNB and HYPE transfers from those sources (11.894 ETH as $23,962.78), in the same 350–500 ms a preview took before.
 
 NFT changes carry `standard` (`erc721`/`erc1155`) and the full `tokenId`. `symbol` reads like "BAYC #42", with long IDs shortened. Collection names come from the contracts and are easy to copy, so a received, named NFT gets an info note.
 
@@ -365,6 +372,7 @@ Live mode reads Hyperliquid's public `/info` API and simulates on any chain that
 | `TOKEN_LIST_FILE` | A [tokenlists.org](https://tokenlists.org)-format JSON file, consulted after the built-in tokens. |
 | `ETHERSCAN_API_KEY` | Adds Etherscan (API v2: Ethereum, Arbitrum and HyperEVM with one key) after Sourcify. |
 | `SIGNING_PREVIEW_OFFLINE_LOOKUPS=1` | Don't call Sourcify, Etherscan, OpenChain or 4byte. The built-in signature list still works. |
+| `SIGNING_PREVIEW_PRICES=off` | No dollar values (otherwise Chainlink's feeds through the configured RPCs, and Hyperliquid's mid prices on HyperEVM). |
 | `SIGNING_PREVIEW_FORK_CACHE` | A file that keeps the HyperEVM simulator's caches (contract code, last values seen) across restarts. The CLI uses `~/.cache/signing-preview/fork-cache.json` unless set; `off` for none. |
 
 `liveDependencies()` was run against Ethereum, Arbitrum One and HyperEVM, with Sourcify, OpenChain and 4byte, on 2026-11-04. Token metadata, proxy detection, verified-ABI and signature decoding and simulation all worked. A first preview of an uncached contract took 0.4–1.8 s. The `/info` client is checked live by `npm run verify:live`.
@@ -785,6 +793,7 @@ src/userop-hash.ts        v0.6/v0.7 UserOperations signed as their hash (persona
 src/hyperliquid/          /info client, asset resolution, L1 action hash
 src/simulation.ts         eth_simulateV1 simulator + mock; src/fork-simulator.ts local EVM over fetched state; src/simulation-probe.ts the eth_call + state-override simulator
 src/block.ts              the block a simulation runs in (each chain's next block; a named one); src/evm/trace.ts the call trace, decoded
+src/prices.ts             dollar values for balance changes: Chainlink feeds through the chain's RPC, Hyperliquid mids on HyperEVM
 contracts/                SimulationProbe.sol (compiled into src/probe-code.ts by npm run build:probe)
 src/interceptor.ts        dependency-free EIP-1193 wrapper
 src/server.ts             HTTP API + demo server (src/cli.ts starts it: npm start / npx signing-preview)

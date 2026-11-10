@@ -104,6 +104,8 @@ const values = (params: readonly AbiParameter[], decoded: readonly unknown[]): T
   params.map((p, i) => ({ ...(p.name && { name: p.name }), type: p.type, value: text(decoded[i]) }));
 
 type Named = { fn: AbiFunction; from: 'verified' | 'standard' | 'signature'; contract?: string };
+/** Whose preview the trace is for: `account` is named `accountLabel` in it ("you" unless said: a Safe, a smart account). */
+export interface TraceEnv { chainId: number; account?: string; accountLabel?: string; deps: Dependencies }
 
 /** The function `data` calls among these, if its arguments decode as that function's. */
 function match(fns: readonly AbiFunction[], data: Hex): { fn: AbiFunction; args: readonly unknown[] } | null {
@@ -137,7 +139,7 @@ function eventOf(log: NonNullable<TraceCall['logs']>[number], abi: ContractAbi |
  * up for the contracts and selectors it meets, within the limits above, and a lookup that fails only leaves a call
  * unnamed.
  */
-export async function describeTrace(root: TraceCall, stateChanges: StateChange[] | undefined, env: { chainId: number; account?: string; deps: Dependencies },
+export async function describeTrace(root: TraceCall, stateChanges: StateChange[] | undefined, env: TraceEnv,
   info: { source: string; agrees?: boolean; note?: string }): Promise<PreviewTrace> {
   const { chainId, deps } = env;
   const flat: { call: TraceCall; depth: number }[] = [];
@@ -207,7 +209,7 @@ export async function describeTrace(root: TraceCall, stateChanges: StateChange[]
   const label = (address: string | null): string | undefined => {
     if (!address) return undefined;
     const a = address.toLowerCase();
-    return a === account ? 'you' : tokens.get(a) ?? abis.get(a)?.name ?? precompileName(a);
+    return a === account ? env.accountLabel ?? 'you' : tokens.get(a) ?? abis.get(a)?.name ?? precompileName(a);
   };
 
   const calls: TraceEntry[] = flat.map(({ call, depth }) => {
@@ -276,7 +278,7 @@ export function sameRun(a: { status: string; logs?: { address: string; topics: s
  * simulation the preview shows for that call. Null when nothing can trace calls on this chain, or the tracing run
  * failed or ran out of time; a call the tracing run has no trace for gets none.
  */
-export async function tracePreviews(requests: SimulationRequest[], shown: (SimulationResult | null | undefined)[], env: { chainId: number; account?: string; deps: Dependencies }): Promise<(PreviewTrace | undefined)[] | null> {
+export async function tracePreviews(requests: SimulationRequest[], shown: (SimulationResult | null | undefined)[], env: TraceEnv): Promise<(PreviewTrace | undefined)[] | null> {
   const sim = env.deps.simulator;
   if (!sim?.trace || !requests.length) return null;
   let traced: SimulationResult[] | null;

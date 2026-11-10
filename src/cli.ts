@@ -11,13 +11,13 @@ import { ChainedSignatures } from './abi.ts';
 import type { Dependencies } from './types.ts';
 
 const mode = process.env.SIGNING_PREVIEW_MODE === 'live' ? 'live' : 'mock';
-const { buildSamples, mockHyperEvmRpc, mockHyperliquidInfo, mockSimulator } = await import('../mocks/data.ts');
+const { buildSamples, mockHyperEvmRpc, mockHyperliquidInfo, mockPrices, mockSimulator } = await import('../mocks/data.ts');
 // Live mode warms the HyperEVM simulator's caches in the background, so first previews there are fast.
 // It also keeps that simulator's caches in a file (SIGNING_PREVIEW_FORK_CACHE, "off" for none), so restarts stay fast.
 const cacheHome = process.env.XDG_CACHE_HOME ?? join(homedir(), '.cache');
 const env = { ...process.env, SIGNING_PREVIEW_FORK_CACHE: process.env.SIGNING_PREVIEW_FORK_CACHE ?? join(cacheHome, 'signing-preview', 'fork-cache.json') };
 const deps: Dependencies = mode === 'live' ? liveDependencies(env, { warmUp: true })
-  : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() }, rpc: mockHyperEvmRpc() };
+  : { tokens: new StaticTokenRegistry(), signatures: new ChainedSignatures([]), simulator: mockSimulator(), hyperliquid: { mainnet: mockHyperliquidInfo() }, rpc: mockHyperEvmRpc(), prices: mockPrices() };
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? '127.0.0.1';
 createPreviewServer({ deps, corsOrigin: process.env.CORS_ORIGIN ?? '*', samples: () => buildSamples(), serveDemo: true, demoData: mode })

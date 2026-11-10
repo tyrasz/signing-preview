@@ -4,6 +4,7 @@ import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext
 import { decodeTransaction, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { pinLatest } from './block.ts';
+import { addUsdValues } from './prices.ts';
 import { tracePreviews } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
 import { approvalChanges, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './evm/effects.ts';
@@ -31,6 +32,11 @@ const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
  * Throws RequestError (code INVALID_REQUEST) when the request is malformed.
  */
 export async function previewRequest(request: SigningRequest, context: PreviewContext = {}, deps: Dependencies = {}): Promise<Preview> {
+  // What the balance changes are worth now, where the dependencies have prices (src/prices.ts).
+  return addUsdValues(await previewOf(request, context, deps), deps);
+}
+
+async function previewOf(request: SigningRequest, context: PreviewContext, deps: Dependencies): Promise<Preview> {
   if (!request || typeof request.method !== 'string') throw new RequestError('Request must have a "method"');
   const params = Array.isArray(request.params) ? request.params : request.params === undefined ? [] : [request.params];
   const method = request.method;

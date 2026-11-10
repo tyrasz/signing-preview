@@ -42,6 +42,16 @@ export interface AssetChange {
   /** Set for simulated changes. NFTs (erc721/erc1155) also carry the token ID; `symbol` then reads e.g. "BAYC #42". */
   standard?: 'native' | 'erc20' | 'erc721' | 'erc1155';
   tokenId?: string;
+  /** What the amount is worth in dollars now ("1,234.56"), when the asset has a price (Dependencies.prices), and where the price is from. */
+  usd?: string;
+  usdSource?: string;
+}
+
+/** A price in dollars for one whole unit of an asset. */
+export interface Price { usd: number; source: string; updatedAt?: number }
+/** Prices for a chain's native token ('native') and tokens (by address). See src/prices.ts. */
+export interface PriceSource {
+  price(chainId: number, asset: string): Promise<Price | undefined>;
 }
 
 /** A permission the transaction leaves in place (or removes), from simulated approval events. */
@@ -529,4 +539,6 @@ export interface Dependencies {
   signatures?: SignatureResolver;
   simulator?: Simulator;
   hyperliquid?: { mainnet?: HyperliquidInfo; testnet?: HyperliquidInfo };
+  /** Dollar prices for balance changes (AssetChange.usd). Without it, amounts carry no dollar value. */
+  prices?: PriceSource;
 }

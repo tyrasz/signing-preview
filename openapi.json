@@ -754,6 +754,14 @@
             "type": "string",
             "pattern": "^[0-9]+$",
             "description": "Exact integer in the smallest unit, as a decimal string."
+          },
+          "usd": {
+            "type": "string",
+            "description": "What the amount is worth in dollars now, e.g. \"1,234.56\", when the asset has a price: the native token and the built-in tokens, from Chainlink's feeds through the chain's RPC (Hyperliquid's mid prices on HyperEVM)."
+          },
+          "usdSource": {
+            "type": "string",
+            "description": "Where the price is from, e.g. \"Chainlink ETH / USD\"."
           }
         }
       },

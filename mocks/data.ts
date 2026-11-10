@@ -1,7 +1,8 @@
 // MOCK DATA ONLY. Addresses, token IDs, prices and balances below are invented
 // for demos and tests (except well-known public contract addresses).
 import { encodeAbiParameters, encodeFunctionData, pad, parseAbi, parseAbiParameters, type Hex } from 'viem';
-import { CCTP, CCTP_NETWORKS, HYPERLIQUID, PERMIT2, spotSystemAddress } from '../src/chains.ts';
+import { builtinTokens, CCTP, CCTP_NETWORKS, HYPERLIQUID, PERMIT2, spotSystemAddress } from '../src/chains.ts';
+import { StaticPrices } from '../src/prices.ts';
 import { l1ActionHash } from '../src/hyperliquid/action-hash.ts';
 import { StaticHyperliquidInfo } from '../src/hyperliquid/info.ts';
 import { MockSimulator } from '../src/simulation.ts';
@@ -416,6 +417,18 @@ function swapTrace(sample: Sample): Pick<SimulationResult, 'trace' | 'stateChang
       { address: POOL, storage: [{ slot: word(8n), before: word(reserves[0]), after: word(reserves[0] + usdcIn) }] },
     ],
   };
+}
+
+/** Mock prices for the demo: the native tokens and the built-in tokens of the sample chains, at round numbers. */
+export function mockPrices(): StaticPrices {
+  const prices: Record<string, number> = { '1:native': 3500, '42161:native': 3500, '999:native': 25 };
+  const dollar = new Set(['USDC', 'USDC.e', 'USDT', 'USDT0', 'DAI', 'USDe', 'USDH', 'USDHL', 'feUSD', 'USR']);
+  const others: Record<string, number> = { WETH: 3500, UETH: 3500, WHYPE: 25, UBTC: 100_000 };
+  for (const chainId of [1, 42161, 999]) for (const t of builtinTokens(chainId)) {
+    const usd = dollar.has(t.symbol) ? 1 : others[t.symbol];
+    if (usd !== undefined) prices[`${chainId}:${t.address}`] = usd;
+  }
+  return new StaticPrices(prices, 'mock price');
 }
 
 export function mockSimulator(): MockSimulator {

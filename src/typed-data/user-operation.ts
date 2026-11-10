@@ -276,7 +276,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
       // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment.
       if (whole && env.context.trace && run?.requests) {
-        const traces = await tracePreviews(run.requests, [run.result], { chainId, account: sender, deps: env.deps });
+        const traces = await tracePreviews(run.requests, [run.result], { chainId, account: sender, accountLabel: mine ? 'you' : 'the account', deps: env.deps });
         if (traces?.[0]) b.trace = traces[0];
         else b.note("No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
       }

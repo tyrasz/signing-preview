@@ -234,7 +234,7 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(at && { at }) });
     if (!run) return null;
     if (env.context.trace && run.requests) {
-      const traces = await tracePreviews(run.requests.slice(0, 1), [run.result], { chainId, account: t.safe.toLowerCase(), deps: env.deps });
+      const traces = await tracePreviews(run.requests.slice(0, 1), [run.result], { chainId, account: t.safe.toLowerCase(), accountLabel: 'the Safe', deps: env.deps });
       if (traces?.[0]) b.trace = traces[0];
       else b.note("No trace: a trace is run in a local EVM over the chain's state, which isn't set up for this chain here, or didn't finish in time.");
     }

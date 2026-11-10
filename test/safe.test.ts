@@ -217,6 +217,16 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   assert.ok(runs[1][0].stateOverrides![OWNERS[0]]?.balance);
   assert.deepEqual(refund.assetChanges.filter(c => c.asset === 'native').map(c => [c.direction, c.raw]), [['out', (130_000n * 1_100_000_000n).toString()]]);
   assert.match(refund.decoding.notes.join(' '), /depends on the gas price of the transaction that runs it \(its gas refund is paid at the lower of its own gas price and the transaction's\): it was simulated at the price a transaction would pay now, 1\.1 gwei/);
+
+  // Asked for a trace (context.trace), the execution is traced as it was simulated: execTransaction, from the owner
+  // standing in for whoever submits it, with the stand-ins in place.
+  const asked: SimulationRequest[][] = [];
+  const tracing: Dependencies = { ...refunding, simulator: { ...refunding.simulator!, trace: async rs => { asked.push(rs); return rs.map(r => ({ status: 'success' as const, source: 'local', transfers: [], trace: { type: 'call' as const, from: r.from, to: r.to, value: 0n, input: r.data, gas: 1_000_000n, gasUsed: 80_000n } })); } } };
+  const traced = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(safeTx({}))] }, { now: NOW, trace: true }, tracing);
+  assert.deepEqual([traced.trace!.calls.length, traced.trace!.calls[0].to, traced.trace!.calls[0].selector, traced.trace!.agrees], [1, SAFE, '0x6a761202', true]);
+  assert.equal(asked[0].length, 1);
+  assert.ok(asked[0][0].stateOverrides!['0x0000000000000000000000000000000000000001'], 'the trace runs with the same stand-ins');
+  assert.equal((await sign({}, tracing)).trace, undefined);
 });
 
 test('Safe4337MultiChainSignatureModule (EntryPoint v0.9): its SafeOps, and a Merkle root signature that names no operations', async () => {
