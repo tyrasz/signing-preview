@@ -205,6 +205,8 @@ const BUNDLER = '0x0000000000000000000000000000000000004337';
  * empty answer left the refusal standing.
  */
 const RECENT_BUNDLERS = new Map<string, { at: number; bundlers: string[] }>();
+/** A node's refusal of a log query's block range as such (not a refusal under load). */
+const RANGE_CAPPED = /block range|range (is )?too (large|wide|big)|range limit|exceeds? .*range|max(imum)? .*range/i;
 async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: string, paymasterAndData: Hex): Promise<string[]> {
   const paymaster = paymasterAndData.slice(0, 42).toLowerCase();
   // The paymaster's own data starts after its address, and from v0.7 on its two gas limits.
@@ -222,7 +224,9 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
       let logs: { transactionHash: string }[];
       // A refused read is tried once more before a wider (heavier) one.
       const read = () => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
-      try { logs = await read().catch(async () => { await new Promise(r => setTimeout(r, 500)); return read(); }); } catch { refused = true; continue; }
+      // A node that caps the range (HyperEVM's at 1,000 blocks) refuses every wider span too: that is its answer.
+      const capped = (e: unknown) => RANGE_CAPPED.test(String((e as { rpcError?: { message?: string } })?.rpcError?.message ?? ''));
+      try { logs = await read().catch(async e => { if (capped(e)) throw e; await new Promise(r => setTimeout(r, 500)); return read(); }); } catch (e) { if (capped(e)) break; refused = true; continue; }
       const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
       if (!hashes.length) continue;
       const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
@@ -694,7 +698,11 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
   const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
-  const candidates = (await bundlers).length ? await bundlers : [BUNDLER];
+  // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const soon = await Promise.race([bundlers, new Promise<string[]>(r => { timer = setTimeout(() => r([]), 1500); (timer as { unref?: () => void }).unref?.(); })]);
+  clearTimeout(timer);
+  const first = soon[0] ?? BUNDLER;
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   let result: OperationRun | null = null;
   for (const stub of stubs) {
@@ -727,15 +735,15 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
-    const first = await run(candidates[0], recover);
+    const ran = await run(first, recover);
     // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one.
-    if (paymaster && first?.rejected?.startsWith('AA33')) {
-      for (const bundler of candidates.slice(1)) {
+    if (paymaster && ran?.rejected?.startsWith('AA33')) {
+      for (const bundler of (await bundlers).filter(b => b !== first)) {
         const again = await run(bundler, recover);
         if (again && !again.rejected?.startsWith('AA33')) return again;
       }
     }
-    return first;
+    return ran;
   };
   // Over the digest the wallet will sign first; if the account checks another form of the hash, over any.
   let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest, stub.cosigners)) : null;
