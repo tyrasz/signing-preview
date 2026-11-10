@@ -448,8 +448,10 @@ async function replay(item: string): Promise<void> {
   // So is one whose calls were simulated alone (validation reverted on the stand-in): what they meet without it isn't
   // what the operation met; a shape to add, not a wrong preview.
   const callsAlone = !row.whole && !row.notSimulated;
-  const warned = !row.outcome && (timeBumped || callsAlone || p.warnings.some(w => w.code === 'userop_execution_reverts' && /handed the whole operation, its signature included/.test(w.message)));
-  if (warned) row.warned = timeBumped ? 'outcome (run a second after its block)' : callsAlone ? 'outcome (its calls simulated alone)' : 'outcome';
+  const handedSignature = p.warnings.some(w => w.code === 'userop_execution_reverts' && /handed the whole operation, its signature included/.test(w.message));
+  const warned = !row.outcome && (timeBumped || callsAlone || handedSignature);
+  // The preview's own warning first: on BNB Chain most such operations are also run a second late.
+  if (warned) row.warned = handedSignature ? 'outcome' : callsAlone ? 'outcome (its calls simulated alone)' : 'outcome (run a second after its block)';
   const judged = row.whole === true && !row.prefix && !warned;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
