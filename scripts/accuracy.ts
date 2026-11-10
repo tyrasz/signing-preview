@@ -1,4 +1,4 @@
-// npm run accuracy -- [--chain 1|42161|8453|10|137|56] [--blocks 30 | --follow 300] [--max 600] [--strict] [--summary-md file] [--per-block 3] [--max-index 8] [--only-type 0x4] [--unsigned-7702] [--simulators eth_simulateV1,fork] [--out report.json]
+// npm run accuracy -- [--chain 1|42161|8453|10|137|56] [--blocks 30 | --block 123 | --follow 300] [--max 600] [--strict] [--summary-md file] [--per-block 3] [--max-index 8] [--only-type 0x4] [--unsigned-7702] [--simulators eth_simulateV1,fork] [--out report.json]
 //
 // How accurate simulation is, measured against what actually happened. Recent Ethereum transactions from one-off
 // senders are replayed at their exact pre-state: on top of the parent block, after the earlier transactions of their
@@ -20,9 +20,10 @@
 // when it is the receipt's L2 part (gasUsed less gasUsedForL1) plus an L1 charge between none and twice the
 // receipt's (the charge is reported). The fork simulator doesn't model ArbOS, so it runs on Ethereum only.
 // --strict exits with 1 when a transaction's preview differs from its receipt: its outcome, a token movement of the
-// sender beyond 2 base units (a share token's rounding), its native coin change or an approval it gave, or its gas by
+// sender beyond 2 base units (a share token's rounding) and a millionth (an interest-bearing token's accrual), its native coin change or an approval it gave, or its gas by
 // 10% or more (smaller gas differences are listed, not failed: a node's eth_simulateV1 can differ from its own chain by
-// a few percent on some EIP-7702 transactions). --summary-md appends the results as Markdown; --max stops after that
+// a few percent on some EIP-7702 transactions; and a BNB Chain block sharing its parent's second runs a second later,
+// so its transactions' gas isn't judged, and its token movements within a ten-thousandth). --summary-md appends the results as Markdown; --max stops after that
 // many transactions.
 // --unsigned-7702 replays the sender's own EIP-7702 authorizations as if the wallet had yet to sign them (code
 // overrides and the request's unsignedAuthorizations), which is how a preview before signing sees them.
@@ -63,8 +64,10 @@ const head = Number(await rpc.call(CHAIN, 'eth_blockNumber', []));
 const blocks: B[] = [];
 const txsBySender = new Map<string, number>();
 const count = (b: B) => { for (const t of b.transactions) txsBySender.set(t.from.toLowerCase(), (txsBySender.get(t.from.toLowerCase()) ?? 0) + 1); };
+// --block <n>: that block alone (to look again at one of its transactions while the node still has its state).
+const ONE_BLOCK = arg('block', '');
 if (!FOLLOW) {
-  for (let i = 0; i < BLOCKS; i++) blocks.push(await rpc.call(CHAIN, 'eth_getBlockByNumber', ['0x' + (head - 1 - i).toString(16), true]) as B);
+  for (let i = 0; i < (ONE_BLOCK ? 1 : BLOCKS); i++) blocks.push(await rpc.call(CHAIN, 'eth_getBlockByNumber', ['0x' + (ONE_BLOCK ? BigInt(ONE_BLOCK) : BigInt(head - 1 - i)).toString(16), true]) as B);
   for (const b of blocks) count(b);
 }
 /**
@@ -104,22 +107,29 @@ const rows: Record<string, unknown>[] = [];
 /** Replays one block's eligible transactions. `seen`: in follow mode, senders seen before this block (left out). */
 async function replay(b: B, seen?: Set<string>) {
   const n = Number(b.number), parent = '0x' + (n - 1).toString(16);
-  // A simulated block must come after its parent: BNB Chain makes blocks faster than one a second, so a block can
-  // share its parent's timestamp (in seconds), which the node refuses. It then runs a second later.
-  const parentTime = BigInt((await rpc.call(CHAIN, 'eth_getBlockByNumber', [parent, false]) as { timestamp: Hex }).timestamp);
-  const time = BigInt(b.timestamp) > parentTime ? b.timestamp : `0x${(parentTime + 1n).toString(16)}` as Hex;
+  // Base and BNB Chain make blocks faster than one a second, so a block can share its parent's timestamp (in
+  // seconds). Base's node simulates such a block at that time; BNB Chain's refuses it ("block timestamps must be in
+  // order"), and the block then runs a second later (bumped below). A contract can work differently a second later:
+  // one on Base wrote 23,578 gas more of storage.
+  let time = b.timestamp;
+  // The block's DIFFICULTY (opcode 0x44), which MEV bots check: on BNB Chain it is the block's difficulty (2 when its
+  // validator was in turn), which BNB Chain's node takes from the prevRandao override (mixHash there holds the
+  // block's milliseconds); Polygon's takes a difficulty override. Elsewhere it is PREVRANDAO, the block's mixHash.
+  const difficulty = (b as B & { difficulty?: Hex }).difficulty ?? '0x0';
+  const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: b.mixHash, difficulty } : { prevRandao: b.mixHash };
   const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
   const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner, prevRandao: b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000, trace });
   const simulators = ([
     // Not the block's gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on publicnode,
     // below Ethereum's 60M); the parent's, the node's default, is all but the same.
-    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time, feeRecipient: b.miner, prevRandao: b.mixHash, baseFeePerGas: b.baseFeePerGas } }) })],
+    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time, feeRecipient: b.miner, ...randomness, baseFeePerGas: b.baseFeePerGas } }) })],
     ['fork', forkAt()],
   ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name));
   let taken = 0;
   for (const t of b.transactions) {
     const from = t.from.toLowerCase(), index = Number(t.transactionIndex);
-    if (taken >= PER_BLOCK || !t.to || index > MAX_INDEX || txsBySender.get(from)! > 1 || seen?.has(from) || t.type === '0x3' || isSystem(t, b) || (ONLY_TYPE && t.type !== ONLY_TYPE)) continue;
+    // Not the block's fee recipient: its balance also takes the block's fees, so its own change can't be told apart.
+    if (taken >= PER_BLOCK || !t.to || index > MAX_INDEX || txsBySender.get(from)! > 1 || seen?.has(from) || t.type === '0x3' || isSystem(t, b) || from === b.miner.toLowerCase() || (ONLY_TYPE && t.type !== ONLY_TYPE)) continue;
     // Senders without code (EOAs; for type-4 transactions the code can be a delegation, which is what they set).
     const code = String(await rpc.call(CHAIN, 'eth_getCode', [from, parent]));
     if (code !== '0x' && !code.startsWith('0xef0100')) continue;
@@ -135,6 +145,10 @@ async function replay(b: B, seen?: Set<string>) {
       if (!actual.has(a)) { const x = await balanceAt(a, parent), y = await balanceAt(a, b.number); actual.set(a, x !== undefined && y !== undefined ? y - x : (logged.get(a) ?? 0n)); }
       return actual.get(a)!;
     };
+    // What the block's other transactions moved for the sender (a token it gets back later in the block, say), from
+    // their receipts: not this transaction's doing.
+    const others = net(receipts.filter(x => x.transactionHash !== t.hash).flatMap(x => parseLogs(x.logs).transfers), from);
+    const actualOfThis = async (a: string) => (await actualOf(a)) - (others.get(a) ?? 0n);
     for (const a of logged.keys()) await actualOf(a);
     // Native: the sender's balance across the block, plus the fee it paid (it sent nothing else in this block), less
     // what other transactions of the block paid it directly (a bot funded just before it acts, say).
@@ -162,7 +176,15 @@ async function replay(b: B, seen?: Set<string>) {
     for (const [name, sim] of simulators) {
       const t0 = Date.now();
       try {
-        const out = (await sim.simulateBatch!([...before, target]))!;
+        let out: SimulationResult[];
+        try { out = (await sim.simulateBatch!([...before, target]))!; } catch (e) {
+          if (!/timestamps must be in order/.test(String(e)) || time !== b.timestamp) throw e;
+          time = `0x${(BigInt((await rpc.call(CHAIN, 'eth_getBlockByNumber', [parent, false]) as { timestamp: Hex }).timestamp) + 1n).toString(16)}` as Hex;
+          out = (await sim.simulateBatch!([...before, target]))!;
+        }
+        // Run a second after its block (BNB Chain): what depends on the second (a pool's price observation, written
+        // once a second; a reward accruing) can differ, so its gas isn't judged (see below).
+        if (time !== b.timestamp) row.timeBumped = true;
         const res: SimulationResult = out[out.length - 1];
         const got = net(res.transfers, from);
         const nativeGot = got.get('native') ?? 0n;
@@ -170,7 +192,7 @@ async function replay(b: B, seen?: Set<string>) {
         // Tokens either side saw (a wrap's WETH has no Transfer event, so only the simulation names it).
         const tokenRows = [];
         for (const a of new Set([...logged.keys(), ...got.keys()])) {
-          const want = await actualOf(a);
+          const want = await actualOfThis(a);
           if (want !== 0n || got.has(a)) tokenRows.push({ token: a, actual: want.toString(), simulated: (got.get(a) ?? 0n).toString() });
         }
         row[name] = {
@@ -183,6 +205,30 @@ async function replay(b: B, seen?: Set<string>) {
           l1Charge: r.gasUsedForL1 && BigInt(r.gasUsedForL1) > 0n && res.gasUsed !== undefined ? Number(res.gasUsed - BigInt(row.receiptGas as string)) / Number(BigInt(r.gasUsedForL1)) : undefined,
           gasUsed: String(res.gasUsed), ms: Date.now() - t0,
         };
+        // A native change that differs: what the block's other transactions sent the sender through a contract (a
+        // builder's rebate, a contract paying it out) moves its balance too, with no log to show it. The block's
+        // earlier transactions were simulated with it, and the rest of the block is simulated after it; what those
+        // calls moved for the sender (traceTransfers, their own values included, so not paidIn as well) is left out of
+        // the actual change.
+        const cell = row[name] as Record<string, any>;
+        if (!cell.native && name === 'eth_simulateV1' && res.status === 'success') {
+          const earlier = out.slice(0, -1).reduce((sum, x) => sum + (net(x.transfers, from).get('native') ?? 0n), 0n);
+          if (earlier !== 0n) { cell.nativeEarlier = earlier.toString(); cell.native = nativeGot === nativeActual + paidIn - earlier; }
+        }
+        if (!cell.native && name === 'eth_simulateV1' && res.status === 'success') {
+          try {
+            // Without their gas limits (together they can exceed the block's) or prices (unlimited gas at a price is
+            // more than a sender has): only what they send the sender matters here, not their fees.
+            const after = await Promise.all(b.transactions.slice(index + 1).filter(x => !SYSTEM.has(x.type)).map(async x => ({ ...await reqOf(x, parent), gas: undefined, gasPrice: undefined })));
+            const whole = (await sim.simulateBatch!([...before, target, ...after]))!.slice(before.length + 1);
+            const later = whole.reduce((sum, x) => sum + (net(x.transfers, from).get('native') ?? 0n), 0n);
+            const earlier = BigInt(cell.nativeEarlier ?? 0);
+            if (later !== 0n) {
+              cell.nativeLater = later.toString();
+              cell.native = nativeGot === nativeActual + paidIn - earlier - later;
+            }
+          } catch (e) { cell.nativeLaterError = String(e).slice(0, 120); }
+        }
         // A fork gas difference: keep the call's storage writes, each with its slot's value before the block, to
         // find the one priced differently (while the RPC still has the state).
         if (name === 'fork' && String(res.gasUsed) !== row.receiptGas) {
@@ -208,11 +254,18 @@ else {
   const seen = new Set<string>();
   const deadline = Date.now() + FOLLOW * 1000;
   let last = head;
+  // A read that fails (a connection reset, the node unreachable for a moment) is tried again a second later: over a
+  // long run one did, and it ended the run.
+  const read = async <X>(method: string, params: unknown[]): Promise<X | undefined> => {
+    try { return await rpc.call(CHAIN, method, params) as X; } catch (e) { console.log(`  ${method} failed: ${(e as Error).message.slice(0, 100)}`); await new Promise(r => setTimeout(r, 1000)); return undefined; }
+  };
   while (Date.now() < deadline && rows.length < MAX) {
-    const now = Number(await rpc.call(CHAIN, 'eth_blockNumber', []));
+    const latest = await read<string>('eth_blockNumber', []);
+    if (latest === undefined) continue;
+    const now = Number(latest);
     if (now <= last) { await new Promise(r => setTimeout(r, 250)); continue; }
     // A node behind the one that answered eth_blockNumber may not have the block yet: try again.
-    const b = await rpc.call(CHAIN, 'eth_getBlockByNumber', ['0x' + now.toString(16), true]) as B | null;
+    const b = await read<B | null>('eth_getBlockByNumber', ['0x' + now.toString(16), true]);
     if (!b) { await new Promise(r => setTimeout(r, 250)); continue; }
     last = now;
     txsBySender.clear();
@@ -232,8 +285,16 @@ for (const row of rows) for (const name of SIMULATORS) {
   if (!r || r.error) continue;
   const receiptGas = BigInt(CHAIN === 42161 ? row.receiptTotal as string : row.receiptGas as string);
   r.gasPercent = receiptGas > 0n && r.gasUsed !== 'undefined' ? Number((BigInt(r.gasUsed) - receiptGas) * 100_000n / receiptGas) / 1000 : undefined;
-  const differs = [!r.outcome && 'outcome', r.tokenDiffs.some((d: { actual: string; simulated: string }) => { const x = BigInt(d.actual) - BigInt(d.simulated); return x > 2n || x < -2n; }) && 'tokens',
-    !r.native && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+  // A token movement within 2 base units (a share token's rounding), or within a millionth (an interest-bearing
+  // token, whose balance at the block's end includes what later transactions accrued), is the receipt's; for a
+  // transaction run a second after its block (timeBumped), within a ten-thousandth (a second's accrual).
+  const share = row.timeBumped ? 10_000n : 1_000_000n;
+  const close = (d: { actual: string; simulated: string }) => { const a = BigInt(d.actual), x = a - BigInt(d.simulated), abs = (v: bigint) => (v < 0n ? -v : v); return abs(x) <= 2n || abs(x) * share <= abs(a); };
+  // An outcome that differs for a transaction run a second after its block is reported, not failed: what it checks
+  // can be that second (a deadline of the block's own timestamp).
+  if (!r.outcome && row.timeBumped) r.warned = 'outcome (run a second after its block)';
+  const differs = [!r.outcome && !row.timeBumped && 'outcome', r.tokenDiffs.some((d: { actual: string; simulated: string }) => !close(d)) && 'tokens',
+    !r.native && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
   if (differs.length) r.differs = differs;
 }
 const out = arg('out', '');
@@ -259,6 +320,8 @@ for (const name of SIMULATORS) {
   }
 }
 const differing = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.differs)).length;
+const bumped = rows.filter(r => r.timeBumped).length;
+if (bumped) say(`  ${bumped} run a second after their block, which shared its parent's second (the node refuses that): gas not judged for them`);
 const l1Rows = rows.map(r => r.l1Fee as { percent?: number } | undefined).filter(x => x?.percent !== undefined).map(x => x!.percent!);
 if (l1Rows.length) say(`  L1 data fee estimate, of ${l1Rows.length}: exact ${l1Rows.filter(x => x === 0).length}, within 1% ${l1Rows.filter(x => Math.abs(x) < 1).length}, within 5% ${l1Rows.filter(x => Math.abs(x) < 5).length}; never under the receipt's: ${l1Rows.every(x => x >= 0)}`);
 if (SUMMARY_MD) appendFileSync(SUMMARY_MD, `### ${chainName(CHAIN)}${differing ? ` — ${differing} differing from the receipts` : ''}\n\n${rows.length} transactions (blocks ${Math.min(...numbers)}-${Math.max(...numbers)}${FOLLOW ? `, ${blocks.length} followed` : ''}), replayed at their exact pre-state:\n\n\`\`\`\n${md.join('\n')}\n\`\`\`\n\n`);

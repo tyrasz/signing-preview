@@ -9,7 +9,7 @@ import { chainName } from '../src/chains.ts';
 
 type Sim = {
   error?: string; outcome: boolean; tokens: number; tokenTotal: number; native: boolean; approvals: number; approvalTotal: number;
-  gas: boolean; gasPercent?: number; differs?: string[]; status: string; revert?: string; tokenDiffs: unknown[];
+  gas: boolean; gasPercent?: number; differs?: string[]; warned?: string; status: string; revert?: string; tokenDiffs: unknown[];
 };
 type Row = { hash: string; selector: string; receipt: string; l1Fee?: { percent?: number } } & Record<string, unknown>;
 
@@ -18,7 +18,7 @@ if (!dir) throw new Error('usage: node scripts/replay-tx-summary.ts <dir>');
 const SIMULATORS: [string, string][] = [['eth_simulateV1', ''], ['fork', ' (fork simulator)']];
 const frac = (n: number, d: number) => (d ? `${n}/${d}` : '–');
 const lines = ['| Chain | Transactions | Outcome matches | Token movements matched | Native change matched | Approvals matched | Gas exact | Gas within 1% | L1 fee estimate within 5% | Differing | Errors |', '|---|---|---|---|---|---|---|---|---|---|---|'];
-const differing: string[] = [], gasNotes: string[] = [];
+const differing: string[] = [], gasNotes: string[] = [], warned: string[] = [];
 let total = 0, wrongTotal = 0;
 for (const name of readdirSync(dir).sort()) {
   const m = /^replay-tx-(\d+)$/.exec(name);
@@ -42,11 +42,13 @@ for (const name of readdirSync(dir).sort()) {
     }
     for (const r of rows) {
       const s = r[sim] as Sim | undefined;
-      if (s && !s.error && !s.gas && !s.differs?.includes('gas') && s.gasPercent !== undefined) gasNotes.push(`- ${chain}${label}: \`${r.hash}\` (${r.selector}): gas ${s.gasPercent > 0 ? '+' : ''}${s.gasPercent}%`);
+      if (s?.warned) warned.push(`- ${chain}${label}: \`${r.hash}\` (${r.selector}): ${s.warned}: ${s.status}${s.revert ? ` (${String(s.revert).slice(0, 80)})` : ''}, the receipt ${r.receipt}`);
+      if (s && !s.error && !s.gas && !s.differs?.includes('gas') && s.gasPercent !== undefined) gasNotes.push(`- ${chain}${label}: \`${r.hash}\` (${r.selector}): gas ${s.gasPercent > 0 ? '+' : ''}${s.gasPercent}%${r.timeBumped ? ' (run a second after its block)' : ''}`);
     }
   }
 }
 console.log(`## Transaction replays: ${total} transactions${wrongTotal ? `, ${wrongTotal} differing from their receipts` : ', none differing from their receipts'}\n`);
 console.log(lines.join('\n'));
 if (differing.length) console.log(`\n### Previews that differed from what happened\n\n${differing.join('\n')}`);
+if (warned.length) console.log(`\n### Reported, not failed\n\n${warned.join('\n')}`);
 if (gasNotes.length) console.log(`\n### Gas off by less than 10% (reported, not failed)\n\n${gasNotes.slice(0, 40).join('\n')}${gasNotes.length > 40 ? `\n- … and ${gasNotes.length - 40} more` : ''}`);
