@@ -132,6 +132,17 @@ test('A paymaster that only pays for its own bundler: the operation runs as a bu
   assert.equal(lookups.length, 1);
 });
 
+test('The operation runs at the price its bundle pays: a contract reading tx.gasprice sees the base fee plus the operation’s priority fee', async () => {
+  const tips = await chain.deploy('TipReader', '', []);
+  const T = parseAbi(['function requireTip(uint256 atLeast) view']);
+  const needs = (tip: bigint) => operation({ callData: call('execute', [tips, 0n, encodeFunctionData({ abi: T, functionName: 'requireTip', args: [tip] })]) });
+  // The operation pays a 1 gwei priority fee (up to 2 gwei in all): a contract wanting that much of a tip runs.
+  assert.ok(!codes(await preview(needs(10n ** 9n))).includes('userop_execution_reverts'));
+  // One wanting more doesn't: the simulation isn't run at the fee cap, or at no price at all.
+  const more = await preview(needs(10n ** 9n + 1n));
+  assert.match(more.warnings.find(w => w.code === 'userop_execution_reverts')?.message ?? '', /: tip\./);
+});
+
 test('EntryPoint v0.6: the patched EntryPoint returns its simulateHandleOp result, so the operation’s logs and gas are kept', async () => {
   const p = await preview(operation({ sender: account6, paymasterAndData: '0x' }), OWNER, '0.6');
   assert.deepEqual(usdcChange(p), ['out 50']);

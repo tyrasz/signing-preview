@@ -183,7 +183,7 @@ async function replay(item: string): Promise<void> {
   if (SESSION_VALIDATORS.some(v => BigInt(op.nonce).toString(16).padStart(64, '0').includes(v.slice(2)))) return skip("a session key's operation (signed by a dApp, not a wallet)");
   // A transaction's receipt; OP Mainnet's public node refuses receipts by hash ("archive requests") but serves its
   // block's receipts.
-  type Receipt = { transactionHash: string; blockNumber: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
+  type Receipt = { transactionHash: string; blockNumber: Hex; effectiveGasPrice?: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
   const r = await call<Receipt>('eth_getTransactionReceipt', [hash]).catch(async () => (await call<Receipt[]>('eth_getBlockReceipts', [tx.blockNumber])).find(x => x.transactionHash.toLowerCase() === hash.toLowerCase())!);
   if (!r) return skip('its receipt could not be read');
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
@@ -236,7 +236,13 @@ async function replay(item: string): Promise<void> {
   }
   const difficulty = block.difficulty ?? '0x0';
   const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: block.mixHash, difficulty } : { prevRandao: block.mixHash };
-  const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time, feeRecipient: block.miner, ...randomness, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
+  const node = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time, feeRecipient: block.miner, ...randomness, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
+  // The whole operation runs at the price its bundle's transaction paid (tx.gasprice), part of what it met. A preview
+  // can't know it, and takes what the operation pays its bundler (src/erc4337-sim.ts); bundlers pay less (on Base, a
+  // 0.001 gwei tip where operations offered 0.0015), and a swap taxed by the priority fee came out 1% apart.
+  const bundlePrice = r.effectiveGasPrice ? BigInt(r.effectiveGasPrice) : undefined;
+  const atBundlePrice = (q: SimulationRequest) => bundlePrice !== undefined && q.gasPrice !== undefined && q.to?.toLowerCase() === EP ? { ...q, gasPrice: bundlePrice } : q;
+  const simulator = { simulate: (q: SimulationRequest) => node.simulate(atBundlePrice(q)), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(qs.map(atBundlePrice)) };
   const deps = { ...liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
   // A node that no longer serves the parent block's state (Ethereum's public RPC keeps about 128 blocks) would leave
@@ -369,9 +375,22 @@ async function replay(item: string): Promise<void> {
   // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
   // ten-thousandth (as scripts/accuracy.ts allows).
   const secondLate = (t: { actual: string; simulated: string }) => timeBumped && abs(BigInt(t.simulated) - BigInt(t.actual)) * 10_000n <= abs(BigInt(t.actual));
-  const tokenMatch = tokens.every(t => t.actual === t.simulated) ? 'exact'
+  const matchOf = () => tokens.every(t => t.actual === t.simulated) ? 'exact'
     : tokens.every(t => t.actual === t.simulated || feeLike(t)) ? 'fee'
     : tokens.every(t => abs(BigInt(t.simulated) - BigInt(t.actual)) <= 2n || feeLike(t) || secondLate(t)) ? 'units' : 'other';
+  let tokenMatch = matchOf();
+  // A token whose events don't account for its balances (a tax token on Base took 1% of a sale with no Transfer for
+  // it): where the events and the preview disagree, the account's balance across the block decides, if it is what
+  // the preview has (the account's other operations in the block would move it too, so only an exact match counts).
+  let byBalance = 0;
+  if (tokenMatch === 'other') {
+    const balanceAt = async (token: string, tag: string) => { try { return BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: token, data: `0x70a08231${sender.slice(2).padStart(64, '0')}` }, tag]))); } catch { return undefined; } };
+    for (const t of tokens.filter(x => x.actual !== x.simulated)) {
+      const before = await balanceAt(t.token, parent), after = await balanceAt(t.token, r.blockNumber);
+      if (before !== undefined && after !== undefined && (after - before).toString() === t.simulated) { t.actual = t.simulated; byBalance++; }
+    }
+    if (byBalance) tokenMatch = matchOf();
+  }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
@@ -379,6 +398,7 @@ async function replay(item: string): Promise<void> {
     gas: simCost !== undefined && actualGasCost > 0n ? { simulated: simCost, actual: actualGasCost.toString(), percent: Number((BigInt(simCost) - actualGasCost) * 100_000n / actualGasCost) / 1000 } : undefined,
     // Without any simulation (the node refused it) there are no simulated movements to compare.
     ...(!ran(p) && { notSimulated: true }),
+    ...(byBalance && { tokensByBalance: byBalance }),
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
   const row = rows.at(-1)!;

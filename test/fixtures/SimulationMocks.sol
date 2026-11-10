@@ -214,6 +214,11 @@ contract TokenPaymaster {
         token.transferFrom(abi.decode(context, (address)), address(this), actualGasCost / 1e9 + 1);
     }
 }
+/// A contract that works by the transaction's priority fee (tx.gasprice above the base fee), as a pool taxing
+/// swaps by it does: here it only runs for a tip of at least `atLeast`.
+contract TipReader {
+    function requireTip(uint256 atLeast) external view { require(tx.gasprice >= block.basefee + atLeast, "tip"); }
+}
 /// A paymaster that only pays for operations its own bundler sends (tx.origin), refusing others as some do.
 contract BundlerPaymaster {
     error BundlerNotAllowed(address bundler);

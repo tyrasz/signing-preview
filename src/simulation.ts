@@ -58,10 +58,10 @@ export const ELSEWHERE = '0x0000000000000000000000000000000000000000';
 
 /** Code overrides of all the calls (EIP-7702 delegations), applied from the start of the simulated block. */
 const overridesOf = (reqs: SimulationRequest[]) => {
-  const all: Record<string, { code?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string }> = {};
+  const all: Record<string, { code?: string; balance?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string }> = {};
   for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
     const k = a.toLowerCase(), prev = all[k] ?? {};
-    all[k] = { ...prev, ...(o.code !== undefined && { code: o.code }), ...(o.stateDiff && { stateDiff: { ...prev.stateDiff, ...o.stateDiff } }), ...(o.movePrecompileToAddress && { movePrecompileToAddress: o.movePrecompileToAddress }) };
+    all[k] = { ...prev, ...(o.code !== undefined && { code: o.code }), ...(o.balance !== undefined && { balance: o.balance }), ...(o.stateDiff && { stateDiff: { ...prev.stateDiff, ...o.stateDiff } }), ...(o.movePrecompileToAddress && { movePrecompileToAddress: o.movePrecompileToAddress }) };
   }
   return Object.keys(all).length ? all : undefined;
 };

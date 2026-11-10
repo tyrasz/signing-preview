@@ -193,6 +193,9 @@ const POST_OP_REVERT_REASON = '0xf62676f440ff169a3a9afdbf812e89e7f95975ee8e5c312
 const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
 /** The simulated bundler when no other is known (simulateHandleOp doesn't check its caller; paymasters can check tx.origin, see recentBundlers). */
 const BUNDLER = '0x0000000000000000000000000000000000004337';
+const BUNDLER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
+/** Chains whose transactions pay the base fee and no tip (Arbitrum): tx.gasprice is the base fee. */
+const NO_TIPS = new Set([42161, 421614]);
 
 /**
  * Bundlers that recently submitted operations this paymaster paid for (at most five), which its operations are
@@ -724,6 +727,13 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const soon = await Promise.race([bundlers, new Promise<string[]>(r => { timer = setTimeout(() => r([]), 1500); (timer as { unref?: () => void }).unref?.(); })]);
   clearTimeout(timer);
   const first = soon[0] ?? BUNDLER;
+  // The price the bundle's transaction pays (tx.gasprice), taken as what the operation pays its bundler: the base fee
+  // plus its priority fee, up to its fee cap (the base fee alone on Arbitrum, which takes no tips). Contracts read it:
+  // a Base DEX's pools add a "MEV tax" to a swap's fee by the transaction's priority fee, and an operation simulated
+  // at no price showed a swap that on-chain, taxed, missed its minimum and reverted. Left out when the fee cap is
+  // under the base fee (the operation waits), or the base fee isn't known.
+  const tip = NO_TIPS.has(op.chainId) ? 0n : op.maxPriorityFeePerGas;
+  const price = fee !== undefined && op.maxFeePerGas >= fee ? (op.maxFeePerGas < fee + tip ? op.maxFeePerGas : fee + tip) : undefined;
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   let result: OperationRun | null = null;
   for (const stub of stubs) {
@@ -744,7 +754,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const data = ep!.version === '0.6'
     ? encodeFunctionData({ abi: HANDLE_V06, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] })
     : encodeFunctionData({ abi: HANDLE, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] }); // v0.7 to v0.9: packed
-  const run = (bundler: string, recover: Hex) => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(op.watch?.length && { watch: op.watch }),
+  const run = (bundler: string, recover: Hex) => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(price !== undefined && price > 0n && { gasPrice: price }), ...(op.watch?.length && { watch: op.watch }),
     // The moved precompile is warm, as precompiles are (EIP-2929), so validation costs what it will.
     // An account the bundle delegates (EIP-7702) is warm from its authorization on, as the chain has it.
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] },
@@ -752,7 +762,8 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(stub.p256 === true ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []),
       // The verifier itself stays cold, as it is on-chain; only the call on to its moved code is warm.
       ...(verifier ? [{ address: VERIFIER_MOVED, storageKeys: [] }] : [])],
-    stateOverrides: { ...op.stateOverrides, [entryPoint]: { ...entryPointOverride(entryPoint, op.chainId)!, ...(op.stateOverrides?.[entryPoint]?.stateDiff && { stateDiff: { ...entryPointOverride(entryPoint, op.chainId)!.stateDiff, ...op.stateOverrides[entryPoint].stateDiff } }) }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
+    // The bundler can afford the priced call's gas, whoever stands in for it.
+    stateOverrides: { ...op.stateOverrides, ...(price !== undefined && price > 0n && { [bundler]: { balance: BUNDLER_BALANCE } }), [entryPoint]: { ...entryPointOverride(entryPoint, op.chainId)!, ...(op.stateOverrides?.[entryPoint]?.stateDiff && { stateDiff: { ...entryPointOverride(entryPoint, op.chainId)!.stateDiff, ...op.stateOverrides[entryPoint].stateDiff } }) }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
       ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
       ...(verifier && { [verifierAt!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code: verifier } }),
       ...(op.delegate && { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } }) } }, ep!.version);

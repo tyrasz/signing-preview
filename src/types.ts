@@ -201,6 +201,8 @@ export interface SimulationRequest {
   /** Code to give accounts for the simulation (EIP-7702 authorizations: the delegation designator, or none). */
   stateOverrides?: Record<string, {
     code?: string;
+    /** The account's native balance for the simulation (hex wei): for a sender that must afford a priced call's gas. */
+    balance?: string;
     /** Storage slots (32-byte hex) set for the simulation, as eth_simulateV1 and eth_call take them. */
     stateDiff?: Record<string, string>;
     /** For a precompile given code: the address its original moves to (eth_simulateV1's movePrecompileToAddress). */
