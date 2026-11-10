@@ -1,9 +1,9 @@
 name: UserOperation replays
 
-# Replays recent ERC-4337 operations on Ethereum and Arbitrum One as their blocks arrive, each previewed on the state
+# Replays recent ERC-4337 operations on Ethereum, Arbitrum One, Base, OP Mainnet, Polygon and BNB Chain as their blocks arrive, each previewed on the state
 # it met (the block before, its header, its earlier transactions), and compares the preview with the receipt:
 # npm run accuracy:4337 (README, Simulation accuracy). Read-only: nothing is signed with a real key or sent.
-# Public RPCs by default; ETHEREUM_RPC_URL / ARBITRUM_RPC_URL repository secrets replace them.
+# Public RPCs by default (EVM_RPCS in src/chains.ts); the chains' *_RPC_URL repository secrets replace them.
 # Fails when an operation's outcome differs from its receipt, or, for one simulated whole on the state it met, its
 # gas is 5% or more off or its token movements differ beyond rounding (scripts/accuracy-4337.ts --strict).
 # Operations whose signature the stand-in can't take only show in the summary: that is a missing shape, not a wrong
@@ -32,17 +32,27 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      # Four at a time, in this order: two on each chain's public RPC.
-      max-parallel: 4
+      # Six at a time, in this order: at most two on each chain's public RPC. The EntryPoint versions each chain uses
+      # (Base, Polygon and BNB Chain had hundreds of v0.7 operations in half an hour, Polygon and BNB Chain hundreds of
+      # v0.8, OP Mainnet a few dozen of v0.7).
+      max-parallel: 6
       matrix:
         include:
-          # Ethereum keeps about 128 blocks of state: start with the operations already in it.
+          # Ethereum keeps about 128 blocks of state, Base's and BNB Chain's public nodes far more: start with the
+          # operations already in it. Arbitrum's, OP Mainnet's and Polygon's keep seconds to minutes: follow only.
           - { name: 'Ethereum, EntryPoint v0.7', chain: '1', entrypoint: '0.7', backfill: '100' }
           - { name: 'Arbitrum One, EntryPoint v0.7', chain: '42161', entrypoint: '0.7', backfill: '0' }
+          - { name: 'Base, EntryPoint v0.7', chain: '8453', entrypoint: '0.7', backfill: '100' }
+          - { name: 'Polygon, EntryPoint v0.7', chain: '137', entrypoint: '0.7', backfill: '0' }
+          - { name: 'BNB Chain, EntryPoint v0.7', chain: '56', entrypoint: '0.7', backfill: '100' }
           - { name: 'Ethereum, EntryPoint v0.8', chain: '1', entrypoint: '0.8', backfill: '100' }
           - { name: 'Arbitrum One, EntryPoint v0.8', chain: '42161', entrypoint: '0.8', backfill: '0' }
+          - { name: 'Polygon, EntryPoint v0.8', chain: '137', entrypoint: '0.8', backfill: '0' }
+          - { name: 'BNB Chain, EntryPoint v0.8', chain: '56', entrypoint: '0.8', backfill: '100' }
+          - { name: 'Base, EntryPoint v0.6', chain: '8453', entrypoint: '0.6', backfill: '100' }
           - { name: 'Ethereum, EntryPoint v0.6', chain: '1', entrypoint: '0.6', backfill: '100' }
           - { name: 'Arbitrum One, EntryPoint v0.6', chain: '42161', entrypoint: '0.6', backfill: '0' }
+          - { name: 'OP Mainnet, EntryPoint v0.7', chain: '10', entrypoint: '0.7', backfill: '0' }
           - { name: 'Arbitrum One, EntryPoint v0.9', chain: '42161', entrypoint: '0.9', backfill: '0' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,6 +68,10 @@ jobs:
         env:
           ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
           ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
           MINUTES: ${{ inputs.minutes || '40' }}
           CHAIN: ${{ matrix.chain }}
           ENTRYPOINT: ${{ matrix.entrypoint }}
