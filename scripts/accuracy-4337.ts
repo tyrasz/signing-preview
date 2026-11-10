@@ -1,7 +1,9 @@
 // npm run accuracy:4337 -- [--chain 1|42161] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 [--backfill 100] | --blocks 100 | --tx 0x…]
 //   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict] [--dump preview.json]
+//   [--differing dir/] (the row and preview of each operation whose preview differed, to look at once its state is gone)
 //
-// --concurrency replays that many operations at once (each on its own state), newest first, while --follow keeps
+// --concurrency replays that many operations at once (each on its own state; oldest first on Ethereum, newest first on
+// Arbitrum, whose state goes first), while --follow keeps
 // watching for new blocks: on Arbitrum an operation must be replayed within about 30 seconds of its block. --backfill
 // first takes the operations of the blocks already behind the head (Ethereum keeps about 128 blocks of state).
 // --summary-md appends the results as Markdown (a CI job summary). --strict exits with 1 when an operation's outcome
@@ -27,7 +29,7 @@
 // form or the bare hash, or the account's owner(); tried in turn while the account rejects the stand-in as theirs.
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { decodeAbiParameters, decodeFunctionData, encodeFunctionData, hashMessage, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
@@ -169,7 +171,10 @@ async function replay(item: string): Promise<void> {
   const simulator = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time: block.timestamp, feeRecipient: block.miner, prevRandao: block.mixHash, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
   const deps = { ...liveDependencies({ [CHAIN === 42161 ? 'ARBITRUM_RPC_URL' : 'ETHEREUM_RPC_URL']: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
-  const code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest']).catch(() => '0x'));
+  // A node that no longer serves the parent block's state (Ethereum's public RPC keeps about 128 blocks) would leave
+  // the preview reading nothing: the operation is skipped rather than replayed on missing state.
+  let code: string;
+  try { code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest'])); } catch { return skip('its state is no longer served by the node'); }
 
   // The request the owner signed, and who might have signed it.
   // A Safe the operation deploys has no fallback handler yet: its setup (in the initCode) names it.
@@ -286,18 +291,25 @@ async function replay(item: string): Promise<void> {
     judged && row.tokens === 'other' && 'tokens',
   ].filter((x): x is string => !!x);
   if (differs.length) row.differs = differs;
+  // --differing <dir>: each differing operation's row and preview, kept to look at once its state is gone.
+  if (differs.length && arg('differing', '')) {
+    mkdirSync(arg('differing', ''), { recursive: true });
+    writeFileSync(`${arg('differing', '')}/${hash}${ops.length > 1 ? `-${index}` : ''}.json`, JSON.stringify({ row, preview: p }, null, 1));
+  }
   process.stdout.write('.');
 }
 
 const head = Number(await call<string>('eth_blockNumber', []));
 const pending = async (from: number, to: number) => [...new Set((await call<{ transactionHash: string }[]>('eth_getLogs', [{ address: EP, topics: [UOE], fromBlock: hex(BigInt(from)), toBlock: hex(BigInt(to)) }])).map(l => l.transactionHash))];
-// Replays, CONCURRENCY at a time, newest first: an older operation's state is the first to go.
+// Replays, CONCURRENCY at a time. On Ethereum, oldest first: a backfill's oldest blocks are the first whose state
+// the node stops serving (about 128 blocks, 25 minutes), and the newest still have time. On Arbitrum, newest first:
+// its 30 seconds of state are gone for anything queued behind.
 const queue: string[] = [];
 let active = 0;
 const idle: (() => void)[] = [];
 const pump = () => {
   while (active < CONCURRENCY && queue.length && rows.length + active < MAX) {
-    const h = queue.pop()!;
+    const h = (CHAIN === 42161 ? queue.pop() : queue.shift())!;
     active++;
     replay(h).catch(e => skip(`error: ${(e as Error).message.slice(0, 80)}`)).finally(() => { active--; pump(); if (!active && (!queue.length || rows.length >= MAX)) idle.splice(0).forEach(f => f()); });
   }

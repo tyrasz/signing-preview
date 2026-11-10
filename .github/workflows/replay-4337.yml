@@ -65,7 +65,7 @@ jobs:
           set -o pipefail
           [[ "$MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
           npm run accuracy:4337 -- --chain "$CHAIN" --entrypoint "$ENTRYPOINT" --follow $((MINUTES * 60)) --backfill "$BACKFILL" \
-            --max 300 --concurrency 3 --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee replay.log
+            --max 300 --concurrency 3 --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json --differing differing 2>&1 | tee replay.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -74,6 +74,7 @@ jobs:
           path: |
             report.json
             replay.log
+            differing/
           if-no-files-found: ignore
           retention-days: 30
 
