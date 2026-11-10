@@ -236,6 +236,10 @@ async function replay(item: string): Promise<void> {
     tried++;
     p = await previewRequest(request(signer), ctx, deps);
     if (!ran(p) && prefix.length > essential.length) { prefix = essential; prefixDropped = true; p = await previewRequest(request(signer), ctx, deps); }
+    // The whole operation didn't run and nothing says why (no rejection, no validation revert): the node failed the
+    // simulation, which a heavy block refused under load does (alone, the same operations ran whole). Once more.
+    const unexplained = (q: Preview) => ran(q) && !q.decoding.notes.some(x => /whole operation was simulated|validation reverts on a stand-in/.test(x)) && !q.warnings.some(w => w.code === 'userop_rejected');
+    if (unexplained(p)) { await new Promise(r => setTimeout(r, 1500)); p = await previewRequest(request(signer), ctx, deps); }
     // A wrong guess shows as the account rejecting the stand-in, or as its validation reverting on a shape for
     // another key (a passkey account given an ECDSA stand-in for a non-owner): either way, the next candidate.
     if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x) || /validation reverts on a stand-in/.test(x))) break;
