@@ -386,6 +386,21 @@ curl -s localhost:8787/v1/replay -H 'content-type: application/json' -d '{ "chai
 - A node that no longer has the block's state is an error ("This chain's node doesn't keep the state of block N…"), never a simulation on the latest block instead. (A block named only so that a trace matches the simulation still falls back, as before.)
 - The local EVM's caches of contract code and last-seen values are of the latest state: for a block that was asked for they are neither used nor written.
 
+### Simulating with state you set
+
+`context.stateOverrides` gives accounts a native balance, code or storage slots for the simulation, in place of the chain's: "what would this do if the account held 2 ETH", "…if this slot were set".
+
+```json
+{ "request": { "method": "eth_sendTransaction", "params": [{ "from": "0x…", "to": "0x…", "value": "0xde0b6b3a7640000", "chainId": "0x1" }] },
+  "context": { "stateOverrides": { "0x…": { "balance": "2000000000000000000", "stateDiff": { "0x09": "0x2a" } } } } }
+```
+
+- Keys are addresses (at most 32). `balance` is in wei (hex, or a decimal string), `code` is hex (at most 24,576 bytes), `stateDiff` maps slots to values (at most 256 per account, each padded to 32 bytes). Anything else is refused (`400 INVALID_REQUEST`), not ignored.
+- They reach every simulator: the node's `eth_simulateV1`, the `eth_call` probe and the local EVM (so a trace runs with them too), under the request's own overrides (an EIP-7702 delegation's code).
+- The preview carries a **caution**, `state_overridden`: it shows what would happen if the chain were in that state, not what will. The inclusion checks (nonce, balance, fee) still describe the real chain.
+- For transactions and batches; a signature's preview says they weren't applied. They combine with `context.block` and `context.trace`.
+- Checked live on Ethereum, Base and HyperEVM (2026-11-10): an empty account sending 5 of the native token fails ("insufficient funds") on the chain's state and succeeds with its balance set to 9, with the trace agreeing with the node's run.
+
 ## Mock and live data
 
 `npm start` uses mock data. To use real data:

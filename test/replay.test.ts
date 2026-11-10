@@ -294,3 +294,50 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   assert.equal(untraced.trace, undefined);
   assert.match(untraced.decoding.notes.join(' '), /No trace: 0xb200000000000000000000397293cb8cda9a10c5 is a contract this chain's node runs itself/);
 });
+
+test('State the caller sets for a simulation reaches it, is checked, and the preview says so', async () => {
+  const send = (context: Record<string, unknown>, d: Dependencies) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId: '0x2105' }] }, { now: NOW, ...context }, d);
+  const { deps: d, batches } = deps(ran());
+  const slot = `0x${'00'.repeat(31)}09`;
+  const p = await send({ stateOverrides: { [ALICE.toUpperCase().replace('0X', '0x')]: { balance: '1000000000000000000' }, [USDC]: { stateDiff: { '0x9': '0x2a' }, code: '0x6001' } } }, d);
+  // In the form simulators take: lowercase addresses, a hex balance, whole 32-byte slots and values.
+  assert.deepEqual(batches[0][0].stateOverrides, { [ALICE.toLowerCase()]: { balance: '0xde0b6b3a7640000' }, [USDC]: { stateDiff: { [slot]: `0x${'00'.repeat(31)}2a` }, code: '0x6001' } });
+  assert.ok(batches.every(b => b[0].stateOverrides));
+  assert.match(p.warnings.find(w => w.code === 'state_overridden')!.message, /^Simulated with state set by whoever asked for this preview \(balance, code, storage of 2 accounts\), not the chain's own/);
+  assert.equal(p.attention, 'caution');
+  // Without any: nothing set, nothing said.
+  const plain = deps(ran());
+  assert.deepEqual([(await send({}, plain.deps)).warnings.some(w => w.code === 'state_overridden'), plain.batches[0][0].stateOverrides], [false, undefined]);
+  // A batch: every call carries them, and the batch says so once.
+  const many = deps(ran());
+  const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', from: ALICE, chainId: '0x2105', atomicRequired: true, calls: [{ to: USDC, data: transfer }, { to: USDC, data: transfer }] }] }, { now: NOW, stateOverrides: { [ALICE]: { balance: '0x1' } } }, many.deps);
+  assert.deepEqual(many.batches[0].map(r => r.stateOverrides), [{ [ALICE.toLowerCase()]: { balance: '0x1' } }, { [ALICE.toLowerCase()]: { balance: '0x1' } }]);
+  assert.equal(batch.warnings.filter(w => w.code === 'state_overridden').length, 1);
+  // Malformed ones are refused, not ignored.
+  for (const [bad, said] of [[{ nope: {} }, /"nope" is not an address/], [{ [ALICE]: { balance: 'lots' } }, /balance must be an amount in wei/], [{ [ALICE]: { nonce: '0x1' } }, /nonce isn't something that can be set/],
+    [{ [ALICE]: { code: '0x123' } }, /code must be hex/], [{ [ALICE]: { stateDiff: { '0x1': 'x' } } }, /stateDiff value must be hex/], [[], /must be an object keyed by address/]] as const) {
+    await assert.rejects(send({ stateOverrides: bad }, d), (e: Error & { code?: string }) => e.code === 'INVALID_REQUEST' && said.test(e.message));
+  }
+  // A signature isn't simulated with them, and says so.
+  const message = await previewRequest({ method: 'personal_sign', params: ['0x68656c6c6f', ALICE] }, { now: NOW, chainId: 8453, stateOverrides: { [ALICE]: { balance: '0x1' } } }, d);
+  assert.match(message.decoding.notes.join(' '), /State overrides \(context\.stateOverrides\) apply to transactions and batches/);
+  // Over HTTP: the spec has them, a preview with them matches it, and a malformed one is a 400.
+  const Ajv2020 = (Ajv2020Module as unknown as { default?: typeof Ajv2020Module }).default ?? Ajv2020Module;
+  const spec = JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8'));
+  const ajv = new (Ajv2020 as unknown as new (o: object) => { addSchema(s: object): void; getSchema(k: string): ((d: unknown) => boolean) & { errors?: unknown[] } | undefined })({ strict: false, allErrors: true });
+  ajv.addSchema({ ...spec, $id: 'spec2' });
+  const matches = (name: string, data: unknown) => { const v = ajv.getSchema(`spec2#/components/schemas/${name}`)!; assert.ok(v(data), `${name}: ${JSON.stringify(v.errors?.slice(0, 3))}`); };
+  const server = createPreviewServer({ deps: deps(ran()).deps });
+  await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const body = { request: { method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId: '0x2105' }] }, context: { stateOverrides: { [ALICE]: { balance: '0x1', stateDiff: { [slot]: '0x1' } } } } };
+    matches('PreviewRequest', body);
+    const ok = await fetch(`${base}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const preview = await ok.json() as { warnings: { code: string }[] };
+    matches('Preview', preview);
+    assert.deepEqual([ok.status, preview.warnings.some(w => w.code === 'state_overridden')], [200, true]);
+    const refused = await fetch(`${base}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, context: { stateOverrides: { [ALICE]: { balance: -1 } } } }) });
+    assert.equal(refused.status, 400);
+  } finally { await new Promise(r => server.close(r)); }
+});

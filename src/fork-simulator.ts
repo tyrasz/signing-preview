@@ -267,6 +267,8 @@ class StateSource {
   requests = 0;
   /** Code given to accounts for this simulation (EIP-7702 delegation designators), instead of theirs. */
   codeOverrides = new Map<string, Uint8Array>();
+  /** Native balances set for this simulation (a request's state overrides), instead of the chain's. */
+  balanceOverrides = new Map<string, bigint>();
   private url: string; private block: string; private fetchImpl: typeof fetch; private batchSize: number; private concurrency: number; private deadline: number;
   readonly chainId: number;
   constructor(chainId: number, url: string, block: string, fetchImpl: typeof fetch, batchSize: number, concurrency: number, deadline: number) {
@@ -474,6 +476,11 @@ class LazyState extends SimpleStateManager {
   }
 
   private async data(key: string): Promise<AccountData | undefined> {
+    const a = await this.chainData(key), balance = this.source.balanceOverrides.get(key);
+    // A balance set for the simulation stands in for the chain's, whatever else the account holds.
+    return balance === undefined ? a : { nonce: a?.nonce ?? 0n, code: a?.code ?? new Uint8Array(0), balance };
+  }
+  private async chainData(key: string): Promise<AccountData | undefined> {
     if (this.source.accounts.has(key)) return this.source.accounts.get(key);
     if (this.misses) { this.misses.accounts.add(key); return this.source.guessAccount(key); }
     await this.source.fetch({ ...newMisses(), accounts: new Set([key]) });
@@ -702,6 +709,7 @@ export class ForkSimulator implements Simulator {
     const authorities = new Set(auths.flat().map(a => a.authority));
     for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
       if (o.code !== undefined && !authorities.has(hexOf(a))) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
+      if (o.balance !== undefined) source.balanceOverrides.set(hexOf(a), BigInt(o.balance));
       // Storage set for the simulation: read before the chain's value, never cached as the chain's.
       for (const [slot, value] of Object.entries(o.stateDiff ?? {})) source.storage.set(`${hexOf(a)}_${bytesToHex(setLengthLeft(hexToBytes(slot as Hex), 32))}`, unpadBytes(hexToBytes(value as Hex)));
     }

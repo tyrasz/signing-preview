@@ -631,6 +631,39 @@
               }
             ],
             "description": "Simulate on the state after this block (a number, or one in decimal or hex) instead of the latest: what the request would have done then, as the first transaction of the block that followed. For transactions and batches. The chain's node has to keep that block's state: most keep recent blocks only, an archive node keeps all."
+          },
+          "stateOverrides": {
+            "type": "object",
+            "maxProperties": 32,
+            "description": "State to give accounts for the simulation, in place of the chain's own, keyed by address: what would happen if the chain were in that state. The preview says so (warning `state_overridden`). For transactions and batches.",
+            "propertyNames": {
+              "pattern": "^0x[0-9a-fA-F]{40}$"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "balance": {
+                  "type": "string",
+                  "pattern": "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$",
+                  "description": "The native balance, in wei: hex, or a decimal string."
+                },
+                "code": {
+                  "type": "string",
+                  "pattern": "^0x([0-9a-fA-F]{2})*$",
+                  "description": "The account's code (at most 24,576 bytes)."
+                },
+                "stateDiff": {
+                  "type": "object",
+                  "maxProperties": 256,
+                  "description": "Storage slots to set: 32-byte slot to 32-byte value, in hex.",
+                  "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]{1,64}$"
+                  }
+                }
+              }
+            }
           }
         }
       },

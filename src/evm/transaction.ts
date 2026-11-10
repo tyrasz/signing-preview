@@ -210,6 +210,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       }
       // A trace is run apart, in a local EVM: the block is named (the latest, and the header of the one after it), so
       // that both simulations run in the same one.
+      // State the caller set for the simulation (PreviewContext.stateOverrides), under the request's own.
+      if (context.stateOverrides && !replay) request.stateOverrides = withOverrides(context.stateOverrides, request.stateOverrides);
       named = replay ? undefined : await namedBlock(context, deps.rpc, tx.chainId);
       at = replay?.at ?? named?.at ?? (context.trace ? await pinLatest(deps.rpc, tx.chainId) : undefined);
       if (at) request.at = at;
@@ -264,10 +266,11 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     // A revert under the request's own gas limit: run it again without the limit to see whether the limit is why.
     if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length && !replay) {
       try {
-        const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined, ...(at && { at }) });
+        const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined, ...(at && { at }), ...(context.stateOverrides && { stateOverrides: context.stateOverrides }) });
         if (unlimited?.status === 'success') sim = { ...sim, revertReason: `out of gas: the gas limit (${tx.gas.toLocaleString('en-US')}) is below the ${unlimited.gasUsed !== undefined ? `${unlimited.gasUsed.toLocaleString('en-US')} gas` : 'gas'} this call needs` };
       } catch { /* keep the first answer */ }
     }
+    if (context.stateOverrides && !replay && !preset) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
     const stateBlock = replay ? BigInt(replay.at.block) : named?.number;
     simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }), ...(stateBlock !== undefined && { block: stateBlock.toString() }) };
     if (sim.status === 'reverted') {
@@ -344,6 +347,55 @@ export function simulationRequest(tx: Tx, d?: Decoded): SimulationRequest {
   for (const a of d?.declaredApprovals ?? []) { watch.add(a.token.toLowerCase()); watch.add(a.spender.toLowerCase()); }
   // The request's gas limit, so a limit too low for the call shows as running out of gas.
   return { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(watch.size && { watch: [...watch] }), ...(tx.gas !== undefined && { gas: tx.gas }), ...(tx.accessList && { accessList: tx.accessList }) };
+}
+
+/**
+ * State overrides as a caller gives them (PreviewContext.stateOverrides), checked and in the form simulators take:
+ * lowercase addresses, a hex balance, hex code, 32-byte slots and values. Throws RequestError when malformed.
+ */
+export function normalizeOverrides(raw: unknown): NonNullable<SimulationRequest['stateOverrides']> {
+  const bad = (what: string): never => { throw new RequestError(`context.stateOverrides: ${what}`); };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) bad('must be an object keyed by address');
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length > 32) bad('at most 32 accounts');
+  const word = (v: unknown, what: string) => (typeof v === 'string' && /^0x[0-9a-fA-F]{1,64}$/.test(v) ? `0x${v.slice(2).toLowerCase().padStart(64, '0')}` : bad(`${what} must be hex of at most 32 bytes`));
+  const out: NonNullable<SimulationRequest['stateOverrides']> = {};
+  for (const [address, value] of entries) {
+    if (!ADDRESS.test(address)) bad(`"${address.slice(0, 50)}" is not an address`);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) bad(`${address} must be an object`);
+    const o = value as Record<string, unknown>, entry: NonNullable<SimulationRequest['stateOverrides']>[string] = {};
+    for (const key of Object.keys(o)) if (!['balance', 'code', 'stateDiff'].includes(key)) bad(`${address}.${key} isn't something that can be set (balance, code, stateDiff)`);
+    if (o.balance !== undefined) {
+      if (typeof o.balance !== 'string' || !/^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$/.test(o.balance)) bad(`${address}.balance must be an amount in wei (hex, or a decimal string)`);
+      entry.balance = `0x${BigInt(o.balance as string).toString(16)}`;
+    }
+    if (o.code !== undefined) {
+      if (typeof o.code !== 'string' || !/^0x([0-9a-fA-F]{2})*$/.test(o.code) || o.code.length > 2 + 2 * 24_576) bad(`${address}.code must be hex, of at most 24,576 bytes`);
+      entry.code = (o.code as string).toLowerCase();
+    }
+    if (o.stateDiff !== undefined) {
+      if (!o.stateDiff || typeof o.stateDiff !== 'object' || Array.isArray(o.stateDiff)) bad(`${address}.stateDiff must be an object of slots`);
+      const slots = Object.entries(o.stateDiff as Record<string, unknown>);
+      if (slots.length > 256) bad(`${address}.stateDiff: at most 256 slots`);
+      entry.stateDiff = Object.fromEntries(slots.map(([slot, v]) => [word(slot, `${address}.stateDiff slot`), word(v, `${address}.stateDiff value`)]));
+    }
+    out[address.toLowerCase()] = entry;
+  }
+  return out;
+}
+
+/** A request's own overrides (an EIP-7702 delegation's code) over the caller's, account by account. */
+export function withOverrides(given: SimulationRequest['stateOverrides'], own: SimulationRequest['stateOverrides']): SimulationRequest['stateOverrides'] {
+  if (!given) return own;
+  const out: NonNullable<SimulationRequest['stateOverrides']> = { ...given };
+  for (const [a, o] of Object.entries(own ?? {})) out[a.toLowerCase()] = { ...out[a.toLowerCase()], ...o };
+  return out;
+}
+
+/** What a preview says when the caller set state for the simulation. */
+export function overriddenWarning(overrides: NonNullable<SimulationRequest['stateOverrides']>): string {
+  const n = Object.keys(overrides).length, kinds = ['balance', 'code', 'stateDiff'].filter(k => Object.values(overrides).some(o => (o as Record<string, unknown>)[k] !== undefined)).map(k => (k === 'stateDiff' ? 'storage' : k));
+  return `Simulated with state set by whoever asked for this preview (${kinds.join(', ')} of ${n} account${n === 1 ? '' : 's'}), not the chain's own: it shows what would happen if the chain were in that state.`;
 }
 
 /** The wallet's own transactions still waiting to be mined, as simulation requests run before this one. */

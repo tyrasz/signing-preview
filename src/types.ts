@@ -235,6 +235,12 @@ export interface PreviewContext {
    * node has to keep that block's state (most keep recent blocks only; an archive node keeps all).
    */
   block?: number | string;
+  /**
+   * State to give accounts for the simulation, in place of the chain's: a native balance, code, storage slots. The
+   * preview then shows what would happen if the chain were in that state, and says so. For transactions and batches.
+   * Addresses are the keys; `balance` is in wei (hex, or a decimal string); `stateDiff` maps 32-byte slots to values.
+   */
+  stateOverrides?: Record<string, { balance?: string; code?: string; stateDiff?: Record<string, string> }>;
   /** Set by replayTransaction (src/replay.ts), never taken from a caller over HTTP: where a mined transaction ran. */
   replay?: ReplayContext;
   /** Set by previewRequest: the block `block` names, read once per chain (src/block.ts). */

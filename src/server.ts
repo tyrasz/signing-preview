@@ -110,6 +110,8 @@ function sanitizeContext(raw: unknown): PreviewContext {
   if (typeof c.origin === 'string') out.origin = c.origin.slice(0, 256);
   if (typeof c.account === 'string' && /^0x[0-9a-fA-F]{40}$/.test(c.account)) out.account = c.account;
   if (c.trace === true) out.trace = true;
+  // Checked by previewRequest, which refuses a malformed one (400).
+  if (c.stateOverrides !== undefined) out.stateOverrides = c.stateOverrides as PreviewContext['stateOverrides'];
   if ((typeof c.block === 'number' && Number.isSafeInteger(c.block) && c.block >= 0) || (typeof c.block === 'string' && /^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$/.test(c.block))) out.block = c.block;
   const hl = c.hyperliquid as Record<string, unknown> | undefined;
   if (hl && typeof hl === 'object' && hl.action && typeof hl.action === 'object' && typeof hl.nonce === 'number') {

@@ -407,6 +407,21 @@ test('Calls that run first in the block: the node runs them and the local EVM st
   } finally { chain.simulateV1 = false; }
 });
 
+test('A balance the caller sets for the simulation: the local EVM and the chain’s own eth_call both run with it', async () => {
+  // An account with nothing sends 1 HYPE: it can't, unless the simulation is told it holds two.
+  const POOR = '0x9007000000000000000000000000000000000001';
+  const req: SimulationRequest = { chainId: 999, from: POOR, to: BOB, data: '0x', value: E };
+  const [without] = (await fork().simulateBatch([req]))!;
+  assert.equal(without.status, 'reverted');
+  const [withIt] = (await fork().simulateBatch([{ ...req, stateOverrides: { [POOR]: { balance: toHex(2n * E) } } }]))!;
+  assert.deepEqual([withIt.status, withIt.transfers.map(t => [t.asset, t.from, t.raw])], ['success', [['native', POOR, E]]]);
+  // Through a preview: the context's overrides reach the simulation, and the preview says the state was set.
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: POOR, to: BOB, value: toHex(E), chainId: '0x3e7' }] }, { now: NOW, stateOverrides: { [POOR]: { balance: (2n * E).toString() } } }, deps);
+  assert.equal(p.simulation?.status, 'success');
+  assert.ok(codes(p).includes('state_overridden'));
+  assert.deepEqual(changes(p), [['out', '1', 'HYPE', 'simulated_state']]);
+});
+
 test('A traced preview, sent through the HTTP server, matches the API’s schema', async () => {
   const { createPreviewServer, openApiDocument } = await import('../src/server.ts');
   const Ajv2020Module = (await import('ajv/dist/2020.js')).default as unknown as { default?: unknown };
