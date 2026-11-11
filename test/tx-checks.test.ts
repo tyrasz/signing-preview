@@ -92,6 +92,29 @@ test('A gas limit above the chain’s cap for one transaction: refused on the ch
   assert.equal(codes(await send({ gas: toHex(30_000_000n) }, amsterdam)).includes('gas_limit_above_cap'), false);
 });
 
+test('HyperEVM: a transaction a small block can’t hold, from an account on small blocks; big blocks’ own base fee', async () => {
+  // Small blocks every second of 3,000,000 gas, big ones every minute of 30,000,000; an account's transactions go
+  // into the kind it chose on HyperCore (eth_usingBigBlocks), and big blocks have their own base fee.
+  const hyper = (big: boolean, latestLimit = 3_000_000n) => { const d = deps(); return { ...d, rpc: { has: () => true, call: async (c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_usingBigBlocks') return big;
+    if (method === 'eth_bigBlockGasPrice') return toHex(3n * GWEI);
+    const r = await d.rpc!.call(c, method, params);
+    return method === 'eth_getBlockByNumber' ? { ...r as object, gasLimit: toHex(latestLimit) } : r;
+  } } } as Dependencies; };
+  const onSmall = await send({ gas: toHex(5_000_000n), chainId: '0x3e7' }, hyper(false));
+  assert.equal(onSmall.warnings.find(w => w.code === 'hyperevm_small_blocks')!.message, "This transaction has a gas limit of 5,000,000, more than HyperEVM's small blocks hold (3,000,000), and this account's transactions go into small blocks: it won't be included until the account switches to big blocks (a HyperCore setting, evmUserModify), which come about once a minute.");
+  assert.equal(onSmall.attention, 'danger');
+  // Under the small blocks' limit, or with a big block the latest (its limit isn't the small blocks'), as it says.
+  assert.equal(codes(await send({ gas: toHex(2_000_000n), chainId: '0x3e7' }, hyper(false))).includes('hyperevm_small_blocks'), false);
+  assert.ok(codes(await send({ gas: toHex(5_000_000n), chainId: '0x3e7' }, hyper(false, 30_000_000n))).includes('hyperevm_small_blocks'));
+  // On big blocks: it waits for the next, and the fee is at big blocks' base fee (3 gwei here, against 1).
+  const onBig = await send({ gas: toHex(5_000_000n), chainId: '0x3e7' }, hyper(true));
+  assert.deepEqual([codes(onBig).includes('hyperevm_small_blocks'), codes(onBig).includes('hyperevm_big_blocks')], [false, true]);
+  assert.match(detail(onBig, 'Network fee')!, /50,000 gas at 3\.1 gwei/);
+  // Elsewhere nothing is asked.
+  assert.equal(codes(await send({ gas: toHex(5_000_000n) }, hyper(false))).some(c => c.startsWith('hyperevm_')), false);
+});
+
 test('Nonces: already used, replacing a pending transaction, waiting behind a gap, or queued behind pending ones', async () => {
   assert.ok(codes(await send({ nonce: '0x3' })).includes('nonce_used'));
   assert.equal((await send({ nonce: '0x3' })).attention, 'danger');

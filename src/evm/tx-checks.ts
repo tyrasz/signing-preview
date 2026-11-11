@@ -24,6 +24,12 @@ const ARBITRUM = new Set([42161, 421614]);
  * Sepolia mines such transactions.
  */
 const TRANSACTION_GAS_CAP = 16_777_216n, GAS_CAPPED = new Set([1, 56, 8453, 10]);
+/**
+ * HyperEVM makes two kinds of block: small ones every second, of 3,000,000 gas (118 of 120 blocks on 2026-11-11), and
+ * big ones every minute, of 30,000,000. An account's transactions all go into one kind, which it chooses on HyperCore
+ * (evmUserModify; the node answers eth_usingBigBlocks), and big blocks have their own base fee (eth_bigBlockGasPrice).
+ */
+const HYPEREVM = 999, HYPEREVM_SMALL_BLOCK = 3_000_000n, HYPEREVM_BIG_BLOCK = 30_000_000n;
 const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
 const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
 const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
@@ -93,7 +99,7 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     call<string>('eth_getTransactionCount', [tx.from, 'latest']),
     call<string>('eth_getTransactionCount', [tx.from, 'pending']),
     call<string>('eth_getBalance', [tx.from, 'latest']),
-    call<{ baseFeePerGas?: string; blockAccessListHash?: string }>('eth_getBlockByNumber', ['latest', false]),
+    call<{ baseFeePerGas?: string; blockAccessListHash?: string; gasLimit?: string }>('eth_getBlockByNumber', ['latest', false]),
     tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
     arbitrum ? call<string>('eth_call', [{ to: NODE_INTERFACE, data: encodeFunctionData({ abi: L1_COMPONENT, functionName: 'gasEstimateL1Component', args: [(tx.to ?? '0x0000000000000000000000000000000000000000') as Hex, tx.to === null, tx.data] }) }, 'latest']) : Promise.resolve(undefined),
   ]);
@@ -112,8 +118,22 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     b.warn('info', 'pending_transactions', `You have ${n} transaction${n === 1n ? '' : 's'} still pending; this one runs after ${n === 1n ? 'it' : 'them'}, but the preview doesn't include ${n === 1n ? 'its' : 'their'} effects.`);
   }
 
-  // Fee cap against the base fee.
-  const baseFee = block?.baseFeePerGas !== undefined ? BigInt(block.baseFeePerGas) : undefined;
+  // HyperEVM: a transaction that needs more than a small block holds, from an account on small blocks, can't be
+  // included; one from an account on big blocks waits for the next big block, at its base fee.
+  const bigBlocks = tx.chainId === HYPEREVM ? await call<boolean>('eth_usingBigBlocks', [tx.from]) : undefined;
+  const bigBase = bigBlocks === true ? await call<string>('eth_bigBlockGasPrice', []) : undefined;
+  if (tx.chainId === HYPEREVM) {
+    const small = block?.gasLimit !== undefined && BigInt(block.gasLimit) < HYPEREVM_BIG_BLOCK ? BigInt(block.gasLimit) : HYPEREVM_SMALL_BLOCK;
+    const needs = tx.gas ?? gasUsed;
+    if (bigBlocks === false && needs !== undefined && needs > small) {
+      b.warn('danger', 'hyperevm_small_blocks', `This transaction ${tx.gas !== undefined ? `has a gas limit of ${needs.toLocaleString('en-US')}` : `needs about ${needs.toLocaleString('en-US')} gas`}, more than HyperEVM's small blocks hold (${small.toLocaleString('en-US')}), and this account's transactions go into small blocks: it won't be included until the account switches to big blocks (a HyperCore setting, evmUserModify), which come about once a minute.`);
+    } else if (bigBlocks === true) {
+      b.warn('info', 'hyperevm_big_blocks', `This account's transactions go into HyperEVM's big blocks (about one a minute, of ${HYPEREVM_BIG_BLOCK.toLocaleString('en-US')} gas): this one waits for the next, and pays its base fee.`);
+    }
+  }
+
+  // Fee cap against the base fee (on HyperEVM, of the kind of block the account's transactions go into).
+  const baseFee = bigBase !== undefined ? BigInt(bigBase) : block?.baseFeePerGas !== undefined ? BigInt(block.baseFeePerGas) : undefined;
   const cap = tx.maxFeePerGas ?? tx.gasPrice;
   if (cap !== undefined && baseFee !== undefined && cap < baseFee) b.warn('caution', 'fee_below_base_fee', `The fee cap (${gwei(cap)}) is below the current base fee (${gwei(baseFee)}): the transaction waits until the base fee falls that low.`);
 
