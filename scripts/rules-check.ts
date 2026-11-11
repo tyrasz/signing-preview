@@ -46,7 +46,7 @@ const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, '0');
 /** The address the i-th program of a batch is placed at. */
 const place = (i: number) => `0x${(0xc0de0000 + i).toString(16).padStart(40, '0')}`;
 
-interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** Slots the program's own account holds beforehand. */ storage?: Record<string, string>; /** One of fuzzPrograms'. */ random?: boolean; /** Said with a difference: what it takes to run the program again. */ detail?: string; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
+interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** Slots the program's own account holds beforehand. */ storage?: Record<string, string>; /** One of fuzzPrograms'. */ random?: boolean; /** Sent at a price (a gwei over the block's base fee), as a transaction is: its gas is bought before it runs. */ priced?: boolean; /** Said with a difference: what it takes to run the program again. */ detail?: string; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
 interface Outcome { kind: 'runs' | 'invalid' | 'fails' | 'refused'; returns: string; gas?: bigint; logs: string; why?: string }
 
 /** Seventeen pushes (1 on top), the opcode, then: store the top of the stack at 0, the memory size at 32, return both. */
@@ -57,7 +57,7 @@ const OPS: Record<string, string> = {
   STOP: '00', SUB: '03', EXP: '0a', SHL: '1b', KECCAK256: '20', BALANCE: '31', CALLER: '33', CALLDATASIZE: '36', CALLDATACOPY: '37', RETURNDATASIZE: '3d', RETURNDATACOPY: '3e',
   EXTCODESIZE: '3b', EXTCODEHASH: '3f', BLOCKHASH: '40', NUMBER: '43', POP: '50', MLOAD: '51', SWAP1: '90',
   MSTORE: '52', SLOAD: '54', SSTORE: '55', GAS: '5a', TLOAD: '5c', TSTORE: '5d', MCOPY: '5e', LOG2: 'a2', CREATE: 'f0', CALL: 'f1', RETURN: 'f3', DELEGATECALL: 'f4', CREATE2: 'f5',
-  STATICCALL: 'fa', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47',
+  STATICCALL: 'fa', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47', GASPRICE: '3a', COINBASE: '41', BASEFEE: '48',
 };
 const asm = (source: string): Hex => `0x${source.trim().split(/\s+/).map(t => {
   if (OPS[t]) return OPS[t];
@@ -107,6 +107,11 @@ function crafted(amsterdam: boolean): Program[] {
     // call that fails outright (a write inside a static call) takes with it.
     { label: 'GAS, on a limit of 20,000,000', code: asm(`GAS ${RET}`), gas: 20_000_000n },
     { label: 'a static call that writes, given all the gas, on a limit of 20,000,000', code: asm(`00 00 00 00 ${KEEPER} GAS STATICCALL ${RET}`), gas: 20_000_000n, state: keeper },
+    // Sent at a price, as a transaction is: its gas is bought before it runs, so its sender's balance is lower by
+    // the gas limit at that price while it runs; what the code reads of the price, and the fee recipient's balance.
+    { label: 'BALANCE of the sender, in a call that pays for its gas', code: asm(`CALLER BALANCE ${RET}`), priced: true },
+    { label: 'GASPRICE and BASEFEE, in a call that pays for its gas', code: asm('GASPRICE 00 MSTORE BASEFEE 20 MSTORE 40 00 RETURN'), priced: true },
+    { label: "BALANCE of the fee recipient, in a call that pays for its gas", code: asm(`COINBASE BALANCE ${RET}`), priced: true },
     { label: 'TSTORE then TLOAD', code: asm(`2a 07 TSTORE 07 TLOAD ${RET}`) },
     { label: 'MCOPY of a word', code: asm(`2a 00 MSTORE 20 00 40 MCOPY 40 MLOAD ${RET}`) },
     { label: 'KECCAK256 of 64 bytes', code: asm(`2a 00 MSTORE 40 00 KECCAK256 ${RET}`) },
@@ -340,14 +345,16 @@ class Chain {
       // The accounts the programs give their authorities: overrides on the node, the block's own state locally.
       const state: StateChanges = Object.assign({}, ...placed.map(p => p.state ?? {}));
       const given = Object.keys(state).length > 0;
-      const node = await this.onNode(placed, given ? { ...overrides, ...state } : overrides, at);
+      // What a priced program pays for its gas: a gwei over the block's base fee (where the node simulates blocks).
+      const price = at && this.simulateV1 ? at.header.baseFeePerGas + 1_000_000_000n : undefined;
+      const node = await this.onNode(placed, given ? { ...overrides, ...state } : overrides, at, price);
       // A public node drops a block's state within seconds or minutes: on such an answer, another block. And a node
       // found to have no eth_simulateV1 is asked again the other way, with the block to match.
       // (Behind a public RPC some backends are a block behind the one that named the latest: asked again a little
       // later each time. Four tries in a row had once reached only those.)
       if (hadSimulate !== this.simulateV1) continue;
       if (!node && attempt < 6) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
-      const local = await this.locally(placed, overrides, given && at ? { ...at, state } : at);
+      const local = await this.locally(placed, overrides, given && at ? { ...at, state } : at, price);
       // The same for the local EVM's reads: a backend that hasn't the named block yet, or no longer its state.
       if (attempt < 6 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
       return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: 'the node did not answer' }, local: local[i] }));
@@ -363,8 +370,8 @@ class Chain {
     return h?.number ? { block: h.number, header: { ...headerOf(this.chainId, h), baseFeePerGas: 0n } } : undefined;
   }
 
-  private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined): Promise<Outcome[] | null> {
-    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}`, ...(p.authorizationList && { authorizationList: authorizationsForNode(p.authorizationList) }) }));
+  private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined, price?: bigint): Promise<Outcome[] | null> {
+    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}`, ...(p.authorizationList && { authorizationList: authorizationsForNode(p.authorizationList) }), ...(p.priced && price !== undefined && { gasPrice: `0x${price.toString(16)}` }) }));
     const kind = (ok: boolean, message?: string): Outcome['kind'] => (ok ? 'runs' : INVALID.test(message ?? '') ? 'invalid' : 'fails');
     // Without the pseudo-logs traceTransfers would add, and the logs a chain writes outside the EVM (Polygon's own transfer logs).
     const logsOf = (logs: { address: string; topics: string[]; data: string }[] | undefined) => (logs ?? []).filter(l => l.address.toLowerCase() !== '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' && !chainsOwnLog(l)).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|');
@@ -381,8 +388,8 @@ class Chain {
     return calls.map((_, i) => { const r = byId.get(i); return r?.error ? { kind: kind(false, r.error.message), returns: (r.error.data ?? '0x').toLowerCase(), logs: '', why: r.error.message } : { kind: 'runs', returns: String(r?.result ?? '0x').toLowerCase(), logs: '' }; });
   }
 
-  private async locally(programs: (Program & { to: string })[], overrides: Record<string, { code?: string; balance?: string }>, at: BlockAt | undefined): Promise<Outcome[]> {
-    const request = (p: Program & { to: string }): SimulationRequest => ({ chainId: this.chainId, from: FROM, to: p.to, data: p.data ?? '0x', value: p.value ?? 0n, gas: p.gas ?? GAS, ...(p.authorizationList && { authorizationList: p.authorizationList }), stateOverrides: overrides, ...(at && { at }) });
+  private async locally(programs: (Program & { to: string })[], overrides: Record<string, { code?: string; balance?: string }>, at: BlockAt | undefined, price?: bigint): Promise<Outcome[]> {
+    const request = (p: Program & { to: string }): SimulationRequest => ({ chainId: this.chainId, from: FROM, to: p.to, data: p.data ?? '0x', value: p.value ?? 0n, gas: p.gas ?? GAS, ...(p.authorizationList && { authorizationList: p.authorizationList }), ...(p.priced && price !== undefined && { gasPrice: price }), stateOverrides: overrides, ...(at && { at }) });
     const one = async (reqs: SimulationRequest[]): Promise<Outcome[]> => (await this.fork.simulateBatch(reqs))!.map(r => ({
       kind: r.status === 'success' ? 'runs' : INVALID.test(r.revertReason ?? '') ? 'invalid' : 'fails', returns: (r.returnData ?? '0x').toLowerCase(), gas: r.gasUsed,
       logs: (r.logs ?? []).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|'), why: r.revertReason,
@@ -400,7 +407,10 @@ interface Report { chainId: number; name: string; block?: string; fork: string[]
 
 /** Differences that are the node's way of answering, not a rule the local EVM has wrong: listed, not counted. */
 const EXPECTED: Record<number, Record<string, string>> = {
-  42161: { 'opcode 0x5a': "GAS: Arbitrum's node takes its charge for L1 data out of the gas the call is given" },
+  42161: {
+    'opcode 0x5a': "GAS: Arbitrum's node takes its charge for L1 data out of the gas the call is given",
+    'GAS, on a limit of 20,000,000': "GAS: Arbitrum's node takes its charge for L1 data out of the gas the call is given",
+  },
   999: {
     'opcode 0x45': "GASLIMIT: HyperEVM's eth_call reports its large blocks' limit (30,000,000), whatever block it names; the local EVM the block's own",
     // Its node answers on its latest block whatever block is named, as the block after it but at its time: what
@@ -429,7 +439,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
     const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
     let l1Charge: bigint | undefined;
     if (!compareGas) {
-      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
+      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && !batch[j].priced && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
       const counts = new Map<bigint, number>();
       for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
       const most = [...counts].sort((a, b) => b[1] - a[1])[0];
@@ -442,7 +452,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
       if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
       report.compared++;
       const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
-        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && beyond(node.gas - local.gas - l1Charge, batch[j].random ? l1Charge : 0n) && !EXPECTED[chainId]?.[batch[j].label]);
+        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && !batch[j].priced && node.kind === 'runs' && local.kind === 'runs' && beyond(node.gas - local.gas - l1Charge, batch[j].random ? l1Charge : 0n) && !EXPECTED[chainId]?.[batch[j].label]);
       // Events are compared where the node reports them (not through eth_call).
       const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
       // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was

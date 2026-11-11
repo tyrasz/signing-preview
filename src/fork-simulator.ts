@@ -74,6 +74,13 @@ export interface ChainProfile {
    */
   precompilePrices?: Record<number, Record<string, number>>;
   /**
+   * Who is paid a transaction's tip as the block goes, where it isn't the block's fee recipient (COINBASE), which
+   * a later call in a batch may read: BNB Chain collects fees at its system address and pays its validator at the
+   * end of the block. (Arbitrum pays its own fee accounts, none of them COINBASE: see `arbitrum`.) Measured on
+   * each node with two priced calls in one simulated block.
+   */
+  tipsTo?: string;
+  /**
    * EIPs the chain runs that its fork doesn't have. HyperEVM, on Cancun's rules, follows an EIP-7702 delegation: a
    * call into an account whose code is 0xef0100 and an address runs that address's code (measured on its node with
    * such code given to an account; it mined no EIP-7702 transaction in 400 blocks, so whether an account there
@@ -154,7 +161,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
   137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true, maxCodeSize: 32_768 },
-  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
+  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES, tipsTo: '0xfffffffffffffffffffffffffffffffffffffffe' },
   999: { hardfork: 'cancun', eips: [7702], ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
@@ -1286,8 +1293,22 @@ export class ForkSimulator implements Simulator {
       // What the call spent, and under Amsterdam what its state took from the reservoir (less what it gave back to it).
       const spent = ex.executionGasUsed + authState + (metered ? reservoir - metered.stateGasReservoir : 0n);
       const gasUsed = transactionGas(req, spent > 0n ? spent : 0n, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
+      // The fee itself is paid once everything this call reports has been read: the calls after it in the batch are
+      // the transactions after it, and meet a sender that has paid (the gas used at its price) and a fee recipient
+      // that has been tipped (the price over the base fee), as on the chain.
+      const settle = async () => {
+        if (!bought || !req.gasPrice) return;
+        const paid = gasUsed * req.gasPrice + (bought - req.gas! * req.gasPrice), base = (block.header as { baseFeePerGas?: bigint }).baseFeePerGas ?? 0n;
+        const payer = (await state.getAccount(sender)) ?? new Account();
+        payer.balance = payer.balance > paid ? payer.balance - paid : 0n;
+        await state.putAccount(sender, payer);
+        const tip = req.gasPrice > base ? gasUsed * (req.gasPrice - base) : 0n;
+        const to = profile.arbitrum ? undefined : profile.tipsTo ? createAddressFromString(profile.tipsTo) : block.header.coinbase;
+        if (tip > 0n && to) { const recipient = (await state.getAccount(to)) ?? new Account(); recipient.balance += tip; await state.putAccount(to, recipient); }
+      };
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
+        await settle();
         results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data,
           // A call that fails changes nothing itself; the transaction's authorizations (EIP-7702) stay as applied.
           ...(traced?.trace && { trace: traced.trace, ...(traced.stateChanges.length && { stateChanges: traced.stateChanges }) }) });
@@ -1342,6 +1363,7 @@ export class ForkSimulator implements Simulator {
       }
       results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })),
         ...(traced?.trace && { trace: traced.trace, stateChanges: traced.stateChanges }) });
+      await settle();
     }
     return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, trace };
   }

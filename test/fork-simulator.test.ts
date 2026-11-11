@@ -398,6 +398,10 @@ test('Gas is bought before a transaction runs: its sender’s balance is lower b
   assert.equal(BigInt(priced.returnData!), whole - 100_000n * 10n ** 9n);
   // What the run reports is the call's own: no change to the sender's balance (the fee is counted apart).
   assert.equal(priced.stateChanges?.some(c => c.address === USER.toLowerCase() && c.balance), false);
+  // The calls of a batch are transactions one after another: the second meets a sender that has paid the first's fee
+  // (21,000 gas at the price), and has bought its own gas.
+  const [, second] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: BOB, data: '0x', value: 0n, gas: 100_000n, gasPrice: 10n ** 9n }, { ...req, gas: 100_000n, gasPrice: 10n ** 9n }]))!;
+  assert.equal(BigInt(second.returnData!), whole - 21_000n * 10n ** 9n - 100_000n * 10n ** 9n);
   // A sender that couldn't pay for the gas is left as it is (the chain would refuse the transaction).
   assert.equal(BigInt((await fork().simulate({ ...req, gas: 100_000n, gasPrice: whole }))!.returnData!), whole);
 });
