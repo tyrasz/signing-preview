@@ -8,7 +8,9 @@ name: Transaction replays
 # secrets replace them.
 # Then, for ten minutes more, transactions go through the previewer's own replay with their call traces (npm run
 # replays): the run against the receipt, the trace against the node's run and its gas, and on Sepolia the state the
-# trace changed against the block's access list. That step fails when more than five replays differ.
+# trace changed against the block's access list. That step fails when more than ten replays differ (of up to 300:
+# BNB Chain's same-second blocks leave one or two in a hundred, and Arbitrum's events that carry a transaction's own
+# L1 fee a few).
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
 # differences are listed in the summary.
@@ -89,7 +91,7 @@ jobs:
           CHAIN: ${{ matrix.chain }}
         run: |
           set -o pipefail
-          npm run replays -- --chain "$CHAIN" --follow 600 --max 300 --strict --tolerate 5 \
+          npm run replays -- --chain "$CHAIN" --follow 600 --max 300 --strict --tolerate 10 \
             --summary-md "$GITHUB_STEP_SUMMARY" --out previewer.json 2>&1 | tee previewer.log
       - name: Upload the report
         if: always()
