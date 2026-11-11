@@ -45,7 +45,7 @@ export interface ChainProfile {
   /** Precompiles the local EVM doesn't have; their calls are answered by eth_call on the chain (HyperEVM's HyperCore reads). */
   forwardedPrecompiles?: string[];
   /** Gas a forwarded precompile call costs. */
-  precompileGas?: (inputBytes: number, outputBytes: number) => bigint;
+  precompileGas?: (inputBytes: number, outputBytes: number, selector?: string) => bigint;
   /**
    * What the chain's opcode 0x44 returns: the block's mixHash (PREVRANDAO, the default), its difficulty (BNB Chain
    * and Polygon, whose blocks still carry one), or 1 (Arbitrum).
@@ -105,6 +105,21 @@ const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).to
  * call that fails (missing input, an unknown asset) uses all the gas it is given and returns nothing, also measured.
  */
 const hyperCoreReadGas = (input: number, output: number) => 1000n + 33n * BigInt(input + output);
+/**
+ * What ArbOS's precompiles charge, measured on Arbitrum One's node (2026-11-11) by the gas a STATICCALL to each
+ * spends: 800 to open the chain's own state, 800 for each storage slot the method reads, and 3 for each word it is
+ * given and each it returns. ArbSys.arbBlockNumber() is 803; ArbGasInfo.getPricesInWei(), which reads two slots
+ * and returns six words, 2,418. Here are the slots read by the methods contracts call most (ArbSys's block number,
+ * chain id, version, isTopLevelCall and getStorageGasAvailable, and ArbGasInfo's getCurrentTxL1GasFees read none);
+ * a method not listed is taken to read one. Before, every call was charged a flat 2,000: a transaction that asked
+ * for the block number came out 1,197 gas high in the local EVM (4 of 17 replayed).
+ */
+const ARBOS_READS: Record<string, number> = {
+  '0xa3b1b31d': 0, '0xd127f54a': 0, '0x051038f2': 0, '0x08bd624c': 0, '0xa94597ff': 0, '0xc6f7de0e': 0,
+  '0xf5d6ded7': 1, '0xf918379a': 1, '0x055f362f': 1, '0x02199f34': 1, // getL1BaseFeeEstimate, getMinimumGasPrice, getL1GasPriceEstimate, getPricesInArbGas
+  '0x612af178': 2, '0x41b247a8': 2, // getGasAccountingParams, getPricesInWei
+};
+const arbosGas = (input: number, output: number, selector?: string) => 800n + 800n * BigInt(ARBOS_READS[selector ?? ''] ?? 1) + 3n * BigInt(Math.ceil(Math.max(0, input - 4) / 32) + Math.ceil(output / 32));
 
 const low = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
 /**
@@ -130,7 +145,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   1: { hardfork: 'osaka', checked: { forkId: '0x07c9462e', on: '2026-11-10' }, ...NEXT_BLOCK[1] },
   // Sepolia runs Amsterdam (Glamsterdam) since 2026-10-06: its blocks say so, and run under those rules (see ETHEREUM_RULES).
   11155111: { hardfork: 'osaka', checked: { forkId: '0x6c1d9423', on: '2026-11-11' }, ...NEXT_BLOCK[11155111] },
-  42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, missingOpcodes: [0x4a] },
+  42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, precompileGas: arbosGas, missingOpcodes: [0x4a] },
   8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453] },
   10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10] },
   // Polygon prices storage its own way. Measured on its node with code overrides (2026-11-10): a cold SLOAD costs
@@ -1047,7 +1062,7 @@ export class ForkSimulator implements Simulator {
     const pointEvaluation = getActivePrecompiles(common).has(POINT_EVALUATION.slice(2)) && !profile.noPointEvaluation ? [POINT_EVALUATION] : [];
     const forwarded = [...(profile.forwardedPrecompiles ?? []), ...pointEvaluation].map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
       // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
-      if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
       const key = `${address}_${bytesToHex(input.data)}`;
       let c = source.calls.get(key);
       if (!c && misses) {
@@ -1059,7 +1074,7 @@ export class ForkSimulator implements Simulator {
         await source.fetch({ ...newMisses(), calls: new Set([key]) });
         c = source.calls.get(key)!;
       }
-      const gas = address === POINT_EVALUATION ? 50_000n : profile.precompileGas?.(input.data.length, c.data.length) ?? 2000n;
+      const gas = address === POINT_EVALUATION ? 50_000n : profile.precompileGas?.(input.data.length, c.data.length, bytesToHex(input.data.subarray(0, 4))) ?? 2000n;
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
     // BLOCKHASH: the recent blocks' hashes, fetched like the rest of the state (the EVM checks the 256-block window).

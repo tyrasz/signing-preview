@@ -21,7 +21,7 @@ import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { getActivePrecompiles } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { hashMessage, type Hex } from 'viem';
+import { hashMessage, toFunctionSelector, type Hex } from 'viem';
 import { CHAIN_PROFILES, ForkSimulator, nodeRulesOf } from '../src/fork-simulator.ts';
 import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
@@ -167,6 +167,20 @@ async function authorizationPrograms(chainId: number): Promise<Program[]> {
     { label: 'an EIP-7702 authorization by an account already delegated', to: TO, authorizationList: [await authorization(delegated, 5)], state: { [address(delegated)]: { nonce: '0x5', code: `0xef0100${SECOND.slice(2)}` } } },
     { label: 'two EIP-7702 authorizations by one account', to: TO, authorizationList: [await authorization(twice, 0), await authorization(twice, 1, SECOND)] },
     { label: 'an EIP-7702 authorization with the wrong nonce', to: TO, authorizationList: [await authorization(wrong, 3)] },
+  ];
+}
+
+/**
+ * Arbitrum's own precompiles, which the chain answers for the local EVM: the calls contracts make most (the L2
+ * block number, the chain's id, gas prices), each from a contract that reports the gas the call spent. What they
+ * return is the chain's either way; what they cost is the local EVM's own figure.
+ */
+function arbosPrograms(): Program[] {
+  const of = (name: string, address: number, methods: string[]): Program[] => methods.map(m => ({ precompile: true, label: `${name}.${m}`, code: caller(address), data: toFunctionSelector(`function ${m}`) }));
+  return [
+    ...of('ArbSys', 0x64, ['arbBlockNumber()', 'arbChainID()', 'arbOSVersion()', 'isTopLevelCall()', 'getStorageGasAvailable()']),
+    // (Not getCurrentTxL1GasFees(): what it returns is the call's own, which differs between the two runs.)
+    ...of('ArbGasInfo', 0x6c, ['getPricesInWei()', 'getL1BaseFeeEstimate()', 'getMinimumGasPrice()', 'getPricesInArbGas()', 'getGasAccountingParams()', 'getL1GasPriceEstimate()']),
   ];
 }
 
@@ -350,6 +364,7 @@ async function check(chainId: number): Promise<Report> {
     ...crafted(amsterdam), ...await precompilePrograms(),
     // (HyperEVM runs Cancun's rules, which have no such transactions, and its node only eth_call.)
     ...(profile.hardfork === 'cancun' ? [] : await authorizationPrograms(chainId)),
+    ...(profile.arbitrum ? arbosPrograms() : []),
   ];
   const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
   for (let i = 0; i < programs.length; i += 16) {
