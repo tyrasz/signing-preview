@@ -314,7 +314,7 @@ export class RpcSimulator implements Simulator {
     }
     return this.simulateAt(reqs);
   }
-  private async simulateAt(reqs: SimulationRequest[], fitted?: SimulationRequest[]): Promise<SimulationResult[] | null> {
+  private async simulateAt(reqs: SimulationRequest[], fitted?: SimulationRequest[], retried = false): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
@@ -333,7 +333,13 @@ export class RpcSimulator implements Simulator {
     // A node that won't build a call with blob hashes (see buildable): asked again without them, from now on.
     if (/not buildable/i.test(body.error?.message ?? '') && !this.noBlobCalls.has(chainId) && [...reqs, ...(this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [])].some(r => r.blobVersionedHashes?.length)) {
       this.noBlobCalls.add(chainId);
-      return this.simulateAt(reqs, fitted);
+      return this.simulateAt(reqs, fitted, retried);
+    }
+    // Refused so with the blob calls already plain: once, a backend's passing refusal (1 replay of 80 on BNB Chain;
+    // it ran when asked again), so asked once more after a pause.
+    if (/not buildable/i.test(body.error?.message ?? '') && this.noBlobCalls.has(chainId) && !retried) {
+      await new Promise(r => setTimeout(r, 500));
+      return this.simulateAt(reqs, fitted, true);
     }
     // A node that adds up the gas limits of the block's calls and won't have them pass the block's (fitGas): the
     // earlier transactions are asked again on less gas each, and none may have run short on it (hadRoom).

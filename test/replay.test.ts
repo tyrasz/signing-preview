@@ -428,6 +428,12 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   assert.deepEqual(plainly.slice(0, 2).map(calls => calls.slice(0, 2).map(c => [c.gasPrice, c.maxFeePerGas, c.blobVersionedHashes, c.maxFeePerBlobGas])), [[[undefined, '0x5', [H(2)], '0x1'], [undefined, undefined, undefined, undefined]], [['0x5', undefined, undefined, undefined], [undefined, undefined, undefined, undefined]]]);
   assert.equal((await bnb.simulateBatch([after]))![0].gasUsed, 21_001n);
   assert.equal(plainly.filter(calls => calls.some(c => c.blobVersionedHashes)).length, 1);
+  // Refused so once more with the blob call already plain (a backend's passing refusal): asked again after a pause.
+  let flaky = 0;
+  const passing = (async (u: string, init: { body: string }) => (++flaky === 1 ? new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Transaction is not buildable' } })) : unbuilding(u, init))) as unknown as typeof fetch;
+  const plainAlready = new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: passing });
+  (plainAlready as unknown as { noBlobCalls: Set<number> }).noBlobCalls.add(56);
+  assert.equal((await plainAlready.simulateBatch([after]))![0].gasUsed, 21_001n);
   // A refusal with no blob call in it is the node's answer, not something to ask again about.
   const never = (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Transaction is not buildable' } }))) as unknown as typeof fetch;
   await assert.rejects(new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: never }).simulateBatch([{ ...after, at: { ...at, before: undefined } }]), /not buildable/);
