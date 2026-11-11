@@ -548,6 +548,32 @@ test('A node that adds up a block’s gas limits gets the earlier transactions o
   } finally { chain.simulateV1 = false; }
 });
 
+test('A node that refuses a block’s earlier transactions two ways at once gets both met: less gas each, and blob calls plain', async () => {
+  // BNB Chain's node, for a replay merged with its second's earlier block: their gas limits add up past the block's,
+  // and once they don't, a blob transaction among them isn't buildable.
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest[] = [
+    { chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 50_000_000n]), value: 0n, gas: 20_000_000n },
+    { chainId: 999, from: USER, to: BOB, data: '0x', value: 1n, gas: 20_000_000n, gasPrice: 5n, blobVersionedHashes: [`0x01${'00'.repeat(31)}`], maxFeePerBlobGas: 1n },
+  ];
+  const refusals: string[] = [];
+  const picky = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { id: number; method: string; params: [{ blockStateCalls: { calls: { gas?: string; blobVersionedHashes?: string[] }[] }[] }] }[];
+    const sim = Array.isArray(body) ? body.find(b => b.method === 'eth_simulateV1') : undefined;
+    const calls = sim?.params[0].blockStateCalls[0].calls ?? [];
+    const refuse = (message: string) => { refusals.push(message); return new Response(JSON.stringify(body.map(b => ({ jsonrpc: '2.0', id: b.id, error: { code: -32000, message } }))), { headers: { 'content-type': 'application/json' } }); };
+    if (sim && calls.reduce((a, c) => a + BigInt(c.gas ?? 0), 0n) > header.gasLimit) return refuse("Block gas limit exceeded by the block's transactions");
+    if (sim && calls.some(c => c.blobVersionedHashes)) return refuse('Transaction is not buildable');
+    return chain.fetchImpl(url, init);
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    const [r] = (await fork({ fetchImpl: picky }).trace([{ chainId: 999, from: BOB, to: usdc, data: call('transfer', ['0xca401000000000000000000000000000000000c3', 30_000_000n]), value: 0n, at: { block: '0x10', header, before: earlier, beforeUsed: async () => [60_000n, 21_000n] } }]))!;
+    assert.equal(r.status, 'success');
+    assert.deepEqual([...new Set(refusals)], ["Block gas limit exceeded by the block's transactions", 'Transaction is not buildable']);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('After a block’s earlier transactions, an account’s nonce counts its authorizations; a node that won’t build blob calls gets them plain', async () => {
   const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
   const KEY = `0x${'9a'.repeat(32)}` as Hex, sender = privateKeyToAccount(KEY).address.toLowerCase();

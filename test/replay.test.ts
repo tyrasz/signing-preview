@@ -342,6 +342,16 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   assert.deepEqual([own.replay!.matches, own.simulation!.source, own.simulation!.gasUsed, localRuns.length, localRuns[0].at!.header.ownTimestamp], [true, "the local EVM, over the chain's state", '51234', 1, 1_762_000_100n]);
   assert.match(own.decoding.notes.join(' '), /run a second later there, the transaction didn't come out as its receipt says\. The run shown is the local EVM's, at the block's own time\./);
   assert.equal(codes(own).includes('replay_differs'), false);
+  // Before that, the node is asked again at the right time: the second's earlier block (99) and this block's earlier
+  // transactions as one block at the block's own time, on the state of the last block of the second before (98).
+  // Where that comes out as the receipt says, it is the run shown (BNB Chain: 14 of 167 such replays in a run).
+  const merged: SimulationRequest[] = [];
+  const together = { simulate: async (r: SimulationRequest) => { merged.push(r); return r.at!.block === '0x62' ? ran() : ran({ gasUsed: 60_000n }); }, trace: async () => null };
+  const second = await replayTransaction({ chainId: 10, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: together });
+  assert.deepEqual([second.replay!.matches, second.simulation!.source, second.simulation!.gasUsed], [true, 'a test', '51234']);
+  const m = merged[1];
+  assert.deepEqual([m.at!.block, m.at!.header.number, m.at!.header.timestamp, m.at!.header.ownTimestamp, m.at!.before!.map(r => r.from)], ['0x62', 99n, 1_762_000_100n, undefined, [DEPOSITOR, BOB.toLowerCase()]]);
+  assert.match(second.decoding.notes.join(' '), /It was run instead with the 2 transactions before it in that second \(those of the block before and its own block's\), as one block at the block's own time on the state of block 98, and came out as its receipt says \(there the block's number reads 99\)\./);
   // The same wherever the node's run isn't what the receipt says and the local EVM's is: a transaction that failed on
   // a gas limit over Amsterdam's cap used 16,777,216 on the chain and all the gas it was given in the node's
   // simulation. No shifted block here: the local EVM runs the same request.

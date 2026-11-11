@@ -246,7 +246,15 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         // failed on a 70,000,000 limit used 16,777,216 on the chain and 50,000,000 in the node's simulation).
         if (replay && outcome.result && deps.simulator.trace) {
           const nodes = compareWithReceipt(outcome.result, replay.receipt);
-          if (!nodes.matches) {
+          // A block in its parent's second: first the node again, at the right time, with the second's earlier
+          // blocks merged into one (ReplayContext.sameSecond).
+          const second = !nodes.matches && replay.sameSecond ? await replay.sameSecond().catch(() => undefined) : undefined;
+          const together: SimulationRequest | undefined = second && { ...request, at: { ...second.at, before: second.before } };
+          const merged = together && await deps.simulator.simulate(together).catch(() => null);
+          if (second && together && merged && compareWithReceipt(merged, replay.receipt).matches) {
+            outcome = { result: merged }; ran = [together];
+            localRun = `${SAME_SECOND} It was run instead with the ${second.before.length} transactions before it in that second (${second.blocks === 1 ? 'those of the block before and' : `those of the ${second.blocks} blocks before and`} its own block's), as one block at the block's own time on the state of block ${(second.at.header.number - 1n).toLocaleString('en-US')}, and came out as its receipt says (there the block's number reads ${second.at.header.number.toLocaleString('en-US')}).`;
+          } else if (!nodes.matches) {
             const exact: SimulationRequest = replay.ownTimestamp !== undefined ? { ...request, at: { ...request.at!, header: { ...request.at!.header, ownTimestamp: replay.ownTimestamp } } } : request;
             const own = (await deps.simulator.trace([exact], { budgetMs: REPLAY_TRACE_MS }).catch(() => null))?.[0];
             if (own && compareWithReceipt(own, replay.receipt).matches) { outcome = { result: { ...own, source: LOCAL_RUN } }; ran = [exact]; localRun = replay.ownTimestamp !== undefined ? OWN_TIME : `The chain's node ran this transaction differently from its receipt (${nodes.differences!.join('; ')}). The run shown is the local EVM's, which is what the receipt says.`; }
@@ -365,6 +373,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 }
 
 /** A simulated block given a later second than the real one had (src/block.ts, afterParent). */
+const SAME_SECOND = "The block shares its second with the one before it, which this chain's node won't simulate: run a second later there, the transaction didn't come out as its receipt says.";
 const OWN_TIME = "The block shares its second with the one before it, which this chain's node won't simulate: run a second later there, the transaction didn't come out as its receipt says. The run shown is the local EVM's, at the block's own time.";
 /** EIP-7825: the most ordinary gas one transaction has; from Amsterdam on, what its gas limit holds beyond pays for new state only. */
 const ORDINARY_GAS_CAP = 16_777_216n;

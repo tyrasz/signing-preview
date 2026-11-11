@@ -338,6 +338,13 @@ export interface ReplayContext {
   shifted?: boolean;
   ownTimestamp?: bigint;
   /**
+   * For a block in its parent's second (`shifted`), a run at the right time, read when asked for: the earlier blocks
+   * of that second and this block's earlier transactions, as one simulated block at the block's own time, on the
+   * state of the last block of the second before (src/replay.ts, sameSecond). Its NUMBER reads that block's plus
+   * one. Undefined where the second goes back further than a few blocks.
+   */
+  sameSecond?: () => Promise<{ at: import('./block.ts').BlockAt; before: SimulationRequest[]; blocks: number } | undefined>;
+  /**
    * What the block's access list records the transaction itself changed (from Amsterdam on): a trace's state
    * changes are checked against it. With who paid the fee and who was paid the tip, which the list counts in
    * their balances and a traced call doesn't.

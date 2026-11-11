@@ -414,29 +414,34 @@ class StateSource {
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
       this.sendAll(nonceJobs),
-      // A node that won't build a call with blob hashes (BNB Chain's: RpcSimulator.buildable) is asked again with
-      // the earlier blob transactions as the plain calls they also are, at their price.
-      simulate().catch(async e => {
-        const message = e instanceof Error ? e.message : String(e);
-        // A node that adds up the calls' gas limits against the block's (fitGas): asked again with each on less
-        // gas, and checked below for any that may have run short.
-        if (/block gas limit exceeded/i.test(message) && !after.fitted) {
-          const fit = await after.fit?.();
-          if (!fit) throw e;
-          after.calls = fit.calls; after.fitted = fit.requests;
-          (blocks[0] as { calls: unknown[] }).calls = fit.calls;
-          return simulate();
-        }
-        const blobs = (after.calls as Record<string, unknown>[]).some(c => c.blobVersionedHashes);
-        if (!blobs || !/not buildable/i.test(message)) throw e;
-        after.calls = (after.calls as Record<string, unknown>[]).map(c => {
+      (async () => {
+        // A node may refuse the calls more than one way (BNB Chain's: their gas limits add up past the block's, and a
+        // blob transaction among them isn't buildable): each refusal is met once, in whatever order it comes.
+        const plain = (calls: unknown[]) => (calls as Record<string, unknown>[]).map(c => {
           if (!c.blobVersionedHashes) return c;
-          const { blobVersionedHashes: _hashes, maxFeePerBlobGas: _cap, maxFeePerGas, maxPriorityFeePerGas: _tip, ...plain } = c;
-          return { ...plain, ...(maxFeePerGas !== undefined && { gasPrice: maxFeePerGas }) };
+          const { blobVersionedHashes: _hashes, maxFeePerBlobGas: _cap, maxFeePerGas, maxPriorityFeePerGas: _tip, ...rest } = c;
+          return { ...rest, ...(maxFeePerGas !== undefined && { gasPrice: maxFeePerGas }) };
         });
-        (blocks[0] as { calls: unknown[] }).calls = after.calls;
-        return simulate();
-      }),
+        let noBlobs = false;
+        for (;;) {
+          try { return await simulate(); } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            // A node that adds up the calls' gas limits against the block's (fitGas): asked again with each on
+            // less gas, and checked below for any that may have run short.
+            if (/block gas limit exceeded/i.test(message) && !after.fitted) {
+              const fit = await after.fit?.();
+              if (!fit) throw e;
+              after.calls = noBlobs ? plain(fit.calls) : fit.calls; after.fitted = fit.requests;
+            } else if (/not buildable/i.test(message) && !noBlobs && (after.calls as Record<string, unknown>[]).some(c => c.blobVersionedHashes)) {
+              // A node that won't build a call with blob hashes (BNB Chain's: RpcSimulator.buildable): the earlier
+              // blob transactions as the plain calls they also are, at their price.
+              noBlobs = true;
+              after.calls = plain(after.calls);
+            } else throw e;
+            (blocks[0] as { calls: unknown[] }).calls = after.calls;
+          }
+        }
+      })(),
     ]);
     const failed = new Error('reading the state after the block\'s earlier transactions failed');
     if (!out || out.length !== blocks.length) throw failed;

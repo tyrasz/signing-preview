@@ -7,7 +7,7 @@
 // node keeps all of them.
 import type { Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { accessListChanges, afterParent, blobBaseFeeAfter, blockAccessList, headerOf, keepsToBlock, LATEST_ONLY, type RpcHeader } from './block.ts';
+import { accessListChanges, afterParent, blobBaseFeeAfter, blockAccessList, headerOf, keepsToBlock, LATEST_ONLY, type BlockAt, type RpcHeader } from './block.ts';
 import { chainName, CHAINS, OP_STACK } from './chains.ts';
 import { formatUnits } from './format.ts';
 import { previewRequest } from './preview.ts';
@@ -48,6 +48,51 @@ function isSystem(chainId: number, t: RpcTx, b: RpcHeader): boolean {
   if (chainId === 56) return t.from.toLowerCase() === b.miner.toLowerCase() && BigInt(t.gasPrice ?? '0x0') === 0n;
   if (chainId === 137) return t.from.toLowerCase() === ZERO && (t.to ?? '').toLowerCase() === ZERO;
   return false;
+}
+
+/** A function's result, worked out the first time it is asked for. */
+function once<T>(f: () => Promise<T>): () => Promise<T> {
+  let out: Promise<T> | undefined;
+  return () => (out ??= f());
+}
+
+/**
+ * A block in its parent's second, run at its own time (ReplayContext.sameSecond). BNB Chain makes two or three
+ * blocks a second, and its node won't simulate a block in its parent's second: a replay runs there a second late,
+ * and one in ten of the transactions in such blocks then comes out otherwise than its receipt (a pool that writes once
+ * a second writes again; a deadline of that second has passed). The node will take the second's earlier blocks and
+ * this one's earlier transactions as one block at the right time, on the state of the last block of the second
+ * before: of 260 such transactions it could run so on 2026-11-11, 255 came out as their receipts, among them every
+ * one the run a second late had wrong. What the block's NUMBER reads is the merged block's (that block's plus one).
+ * Up to three earlier blocks in the second; their own transactions (a validator's system calls) are left out, as
+ * the block's are. Asked for only where the run a second late isn't what the receipt says.
+ */
+async function sameSecond(chainId: number, block: RpcBlock, index: number, header: BlockAt['header'], deps: Dependencies): Promise<{ at: BlockAt; before: SimulationRequest[]; blocks: number } | undefined> {
+  const rpc = deps.rpc!, tag = (n: bigint) => `0x${n.toString(16)}`, time = BigInt(block.timestamp);
+  const earlierBlocks: RpcBlock[] = [];
+  let n = BigInt(block.number) - 1n;
+  for (;; n--) {
+    const b = await rpc.call(chainId, 'eth_getBlockByNumber', [tag(n), true]) as RpcBlock | null;
+    if (!b?.transactions) return undefined;
+    if (BigInt(b.timestamp) !== time) break;
+    if (earlierBlocks.length === 3) return undefined;
+    earlierBlocks.unshift(b);
+  }
+  if (!earlierBlocks.length) return undefined;
+  const base = tag(n);
+  // What a replay runs of a block (the chain's own transactions left out, but an OP Stack block's L1 info deposit).
+  const runs = (t: RpcTx, b: RpcBlock) => !isSystem(chainId, t, b) || t.from.toLowerCase() === L1_INFO_DEPOSITOR;
+  const txs = [...earlierBlocks.flatMap(b => b.transactions.filter(t => runs(t, b))), ...block.transactions.filter(t => Number(BigInt(t.transactionIndex)) < index && runs(t, block))];
+  // What each used, for a node that adds up a block's gas limits (BlockAt.beforeUsed): the blocks' receipts.
+  const beforeUsed = once(async () => {
+    const receipts = await Promise.all([...earlierBlocks, block].map(b => rpc.call(chainId, 'eth_getBlockReceipts', [b.number]).catch(() => null))) as ((RpcReceipt & { transactionHash: string })[] | null)[];
+    const byHash = new Map(receipts.flatMap(r => (Array.isArray(r) ? r : [])).map(r => [r.transactionHash.toLowerCase(), r]));
+    const used = txs.map(t => { const r = byHash.get(t.hash.toLowerCase()); return r && BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0); });
+    return used.every(u => u !== undefined) ? used as bigint[] : undefined;
+  });
+  const at: BlockAt = { block: base, header: { ...header, number: n + 1n }, required: true, beforeUsed };
+  const before = await Promise.all(txs.map(async t => ({ ...await requestOf(chainId, t, base, deps), at })));
+  return { at, before, blocks: earlierBlocks.length };
 }
 
 /**
@@ -125,7 +170,7 @@ export async function replayTransaction(input: { chainId: number; hash: string }
       hash: tx.hash, block: number.toString(), index, time: new Date(time * 1000).toISOString(),
       receipt: { status: receipt.status === '0x1' ? 'success' : 'reverted', gasUsed: gasUsed.toString(), fee: `${formatUnits(gasUsed * gasPrice + extra, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? 'native'}` },
     },
-    when: { block: tx.blockNumber, time }, ...(shifted && { shifted, ownTimestamp: BigInt(block.timestamp) }),
+    when: { block: tx.blockNumber, time }, ...(shifted && { shifted, ownTimestamp: BigInt(block.timestamp), ...(!state && { sameSecond: once(() => sameSecond(chainId, block, index, { ...header, timestamp: BigInt(block.timestamp), ...(blobBaseFee !== undefined && { blobBaseFee }) }, deps)) }) }),
     ...(own && { recorded: { changes: own, sender: tx.from.toLowerCase(), nonce: BigInt(tx.nonce), coinbase: header.coinbase.toLowerCase(), fee: gasUsed * gasPrice + extra, tip: gasUsed * (gasPrice > header.baseFeePerGas ? gasPrice - header.baseFeePerGas : 0n) } }),
   };
   const request = {
