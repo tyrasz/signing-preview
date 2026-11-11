@@ -719,11 +719,10 @@ function intrinsicGas(req: SimulationRequest, amsterdam: boolean): { intrinsic: 
 }
 
 /**
- * Amsterdam's charge for an EIP-7702 authorization of an account that exists: 7,816 for the tuple and its checks,
- * and 23 bytes of new state (the delegation) at 1,530 a byte. Not checked against the chain: Sepolia's recent blocks
- * had no such transaction when this was measured.
+ * Amsterdam's charge for each EIP-7702 authorization a transaction carries, applied or not: 7,816 for the tuple and
+ * its checks. One that is applied also pays for the state it adds (see ForkSimulator.authorize).
  */
-const AMSTERDAM_AUTHORIZATION = 7_816n + 23n * 1_530n;
+const AMSTERDAM_AUTHORIZATION = 7_816n;
 
 const requestKey = (reqs: SimulationRequest[]) => reqs.map(r => `${r.chainId}:${r.from}:${r.to}:${r.value}:${r.data}`).join('|').toLowerCase();
 
@@ -961,7 +960,9 @@ export class ForkSimulator implements Simulator {
       const fn = o.movePrecompileToAddress ? active.get(hexOf(a).slice(2)) : undefined;
       return fn ? [{ address: hexOf(a) as Hex }, { address: hexOf(o.movePrecompileToAddress!) as Hex, function: fn }] : [];
     });
-    const precompiles = [...forwarded, ...moved];
+    // A chain without the point-evaluation precompile has an ordinary empty account at 0x0a.
+    const absent = profile.noPointEvaluation && active.has(POINT_EVALUATION.slice(2)) ? [{ address: POINT_EVALUATION as Hex }] : [];
+    const precompiles = [...forwarded, ...moved, ...absent];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
     // Only the calls themselves are traced, not the balance and approval reads around them.
     let trace: StorageStep[] | undefined, callIndex = 0, recording = false;
@@ -1103,8 +1104,10 @@ export class ForkSimulator implements Simulator {
       const senderAccount = (await state.getAccount(sender)) ?? new Account();
       senderAccount.nonce++;
       await state.putAccount(sender, senderAccount);
-      const authRefund = await this.authorize(state, evm, auths[i], chainId);
-      const gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic : GAS;
+      const authorized = await this.authorize(state, evm, auths[i], chainId);
+      // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
+      const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
+      const gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState : GAS;
       callIndex = i;
       recording = true;
       if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
@@ -1113,7 +1116,7 @@ export class ForkSimulator implements Simulator {
       recording = false;
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
-      const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + (profile.hardfork === 'amsterdam' ? 0n : authRefund), !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
+      const gasUsed = transactionGas(req, ex.executionGasUsed + authState, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
         results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data, ...(traced?.trace && { trace: traced.trace }) });
@@ -1175,11 +1178,14 @@ export class ForkSimulator implements Simulator {
   /**
    * Applies EIP-7702 authorizations as the chain does at the start of a transaction: each one for this chain (or
    * every chain) whose authority has no code or a delegation, and whose nonce matches the authority's (checked for
-   * signed ones only), sets the authority's code and bumps its nonce. Returns the refund they earn: 12,500 for each
-   * whose authority already existed.
+   * signed ones only), sets the authority's code and bumps its nonce. Returns the refund they earn before Amsterdam
+   * (12,500 for each whose authority already existed), and what Amsterdam charges for the state they add: for an
+   * authority with no account yet, the account's write (9,000) and its 120 bytes; for one not yet delegated, the
+   * delegation's 23 bytes; each byte 1,530. (Two mined on Sepolia, by new accounts, cost 494,493 gas each: the node's
+   * figure and, with these, the local EVM's.)
    */
-  private async authorize(state: LazyState, evm: EVM, list: Authorization[], chainId: number): Promise<bigint> {
-    let refund = 0n;
+  private async authorize(state: LazyState, evm: EVM, list: Authorization[], chainId: number): Promise<{ refund: bigint; state: bigint }> {
+    let refund = 0n, added = 0n;
     for (const a of list) {
       if (!a.authority || (a.chainId !== 0n && a.chainId !== BigInt(chainId))) continue;
       const who = createAddressFromString(a.authority);
@@ -1189,12 +1195,13 @@ export class ForkSimulator implements Simulator {
       const account = await state.getAccount(who);
       if (a.nonce !== undefined && (account?.nonce ?? 0n) !== a.nonce) continue;
       if (account) refund += 12_500n;
+      added += (account ? 0n : 9_000n + 120n * 1_530n) + (isDelegation(code) || a.address === ZERO ? 0n : 23n * 1_530n);
       const next = account ?? new Account();
       next.nonce++;
       await state.putAccount(who, next);
       await state.putCode(who, a.address === ZERO ? new Uint8Array(0) : hexToBytes(`0xef0100${a.address.slice(2)}`));
     }
-    return refund;
+    return { refund, state: added };
   }
 }
 
