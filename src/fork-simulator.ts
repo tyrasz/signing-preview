@@ -644,8 +644,10 @@ class LazyState extends SimpleStateManager {
     // Arbitrum's Stylus contracts are WASM behind a 0xEFF000 prefix, which no EVM runs: better no answer than a wrong one.
     if (NEXT_BLOCK[this.source.chainId]?.arbitrum && a.code.length > 3 && a.code[0] === 0xef && a.code[1] === 0xf0 && a.code[2] === 0x00) throw new ForkUnsupported(`${key} is a Stylus (WASM) contract, which the local EVM can't run`);
     // Any other code that starts with 0xEF and isn't an EIP-7702 delegation is a marker, not EVM code (none can be
-    // deployed since London): a contract the chain's node runs itself, as Base does at 0xb200…10c5.
-    if (isNative(a.code)) throw new ForkUnsupported(`${key} is a contract this chain's node runs itself (its code is a marker, not EVM code), which the local EVM can't run`);
+    // deployed since London): a contract the chain's node runs itself, as Base does its B20 tokens.
+    if (isNative(a.code)) throw new ForkUnsupported(B20.test(key)
+      ? `${key} is a B20 token (Base's native token standard: its node runs the token itself, behind the marker code 0xef), which the local EVM can't run`
+      : `${key} is a contract this chain's node runs itself (its code is a marker, not EVM code), which the local EVM can't run`);
     const exists = a.balance > 0n || a.nonce > 0n || a.code.length > 0;
     const make = () => exists ? new Account(a.nonce, a.balance, undefined, hexToBytes(keccak256(a.code))) : undefined;
     for (const layer of this.accountStack) if (!layer.has(key)) layer.set(key, make());
@@ -840,6 +842,12 @@ const BLOCKHASH_PROBE = '0x00000000000000000000000000000000b10c4a54';
 const ETHEREUM_RULES = new Set([1, 11155111]);
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
 /** Code that is a marker for something the chain's node runs itself: it starts with 0xEF and is no delegation. */
+/**
+ * A B20 token's address (Base, from its fork of 2026-11-05): the ten-byte prefix 0xb2 00…00, a variant byte, and nine
+ * bytes of a hash. Its node runs the token in Rust; what it stores where isn't published here, and its access list
+ * shows none of it, so the local EVM can't run one (6% of Base transactions replayed on 2026-11-11 reached one).
+ */
+const B20 = /^0xb2000000000000000000/i;
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
 
 /** An EIP-7702 authorization: signed (its authority recovered, null if the signature can't be read), or for the sender, to be signed by the wallet (no nonce to check). */
