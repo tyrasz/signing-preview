@@ -363,12 +363,6 @@ export interface SimulationRequest {
   watch?: string[];
   /** The transaction's gas limit, gas price and EIP-2930 access list, when the request sets them (contracts can read gasleft() and tx.gasprice). */
   gas?: bigint;
-  /**
-   * For one of a replay's earlier transactions (BlockAt.before): the gas it used on the chain. A node that adds up
-   * the gas limits of a simulated block's calls and refuses when they pass the block's is asked again with these
-   * calls given less gas each, sized by what they used (fitGas).
-   */
-  mined?: { gasUsed: bigint };
   gasPrice?: bigint;
   /**
    * The simulated block's base fee, for calls that read it (BASEFEE): eth_simulateV1 without validation otherwise

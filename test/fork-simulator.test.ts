@@ -503,7 +503,7 @@ test('A node that adds up a block’s gas limits gets the earlier transactions o
   // BNB Chain's public node runs it) refuses calls whose limits add up past the block's.
   const CAROL = '0xca401000000000000000000000000000000000c3';
   const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
-  const earlier = (used?: bigint): SimulationRequest[] => [50_000_000n, 1n].map(amount => ({ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, amount]), value: 0n, gas: 20_000_000n, ...(used !== undefined && { mined: { gasUsed: used } }) }));
+  const earlier: SimulationRequest[] = [50_000_000n, 1n].map(amount => ({ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, amount]), value: 0n, gas: 20_000_000n }));
   const target: SimulationRequest = { chainId: 999, from: BOB, to: usdc, data: call('transfer', [CAROL, 30_000_000n]), value: 0n };
   await chain.setBalance(BOB, E);
   const asked: bigint[][] = [];
@@ -518,18 +518,18 @@ test('A node that adds up a block’s gas limits gets the earlier transactions o
   chain.simulateV1 = true;
   try {
     // Each used about 60,000: it gets 140,000 and half the room left, 15 million in all.
-    const [r] = (await fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header, before: earlier(60_000n) } }]))!;
+    const [r] = (await fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header, before: earlier, beforeUsed: async () => [60_000n, 60_000n] } }]))!;
     assert.equal(r.status, 'success');
     assert.deepEqual([asked[0], [...new Set(asked.slice(1).map(l => l.join()))]], [[20_000_000n, 20_000_000n], ['15000000,15000000']]);
     // A call that uses all of the little it was sized for isn't taken on trust. This one grows its memory for
     // 92,000 gas; sized as if it had used 100, in a block of 200,000, it gets 55,075 and runs out.
     const HEAVY = '0x00000000000000000000000000000000000c0dea';
     await chain.putCode(HEAVY, '0x6001620300005200');
-    const heavy: SimulationRequest = { chainId: 999, from: USER, to: HEAVY, data: '0x', value: 0n, gas: 20_000_000n, mined: { gasUsed: 100n } };
-    await assert.rejects(fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header: { ...header, gasLimit: 200_000n }, before: [heavy, earlier(60_000n)[0]] } }]), /may have run short/);
+    const heavy: SimulationRequest = { chainId: 999, from: USER, to: HEAVY, data: '0x', value: 0n, gas: 20_000_000n };
+    await assert.rejects(fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header: { ...header, gasLimit: 200_000n }, before: [heavy, earlier[0]], beforeUsed: async () => [100n, 60_000n] } }]), /may have run short/);
     assert.deepEqual(asked.at(-1), [55_075n, 144_925n]);
     // Without what they used, the node's refusal stands.
-    await assert.rejects(fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header, before: earlier() } }]), /Block gas limit exceeded/);
+    await assert.rejects(fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header, before: earlier } }]), /Block gas limit exceeded/);
   } finally { chain.simulateV1 = false; }
 });
 

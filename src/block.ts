@@ -47,6 +47,12 @@ export interface BlockAt {
    */
   before?: import('./types.ts').SimulationRequest[];
   /**
+   * The gas each of `before` used on the chain, in order, read when asked for (the block's receipts). A node that
+   * adds up the gas limits of a simulated block's calls and refuses when they pass the block's is asked again with
+   * those calls given less gas each, sized by what they used (fitGas). Undefined where it can't be read.
+   */
+  beforeUsed?: () => Promise<bigint[] | undefined>;
+  /**
    * What the simulated block has already changed when the calls run, as differences from `block`'s state: a replayed
    * transaction's block as its earlier transactions left it, read from the block's access list (stateBefore) in
    * place of running them (`before`). Simulators start from it; a request's own state overrides go on top.

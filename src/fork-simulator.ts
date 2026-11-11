@@ -372,7 +372,7 @@ class StateSource {
    * Reads are of the state after these calls (the transactions before a replayed one in its block), which the node
    * runs first, in a simulated block of their own (see fetchAfter). `sent`: how many of them each address sent.
    */
-  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges; /** The calls on less gas each, for a node that adds their limits up against the block's (fitGas); undefined when they can't be. */ fit?: () => { requests: SimulationRequest[]; calls: unknown[] } | undefined; /** Set once the calls are the fitted ones: none may have run short on its gas (hadRoom, against `earlier`). */ fitted?: SimulationRequest[]; earlier?: SimulationRequest[] };
+  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges; /** The calls on less gas each, for a node that adds their limits up against the block's (fitGas); undefined when they can't be. */ fit?: () => Promise<{ requests: SimulationRequest[]; calls: unknown[] } | undefined>; /** Set once the calls are the fitted ones: none may have run short on its gas (hadRoom, against `earlier`). */ fitted?: SimulationRequest[]; earlier?: SimulationRequest[] };
 
   async fetch(m: Misses): Promise<void> {
     if (!this.after) return this.fetchAt(m);
@@ -416,12 +416,12 @@ class StateSource {
       this.sendAll(nonceJobs),
       // A node that won't build a call with blob hashes (BNB Chain's: RpcSimulator.buildable) is asked again with
       // the earlier blob transactions as the plain calls they also are, at their price.
-      simulate().catch(e => {
+      simulate().catch(async e => {
         const message = e instanceof Error ? e.message : String(e);
         // A node that adds up the calls' gas limits against the block's (fitGas): asked again with each on less
         // gas, and checked below for any that may have run short.
         if (/block gas limit exceeded/i.test(message) && !after.fitted) {
-          const fit = after.fit?.();
+          const fit = await after.fit?.();
           if (!fit) throw e;
           after.calls = fit.calls; after.fitted = fit.requests;
           (blocks[0] as { calls: unknown[] }).calls = fit.calls;
@@ -1008,7 +1008,7 @@ export class ForkSimulator implements Simulator {
       const toCall = (r: SimulationRequest) => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
         ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) });
       const earlier = options.after;
-      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: earlier.map(toCall), earlier, fit: () => { const requests = fitGas(earlier, at.header.gasLimit); return requests && { requests, calls: requests.map(toCall) }; } };
+      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: earlier.map(toCall), earlier, fit: async () => { const requests = fitGas(earlier, await at.beforeUsed?.(), at.header.gasLimit); return requests && { requests, calls: requests.map(toCall) }; } };
     }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.

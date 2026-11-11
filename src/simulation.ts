@@ -121,12 +121,12 @@ async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChang
  * Each call gets what its transaction used and a margin: half as much again (a refund takes off at most a fifth of
  * what ran, and each call a transaction makes keeps a sixty-fourth back) and 50,000, then an equal share of what
  * room is left, never more than its own limit. What less gas can change is a call running short, so the caller
- * checks that none did (hadRoom) and takes nothing from a run where one might have. Undefined when what a
- * transaction used isn't known, or they can't fit.
+ * checks that none did (hadRoom) and takes nothing from a run where one might have. `used` is what each used on
+ * the chain (BlockAt.beforeUsed). Undefined when that isn't known, or they can't fit.
  */
-export function fitGas(earlier: SimulationRequest[], room: bigint): SimulationRequest[] | undefined {
-  if (!earlier.length || earlier.some(r => !r.mined || r.gas === undefined)) return undefined;
-  const needs = earlier.map(r => { const need = r.mined!.gasUsed * 3n / 2n + 50_000n; return need < r.gas! ? need : r.gas!; });
+export function fitGas(earlier: SimulationRequest[], used: bigint[] | undefined, room: bigint): SimulationRequest[] | undefined {
+  if (!earlier.length || used?.length !== earlier.length || earlier.some(r => r.gas === undefined)) return undefined;
+  const needs = earlier.map((r, i) => { const need = used[i] * 3n / 2n + 50_000n; return need < r.gas! ? need : r.gas!; });
   const spare = room - needs.reduce((a, b) => a + b, 0n);
   if (spare < 0n) return undefined;
   const share = spare / BigInt(earlier.length);
@@ -339,7 +339,7 @@ export class RpcSimulator implements Simulator {
     // earlier transactions are asked again on less gas each, and none may have run short on it (hadRoom).
     if (/block gas limit exceeded/i.test(body.error?.message ?? '') && before.length) {
       const earlier = this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [], limit = reqs[0]?.at?.header.gasLimit;
-      const fit = !fitted && limit !== undefined ? fitGas(earlier, limit - reqs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n)) : undefined;
+      const fit = !fitted && limit !== undefined ? fitGas(earlier, await reqs[0].at?.beforeUsed?.(), limit - reqs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n)) : undefined;
       if (fit) return this.simulateAt(reqs, fit);
       throw new Error(`the chain's node won't run the ${before.length} transactions before this one in its block: it adds up their gas limits, which pass the block's, where the chain counts the gas they used (${body.error!.message}); a node that counts as the chain does can`);
     }
