@@ -2,7 +2,7 @@ import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } f
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
 import type { ApprovalChange, Dependencies, Preview, PreviewContext, PreviewTrace, ReplayInfo, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { blockText, namedBlock, pinLatest, type BlockAt, type Pinned } from '../block.ts';
-import { compareWithReceipt, noTrace, tracePreviews, type TraceEnv } from './trace.ts';
+import { compareWithReceipt, noTrace, sameRun, tracePreviews, type TraceEnv } from './trace.ts';
 import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
 import { delegatedAbis, delegationEffects, ownDelegateAfter, SUPPORTS_7702 } from './eip7702.ts';
@@ -182,8 +182,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   let outcome = preset;
   // What was simulated for the result shown (the wallet's pending transactions, then this one), for tracing it.
   let ran: SimulationRequest[] | undefined;
-  // A replay shown as the local EVM ran it, at the block's own time (see below).
-  let ownTime = false;
+  // A replay shown as the local EVM ran it, where the node's run wasn't what the receipt says: why (see below).
+  let localRun: string | undefined;
   let trace: PreviewTrace | undefined;
   // A mined transaction replayed where it ran (src/replay.ts), or a past block named for the simulation
   // (PreviewContext.block); else the latest block, named only when a trace has to run on the same one.
@@ -215,7 +215,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       // State the caller set for the simulation (PreviewContext.stateOverrides), under the request's own.
       if (context.stateOverrides && !replay) request.stateOverrides = withOverrides(context.stateOverrides, request.stateOverrides);
       named = replay ? undefined : await namedBlock(context, deps.rpc, tx.chainId);
-      at = replay?.at ?? named?.at ?? (context.trace ? await pinLatest(deps.rpc, tx.chainId) : undefined);
+      // A gas limit over the cap on ordinary gas, on Ethereum or its testnet: the block is named too, to know whether
+      // its rules are Amsterdam's (see below).
+      const overCap = !replay && tx.gas !== undefined && tx.gas > ORDINARY_GAS_CAP && (tx.chainId === 1 || tx.chainId === 11155111);
+      at = replay?.at ?? named?.at ?? (context.trace || overCap ? await pinLatest(deps.rpc, tx.chainId) : undefined);
       if (at) request.at = at;
       // A replay runs at the price the transaction paid, after the transactions before it in its block (named with
       // the block: they run first, and only this one is reported).
@@ -234,13 +237,31 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       } else {
         if (pending.length) b.note("Your pending transactions couldn't be simulated before this one on this chain, so the simulation runs on the latest state without them.");
         outcome = { result: await deps.simulator.simulate(request) };
-        // A replayed block in its parent's second ran a second later on the chain's node, which takes no other.
-        // Where that run isn't what the receipt says (the transaction read the time), the local EVM runs it at the
-        // block's own time, and if that is what happened, it is the run shown, and the one a trace is of.
-        if (replay?.ownTimestamp !== undefined && outcome.result && !compareWithReceipt(outcome.result, replay.receipt).matches && deps.simulator.trace) {
-          const exact: SimulationRequest = { ...request, at: { ...request.at!, header: { ...request.at!.header, ownTimestamp: replay.ownTimestamp } } };
-          const own = (await deps.simulator.trace([exact], { budgetMs: REPLAY_TRACE_MS }).catch(() => null))?.[0];
-          if (own && compareWithReceipt(own, replay.receipt).matches) { outcome = { result: own }; ran = [exact]; ownTime = true; }
+        // A replay has its receipt to go by. Where the node's run isn't what the receipt says, the local EVM runs
+        // the transaction too, and if its run is what happened, it is the one shown, and the one a trace is of.
+        // Two ways a node's run is known to go wrong: a block in its parent's second (BNB Chain's often are) runs
+        // a second later on the node, which takes no other time, so a transaction that reads the time comes out
+        // differently (the local EVM runs it at the block's own); and from Amsterdam on, a gas limit over 16,777,216
+        // holds the rest back for new state, which Sepolia's node doesn't do when it simulates (a transaction that
+        // failed on a 70,000,000 limit used 16,777,216 on the chain and 50,000,000 in the node's simulation).
+        if (replay && outcome.result && deps.simulator.trace) {
+          const nodes = compareWithReceipt(outcome.result, replay.receipt);
+          if (!nodes.matches) {
+            const exact: SimulationRequest = replay.ownTimestamp !== undefined ? { ...request, at: { ...request.at!, header: { ...request.at!.header, ownTimestamp: replay.ownTimestamp } } } : request;
+            const own = (await deps.simulator.trace([exact], { budgetMs: REPLAY_TRACE_MS }).catch(() => null))?.[0];
+            if (own && compareWithReceipt(own, replay.receipt).matches) { outcome = { result: { ...own, source: LOCAL_RUN } }; ran = [exact]; localRun = replay.ownTimestamp !== undefined ? OWN_TIME : `The chain's node ran this transaction differently from its receipt (${nodes.differences!.join('; ')}). The run shown is the local EVM's, which is what the receipt says.`; }
+          }
+        }
+      }
+      // From Amsterdam on, what a gas limit holds over 16,777,216 is kept back for new state: the code has the cap
+      // to run on, and a transaction that burns all its gas burns that much. Sepolia's node doesn't simulate that
+      // (it gives the whole limit as ordinary gas), so for such a request the local EVM runs it too, and where the
+      // two come out differently, the local EVM's run is the one shown.
+      if (overCap && at?.header.amsterdam && outcome.result && deps.simulator.trace) {
+        const own = (await deps.simulator.trace([...pending, request]).catch(() => null))?.at(-1);
+        if (own && (!sameRun(own, outcome.result) || own.gasUsed !== outcome.result.gasUsed)) {
+          outcome = { result: { ...own, source: LOCAL_RUN } };
+          b.note(`The gas limit (${tx.gas!.toLocaleString('en-US')}) is over what a transaction has to run on here (${ORDINARY_GAS_CAP.toLocaleString('en-US')}): the rest only pays for new state. The chain's node doesn't simulate that and its run came out differently, so the run shown is the local EVM's.`);
         }
       }
       // Contracts read the price the transaction pays (tx.gasprice, and the base fee): a pool taxing swaps by the
@@ -306,7 +327,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       const compared = compareWithReceipt(sim, replay.receipt);
       replayed = { ...replay.info, ...compared };
       const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.earlier ? `after the ${replay.earlier} transaction${replay.earlier === 1 ? '' : 's'} before it in the block${replay.at.state ? " (the state they left read from the block's access list)" : ''}` : 'first in the block'}, at the price it paid.`;
-      if (replay.shifted) b.note(ownTime ? OWN_TIME : SHIFTED);
+      if (localRun) b.note(localRun); else if (replay.shifted) b.note(SHIFTED);
       if (compared.matches) b.note(`${where} The run has the same outcome, events and gas as its receipt.`);
       else {
         b.note(where);
@@ -345,6 +366,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 
 /** A simulated block given a later second than the real one had (src/block.ts, afterParent). */
 const OWN_TIME = "The block shares its second with the one before it, which this chain's node won't simulate: run a second later there, the transaction didn't come out as its receipt says. The run shown is the local EVM's, at the block's own time.";
+/** EIP-7825: the most ordinary gas one transaction has; from Amsterdam on, what its gas limit holds beyond pays for new state only. */
+const ORDINARY_GAS_CAP = 16_777_216n;
+/** What ran a simulation shown in place of the node's (the local EVM's own source says the RPC has no eth_simulateV1, which isn't why here). */
+const LOCAL_RUN = "the local EVM, over the chain's state";
 const SHIFTED = "The block shares its second with the one before it, which this chain's node won't simulate: it was run one second later than it was, so anything that reads the block's time saw a second more.";
 
 /** How long a replay's tracing run may take: it runs the block's earlier transactions too. */

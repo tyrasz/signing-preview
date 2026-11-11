@@ -274,9 +274,29 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   const localRuns: SimulationRequest[] = [];
   const timed = { simulate: async () => ran({ gasUsed: 60_000n }), trace: async (reqs: SimulationRequest[]) => { localRuns.push(...reqs); return [ran({ source: 'the local EVM' })]; } };
   const own = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: timed });
-  assert.deepEqual([own.replay!.matches, own.simulation!.source, own.simulation!.gasUsed, localRuns.length, localRuns[0].at!.header.ownTimestamp], [true, 'the local EVM', '51234', 1, 1_762_000_100n]);
+  assert.deepEqual([own.replay!.matches, own.simulation!.source, own.simulation!.gasUsed, localRuns.length, localRuns[0].at!.header.ownTimestamp], [true, "the local EVM, over the chain's state", '51234', 1, 1_762_000_100n]);
   assert.match(own.decoding.notes.join(' '), /run a second later there, the transaction didn't come out as its receipt says\. The run shown is the local EVM's, at the block's own time\./);
   assert.equal(codes(own).includes('replay_differs'), false);
+  // The same wherever the node's run isn't what the receipt says and the local EVM's is: a transaction that failed on
+  // a gas limit over Amsterdam's cap used 16,777,216 on the chain and all the gas it was given in the node's
+  // simulation. No shifted block here: the local EVM runs the same request.
+  const { deps: plain } = deps(ran());
+  const burnt: SimulationRequest[] = [];
+  const local = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { ...plain, simulator: { simulate: async () => ran({ gasUsed: 50_000_000n }), trace: async (reqs: SimulationRequest[]) => { burnt.push(...reqs); return [ran({ source: 'the local EVM' })]; } } });
+  assert.deepEqual([local.replay!.matches, local.simulation!.source, local.simulation!.gasUsed, burnt[0].at!.header.ownTimestamp, codes(local).includes('replay_differs')], [true, "the local EVM, over the chain's state", '51234', undefined, false]);
+  assert.match(local.decoding.notes.join(' '), /The chain's node ran this transaction differently from its receipt \(the run used 50,000,000 gas where the receipt says 51,234\)\. The run shown is the local EVM's, which is what the receipt says\./);
+  // A request not yet mined has no receipt to go by, but one case is known: on a chain whose blocks are Amsterdam's,
+  // a gas limit over 16,777,216 leaves the code that much to run on, which the node's simulation doesn't hold to.
+  // The local EVM runs such a request too, and where the two differ, its run is shown.
+  const amsterdam = { has: () => true, call: async (_c: number, method: string) => (method === 'eth_getBlockByNumber' ? { number: '0x64', timestamp: hex(1_762_000_100), miner: BOB, mixHash: H(1), gasLimit: '0x8f0d180', baseFeePerGas: '0x5e69ec0', blockAccessListHash: H(9), slotNumber: '0x1' } : method === 'eth_feeHistory' ? { baseFeePerBlobGas: ['0x1', '0x1'] } : method === 'eth_getCode' ? '0x' : '0x0') } as unknown as NonNullable<Dependencies['rpc']>;
+  const failing = { status: 'reverted' as const, logs: undefined, transfers: [] };
+  const over = (gas: bigint, chainId = '0xaa36a7') => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, gas: hex(gas), chainId }] }, { now: NOW },
+    { tokens: new StaticTokenRegistry(), rpc: amsterdam, simulator: { simulate: async () => ran({ ...failing, gasUsed: 50_000_000n }), trace: async () => [ran({ ...failing, gasUsed: 16_777_216n, source: 'local' })] } });
+  const capped = await over(70_000_000n);
+  assert.deepEqual([capped.simulation!.status, capped.simulation!.gasUsed, capped.simulation!.source], ['reverted', '16777216', "the local EVM, over the chain's state"]);
+  assert.match(capped.decoding.notes.join(' '), /The gas limit \(70,000,000\) is over what a transaction has to run on here \(16,777,216\): the rest only pays for new state\. The chain's node doesn't simulate that and its run came out differently, so the run shown is the local EVM's\./);
+  // Under the cap, or on a chain that isn't Ethereum's, the node's run stands.
+  assert.deepEqual([(await over(500_000n)).simulation!.gasUsed, (await over(70_000_000n, '0x2105')).simulation!.gasUsed], ['50000000', '50000000']);
   // If the local EVM's run isn't what happened either, the node's stays, with what differs.
   const neither = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { ...timed, trace: async () => [ran({ gasUsed: 70_000n })] } });
   assert.deepEqual([neither.replay!.matches, neither.simulation!.gasUsed, codes(neither).includes('replay_differs')], [false, '60000', true]);

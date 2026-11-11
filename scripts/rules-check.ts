@@ -34,6 +34,7 @@ import type { SimulationRequest } from '../src/types.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const STRICT = process.argv.includes('--strict'), SUMMARY_MD = arg('summary-md', ''), OUT = arg('out', '');
+const FUZZ = Number(arg('fuzz', '0')), SEED = Number(arg('seed', String(Date.now() % 1_000_000))), ONLY_FUZZ = process.argv.includes('--only-fuzz');
 const CHAINS_ASKED = arg('chain', 'all') === 'all' ? Object.keys(EVM_RPCS).map(Number) : arg('chain', '1').split(',').map(Number);
 
 const FROM = '0x000000000000000000000000000000000000dead';
@@ -45,7 +46,7 @@ const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, '0');
 /** The address the i-th program of a batch is placed at. */
 const place = (i: number) => `0x${(0xc0de0000 + i).toString(16).padStart(40, '0')}`;
 
-interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
+interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** Slots the program's own account holds beforehand. */ storage?: Record<string, string>; /** One of fuzzPrograms'. */ random?: boolean; /** Said with a difference: what it takes to run the program again. */ detail?: string; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
 interface Outcome { kind: 'runs' | 'invalid' | 'fails' | 'refused'; returns: string; gas?: bigint; logs: string; why?: string }
 
 /** Seventeen pushes (1 on top), the opcode, then: store the top of the stack at 0, the memory size at 32, return both. */
@@ -56,7 +57,7 @@ const OPS: Record<string, string> = {
   STOP: '00', SUB: '03', EXP: '0a', SHL: '1b', KECCAK256: '20', BALANCE: '31', CALLER: '33', CALLDATASIZE: '36', CALLDATACOPY: '37', RETURNDATASIZE: '3d', RETURNDATACOPY: '3e',
   EXTCODESIZE: '3b', EXTCODEHASH: '3f', BLOCKHASH: '40', NUMBER: '43', POP: '50', MLOAD: '51', SWAP1: '90',
   MSTORE: '52', SLOAD: '54', SSTORE: '55', GAS: '5a', TLOAD: '5c', TSTORE: '5d', MCOPY: '5e', LOG2: 'a2', CREATE: 'f0', CALL: 'f1', RETURN: 'f3', DELEGATECALL: 'f4', CREATE2: 'f5',
-  STATICCALL: 'fa', REVERT: 'fd', SELFDESTRUCT: 'ff',
+  STATICCALL: 'fa', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47',
 };
 const asm = (source: string): Hex => `0x${source.trim().split(/\s+/).map(t => {
   if (OPS[t]) return OPS[t];
@@ -102,6 +103,10 @@ function crafted(amsterdam: boolean): Program[] {
     { label: 'a slot set in one call, then cleared and another set in the next', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER2} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER2} GAS CALL ${RET}`), gas: 150_000n, state: keeper },
     // A call that clears the slot and then reverts gives nothing back: the slot is as it was.
     { label: 'a slot set in one call, cleared in a call that then reverts, then memory grown by the caller', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER3} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER3} GAS CALL POP 01 030000 MSTORE 00 ${RET}`), gas: 170_000n, state: keeper },
+    // With a gas limit over the cap on ordinary gas (16,777,216): how much the code has to run on, and what a
+    // call that fails outright (a write inside a static call) takes with it.
+    { label: 'GAS, on a limit of 20,000,000', code: asm(`GAS ${RET}`), gas: 20_000_000n },
+    { label: 'a static call that writes, given all the gas, on a limit of 20,000,000', code: asm(`00 00 00 00 ${KEEPER} GAS STATICCALL ${RET}`), gas: 20_000_000n, state: keeper },
     { label: 'TSTORE then TLOAD', code: asm(`2a 07 TSTORE 07 TLOAD ${RET}`) },
     { label: 'MCOPY of a word', code: asm(`2a 00 MSTORE 20 00 40 MCOPY 40 MLOAD ${RET}`) },
     { label: 'KECCAK256 of 64 bytes', code: asm(`2a 00 MSTORE 40 00 KECCAK256 ${RET}`) },
@@ -172,6 +177,73 @@ async function authorizationPrograms(chainId: number): Promise<Program[]> {
     { label: 'two EIP-7702 authorizations by one account', to: TO, authorizationList: [await authorization(twice, 0), await authorization(twice, 1, SECOND)] },
     { label: 'an EIP-7702 authorization with the wrong nonce', to: TO, authorizationList: [await authorization(wrong, 3)] },
   ];
+}
+
+/**
+ * Random programs, the same for a seed: what storage, calls and gas do together, in shapes nobody thought to write.
+ * Each is a contract and three helpers, every one a short run of steps: a slot set (to 0, 1 or 2) or read,
+ * transient storage, memory grown, an event, a call, delegate call or static call to a helper further down (with
+ * all the gas or a set amount), a wei sent to an account that doesn't exist or to a precompile, a creation (plain,
+ * with a constructor that writes, or colliding), a call into a delegated account, a read past the end of what was
+ * returned, a hash. Helpers end by stopping, reverting, failing, destroying themselves or returning; the contract
+ * returns its three slots. Some accounts hold a slot
+ * beforehand, and the gas limit is one of several, tight ones among them. (None over the cap on ordinary gas: a
+ * node's simulation is no guide to the chain there, see OVER_THE_CAP.)
+ * The rules that differ between forks live here: what a slot costs set, changed, cleared and cleared again, across
+ * calls that succeed or fail (Amsterdam's state gas above all, where the first rule written from four programs
+ * needed a second look).
+ */
+function fuzzPrograms(count: number, seed: number): Program[] {
+  // mulberry32: small, and the same everywhere.
+  let state = seed >>> 0;
+  const rand = () => { state = (state + 0x6d2b79f5) >>> 0; let t = state; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const pick = <T>(xs: T[]): T => xs[Math.floor(rand() * xs.length)];
+  const out: Program[] = [];
+  for (let k = 0; k < count; k++) {
+    const address = (i: number) => (0xf0220000 + k * 8 + i).toString(16).padStart(40, '0');
+    const helpers = [1, 2, 3].map(address), delegated = address(4);
+    const fresh = () => (0xf0990000 + Math.floor(rand() * 0xffff)).toString(16).padStart(40, '0');
+    // Steps of a contract at `level` (0: the program itself), which may call helpers from that level down.
+    const steps = (level: number): string => {
+      const parts: string[] = [];
+      for (let j = 2 + Math.floor(rand() * 6); j > 0; j--) {
+        const r = rand();
+        if (r < 0.28) parts.push(`${pick(['00', '00', '01', '02'])} ${pick(['01', '02', '03'])} SSTORE`);
+        else if (r < 0.36) parts.push(`${pick(['01', '02', '03'])} SLOAD POP`);
+        else if (r < 0.42) parts.push(`${pick(['00', '01'])} ${pick(['01', '02'])} TSTORE`);
+        else if (r < 0.50) parts.push(`01 ${pick(['1000', '8000', '030000'])} MSTORE`);
+        else if (r < 0.55) parts.push('2a 00 MSTORE 01 20 00 LOG1');
+        else if (r < 0.80 && level < 3) {
+          const target = helpers[level + Math.floor(rand() * (3 - level))], gas = pick(['GAS', 'GAS', '7530', '0186a0', '01d4c0']);
+          const kind = pick(['CALL', 'CALL', 'CALL', 'DELEGATECALL', 'STATICCALL']);
+          parts.push(kind === 'CALL' ? `00 00 00 00 ${pick(['00', '00', '01'])} ${target} ${gas} CALL POP` : `00 00 00 00 ${target} ${gas} ${kind} POP`);
+        } else if (r < 0.86) parts.push(`00 00 00 00 01 ${fresh()} GAS CALL POP`);
+        else if (r < 0.88) parts.push(`${fresh()} ${pick(['BALANCE', 'EXTCODESIZE', 'EXTCODEHASH'])} POP`);
+        // Creations: ten bytes of code; a constructor that sets a slot first (the new account's own storage), with a
+        // wei; CREATE2 with one salt, which collides the second time it runs.
+        else if (r < 0.91) parts.push('600a6000f3 d8 SHL 00 MSTORE 05 00 00 CREATE POP');
+        else if (r < 0.93) parts.push(`6001600155600a6000f3 b0 SHL 00 MSTORE 0a 00 ${pick(['00', '01'])} CREATE POP`);
+        else if (r < 0.945) parts.push('600a6000f3 d8 SHL 00 MSTORE 07 05 00 00 CREATE2 POP');
+        // A wei to a precompile; a call into an account that is delegated (EIP-7702) to the first helper.
+        else if (r < 0.96) parts.push(`00 00 00 00 ${pick(['00', '01'])} ${pick(['01', '04', '09'])} GAS CALL POP`);
+        else if (r < 0.975) parts.push(`00 00 00 00 00 ${delegated} ${pick(['GAS', '0186a0'])} CALL POP`);
+        // Reading past the end of what the last call returned: the call fails outright.
+        else if (r < 0.985) parts.push('20 RETURNDATASIZE 00 RETURNDATACOPY');
+        else parts.push('2a 00 MSTORE 20 00 KECCAK256 POP');
+      }
+      return parts.join(' ');
+    };
+    const ending = () => { const r = rand(); return r < 0.66 ? 'STOP' : r < 0.86 ? '00 00 REVERT' : r < 0.91 ? 'INVALID' : r < 0.95 ? `${pick(['CALLER', fresh()])} SELFDESTRUCT` : '2a 00 MSTORE 20 00 RETURN'; };
+    const held = (): Record<string, string> | undefined => (rand() < 0.4 ? { [`0x${word(pick([1, 2, 3]))}`]: `0x${word(5)}` } : undefined);
+    const code = asm(`${steps(0)} 01 SLOAD 00 MSTORE 02 SLOAD 20 MSTORE 03 SLOAD 40 MSTORE 60 00 RETURN`);
+    const helperCode = [1, 2, 3].map(level => asm(`${steps(level)} ${ending()}`));
+    const state: StateChanges = Object.fromEntries(helpers.map((h, i) => { const slots = held(); return [`0x${h}`, { code: helperCode[i], balance: '0x64', ...(slots && { stateDiff: slots }) }]; }));
+    state[`0x${delegated}`] = { code: `0xef0100${helpers[0]}`, balance: '0x64' };
+    const storage = held(), gas = pick([undefined, undefined, 60_000n, 100_000n, 150_000n, 250_000n, 400_000n, 2_000_000n, 16_000_000n]);
+    out.push({ random: true, label: `random program ${seed}/${k}`, to: `0x${address(0)}`, code, balance: 100n, state, ...(storage && { storage }), ...(gas !== undefined && { gas }),
+      detail: `--seed ${seed}: gas ${gas ?? GAS}; code ${code}; helpers ${helperCode.join(' ')}; held ${JSON.stringify(storage ?? {})} ${JSON.stringify(Object.fromEntries(Object.entries(state).map(([a, v]) => [a.slice(-2), v.stateDiff ?? {}])))}` });
+  }
+  return out;
 }
 
 /**
@@ -264,7 +336,7 @@ class Chain {
       const at = this.simulateV1 ? await pinLatest(this.client, this.chainId) : await this.inBlock();
       const placed = programs.map((p, i) => ({ ...p, to: p.to ?? place(i) }));
       const overrides: Record<string, { code?: string; balance?: string }> = { ...RICH };
-      for (const p of placed) if (p.code) overrides[p.to] = { code: p.code, ...(p.balance !== undefined && { balance: `0x${p.balance.toString(16)}` }) };
+      for (const p of placed) if (p.code) overrides[p.to] = { code: p.code, ...(p.balance !== undefined && { balance: `0x${p.balance.toString(16)}` }), ...(p.storage && { stateDiff: p.storage }) };
       // The accounts the programs give their authorities: overrides on the node, the block's own state locally.
       const state: StateChanges = Object.assign({}, ...placed.map(p => p.state ?? {}));
       const given = Object.keys(state).length > 0;
@@ -324,7 +396,7 @@ class Chain {
   }
 }
 
-interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** How many of `differences` are programs'. */ programsDiffer?: number; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
+interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** How many of `differences` are programs'. */ programsDiffer?: number; /** Its blocks are Amsterdam's. */ amsterdam?: boolean; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
 
 /** Differences that are the node's way of answering, not a rule the local EVM has wrong: listed, not counted. */
 const EXPECTED: Record<number, Record<string, string>> = {
@@ -339,12 +411,71 @@ const EXPECTED: Record<number, Record<string, string>> = {
   },
 };
 
+/**
+ * Whether a gas difference is more than `slack` either way. A random program on Arbitrum is allowed the L1 charge
+ * itself: its node takes the charge out of the gas a call is given, so a call inside that fails with all it was
+ * handed burns a little less there (2 and 5 gas, in two programs of 192).
+ */
+const beyond = (difference: bigint, slack: bigint) => (difference < 0n ? -difference : difference) > (slack < 0n ? -slack : slack);
+
+/** Runs the programs on the chain's node and in the local EVM, sixteen to a simulated block, and notes what differs. */
+async function compare(chain: Chain, chainId: number, programs: Program[], report: Report): Promise<void> {
+  const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
+  for (let i = 0; i < programs.length; i += 16) {
+    // Arbitrum's node adds a charge for L1 data to every call's gas: the same for calls with the same calldata and
+    // gas limit in one block, but for the block's first call, which pays a few gas more. So there a call that isn't
+    // compared goes first, and programs sent no calldata (at the usual gas limit) are compared less that charge:
+    // what most of the batch differs by.
+    const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
+    let l1Charge: bigint | undefined;
+    if (!compareGas) {
+      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
+      const counts = new Map<bigint, number>();
+      for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
+      const most = [...counts].sort((a, b) => b[1] - a[1])[0];
+      if (most && most[1] * 2 > deltas.length) l1Charge = most[0];
+      if (process.env.RULES_DEBUG) console.log(`  batch ${i / 16}: L1 charge ${l1Charge}, deltas ${[...counts].map(([d, n]) => `${d}×${n}`).join(' ')}`);
+    }
+    results.forEach(({ node, local }, j) => {
+      // RULES_SHOW=<part of a label>: what the node and the local EVM gave for the programs it names.
+      if (process.env.RULES_SHOW && batch[j].label.includes(process.env.RULES_SHOW)) console.log(`  ${batch[j].label}: the node ${node.kind}, ${node.gas} gas, returns ${node.returns.slice(0, 74)}, ${node.logs ? node.logs.split('|').length : 0} events; the local EVM ${local.kind}, ${local.gas} gas, returns ${local.returns.slice(0, 74)}, ${local.logs ? local.logs.split('|').length : 0} events`);
+      if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
+      report.compared++;
+      const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
+        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && beyond(node.gas - local.gas - l1Charge, batch[j].random ? l1Charge : 0n) && !EXPECTED[chainId]?.[batch[j].label]);
+      // Events are compared where the node reports them (not through eth_call).
+      const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
+      // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was
+      // given, which on Arbitrum follows from what the node charged before it: that word is left out there.
+      const words = (o: Outcome) => (batch[j].precompile && o.kind === 'runs' && o.returns.length === 2 + 4 * 64 ? [0, 1, 2, 3].map(k => BigInt(`0x${o.returns.slice(2 + 64 * k, 66 + 64 * k)}`)) : undefined);
+      const nodeWords = words(node), localWords = words(local);
+      if (!compareGas && nodeWords && localWords && nodeWords[0] === 0n && localWords[0] === 0n) { node.returns = local.returns = `0x${[nodeWords[0], 0n, nodeWords[2], nodeWords[3]].map(w => w.toString(16).padStart(64, '0')).join('')}`; if (nodeWords[2] !== localWords[2] || nodeWords[3] !== localWords[3]) local.returns += '00'; }
+      const said = (o: Outcome, w: bigint[] | undefined) => (w ? `, the precompile ${w[0] ? 'succeeds' : 'fails'} spending ${w[1]} gas and returning ${w[2]} bytes (hash ${w[3].toString(16).slice(0, 10)}…)` : `, returns ${o.returns.slice(0, 74)}`);
+      const returns = node.kind === local.kind && node.kind !== 'invalid' && node.returns !== local.returns;
+      if (node.kind !== local.kind || returns || gas || logs) {
+        const known = EXPECTED[chainId]?.[batch[j].label] ?? (report.amsterdam ? OVER_THE_CAP[batch[j].label] : undefined);
+        (known ? report.expected : report.differences).push(known ? `${batch[j].label}: ${known}` : `${batch[j].label}: the node ${node.kind}${node.kind === 'fails' && node.why ? ` (${node.why.slice(0, 60)})` : ''}${node.gas !== undefined ? `, ${node.gas} gas` : ''}${returns ? said(node, nodeWords) : ''}; the local EVM ${local.kind}${local.kind !== 'runs' && local.why ? ` (${local.why.slice(0, 80)})` : ''}${local.gas !== undefined ? `, ${local.gas} gas` : ''}${returns ? said(local, localWords) : ''}${logs ? '; their events differ' : ''}${batch[j].detail ? ` [${batch[j].detail}]` : ''}`);
+      }
+    });
+  }
+}
+
+/**
+ * From Amsterdam on, what a gas limit holds over 16,777,216 is kept back for new state: code has the cap to run on,
+ * and a transaction that burns all its gas burns that much. Sepolia's node doesn't do so when it simulates (it
+ * gives the whole limit as ordinary gas), so the two programs that show it differ there, and the chain decides: a
+ * mined transaction that failed on a 70,000,000 limit used exactly 16,777,216, as the local EVM has it.
+ */
+const OVER_THE_CAP: Record<string, string> = Object.fromEntries(['GAS, on a limit of 20,000,000', 'a static call that writes, given all the gas, on a limit of 20,000,000']
+  .map(label => [label, "the node's simulation gives the whole gas limit as ordinary gas; the chain keeps what is over 16,777,216 back for new state (a mined transaction that failed on a 70,000,000 limit used 16,777,216), as the local EVM does"]));
+
 async function check(chainId: number): Promise<Report> {
   const chain = new Chain(chainId), profile = CHAIN_PROFILES[chainId];
   const report: Report = { chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, differences: [], expected: [], drift: false };
   const head = await chain.client.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as { number: string; blockAccessListHash?: string };
   report.block = BigInt(head.number).toString();
   const amsterdam = head.blockAccessListHash !== undefined && (chainId === 1 || chainId === 11155111);
+  report.amsterdam = amsterdam;
 
   // The node's own account of its rules.
   const config = await chain.client.call(chainId, 'eth_config', []).then(c => c as { next?: { activationTime?: number; forkId?: string; precompiles?: Record<string, string> } }, () => undefined);
@@ -373,44 +504,9 @@ async function check(chainId: number): Promise<Report> {
     ...(profile.hardfork === 'cancun' ? [] : await authorizationPrograms(chainId)),
     ...(profile.arbitrum ? arbosPrograms() : []),
   ];
-  const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
-  for (let i = 0; i < programs.length; i += 16) {
-    // Arbitrum's node adds a charge for L1 data to every call's gas: the same for calls with the same calldata and
-    // gas limit in one block, but for the block's first call, which pays a few gas more. So there a call that isn't
-    // compared goes first, and programs sent no calldata (at the usual gas limit) are compared less that charge:
-    // what most of the batch differs by.
-    const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
-    let l1Charge: bigint | undefined;
-    if (!compareGas) {
-      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
-      const counts = new Map<bigint, number>();
-      for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
-      const most = [...counts].sort((a, b) => b[1] - a[1])[0];
-      if (most && most[1] * 2 > deltas.length) l1Charge = most[0];
-      if (process.env.RULES_DEBUG) console.log(`  batch ${i / 16}: L1 charge ${l1Charge}, deltas ${[...counts].map(([d, n]) => `${d}×${n}`).join(' ')}`);
-    }
-    results.forEach(({ node, local }, j) => {
-      // RULES_SHOW=<part of a label>: what the node and the local EVM gave for the programs it names.
-      if (process.env.RULES_SHOW && batch[j].label.includes(process.env.RULES_SHOW)) console.log(`  ${batch[j].label}: the node ${node.kind}, ${node.gas} gas, returns ${node.returns.slice(0, 74)}, ${node.logs ? node.logs.split('|').length : 0} events; the local EVM ${local.kind}, ${local.gas} gas, returns ${local.returns.slice(0, 74)}, ${local.logs ? local.logs.split('|').length : 0} events`);
-      if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
-      report.compared++;
-      const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
-        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && node.gas - local.gas !== l1Charge && !EXPECTED[chainId]?.[batch[j].label]);
-      // Events are compared where the node reports them (not through eth_call).
-      const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
-      // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was
-      // given, which on Arbitrum follows from what the node charged before it: that word is left out there.
-      const words = (o: Outcome) => (batch[j].precompile && o.kind === 'runs' && o.returns.length === 2 + 4 * 64 ? [0, 1, 2, 3].map(k => BigInt(`0x${o.returns.slice(2 + 64 * k, 66 + 64 * k)}`)) : undefined);
-      const nodeWords = words(node), localWords = words(local);
-      if (!compareGas && nodeWords && localWords && nodeWords[0] === 0n && localWords[0] === 0n) { node.returns = local.returns = `0x${[nodeWords[0], 0n, nodeWords[2], nodeWords[3]].map(w => w.toString(16).padStart(64, '0')).join('')}`; if (nodeWords[2] !== localWords[2] || nodeWords[3] !== localWords[3]) local.returns += '00'; }
-      const said = (o: Outcome, w: bigint[] | undefined) => (w ? `, the precompile ${w[0] ? 'succeeds' : 'fails'} spending ${w[1]} gas and returning ${w[2]} bytes (hash ${w[3].toString(16).slice(0, 10)}…)` : `, returns ${o.returns.slice(0, 74)}`);
-      const returns = node.kind === local.kind && node.kind !== 'invalid' && node.returns !== local.returns;
-      if (node.kind !== local.kind || returns || gas || logs) {
-        const known = EXPECTED[chainId]?.[batch[j].label];
-        (known ? report.expected : report.differences).push(known ? `${batch[j].label}: ${known}` : `${batch[j].label}: the node ${node.kind}${node.kind === 'fails' && node.why ? ` (${node.why.slice(0, 60)})` : ''}${node.gas !== undefined ? `, ${node.gas} gas` : ''}${returns ? said(node, nodeWords) : ''}; the local EVM ${local.kind}${local.kind !== 'runs' && local.why ? ` (${local.why.slice(0, 80)})` : ''}${local.gas !== undefined ? `, ${local.gas} gas` : ''}${returns ? said(local, localWords) : ''}${logs ? '; their events differ' : ''}`);
-      }
-    });
-  }
+  if (!ONLY_FUZZ) await compare(chain, chainId, programs, report);
+  // --fuzz N: as many random programs again (see fuzzPrograms), from --seed.
+  if (FUZZ) await compare(chain, chainId, fuzzPrograms(FUZZ, SEED), report);
   report.programsDiffer = report.differences.length;
   // Where blocks carry their access lists (Amsterdam), what happened is on record down to each storage slot: recent
   // transactions are replayed with a trace, and each must match its receipt and change exactly the state its

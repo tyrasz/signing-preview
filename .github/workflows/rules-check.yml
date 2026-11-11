@@ -3,7 +3,9 @@ name: Rules check
 # Does the local EVM still run each chain's rules? Chains change them: a fork activates, a precompile is added, a
 # price moves. On each chain the previewer simulates, this asks the node which fork it runs (against the one the
 # local EVM was last checked on) and runs every opcode and each precompile on the node and in the local EVM,
-# comparing what they return, the events and the gas: npm run rules (README, What the local EVM runs).
+# comparing what they return, the events and the gas: npm run rules (README, What the local EVM runs). With 48 random
+# programs a day (--fuzz: new ones each run; a difference prints the seed), and on a chain whose blocks carry their
+# access lists, recent transactions replayed against their receipts and those lists.
 # Read-only: nothing is signed or sent. Public RPCs by default (EVM_RPCS in src/chains.ts); the chains' *_RPC_URL
 # repository secrets replace them.
 # Fails when a chain's fork isn't the one checked, or anything differs (scripts/rules-check.ts --strict).
@@ -46,7 +48,7 @@ jobs:
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
         run: |
           set -o pipefail
-          npm run rules -- --chain all --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee rules.log
+          npm run rules -- --chain all --strict --fuzz 48 --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee rules.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
