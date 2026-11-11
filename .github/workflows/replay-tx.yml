@@ -4,7 +4,8 @@ name: Transaction replays
 # latest state) as their blocks arrive, each at its exact pre-state (the block before, its header, its earlier
 # transactions), and compares the simulation with the receipt: npm run accuracy (README, Simulation accuracy).
 # Read-only: nothing is signed or sent. Public RPCs by default (EVM_RPCS in src/chains.ts); ETHEREUM_RPC_URL,
-# ARBITRUM_RPC_URL, BASE_RPC_URL, OPTIMISM_RPC_URL, POLYGON_RPC_URL and BSC_RPC_URL repository secrets replace them.
+# ARBITRUM_RPC_URL, BASE_RPC_URL, OPTIMISM_RPC_URL, POLYGON_RPC_URL, BSC_RPC_URL and SEPOLIA_RPC_URL repository
+# secrets replace them.
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
 # differences are listed in the summary.
@@ -42,6 +43,9 @@ jobs:
           - { name: 'OP Mainnet', chain: '10' }
           - { name: 'Polygon', chain: '137' }
           - { name: 'BNB Chain', chain: '56' }
+          # The testnet that runs each Ethereum fork before mainnet does (Glamsterdam since 2026-10-06): where the
+          # next fork's rules are checked against receipts.
+          - { name: 'Ethereum Sepolia', chain: '11155111' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,6 +64,7 @@ jobs:
           OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
           POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
           BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
           MINUTES: ${{ inputs.minutes || '30' }}
           CHAIN: ${{ matrix.chain }}
         run: |
