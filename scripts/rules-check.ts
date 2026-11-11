@@ -438,15 +438,17 @@ const EXPECTED: Record<number, Record<string, string>> = {
  */
 const beyond = (difference: bigint, slack: bigint) => (difference < 0n ? -difference : difference) > (slack < 0n ? -slack : slack);
 
-/** Runs the programs on the chain's node and in the local EVM, sixteen to a simulated block, and notes what differs. */
+/** Runs the programs on the chain's node and in the local EVM, up to sixteen to a simulated block, and notes what differs. */
 async function compare(chain: Chain, chainId: number, programs: Program[], report: Report): Promise<void> {
   const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
-  // Sixteen to a block, and no more than 60,000,000 gas of limits in one: BNB Chain's node adds up a block's gas
-  // limits and refuses a block they pass (70,000,000), which four random programs on 16,000,000 each did.
+  // Sixteen to a block, and no more than 30,000,000 gas of limits in one. A node refuses a simulated block its calls
+  // don't fit in ("Block gas limit exceeded by the block's transactions"): BNB Chain's adds up their limits (four
+  // random programs on 16,000,000 each passed its 70,000,000), OP Mainnet's and Base's count the gas used before a
+  // call and its limit (40,000,000 a block there; random programs on tight limits burn all of theirs).
   const batches: Program[][] = [];
   for (const p of programs) {
     const last = batches.at(-1), limit = (q: Program) => q.gas ?? GAS;
-    if (last && last.length < 16 && last.reduce((sum, q) => sum + limit(q), 0n) + limit(p) <= 60_000_000n) last.push(p);
+    if (last && last.length < 16 && last.reduce((sum, q) => sum + limit(q), 0n) + limit(p) <= 30_000_000n) last.push(p);
     else batches.push([p]);
   }
   for (const batch of batches) {
