@@ -399,7 +399,10 @@ class StateSource {
     const nonceJobs = accounts.map(a => ({ method: 'eth_getTransactionCount', params: [a, this.block], done: (r: unknown) => { nonces.set(a, moved(a, BigInt(r as string))); } }));
     const slots = new Map<string, string[]>();
     const want = (a: string, slot: string) => { const l = slots.get(a) ?? []; if (!l.includes(slot)) l.push(slot); slots.set(a, l); };
-    for (const a of accounts) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`)) want(a, slot);
+    // A precompile keeps no storage, and can't be asked for any this way: the node runs the precompile at its
+    // address whatever code an override puts there (the point-evaluation precompile, which a rollup's blob
+    // transaction calls, answered the reader's input with "PrecompileError", and the transaction had no trace).
+    for (const a of accounts) if (!lowAddress(a)) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`)) want(a, slot);
     for (const k of m.storage) { const [a, slot] = k.split('_'); want(a, slot); }
     const needCode = accounts.filter(a => !this.codeOverrides.has(a));
     const accountCalls = [...(accounts.length ? [{ to: BALANCE_READER, data: `0x${accounts.map(word).join('')}` }] : []), ...needCode.map(a => ({ to: CODE_READER, data: `0x${word(a)}` }))];
@@ -441,7 +444,15 @@ class StateSource {
       contracts.forEach((a, i) => {
         // A contract the node runs itself keeps its own code whatever the override says, so its storage can't be
         // read this way: left unread, and running it is refused (LazyState.load).
-        if (r[i].status !== '0x1') { if (isNative(this.accounts.get(a)?.code ?? new Uint8Array(0))) return; throw failed; }
+        // So does a precompile, wherever its address is: an account with no code that won't run the reader has no
+        // storage to read.
+        if (r[i].status !== '0x1') {
+          const code = this.accounts.get(a)?.code;
+          if (code && isNative(code)) return;
+          if (code?.length !== 0) throw failed;
+          for (const slot of slots.get(a)!) this.storage.set(`${a}_${slot}`, new Uint8Array(0));
+          return;
+        }
         words(r[i].returnData, slots.get(a)!.length).forEach((v, j) => this.storage.set(`${a}_${slots.get(a)![j]}`, unpadBytes(hexToBytes(v))));
       });
     }
@@ -561,6 +572,9 @@ class StateSource {
     }
   }
 }
+
+/** An address in the range chains keep for precompiles and their own contracts (under 0x10000): its proxy slots aren't read ahead. */
+const lowAddress = (a: string) => BigInt(a) < 0x10000n;
 
 /**
  * SimpleStateManager whose missing values come from the StateSource. With `misses` set (a speculative run), a value

@@ -464,6 +464,39 @@ test('Calls that run first in the block: the node runs them and the local EVM st
   } finally { chain.simulateV1 = false; }
 });
 
+test('After a block’s earlier transactions, a precompile is asked for no storage, and one that won’t run the reader has none', async () => {
+  // Storage after earlier transactions is read by putting a reader in each contract's place. A node runs a
+  // precompile at its address whatever code is put there: Ethereum's point-evaluation precompile answered the
+  // reader's input with an error, and a rollup's blob transaction that calls it had no trace.
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const IDENTITY = '0x0000000000000000000000000000000000000004', FAR = '0x00000000000000000000000000000000000fffff';
+  const earlier: SimulationRequest = { chainId: 999, from: USER, to: BOB, data: '0x', value: 1n };
+  const read: string[][] = [];
+  // A node whose precompile at FAR (an address outside the usual range, as some chains have) fails on the reader.
+  const node = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string; params: [{ blockStateCalls: { stateOverrides?: Record<string, unknown>; calls: { to: string }[] }[] }] }[];
+    const sim = Array.isArray(body) ? body.find(b => b.method === 'eth_simulateV1') : undefined;
+    const res = await chain.fetchImpl(url, init);
+    if (!sim) return res;
+    const blocks = sim.params[0].blockStateCalls, storage = blocks.length > 1 ? blocks.at(-1)! : undefined;
+    // The storage block is the one whose calls go to the contracts themselves (the readers put in their place).
+    const reads = storage && storage.calls.every(c => Object.keys(storage.stateOverrides ?? {}).includes(c.to)) ? storage.calls.map(c => c.to) : [];
+    read.push(reads);
+    const out = await res.json() as { id: number; result?: { calls: { status: string }[] }[] }[];
+    for (const o of out) if (o.result && reads.length) o.result.at(-1)!.calls.forEach((c, i) => { if (reads[i] === FAR) c.status = '0x0'; });
+    return new Response(JSON.stringify(out), { headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    for (const to of [IDENTITY, FAR]) {
+      const [r] = (await fork({ fetchImpl: node }).trace([{ chainId: 999, from: USER, to, data: '0x1234', value: 0n, at: { block: '0x10', header, before: [earlier] } }]))!;
+      assert.equal(r.status, 'success');
+    }
+    // The identity precompile's storage was never asked for; FAR's was, failed, and counted as empty.
+    assert.deepEqual([read.flat().includes(IDENTITY), read.flat().includes(FAR)], [false, true]);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('After a block’s earlier transactions, an account’s nonce counts its authorizations; a node that won’t build blob calls gets them plain', async () => {
   const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
   const KEY = `0x${'9a'.repeat(32)}` as Hex, sender = privateKeyToAccount(KEY).address.toLowerCase();
