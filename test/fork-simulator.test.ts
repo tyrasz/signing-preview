@@ -441,6 +441,17 @@ test('Rules that aren’t today’s or aren’t the local EVM’s: a past Ethere
   assert.equal((await run(header(17_500_000n, 1_690_000_000n))).status, 'success');
   assert.equal((await run(header(16_000_000n, 1_670_000_000n), false)).status, 'success');
   await assert.rejects(run(header(15_000_000n, 1_655_000_000n)), ForkUnsupported);
+  // Arbitrum's BLOCKHASH is the chain's own function of the number (it takes L1 block numbers), which only its node
+  // can answer: the opcode is run there, where another chain's is the hash of the block with that number.
+  const PREVIOUS = '0x00000000000000000000000000000000000c0de7';
+  await chain.putCode(PREVIOUS, '0x600143034060005260206000f3');
+  const previous = async (chainId: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: PREVIOUS, data: '0x', value: 0n }]))![0].returnData;
+  clearForkCaches();
+  const calls = chain.stats.calls.eth_call ?? 0;
+  assert.equal(await previous(1), keccak256(encodeAbiParameters([{ type: 'uint256' }], [16n])));
+  assert.equal(chain.stats.calls.eth_call ?? 0, calls);
+  assert.notEqual(await previous(42161), await previous(1));
+  assert.ok((chain.stats.calls.eth_call ?? 0) > calls);
   // Arbitrum has no BLOBBASEFEE: its node refuses the opcode, and so does the local EVM for it.
   const BLOBFEE = '0x00000000000000000000000000000000000c0de1';
   await chain.putCode(BLOBFEE, '0x4a60005260206000f3');
@@ -451,6 +462,10 @@ test('Rules that aren’t today’s or aren’t the local EVM’s: a past Ethere
   const precompileGas = async (chainId: number, address: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: `0x${address.toString(16).padStart(40, '0')}`, data: '0x', value: 0n }]))![0].gasUsed! - 21_000n;
   assert.deepEqual([await precompileGas(1, 6), await precompileGas(1, 7), await precompileGas(1, 8)], [150n, 6_000n, 45_000n]);
   assert.deepEqual([await precompileGas(137, 6), await precompileGas(137, 7), await precompileGas(137, 8)], [540n, 12_600n, 67_500n]);
+  // ...blake2f 22 gas a round where Ethereum charges 1. A thousand rounds: 21,000, the calldata's 3,204 and 22,000
+  // there; on Ethereum the 1,000 leave the transaction under its calldata floor, which is what it pays.
+  const blake = async (chainId: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: `0x${'0'.repeat(39)}9`, data: `0x000003e8${'5a'.repeat(64)}${'c3'.repeat(128)}${'00'.repeat(15)}0301`, value: 0n }]))![0].gasUsed!;
+  assert.deepEqual([await blake(137), await blake(1)], [46_204n, 29_010n]);
   // ...and has no point-evaluation precompile: 0x0a is an empty account there, a call to it the bare 21,000.
   assert.equal(await precompileGas(137, 10), 0n);
   // Polygon, which carries no blobs, has no BLOBHASH either.

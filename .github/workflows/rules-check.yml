@@ -1,0 +1,91 @@
+name: Rules check
+
+# Does the local EVM still run each chain's rules? Chains change them: a fork activates, a precompile is added, a
+# price moves. On each chain the previewer simulates, this asks the node which fork it runs (against the one the
+# local EVM was last checked on) and runs every opcode and each precompile on the node and in the local EVM,
+# comparing what they return, the events and the gas: npm run rules (README, What the local EVM runs).
+# Read-only: nothing is signed or sent. Public RPCs by default (EVM_RPCS in src/chains.ts); the chains' *_RPC_URL
+# repository secrets replace them.
+# Fails when a chain's fork isn't the one checked, or anything differs (scripts/rules-check.ts --strict).
+
+on:
+  schedule:
+    - cron: '23 4 * * *' # daily at 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rules-check
+  cancel-in-progress: false
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Compare each chain's node with the local EVM
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          HYPEREVM_RPC_URL: ${{ secrets.HYPEREVM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+        run: |
+          set -o pipefail
+          npm run rules -- --chain all --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee rules.log
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rules-check
+          path: |
+            report.json
+            rules.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  report-failure:
+    needs: rules
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rules-check
+          path: report
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="A chain's rules differ from the local EVM's"
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          {
+            echo "The scheduled rules check found a chain whose node and the local EVM no longer agree, or whose fork is not the one the local EVM was last checked against: $RUN_URL. The node's own simulation is unaffected; call traces, and simulations on RPCs without eth_simulateV1, run in the local EVM. What the run said:"
+            echo
+            echo '```'
+            grep -a -v '^> \|^$\|UNDICI\|trace-warnings' report/rules.log | tail -n 80 || echo "(No log.)"
+            echo '```'
+          } > body.md
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body-file body.md
+          else
+            gh issue create --repo "$REPO" --title "$title" --body-file body.md
+          fi

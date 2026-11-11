@@ -83,7 +83,8 @@ test('The block a simulation names: each chain’s next block, and what the node
   assert.deepEqual([headerAfter(137, h).prevRandao, headerAfter(137, h).difficulty, headerAfter(137, h).timestamp], [`0x${'00'.repeat(31)}02`, 2n, 1002n]);
   // A block as it was (a replay): its own number and time.
   assert.deepEqual([headerOf(8453, h).number, headerOf(8453, h).timestamp, headerOf(42161, h).number, headerOf(42161, h).arbBlockNumber], [100n, 1000n, 16n, 100n]);
-  assert.deepEqual(nodeOverrides(headerAfter(137, h)), { time: '0x3ea', feeRecipient: '0x00000000000000000000000000000000000000aa', prevRandao: `0x${'00'.repeat(31)}02`, baseFeePerGas: '0x7', difficulty: '0x2' });
+  // (Polygon's fee recipient is one fixed address in every block, whatever its header's miner field says.)
+  assert.deepEqual(nodeOverrides(headerAfter(137, h)), { time: '0x3ea', feeRecipient: '0x7ee41d8a25641000661b1ef5e6ae8a00400466b0', prevRandao: `0x${'00'.repeat(31)}02`, baseFeePerGas: '0x7', difficulty: '0x2' });
   assert.deepEqual(Object.keys(nodeOverrides(headerAfter(1, h))), ['time', 'feeRecipient', 'prevRandao', 'baseFeePerGas']);
   const rpc = { has: (c: number) => c === 8453, call: async (_c: number, m: string) => (m === 'eth_getBlockByNumber' ? h : null) };
   assert.deepEqual(await pinLatest(rpc, 8453), { block: '0x64', header: headerAfter(8453, h) });

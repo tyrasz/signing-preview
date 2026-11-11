@@ -404,6 +404,8 @@ test('Glamsterdam, as a preview sees it: the chain’s own transfer log is the n
   const glam = { ...h, blockAccessListHash: H(9), slotNumber: '0xb046bd' };
   assert.deepEqual([headerAfter(1, glam).amsterdam, headerAfter(1, glam).slotNumber, headerOf(1, glam).slotNumber], [true, 11_552_446n, 11_552_445n]);
   assert.deepEqual([headerAfter(1, h).amsterdam, headerAfter(1, h).slotNumber, headerOf(1, h).amsterdam], [undefined, undefined, undefined]);
+  // Polygon's blocks name no miner, and COINBASE there is one fixed address in every block.
+  assert.deepEqual([headerAfter(137, { ...h, miner: `0x${'00'.repeat(20)}` }).coinbase, headerOf(137, h).coinbase, headerAfter(1, h).coinbase], ['0x7ee41d8a25641000661b1ef5e6ae8a00400466b0', '0x7ee41d8a25641000661b1ef5e6ae8a00400466b0', BOB.toLowerCase()]);
 
   // A node's allowance for one simulation can run out on a block's earlier transactions (Sepolia's blocks hold 200
   // million gas): said as that, not as this transaction's gas limit being too low.

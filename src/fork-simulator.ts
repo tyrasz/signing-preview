@@ -65,11 +65,14 @@ export interface ChainProfile {
    */
   storageGas?: { coldRead: number; coldWrite: number };
   /**
-   * The chain's prices for the bn254 precompiles where they aren't Ethereum's (150 to add, 6,000 to multiply,
-   * 45,000 for a pairing and 34,000 a pair): Polygon charges 540, 12,600, 67,500 and 51,000, measured on its node
-   * by the gas a STATICCALL to each spends. Applied with `storageGas` (the chain that has one has the other).
+   * The chain's prices for precompiles where they aren't Ethereum's, as the EVM library's parameters by the EIP that
+   * set them (1679: Istanbul's bn254 prices; 2537: BLS12-381's). Polygon's were measured on its node by the gas a
+   * STATICCALL to each spends: bn254 add 540 (Ethereum 150), multiply 12,600 (6,000), pairing 67,500 and 51,000 a
+   * pair (45,000 and 34,000); BLS12-381 G1 add 1,050 (375), G1 multiply 73,200 (12,000), G2 add 1,620 (600), G2
+   * multiply 144,000 (22,500), pairing 109,330 and 94,540 a pair (37,700 and 32,600), map to G1 15,400 (5,500), map
+   * to G2 66,640 (23,800); the multi-scalar discounts are Ethereum's; blake2f 22 a round (1). Applied with `storageGas`.
    */
-  bn254Gas?: { add: number; mul: number; pairing: number; pair: number };
+  precompilePrices?: Record<number, Record<string, number>>;
   /** The chain has no point-evaluation precompile at 0x0a (it carries no blobs): the address is an empty account there. */
   noPointEvaluation?: boolean;
   /**
@@ -105,6 +108,11 @@ const BSC_PRECOMPILES = Array.from({ length: 6 }, (_, i) => low(0x64 + i));
  * BLS precompiles, P256VERIFY at 6,900 gas). Block times are for the simulated next block's timestamp, in whole
  * seconds: chains that make several blocks a second get the next second (BNB Chain) or the same one (Arbitrum).
  */
+const POLYGON_PRECOMPILES = {
+  1679: { bn254AddGas: 540, bn254MulGas: 12_600, bn254PairingGas: 67_500, bn254PairingWordGas: 51_000, blake2RoundGas: 22 },
+  2537: { bls12381G1AddGas: 1_050, bls12381G1MulGas: 73_200, bls12381G2AddGas: 1_620, bls12381G2MulGas: 144_000, bls12381PairingBaseGas: 109_330, bls12381PairingPerPairGas: 94_540, bls12381MapG1Gas: 15_400, bls12381MapG2Gas: 66_640 },
+};
+
 export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   1: { hardfork: 'osaka', checked: { forkId: '0x07c9462e', on: '2026-11-10' }, ...NEXT_BLOCK[1] },
   // Sepolia runs Amsterdam (Glamsterdam) since 2026-10-06: its blocks say so, and run under those rules (see ETHEREUM_RULES).
@@ -117,7 +125,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
-  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, bn254Gas: { add: 540, mul: 12_600, pairing: 67_500, pair: 51_000 }, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true },
+  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true },
   56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
   999: { hardfork: 'cancun', ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
@@ -133,6 +141,12 @@ export interface ForkSimulatorOptions {
   maxRounds?: number;
   /** Overall time budget; past it the simulation fails (a caller can fall back to something cheaper). */
   timeoutMs?: number;
+  /**
+   * False: only the tokens a request names (SimulationRequest.watch) are read around its call, not its target, the
+   * addresses in its calldata and the chain's well-known tokens. For runs that want the call itself, not what it
+   * moved (scripts/rules-check.ts): each token read is state to fetch.
+   */
+  watchTokens?: boolean;
   /** The state to simulate on: 'latest' (default), or a block number to replay a transaction at its pre-state. */
   block?: (chainId: number) => string;
   /**
@@ -405,6 +419,17 @@ class StateSource {
     for (const n of m.blocks) {
       const known = BLOCK_HASHES.get(`${this.chainId}:${n}`);
       if (known) { this.blocks.set(n, known); continue; }
+      // Arbitrum's BLOCKHASH takes the L1 block numbers NUMBER gives, and answers with a value of its own for each
+      // (not that L1 block's hash, nor the hash of the L2 block with that number): the chain is asked, by running
+      // the opcode there.
+      if (NEXT_BLOCK[this.chainId]?.arbitrum) {
+        jobs.push({ method: 'eth_call', params: [{ to: BLOCKHASH_PROBE, data: '0x' }, this.block, { [BLOCKHASH_PROBE]: { code: `0x67${n.toString(16).padStart(16, '0')}4060005260206000f3` } }], done: (r, e) => {
+          const h = hexToBytes((e || typeof r !== 'string' || r.length !== 66 ? `0x${'00'.repeat(32)}` : r) as Hex);
+          this.blocks.set(n, h);
+          if (h.some(b => b !== 0)) BLOCK_HASHES.set(`${this.chainId}:${n}`, h);
+        } });
+        continue;
+      }
       jobs.push({ method: 'eth_getBlockByNumber', params: [`0x${n.toString(16)}`, false], done: r => {
         const h = hexToBytes(((r as { hash?: Hex } | null)?.hash ?? `0x${'00'.repeat(32)}`) as Hex);
         this.blocks.set(n, h);
@@ -634,8 +659,8 @@ function storagePricing(profile: ChainProfile) {
   const params = JSON.parse(JSON.stringify(paramsEVM)) as Record<string, Record<string, number>>;
   Object.assign(params[2929], { coldsloadGas: g.coldWrite, sstoreCleanEIP2200Gas: 5000 - g.coldWrite });
   Object.assign(params[3529], { sstoreClearRefundEIP2200Gas: 5000 - g.coldWrite + 1900 });
-  // The chain's own prices for the bn254 precompiles (ChainProfile.bn254Gas), in place of Istanbul's.
-  if (profile.bn254Gas) Object.assign(params[1679], { bn254AddGas: profile.bn254Gas.add, bn254MulGas: profile.bn254Gas.mul, bn254PairingGas: profile.bn254Gas.pairing, bn254PairingWordGas: profile.bn254Gas.pair });
+  // The chain's own prices for precompiles (ChainProfile.precompilePrices), in place of Ethereum's.
+  for (const [eip, prices] of Object.entries(profile.precompilePrices ?? {})) Object.assign(params[eip], prices);
   type RunState = { stack: { peek(): bigint[]; pop(): bigint; push(v: bigint): void }; interpreter: { getAddress(): Address; storageLoad(key: Uint8Array): Promise<Uint8Array>; journal: { isWarmedStorage(a: Uint8Array, k: Uint8Array): boolean; addWarmedStorage(a: Uint8Array, k: Uint8Array): void } } };
   const slot = (key: bigint) => hexToBytes(`0x${key.toString(16).padStart(64, '0')}`);
   const sload = {
@@ -655,6 +680,8 @@ function storagePricing(profile: ChainProfile) {
 }
 
 const POINT_EVALUATION = '0x000000000000000000000000000000000000000a';
+/** An unused address given code that returns BLOCKHASH of a number, for chains whose BLOCKHASH only they can answer. */
+const BLOCKHASH_PROBE = '0x00000000000000000000000000000000b10c4a54';
 /** Chains that run Ethereum's own fork schedule: mainnet and Sepolia. */
 const ETHEREUM_RULES = new Set([1, 11155111]);
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
@@ -754,7 +781,7 @@ export class ForkSimulator implements Simulator {
   constructor(urls: Record<number, string>, options: ForkSimulatorOptions = {}) {
     this.urls = urls;
     this.opts = { fetchImpl: options.fetchImpl ?? fetch, batchSize: options.batchSize ?? 20, concurrency: options.concurrency ?? 4, maxRounds: options.maxRounds ?? 24,
-      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', trace: options.trace ?? false, profiles: { ...CHAIN_PROFILES, ...options.profiles } };
+      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', trace: options.trace ?? false, watchTokens: options.watchTokens ?? true, profiles: { ...CHAIN_PROFILES, ...options.profiles } };
     if (this.opts.cacheFile) this.loaded = loadForkCache(this.opts.cacheFile);
   }
 
@@ -859,10 +886,10 @@ export class ForkSimulator implements Simulator {
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and
     // Withdrawal, not Transfer, so logs alone miss the wrapped token.
     const skip = (a: string) => reqs.some(r => hexOf(r.from) === a || (r.account && hexOf(r.account) === a)) || a === ZERO || BigInt(a) < 0x10000n;
-    const tokens = new Set<string>([
+    const tokens = new Set<string>((this.opts.watchTokens ? [
       ...reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(hexOf).slice(0, 40),
       ...builtinTokens(chainId).map(t => hexOf(t.address)),
-    ].filter(a => !skip(a)));
+    ] : reqs.flatMap(r => r.watch ?? []).map(hexOf)).filter(a => !skip(a)));
     const approvals = new Map<string, SimulatedApproval>();
     const key = requestKey(reqs);
     this.seen.set(key, new Set());
@@ -1097,7 +1124,8 @@ export class ForkSimulator implements Simulator {
       // and the access list (EIP-2929, EIP-3651), and "original" storage values taken afresh (EIP-2200).
       await evm.journal.cleanup();
       state.originalStorageCache.clear();
-      for (const a of [caller, target, block.header.coinbase.toString(), ...evm.precompiles.keys()]) evm.journal.addAlwaysWarmAddress(a);
+      // (An address that isn't a precompile on this chain is an account like any other: cold until touched.)
+      for (const a of [caller, target, block.header.coinbase.toString(), ...[...evm.precompiles.keys()].filter(k => !absent.some(x => x.address.slice(2) === k))]) evm.journal.addAlwaysWarmAddress(a);
       for (const e of req.accessList ?? []) { evm.journal.addAlwaysWarmAddress(e.address); for (const k of e.storageKeys) evm.journal.addAlwaysWarmSlot(e.address, k); }
       // The sender's nonce goes up first, then the EIP-7702 authorizations apply (and stay, whatever the call does).
       const sender = createAddressFromString(caller);

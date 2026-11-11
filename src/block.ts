@@ -47,11 +47,11 @@ export interface BlockAt {
  * returns, the block's mixHash unless said (its difficulty on BNB Chain and Polygon, 1 on Arbitrum); and Arbitrum's
  * two block numbers.
  */
-export const NEXT_BLOCK: Record<number, { blockTime: number; /** The chain carries blobs (EIP-4844), so its blocks have a blob base fee. */ blobs?: boolean; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon); BNB Chain's read it from prevRandao. */ difficultyOverride?: boolean }> = {
+export const NEXT_BLOCK: Record<number, { blockTime: number; /** What COINBASE returns where it isn't the header's miner: Polygon's blocks name none, and every one pays its fees to one address (measured on its node; an override of the fee recipient is ignored). */ coinbase?: string; /** The chain carries blobs (EIP-4844), so its blocks have a blob base fee. */ blobs?: boolean; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon); BNB Chain's read it from prevRandao. */ difficultyOverride?: boolean }> = {
   1: { blockTime: 12, blobs: true }, 11155111: { blockTime: 12, blobs: true },
   42161: { blockTime: 0, randomness: 'one', arbitrum: true }, 421614: { blockTime: 0, randomness: 'one', arbitrum: true },
   8453: { blockTime: 2 }, 10: { blockTime: 2 },
-  137: { blockTime: 2, randomness: 'difficulty', difficultyOverride: true },
+  137: { blockTime: 2, randomness: 'difficulty', difficultyOverride: true, coinbase: '0x7ee41d8a25641000661b1ef5e6ae8a00400466b0' },
   56: { blockTime: 1, randomness: 'difficulty' },
   999: { blockTime: 1 }, 998: { blockTime: 1 },
 };
@@ -70,7 +70,7 @@ export function headerAfter(chainId: number, h: RpcHeader): BlockAt['header'] {
     number: rules.arbitrum && h.l1BlockNumber ? BigInt(h.l1BlockNumber) : BigInt(h.number) + 1n,
     ...(rules.arbitrum && { arbBlockNumber: BigInt(h.number) + 1n }),
     timestamp: BigInt(h.timestamp) + BigInt(rules.blockTime),
-    coinbase: h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
+    coinbase: rules.coinbase ?? h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
     prevRandao: rules.randomness === 'one' ? word(1n) : rules.randomness === 'difficulty' ? word(difficulty) : (h.mixHash ?? word(0n)) as Hex,
     ...(rules.difficultyOverride && { difficulty }),
     ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
@@ -88,7 +88,7 @@ export function headerOf(chainId: number, h: RpcHeader): BlockAt['header'] {
   return {
     number: rules.arbitrum && h.l1BlockNumber ? BigInt(h.l1BlockNumber) : BigInt(h.number),
     ...(rules.arbitrum && { arbBlockNumber: BigInt(h.number) }),
-    timestamp: BigInt(h.timestamp), coinbase: h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
+    timestamp: BigInt(h.timestamp), coinbase: rules.coinbase ?? h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
     prevRandao: rules.randomness === 'one' ? word(1n) : rules.randomness === 'difficulty' ? word(difficulty) : (h.mixHash ?? word(0n)) as Hex,
     ...(rules.difficultyOverride && { difficulty }),
     ...(h.blockAccessListHash !== undefined && { amsterdam: true }),

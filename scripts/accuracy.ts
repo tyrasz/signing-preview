@@ -125,8 +125,11 @@ async function replay(b: B, seen?: Set<string>) {
   // L1 block the chain had seen, with the chain's own number for ArbSys.
   const word32 = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
   const l1Number = (b as B & { l1BlockNumber?: Hex }).l1BlockNumber;
+  const glam = b as B & { blockAccessListHash?: Hex; slotNumber?: Hex };
   const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: CHAIN === 42161 && l1Number ? BigInt(l1Number) : BigInt(n), arbBlockNumber: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner,
-    prevRandao: CHAIN === 42161 ? word32(1n) : CHAIN === 56 || CHAIN === 137 ? word32(BigInt(difficulty)) : b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas) }), timeoutMs: 120_000, trace });
+    prevRandao: CHAIN === 42161 ? word32(1n) : CHAIN === 56 || CHAIN === 137 ? word32(BigInt(difficulty)) : b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas),
+    // An Amsterdam (Glamsterdam) block says so in its header, and has a slot number: the local EVM runs its rules.
+    ...(glam.blockAccessListHash !== undefined && { amsterdam: true }), ...(glam.slotNumber !== undefined && { slotNumber: BigInt(glam.slotNumber) }) }), timeoutMs: 120_000, trace });
   const simulators = ([
     // Not the block's gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on publicnode,
     // below Ethereum's 60M); the parent's, the node's default, is all but the same.
