@@ -95,13 +95,16 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
   if (!rpc?.has(tx.chainId)) return undefined;
   const call = <T>(method: string, params: unknown[]) => rpc.call(tx.chainId, method, params).then(r => r as T, () => undefined);
   const arbitrum = ARBITRUM.has(tx.chainId);
-  const [latestNonce, pendingNonce, balance, block, tip, l1] = await Promise.all([
+  const [latestNonce, pendingNonce, balance, block, tip, l1, bigBlocks, bigPrice] = await Promise.all([
     call<string>('eth_getTransactionCount', [tx.from, 'latest']),
     call<string>('eth_getTransactionCount', [tx.from, 'pending']),
     call<string>('eth_getBalance', [tx.from, 'latest']),
     call<{ baseFeePerGas?: string; blockAccessListHash?: string; gasLimit?: string }>('eth_getBlockByNumber', ['latest', false]),
     tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
     arbitrum ? call<string>('eth_call', [{ to: NODE_INTERFACE, data: encodeFunctionData({ abi: L1_COMPONENT, functionName: 'gasEstimateL1Component', args: [(tx.to ?? '0x0000000000000000000000000000000000000000') as Hex, tx.to === null, tx.data] }) }, 'latest']) : Promise.resolve(undefined),
+    // HyperEVM: which kind of block the account's transactions go into, and big blocks' base fee (HYPEREVM).
+    tx.chainId === HYPEREVM ? call<boolean>('eth_usingBigBlocks', [tx.from]) : Promise.resolve(undefined),
+    tx.chainId === HYPEREVM ? call<string>('eth_bigBlockGasPrice', []) : Promise.resolve(undefined),
   ]);
   const chain = CHAINS[tx.chainId];
   const native = (v: bigint) => `${formatUnits(v, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? 'native'}`;
@@ -120,8 +123,7 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
 
   // HyperEVM: a transaction that needs more than a small block holds, from an account on small blocks, can't be
   // included; one from an account on big blocks waits for the next big block, at its base fee.
-  const bigBlocks = tx.chainId === HYPEREVM ? await call<boolean>('eth_usingBigBlocks', [tx.from]) : undefined;
-  const bigBase = bigBlocks === true ? await call<string>('eth_bigBlockGasPrice', []) : undefined;
+  const bigBase = bigBlocks === true ? bigPrice : undefined;
   if (tx.chainId === HYPEREVM) {
     const small = block?.gasLimit !== undefined && BigInt(block.gasLimit) < HYPEREVM_BIG_BLOCK ? BigInt(block.gasLimit) : HYPEREVM_SMALL_BLOCK;
     const needs = tx.gas ?? gasUsed;
