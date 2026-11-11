@@ -446,6 +446,11 @@ test('Rules that aren’t today’s or aren’t the local EVM’s: a past Ethere
   await chain.putCode(BLOBFEE, '0x4a60005260206000f3');
   const blobFee = async (chainId: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: BLOBFEE, data: '0x', value: 0n }]))![0].status;
   assert.deepEqual([await blobFee(1), await blobFee(42161), await blobFee(137)], ['success', 'reverted', 'reverted']);
+  // Polygon prices the bn254 precompiles its own way: adding two points costs 540 there (150 on Ethereum), a pairing
+  // of no pairs 67,500 (45,000). A call straight to each, with no input: the 21,000 base and the precompile's price.
+  const precompileGas = async (chainId: number, address: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: `0x${address.toString(16).padStart(40, '0')}`, data: '0x', value: 0n }]))![0].gasUsed! - 21_000n;
+  assert.deepEqual([await precompileGas(1, 6), await precompileGas(1, 7), await precompileGas(1, 8)], [150n, 6_000n, 45_000n]);
+  assert.deepEqual([await precompileGas(137, 6), await precompileGas(137, 7), await precompileGas(137, 8)], [540n, 12_600n, 67_500n]);
   // Polygon, which carries no blobs, has no BLOBHASH either.
   const BLOBHASH = '0x00000000000000000000000000000000000c0de2';
   await chain.putCode(BLOBHASH, '0x60004960005260206000f3');
@@ -503,6 +508,49 @@ test('Rules that aren’t today’s or aren’t the local EVM’s: a past Ethere
     const [old] = (await base().simulateBatch([{ chainId: 8453, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n, at: { block: '0x10', header: header(40_000_000n, 1_780_000_000n), required: true } }]))!;
     assert.match(old.rulesNote!, /^This block is from before Base's current rules took effect \(2026-11-05\)\. The local EVM runs today's rules/);
   } finally { chain.config = undefined; }
+});
+
+test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s node charges, and the chain’s own transfer log', async () => {
+  // A block whose header says it is Amsterdam's, on Ethereum's testnet. The gas figures are those Sepolia's node gave
+  // for the same requests on 2026-11-11.
+  const amsterdam = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 200_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex, amsterdam: true, slotNumber: 11_552_491n };
+  const osaka = { ...amsterdam, amsterdam: undefined, slotNumber: undefined };
+  const FROM = '0x00000000000000000000000000000000000a11ce', EOA = BOB, NEW = '0x00000000000000000000000000000000beef0456';
+  await chain.setBalance(FROM, 10n * E);
+  const run = async (extra: Partial<SimulationRequest>, header: typeof amsterdam | typeof osaka = amsterdam, chainId = 11155111) =>
+    (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: FROM, to: EOA, data: '0x', value: 0n, at: { block: '0x10', header }, ...extra }]))![0];
+  const gas = async (extra: Partial<SimulationRequest>, header: typeof amsterdam | typeof osaka = amsterdam) => (await run(extra, header)).gasUsed;
+  // A base of 12,000; 3,000 for the recipient unless the sender calls itself; 6,000 more when value moves.
+  assert.deepEqual([await gas({}), await gas({ to: FROM }), await gas({ value: 1n })], [15_000n, 12_000n, 21_000n]);
+  // A new account's state is paid for: 120 bytes at 1,530 each.
+  assert.equal(await gas({ to: NEW, value: 1n }), 204_600n);
+  // The calldata floor counts every byte, zero or not, as four tokens at 16.
+  assert.deepEqual([await gas({ data: `0x${'11'.repeat(1000)}` }), await gas({ data: `0x${'00'.repeat(1000)}` })], [79_000n, 79_000n]);
+  // An access list: 2,900 an address, 2,000 a key, and its bytes at the floor's price.
+  const slot = (n: number) => `0x${n.toString(16).padStart(64, '0')}`;
+  assert.equal(await gas({ accessList: [{ address: usdc, storageKeys: [slot(1), slot(2)] }, { address: weth, storageKeys: [slot(3)] }] }), 35_504n);
+  // A creation: 100 bytes of code, whose state is paid for too.
+  assert.equal(await gas({ to: null, data: '0x60646000f3' }), 360_712n);
+  // The same requests under Osaka's rules (a block that isn't Amsterdam's): the 21,000 base.
+  assert.deepEqual([await gas({}, osaka), await gas({ to: FROM }, osaka), await gas({ value: 1n }, osaka)], [21_000n, 21_000n, 21_000n]);
+  // Only Ethereum and its testnet take the header's word: another chain keeps its own profile.
+  assert.equal((await run({}, amsterdam, 8453)).gasUsed, 21_000n);
+
+  // A native transfer is logged by the chain itself (EIP-7708), from an address of its own: the native coin moving,
+  // not a token there.
+  const sent = await run({ value: E });
+  assert.deepEqual(sent.logs!.map(l => [l.address, l.topics.length]), [['0xfffffffffffffffffffffffffffffffffffffffe', 3]]);
+  assert.deepEqual(sent.transfers.map(t => [t.asset, t.from, t.raw]), [['native', FROM, E]]);
+  assert.equal((await run({ value: E }, osaka)).logs!.length, 0);
+  // SLOTNUM (EIP-7843) reads the block's slot; before Amsterdam it is no opcode.
+  const SLOT = '0x00000000000000000000000000000000000c0de4';
+  await chain.putCode(SLOT, '0x4b60005260206000f3');
+  assert.equal(BigInt((await run({ to: SLOT })).returnData!), 11_552_491n);
+  assert.equal((await run({ to: SLOT }, osaka)).status, 'reverted');
+  // A gas limit leaves the call what Amsterdam leaves it: the limit less 15,000 here, not less 21,000.
+  const GASLEFT = '0x00000000000000000000000000000000000c0de6';
+  await chain.putCode(GASLEFT, '0x5a60005260206000f3');
+  assert.equal(BigInt((await run({ to: GASLEFT, gas: 100_000n })).returnData!), 100_000n - 15_000n - 2n);
 });
 
 test('A traced preview, sent through the HTTP server, matches the API’s schema', async () => {

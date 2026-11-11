@@ -30,6 +30,12 @@ const CORE_WRITER = '0x3333333333333333333333333333333333333333';
 const RAW_ACTION_TOPIC = '0x8c7f585fb295f7eb1e6aeb8fba61b23a4fe60beda405f0045073b185c74412e3'; // RawAction(address,bytes)
 /** eth_simulateV1 with traceTransfers reports native transfers as ERC-20 logs from this address. */
 const NATIVE_PSEUDO_TOKEN = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
+/**
+ * EIP-7708 (Amsterdam): the address a chain logs its own native transfers from, as ERC-20 Transfer events. They are
+ * real logs (in receipts too), and a node that emits them adds no pseudo-logs for traceTransfers. They are the
+ * native coin moving, not a token at that address.
+ */
+export const NATIVE_LOG_ADDRESS = '0xfffffffffffffffffffffffffffffffffffffffe';
 
 type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
 
@@ -255,9 +261,15 @@ export class RpcSimulator implements Simulator {
     }
     const results = body.result?.[0]?.calls?.slice(before.length);
     const source = `eth_simulateV1 @ chain ${chainId}`;
-    // Errors that are the answer for a single transaction: the network would reject it the same way.
-    const rejected = body.error?.message && reqs.length === 1 ? rejection(body.error.message) : null;
+    // Errors that are the answer for a single transaction: the network would reject it the same way. Not when calls
+    // ran before it (a replay's earlier transactions): the error may be about any of them, or about the node's own
+    // allowance for one simulation, which a block's worth of transactions can use up (Sepolia's blocks hold 200
+    // million gas, more than its public node allows one simulation).
+    const rejected = body.error?.message && reqs.length === 1 && !before.length ? rejection(body.error.message) : null;
     if (rejected) return [{ status: 'reverted', source, revertReason: rejected, transfers: [], limited: true }];
+    if (body.error && before.length && /intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(body.error.message ?? '')) {
+      throw new Error(`the chain's node couldn't run the ${before.length} transactions before this one in its block within its gas allowance for one simulation (${body.error.message}); a node with a higher allowance can`);
+    }
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const parsed: SimulationResult[] = results.map(result => {
       const gasUsed = BigInt(result.gasUsed);
@@ -373,7 +385,7 @@ export class RpcSimulator implements Simulator {
       after.push([...touched.values()].slice(0, 24));
     });
     // Tokens: from the senders' Transfer logs, then the ones the calls name, then the chain's well-known ones.
-    const skip = (a: string) => owners.includes(a) || /^0x0{40}$/.test(a) || BigInt(a) < 0x10000n || a === NATIVE_PSEUDO_TOKEN;
+    const skip = (a: string) => owners.includes(a) || /^0x0{40}$/.test(a) || BigInt(a) < 0x10000n || a === NATIVE_PSEUDO_TOKEN || a === NATIVE_LOG_ADDRESS;
     const nftCollections = new Set(parsed.flatMap(r => (r.nftTransfers ?? []).map(t => t.collection)));
     const logged = parsed.flatMap(r => r.transfers.filter(t => t.asset !== 'native' && (owners.includes(t.from) || owners.includes(t.to))).map(t => t.asset));
     const named = reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(a => a.toLowerCase());
@@ -485,13 +497,16 @@ export function parseTransfers(logs: Log[]): SimulatedTransfer[] {
  */
 export function parseLogs(logs: Log[]): { transfers: SimulatedTransfer[]; nftTransfers: SimulatedNftTransfer[]; approvals: SimulatedApproval[]; coreActions?: { user: string; data: string }[] } {
   const transfers: SimulatedTransfer[] = [], nftTransfers: SimulatedNftTransfer[] = [], approvals: SimulatedApproval[] = [], coreActions: { user: string; data: string }[] = [];
+  // A chain that logs native transfers itself (EIP-7708): those are the record, and a pseudo-log beside one would count it twice.
+  const chainLogsNative = logs.some(l => l.address.toLowerCase() === NATIVE_LOG_ADDRESS);
   for (const log of logs) {
     const address = log.address.toLowerCase();
     const [topic0, t1, t2, t3] = log.topics.map(t => t.toLowerCase());
     const n = log.topics.length;
+    if (address === NATIVE_PSEUDO_TOKEN && chainLogsNative) continue;
     if (topic0 === TRANSFER_TOPIC) {
       // ERC-20: 3 topics + amount; ERC-721: 4 topics (tokenId indexed), no data.
-      if (n === 3 && isWords(log.data, 1)) transfers.push({ asset: address === NATIVE_PSEUDO_TOKEN ? 'native' : address, from: topicAddress(t1), to: topicAddress(t2), raw: BigInt(log.data) });
+      if (n === 3 && isWords(log.data, 1)) transfers.push({ asset: address === NATIVE_PSEUDO_TOKEN || address === NATIVE_LOG_ADDRESS ? 'native' : address, from: topicAddress(t1), to: topicAddress(t2), raw: BigInt(log.data) });
       else if (n === 4 && isEmpty(log.data)) nftTransfers.push({ standard: 'erc721', collection: address, from: topicAddress(t1), to: topicAddress(t2), tokenId: BigInt(t3), amount: 1n });
     } else if (topic0 === TRANSFER_SINGLE_TOPIC && n === 4 && isWords(log.data, 2)) {
       nftTransfers.push({ standard: 'erc1155', collection: address, from: topicAddress(t2), to: topicAddress(t3), tokenId: BigInt('0x' + log.data.slice(2, 66)), amount: BigInt('0x' + log.data.slice(66)) });

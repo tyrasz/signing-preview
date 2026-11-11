@@ -9,6 +9,7 @@
 import { decodeEventLog, decodeFunctionData, decodeFunctionResult, parseAbi, parseAbiItem, toEventSelector, toFunctionSelector, toFunctionSignature, type Abi, type AbiEvent, type AbiFunction, type AbiParameter, type Hex } from 'viem';
 import { builtinTokens, CHAINS } from '../chains.ts';
 import { NEXT_BLOCK } from '../block.ts';
+import { NATIVE_LOG_ADDRESS } from '../simulation.ts';
 import type { ContractAbi, Dependencies, PreviewTrace, ReplayContext, SimulationRequest, SimulationResult, StateChange, TraceCall, TraceEntry, TraceEvent, TraceValue } from '../types.ts';
 import { COMMON_SIGNATURES } from '../abi.ts';
 
@@ -210,6 +211,8 @@ export async function describeTrace(root: TraceCall, stateChanges: StateChange[]
   const label = (address: string | null): string | undefined => {
     if (!address) return undefined;
     const a = address.toLowerCase();
+    // EIP-7708's log of a native transfer comes from an address of the chain's own, not a token's.
+    if (a === NATIVE_LOG_ADDRESS) return `${CHAINS[env.chainId]?.nativeSymbol ?? 'native coin'} (the chain's own log)`;
     return a === account ? env.accountLabel ?? 'you' : tokens.get(a) ?? abis.get(a)?.name ?? precompileName(a);
   };
 

@@ -22,7 +22,7 @@ import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
-import { approvalKey, decodeRevert, decodeState, ELSEWHERE, namedApproval, parseLogs, stateCall } from './simulation.ts';
+import { approvalKey, decodeRevert, decodeState, ELSEWHERE, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -64,6 +64,12 @@ export interface ChainProfile {
    * which the price of changing a set slot, 5,000 less it, and the refund for clearing one follow).
    */
   storageGas?: { coldRead: number; coldWrite: number };
+  /**
+   * The chain's prices for the bn254 precompiles where they aren't Ethereum's (150 to add, 6,000 to multiply,
+   * 45,000 for a pairing and 34,000 a pair): Polygon charges 540, 12,600, 67,500 and 51,000, measured on its node
+   * by the gas a STATICCALL to each spends. Applied with `storageGas` (the chain that has one has the other).
+   */
+  bn254Gas?: { add: number; mul: number; pairing: number; pair: number };
   /** The chain has no point-evaluation precompile at 0x0a (it carries no blobs): the address is an empty account there. */
   noPointEvaluation?: boolean;
   /**
@@ -101,7 +107,8 @@ const BSC_PRECOMPILES = Array.from({ length: 6 }, (_, i) => low(0x64 + i));
  */
 export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   1: { hardfork: 'osaka', checked: { forkId: '0x07c9462e', on: '2026-11-10' }, ...NEXT_BLOCK[1] },
-  11155111: { hardfork: 'osaka', ...NEXT_BLOCK[11155111] },
+  // Sepolia runs Amsterdam (Glamsterdam) since 2026-10-06: its blocks say so, and run under those rules (see ETHEREUM_RULES).
+  11155111: { hardfork: 'osaka', checked: { forkId: '0x6c1d9423', on: '2026-11-11' }, ...NEXT_BLOCK[11155111] },
   42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, missingOpcodes: [0x4a] },
   8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453] },
   10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10] },
@@ -110,7 +117,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
-  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, missingOpcodes: [0x49, 0x4a] },
+  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, bn254Gas: { add: 540, mul: 12_600, pairing: 67_500, pair: 51_000 }, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true },
   56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
   999: { hardfork: 'cancun', ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
@@ -132,7 +139,7 @@ export interface ForkSimulatorOptions {
    * The simulated block's header. By default, the next block after `block`: its number + 1, its timestamp plus the
    * chain's block time, and its fee recipient, randomness and base fee. Replays pass the real block's header.
    */
-  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint; /** The block's blob base fee (BLOBBASEFEE). */ blobBaseFee?: bigint } | undefined;
+  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint; /** The block's blob base fee (BLOBBASEFEE). */ blobBaseFee?: bigint; /** The block is one of Amsterdam's. */ amsterdam?: boolean; /** The beacon slot (SLOTNUM), from Amsterdam on. */ slotNumber?: bigint } | undefined;
   profiles?: Record<number, ChainProfile>;
   /**
    * A file to keep the caches shared by all simulations in (contract code and the last value seen of each slot), so
@@ -627,6 +634,8 @@ function storagePricing(profile: ChainProfile) {
   const params = JSON.parse(JSON.stringify(paramsEVM)) as Record<string, Record<string, number>>;
   Object.assign(params[2929], { coldsloadGas: g.coldWrite, sstoreCleanEIP2200Gas: 5000 - g.coldWrite });
   Object.assign(params[3529], { sstoreClearRefundEIP2200Gas: 5000 - g.coldWrite + 1900 });
+  // The chain's own prices for the bn254 precompiles (ChainProfile.bn254Gas), in place of Istanbul's.
+  if (profile.bn254Gas) Object.assign(params[1679], { bn254AddGas: profile.bn254Gas.add, bn254MulGas: profile.bn254Gas.mul, bn254PairingGas: profile.bn254Gas.pairing, bn254PairingWordGas: profile.bn254Gas.pair });
   type RunState = { stack: { peek(): bigint[]; pop(): bigint; push(v: bigint): void }; interpreter: { getAddress(): Address; storageLoad(key: Uint8Array): Promise<Uint8Array>; journal: { isWarmedStorage(a: Uint8Array, k: Uint8Array): boolean; addWarmedStorage(a: Uint8Array, k: Uint8Array): void } } };
   const slot = (key: bigint) => hexToBytes(`0x${key.toString(16).padStart(64, '0')}`);
   const sload = {
@@ -646,6 +655,8 @@ function storagePricing(profile: ChainProfile) {
 }
 
 const POINT_EVALUATION = '0x000000000000000000000000000000000000000a';
+/** Chains that run Ethereum's own fork schedule: mainnet and Sepolia. */
+const ETHEREUM_RULES = new Set([1, 11155111]);
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
 /** Code that is a marker for something the chain's node runs itself: it starts with 0xEF and is no delegation. */
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
@@ -674,18 +685,45 @@ const authorizationCount = (req: SimulationRequest) => (req.authorizationList?.l
  * authorizations, the execution, less the refund (at most a fifth of the total), and from Prague on, at least
  * EIP-7623's calldata floor.
  */
-function transactionGas(req: SimulationRequest, execution: bigint, refund: bigint, prague: boolean): bigint {
+function transactionGas(req: SimulationRequest, execution: bigint, refund: bigint, prague: boolean, amsterdam = false): bigint {
+  const { intrinsic, floor } = intrinsicGas(req, amsterdam);
+  const used = intrinsic + execution;
+  const net = used - (refund < used / 5n ? refund : used / 5n);
+  return (prague || amsterdam) && floor > net ? floor : net;
+}
+
+/** What a transaction pays before its call runs (what its gas limit is less, for the call), and the least it can pay (the calldata floor). */
+function intrinsicGas(req: SimulationRequest, amsterdam: boolean): { intrinsic: bigint; floor: bigint } {
   const data = req.data, creation = !req.to;
   let zero = 0n, nonzero = 0n;
   for (let i = 2; i < data.length; i += 2) if (data.slice(i, i + 2) === '00') zero++; else nonzero++;
   const words = creation ? (BigInt(data.length - 2) / 2n + 31n) / 32n : 0n;
+  if (amsterdam) {
+    // Amsterdam (EIP-2780, 7976, 7981, 8037, 8038), as the chain's node charges it on Sepolia: a base of 12,000;
+    // 3,000 for the recipient's account unless the sender calls itself, and 6,000 more when value moves; a creation
+    // pays 12,000 instead. An access list costs 2,900 an address and 2,000 a key, plus its bytes at the floor's
+    // price. The floor counts every calldata byte as four tokens, at 16 each, over the same base.
+    const base = 12_000n + (creation ? 12_000n : hexOf(req.to!) === hexOf(req.from) ? 0n : 3_000n + (req.value > 0n ? 6_000n : 0n));
+    const list = req.accessList ?? [], keys = list.reduce((n, e) => n + BigInt(e.storageKeys.length), 0n);
+    const listBytes = 20n * BigInt(list.length) + 32n * keys;
+    return {
+      intrinsic: base + 4n * zero + 16n * nonzero + 2n * words + 2_900n * BigInt(list.length) + 2_000n * keys + 64n * listBytes + AMSTERDAM_AUTHORIZATION * BigInt(authorizationCount(req)),
+      floor: base + 64n * (zero + nonzero + listBytes),
+    };
+  }
   const listed = (req.accessList ?? []).reduce((g, e) => g + 2400n + 1900n * BigInt(e.storageKeys.length), 0n);
-  const intrinsic = 21_000n + 4n * zero + 16n * nonzero + (creation ? 32_000n + 2n * words : 0n) + listed + 25_000n * BigInt(authorizationCount(req));
-  const used = intrinsic + execution;
-  const net = used - (refund < used / 5n ? refund : used / 5n);
-  const floor = 21_000n + 10n * (zero + 4n * nonzero);
-  return prague && floor > net ? floor : net;
+  return {
+    intrinsic: 21_000n + 4n * zero + 16n * nonzero + (creation ? 32_000n + 2n * words : 0n) + listed + 25_000n * BigInt(authorizationCount(req)),
+    floor: 21_000n + 10n * (zero + 4n * nonzero),
+  };
 }
+
+/**
+ * Amsterdam's charge for an EIP-7702 authorization of an account that exists: 7,816 for the tuple and its checks,
+ * and 23 bytes of new state (the delegation) at 1,530 a byte. Not checked against the chain: Sepolia's recent blocks
+ * had no such transaction when this was measured.
+ */
+const AMSTERDAM_AUTHORIZATION = 7_816n + 23n * 1_530n;
 
 const requestKey = (reqs: SimulationRequest[]) => reqs.map(r => `${r.chainId}:${r.from}:${r.to}:${r.value}:${r.data}`).join('|').toLowerCase();
 
@@ -806,10 +844,12 @@ export class ForkSimulator implements Simulator {
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
     const prefetch = source.fetch(first);
     const fixed = at?.header ?? this.opts.header?.(chainId);
-    const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number }
+    const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam }
       : this.blockContext(source, tag, profile), prefetch, this.rulesOf(chainId, source)]);
     // Ethereum's past blocks run under the rules of their time; every other chain's under today's (see rulesNote).
-    const hardfork = chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
+    // A block of Amsterdam's (Glamsterdam: its header says so) runs Amsterdam's rules, on Ethereum and its testnet.
+    const amsterdam = ETHEREUM_RULES.has(chainId) && !!block.amsterdam;
+    const hardfork = amsterdam ? 'amsterdam' : chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
     if (hardfork !== profile.hardfork) profile = { ...profile, hardfork };
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never });
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
@@ -876,7 +916,7 @@ export class ForkSimulator implements Simulator {
     // a block time later, with opcode 0x44 as the chain answers it (src/block.ts).
     const next = headerAfter(source.chainId, await source.header(tag));
     return { header: { number: next.number, coinbase: createAddressFromString(next.coinbase), timestamp: next.timestamp, difficulty: 0n, prevRandao: hexToBytes(next.prevRandao),
-      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n }, arbBlockNumber: next.arbBlockNumber ?? next.number };
+      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n, ...(next.slotNumber !== undefined && { slotNumber: next.slotNumber }) }, arbBlockNumber: next.arbBlockNumber ?? next.number, amsterdam: next.amsterdam };
   }
 
   /** One run of the calls, in order, on a fresh state over `source`. */
@@ -1064,7 +1104,7 @@ export class ForkSimulator implements Simulator {
       senderAccount.nonce++;
       await state.putAccount(sender, senderAccount);
       const authRefund = await this.authorize(state, evm, auths[i], chainId);
-      const gasLimit = req.gas ? req.gas - transactionGas({ ...req, data: req.data }, 0n, 0n, false) : GAS;
+      const gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic : GAS;
       callIndex = i;
       recording = true;
       if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
@@ -1073,7 +1113,7 @@ export class ForkSimulator implements Simulator {
       recording = false;
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
-      const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork));
+      const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + (profile.hardfork === 'amsterdam' ? 0n : authRefund), !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
         results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data, ...(traced?.trace && { trace: traced.trace }) });
@@ -1082,7 +1122,7 @@ export class ForkSimulator implements Simulator {
       const logs = (ex.logs ?? []).map(([address, topics, data]) => ({ address: bytesToHex(address), topics: topics.map(t => bytesToHex(t)), data: bytesToHex(data) }));
       const parsed = parseLogs(logs);
       // Tokens whose Transfer logs involve the account: read its balance of each, before and after.
-      for (const l of logs) if (l.topics[0] === TRANSFER && l.topics.length === 3 && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from)) {
+      for (const l of logs) if (l.topics[0] === TRANSFER && l.topics.length === 3 && hexOf(l.address) !== NATIVE_LOG_ADDRESS && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from)) {
         const t = hexOf(l.address);
         seenTokens.add(t);
         if (i > 0 && !tokens.has(t)) rerun = true;

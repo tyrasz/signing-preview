@@ -18,6 +18,16 @@ export interface BlockAt {
     arbBlockNumber?: bigint;
     /** The block's blob base fee (BLOBBASEFEE), on chains with blobs: a rollup's batch poster reads it. */
     blobBaseFee?: bigint;
+    /**
+     * The block is one of Amsterdam's (Glamsterdam): the header it follows carries a block access list hash
+     * (EIP-7928), which headers have from that fork on. The local EVM then runs Amsterdam's rules.
+     */
+    amsterdam?: boolean;
+    /**
+     * The beacon slot the block is in (SLOTNUM, EIP-7843), from Amsterdam on. A block simulated after another is
+     * taken to be in the next slot, as the chain's node takes it whatever time it is given.
+     */
+    slotNumber?: bigint;
   };
   /**
    * The block was asked for (a past block, a replay), not named only so that two runs match: a node that can't serve
@@ -47,7 +57,7 @@ export const NEXT_BLOCK: Record<number, { blockTime: number; /** The chain carri
 };
 
 /** A block header as eth_getBlockByNumber returns it (the fields used here). */
-export interface RpcHeader { number: string; timestamp: string; miner: string; mixHash?: string; gasLimit: string; baseFeePerGas?: string; difficulty?: string; l1BlockNumber?: string }
+export interface RpcHeader { number: string; timestamp: string; miner: string; mixHash?: string; gasLimit: string; baseFeePerGas?: string; difficulty?: string; l1BlockNumber?: string; /** EIP-7928: present from Amsterdam (Glamsterdam) on. */ blockAccessListHash?: string; /** EIP-7843: the beacon slot, from Amsterdam on. */ slotNumber?: string }
 
 const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
 
@@ -63,6 +73,8 @@ export function headerAfter(chainId: number, h: RpcHeader): BlockAt['header'] {
     coinbase: h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
     prevRandao: rules.randomness === 'one' ? word(1n) : rules.randomness === 'difficulty' ? word(difficulty) : (h.mixHash ?? word(0n)) as Hex,
     ...(rules.difficultyOverride && { difficulty }),
+    ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
+    ...(h.slotNumber !== undefined && { slotNumber: BigInt(h.slotNumber) + 1n }),
   };
 }
 
@@ -79,6 +91,8 @@ export function headerOf(chainId: number, h: RpcHeader): BlockAt['header'] {
     timestamp: BigInt(h.timestamp), coinbase: h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
     prevRandao: rules.randomness === 'one' ? word(1n) : rules.randomness === 'difficulty' ? word(difficulty) : (h.mixHash ?? word(0n)) as Hex,
     ...(rules.difficultyOverride && { difficulty }),
+    ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
+    ...(h.slotNumber !== undefined && { slotNumber: BigInt(h.slotNumber) }),
   };
 }
 

@@ -8,11 +8,11 @@ import { readFileSync } from 'node:fs';
 import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
-import { afterParent, nodeOverrides, parseBlock, pinBlock, priceFields } from '../src/block.ts';
+import { afterParent, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
-import { parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { NATIVE_LOG_ADDRESS, parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { builtinTokens, StaticTokenRegistry } from '../src/chains.ts';
 import { CHAINLINK_FEEDS, ChainlinkPrices } from '../src/prices.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, TraceCall } from '../src/types.ts';
@@ -381,4 +381,38 @@ test('A trace says when the local EVM’s gas, or its rules, aren’t the chain�
   ajv.addSchema({ ...spec, $id: 'spec3' });
   const check = ajv.getSchema('spec3#/components/schemas/PreviewTrace')!;
   assert.ok(check(JSON.parse(JSON.stringify(off))), JSON.stringify(check.errors?.slice(0, 3)));
+});
+
+test('Glamsterdam, as a preview sees it: the chain’s own transfer log is the native coin, and a header says which rules its block runs', async () => {
+  // EIP-7708: a chain that logs its native transfers itself does so from an address of its own, as ERC-20 Transfer
+  // events. They are the native coin moving, never a token at that address.
+  const native = { address: NATIVE_LOG_ADDRESS, topics: [TRANSFER, pad(ALICE), pad(BOB)], data: pad(hex(10n ** 18n)) };
+  assert.deepEqual(parseLogs([native, LOG]).transfers.map(t => [t.asset, t.raw]), [['native', 10n ** 18n], [USDC, 200_000_000n]]);
+  // A node that also adds the pseudo-log traceTransfers asks for would count the transfer twice: the chain's own is kept.
+  const pseudo = { ...native, address: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' };
+  assert.deepEqual(parseLogs([pseudo, native]).transfers.map(t => [t.asset, t.raw]), [['native', 10n ** 18n]]);
+  assert.deepEqual(parseLogs([pseudo]).transfers.map(t => [t.asset, t.raw]), [['native', 10n ** 18n]]);
+  // Through a preview: sending 1 ETH on such a chain shows 1 ETH leaving, not a token called by an address.
+  const send = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: BOB, value: hex(10n ** 18n), chainId: '0xaa36a7' }] }, { now: NOW },
+    { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ({ status: 'success', source: 'a test', gasUsed: 21_000n, ...parseLogs([native]), logs: [native] }) } });
+  assert.deepEqual(send.assetChanges.map(c => [c.direction, c.amount, c.symbol, c.asset]), [['out', '1', 'ETH', 'native']]);
+  assert.equal(send.warnings.length, 0);
+
+  // A header from Amsterdam on carries a block access list hash and a slot number: the block after it runs
+  // Amsterdam's rules, in the next slot; a block replayed as it was, in its own.
+  const h = { number: '0x64', timestamp: '0x3e8', miner: BOB, mixHash: H(1), gasLimit: '0xbebc200', baseFeePerGas: '0x7' };
+  const glam = { ...h, blockAccessListHash: H(9), slotNumber: '0xb046bd' };
+  assert.deepEqual([headerAfter(1, glam).amsterdam, headerAfter(1, glam).slotNumber, headerOf(1, glam).slotNumber], [true, 11_552_446n, 11_552_445n]);
+  assert.deepEqual([headerAfter(1, h).amsterdam, headerAfter(1, h).slotNumber, headerOf(1, h).amsterdam], [undefined, undefined, undefined]);
+
+  // A node's allowance for one simulation can run out on a block's earlier transactions (Sepolia's blocks hold 200
+  // million gas): said as that, not as this transaction's gas limit being too low.
+  const exhausted = (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38013, message: 'intrinsic gas too low' } }))) as unknown as typeof fetch;
+  const header = { number: 100n, timestamp: 5n, coinbase: BOB.toLowerCase(), gasLimit: 1n, baseFeePerGas: 2n, prevRandao: H(1) as `0x${string}` };
+  const request = { chainId: 8453, from: ALICE.toLowerCase(), to: BOB, data: '0x', value: 0n };
+  await assert.rejects(new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl: exhausted }).simulateBatch([{ ...request, at: { block: '0x63', header, required: true, before: [request, request] } }]),
+    /the chain's node couldn't run the 2 transactions before this one in its block within its gas allowance for one simulation \(intrinsic gas too low\)/);
+  // Alone, the same error is the transaction's own: the network would refuse it too.
+  const [alone] = (await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl: exhausted }).simulateBatch([request]))!;
+  assert.match(alone.revertReason!, /the gas limit is below the minimum/);
 });

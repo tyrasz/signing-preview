@@ -29,6 +29,8 @@ export const EVM_RPCS: Record<number, { env: string; public: string }> = {
   10: { env: 'OPTIMISM_RPC_URL', public: 'https://optimism-rpc.publicnode.com' },
   137: { env: 'POLYGON_RPC_URL', public: 'https://polygon-bor-rpc.publicnode.com' },
   56: { env: 'BSC_RPC_URL', public: 'https://bsc-rpc.publicnode.com' },
+  // Ethereum's testnet, which runs each fork months before mainnet does (Glamsterdam since 2026-10-06).
+  11155111: { env: 'SEPOLIA_RPC_URL', public: 'https://ethereum-sepolia-rpc.publicnode.com' },
 };
 /** The RPC for a chain: its environment variable's (empty counts as unset, as an unset CI secret is), else the public one. */
 export const rpcUrlFor = (chainId: number, env: Record<string, string | undefined>): string | undefined =>
