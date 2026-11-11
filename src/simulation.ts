@@ -187,6 +187,8 @@ export class RpcSimulator implements Simulator {
   private noSimulate = new Set<number>();
   /** ...and that also ignore eth_call state overrides: only success or failure can be checked. */
   private noProbe = new Set<number>();
+  /** Chains whose node refused a call that names blob hashes (see buildable). */
+  private noBlobCalls = new Set<number>();
   /** `urls`: an RPC per chain. See RpcSimulatorOptions for the fallback simulator and replays. */
   constructor(urls: Record<number, string>, options: RpcSimulatorOptions = {}) {
     this.urls = urls;
@@ -242,7 +244,16 @@ export class RpcSimulator implements Simulator {
   /** A replay's earlier calls (see RpcSimulatorOptions.replay), as eth_simulateV1 calls. */
   private async before(chainId: number, reqs?: SimulationRequest[]): Promise<unknown[]> {
     const before = this.replay?.(chainId)?.before ?? reqs?.[0]?.at?.before ?? [];
-    return Promise.all(before.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
+    return Promise.all(before.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(this.buildable(chainId, req)) })));
+  }
+  /**
+   * A call as this chain's node will take it. BNB Chain's node refuses any call that names blob hashes ("Transaction
+   * is not buildable", whatever else it is given), so a block with a blob transaction in it couldn't be replayed
+   * past that transaction. On such a node a blob transaction is sent as the plain call it also is, at its price:
+   * what it does to the chain's state is the same (the blobs are data for elsewhere); only BLOBHASH reads nothing.
+   */
+  private buildable(chainId: number, req: SimulationRequest): SimulationRequest {
+    return this.noBlobCalls.has(chainId) && req.blobVersionedHashes?.length ? { ...req, blobVersionedHashes: undefined, maxFeePerBlobGas: undefined } : req;
   }
   /** eth_simulateV1's blockOverrides: the replayed block's header, and a base fee the calls ask for (see SimulationRequest.baseFee). */
   private blockOverrides(reqs: SimulationRequest[]): Record<string, string> | undefined {
@@ -277,7 +288,7 @@ export class RpcSimulator implements Simulator {
     const url = this.urls[chainId];
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
-    const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
+    const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(this.buildable(chainId, req)) })));
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(chainId, reqs);
@@ -285,6 +296,11 @@ export class RpcSimulator implements Simulator {
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
       return this.withoutSimulateV1(url, chainId, reqs);
+    }
+    // A node that won't build a call with blob hashes (see buildable): asked again without them, from now on.
+    if (/not buildable/i.test(body.error?.message ?? '') && !this.noBlobCalls.has(chainId) && [...reqs, ...(this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [])].some(r => r.blobVersionedHashes?.length)) {
+      this.noBlobCalls.add(chainId);
+      return this.simulateAt(reqs);
     }
     const results = body.result?.[0]?.calls?.slice(before.length);
     const source = `eth_simulateV1 @ chain ${chainId}`;

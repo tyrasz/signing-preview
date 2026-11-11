@@ -340,6 +340,25 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   assert.deepEqual([rest.length, only.gasUsed], [0, 21_001n]);
   assert.deepEqual(sent[0].calls.map(c => [c.from, c.maxFeePerGas, c.blobVersionedHashes]), [[BOB.toLowerCase(), '0x5', [H(2)]], [ALICE.toLowerCase(), undefined, undefined]]);
 
+  // BNB Chain's node refuses any call that names blob hashes. Asked again without them (the blob transaction as the
+  // plain call it also is, at its price), it runs the block; from then on that chain is plainly that way at once.
+  const plainly: { from: string; gasPrice?: string; maxFeePerGas?: string; blobVersionedHashes?: string[]; maxFeePerBlobGas?: string }[][] = [];
+  const unbuilding = (async (_u: string, init: { body: string }) => {
+    const calls = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: (typeof plainly)[number] }[] }] }).params[0].blockStateCalls[0].calls;
+    plainly.push(calls);
+    if (calls.some(c => c.blobVersionedHashes)) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Transaction is not buildable' } }));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map((_, i) => ({ status: '0x1', gasUsed: `0x${(21_000 + i).toString(16)}`, returnData: '0x', logs: [] })) }] }));
+  }) as unknown as typeof fetch;
+  const bnb = new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: unbuilding });
+  const after = { chainId: 56, from: ALICE.toLowerCase(), to: BOB, data: '0x' as const, value: 0n, at: { ...at, before: at.before.map(b => ({ ...b, chainId: 56 })) } };
+  assert.equal((await bnb.simulateBatch([after]))![0].gasUsed, 21_001n);
+  assert.deepEqual(plainly.slice(0, 2).map(calls => calls.slice(0, 2).map(c => [c.gasPrice, c.maxFeePerGas, c.blobVersionedHashes, c.maxFeePerBlobGas])), [[[undefined, '0x5', [H(2)], '0x1'], [undefined, undefined, undefined, undefined]], [['0x5', undefined, undefined, undefined], [undefined, undefined, undefined, undefined]]]);
+  assert.equal((await bnb.simulateBatch([after]))![0].gasUsed, 21_001n);
+  assert.equal(plainly.filter(calls => calls.some(c => c.blobVersionedHashes)).length, 1);
+  // A refusal with no blob call in it is the node's answer, not something to ask again about.
+  const never = (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Transaction is not buildable' } }))) as unknown as typeof fetch;
+  await assert.rejects(new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: never }).simulateBatch([{ ...after, at: { ...at, before: undefined } }]), /not buildable/);
+
   // A node that takes a past block for an archive request it won't serve: the same plain answer.
   const refusing = (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32602, message: 'Archive requests require a personal token.' } }), { status: 403 })) as unknown as typeof fetch;
   await assert.rejects(new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl: refusing }).simulateBatch([{ chainId: 8453, from: ALICE, to: BOB, data: '0x', value: 0n, at: { ...at, before: undefined } }]), /doesn't keep the state of block 99/);

@@ -77,7 +77,9 @@ function pick(txs: Tx[]): string[] {
 }
 
 async function block(n: number): Promise<void> {
-  const b = await call<{ transactions: Tx[] }>('eth_getBlockByNumber', [`0x${n.toString(16)}`, true]);
+  // A node that is turning requests away (HTTP 429 on a busy public endpoint) costs this block, not the run.
+  const b = await call<{ transactions: Tx[] }>('eth_getBlockByNumber', [`0x${n.toString(16)}`, true]).catch(() => null);
+  if (!b) return void await new Promise(r => setTimeout(r, 3000));
   const hashes = pick(b?.transactions ?? []).slice(0, Math.max(0, MAX - rows.length));
   for (let i = 0; i < hashes.length; i += CONCURRENCY) await Promise.all(hashes.slice(i, i + CONCURRENCY).map(h => replay(h, n)));
 }

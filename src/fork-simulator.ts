@@ -372,7 +372,7 @@ class StateSource {
    * Reads are of the state after these calls (the transactions before a replayed one in its block), which the node
    * runs first, in a simulated block of their own (see fetchAfter). `sent`: how many of them each address sent.
    */
-  after?: { calls: unknown[]; blockOverrides: Record<string, string>; sent: Map<string, bigint>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges };
+  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges };
 
   async fetch(m: Misses): Promise<void> {
     if (!this.after) return this.fetchAt(m);
@@ -391,7 +391,12 @@ class StateSource {
     const accounts = [...m.accounts];
     const word = (h: string) => h.slice(2).padStart(64, '0');
     const nonces = new Map<string, bigint>();
-    const nonceJobs = accounts.map(a => ({ method: 'eth_getTransactionCount', params: [a, this.block], done: (r: unknown) => { nonces.set(a, BigInt(r as string) + (after.sent.get(a) ?? 0n)); } }));
+    // A nonce after the earlier calls: the parent block's, up by one for each transaction the address sent and for
+    // each authorization of its own that named the nonce it had by then (an account that delegates itself in two
+    // transactions of a block: BNB Chain's busiest sender does, and a trace of the second took its authorization
+    // for stale).
+    const moved = (a: string, nonce: bigint) => { for (const b of after.bumps.get(a) ?? []) if (b === 'sent' || b === nonce) nonce++; return nonce; };
+    const nonceJobs = accounts.map(a => ({ method: 'eth_getTransactionCount', params: [a, this.block], done: (r: unknown) => { nonces.set(a, moved(a, BigInt(r as string))); } }));
     const slots = new Map<string, string[]>();
     const want = (a: string, slot: string) => { const l = slots.get(a) ?? []; if (!l.includes(slot)) l.push(slot); slots.set(a, l); };
     for (const a of accounts) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`)) want(a, slot);
@@ -403,9 +408,22 @@ class StateSource {
     if (accountCalls.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE }, [CODE_READER]: { code: CODE_READER_CODE } }, calls: accountCalls });
     if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}` })) });
     let out: { calls: { status: string; returnData: Hex }[] }[] | undefined;
+    const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
       this.sendAll(nonceJobs),
-      this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]),
+      // A node that won't build a call with blob hashes (BNB Chain's: RpcSimulator.buildable) is asked again with
+      // the earlier blob transactions as the plain calls they also are, at their price.
+      simulate().catch(e => {
+        const blobs = (after.calls as Record<string, unknown>[]).some(c => c.blobVersionedHashes);
+        if (!blobs || !/not buildable/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        after.calls = (after.calls as Record<string, unknown>[]).map(c => {
+          if (!c.blobVersionedHashes) return c;
+          const { blobVersionedHashes: _hashes, maxFeePerBlobGas: _cap, maxFeePerGas, maxPriorityFeePerGas: _tip, ...plain } = c;
+          return { ...plain, ...(maxFeePerGas !== undefined && { gasPrice: maxFeePerGas }) };
+        });
+        (blocks[0] as { calls: unknown[] }).calls = after.calls;
+        return simulate();
+      }),
     ]);
     const failed = new Error('reading the state after the block\'s earlier transactions failed');
     if (!out || out.length !== blocks.length) throw failed;
@@ -956,9 +974,13 @@ export class ForkSimulator implements Simulator {
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
     source.historic = !!at?.required;
     if (options?.after?.length && at) {
-      const hex = (v: bigint) => `0x${v.toString(16)}`, sent = new Map<string, bigint>();
-      for (const r of options.after) sent.set(hexOf(r.from), (sent.get(hexOf(r.from)) ?? 0n) + 1n);
-      source.after = { sent, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
+      const hex = (v: bigint) => `0x${v.toString(16)}`, bumps = new Map<string, (bigint | 'sent')[]>();
+      const bump = (a: string, by: bigint | 'sent') => { const l = bumps.get(a) ?? []; l.push(by); bumps.set(a, l); };
+      for (const r of options.after) {
+        bump(hexOf(r.from), 'sent');
+        for (const a of await authorizationsOf(r)) if (a.authority && a.nonce !== undefined && (a.chainId === 0n || a.chainId === BigInt(chainId))) bump(a.authority, a.nonce);
+      }
+      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
         ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })) };
     }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for

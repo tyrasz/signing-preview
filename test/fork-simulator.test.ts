@@ -464,6 +464,41 @@ test('Calls that run first in the block: the node runs them and the local EVM st
   } finally { chain.simulateV1 = false; }
 });
 
+test('After a block’s earlier transactions, an account’s nonce counts its authorizations; a node that won’t build blob calls gets them plain', async () => {
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const KEY = `0x${'9a'.repeat(32)}` as Hex, sender = privateKeyToAccount(KEY).address.toLowerCase();
+  await chain.setBalance(sender, E);
+  const authorization = async (nonce: number, chainId = 999) => {
+    const a = await privateKeyToAccount(KEY).signAuthorization({ address: weth as Hex, chainId, nonce });
+    return { address: weth, chainId: toHex(chainId), nonce: toHex(nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) };
+  };
+  // The sender (nonce 0 before the block) delegated itself in an earlier transaction: sending it took its nonce to
+  // 1, and its authorization, for 1, to 2. One for another chain, or for a nonce that isn't the account's, moves
+  // nothing. So the transaction replayed is sent at 2, and its own authorization, for 3, is good: it is applied.
+  const earlier: SimulationRequest[] = [
+    { chainId: 999, from: sender, to: BOB, data: '0x', value: 0n, authorizationList: [await authorization(1), await authorization(2, 5), await authorization(7)] },
+    { chainId: 999, from: USER, to: BOB, data: '0x', value: 1n, gasPrice: 5n, blobVersionedHashes: [`0x01${'00'.repeat(31)}`], maxFeePerBlobGas: 1n },
+  ];
+  const target: SimulationRequest = { chainId: 999, from: sender, to: BOB, data: '0x', value: 0n, authorizationList: [await authorization(3)] };
+  // This node, like BNB Chain's, refuses a call that names blob hashes.
+  const asked: Record<string, unknown>[][] = [];
+  const picky = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { id: number; method: string; params: [{ blockStateCalls: { calls: Record<string, unknown>[] }[] }] }[];
+    const sim = Array.isArray(body) ? body.find(b => b.method === 'eth_simulateV1') : undefined;
+    if (sim) asked.push(sim.params[0].blockStateCalls[0].calls);
+    if (sim?.params[0].blockStateCalls[0].calls.some(c => c.blobVersionedHashes)) return new Response(JSON.stringify(body.map(b => ({ jsonrpc: '2.0', id: b.id, error: { code: -32000, message: 'Transaction is not buildable' } }))), { headers: { 'content-type': 'application/json' } });
+    return chain.fetchImpl(url, init);
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    const [r] = (await fork({ fetchImpl: picky }).trace([{ ...target, at: { block: '0x10', header, before: earlier } }]))!;
+    assert.deepEqual([r.status, r.stateChanges!.find(c => c.address === sender)], ['success', { address: sender, nonce: { before: 3n, after: 4n }, code: true }]);
+    // Asked twice: as the transactions were, then with the blob transaction as a plain call at its price.
+    const shapes = asked.map(calls => JSON.stringify(calls.map(c => [c.gasPrice ?? null, c.maxFeePerGas ?? null, c.blobVersionedHashes !== undefined])));
+    assert.deepEqual([shapes[0], [...new Set(shapes.slice(1))]], ['[[null,null,false],[null,"0x5",true]]', ['[[null,null,false],["0x5",null,false]]']]);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('A replay that starts from what its block had changed (the block’s access list): balances, nonces, code and storage', async () => {
   // As above, Bob's transfer of 30 USDC only works after the user's 50 to him. Here nothing is run first: the state
   // the earlier transaction left is given (BlockAt.state), as a block's access list has it from Amsterdam on.
