@@ -8,6 +8,7 @@
 // What can't be named keeps its selector and raw data.
 import { decodeEventLog, decodeFunctionData, decodeFunctionResult, parseAbi, parseAbiItem, toEventSelector, toFunctionSelector, toFunctionSignature, type Abi, type AbiEvent, type AbiFunction, type AbiParameter, type Hex } from 'viem';
 import { builtinTokens, CHAINS } from '../chains.ts';
+import { NEXT_BLOCK } from '../block.ts';
 import type { ContractAbi, Dependencies, PreviewTrace, ReplayContext, SimulationRequest, SimulationResult, StateChange, TraceCall, TraceEntry, TraceEvent, TraceValue } from '../types.ts';
 import { COMMON_SIGNATURES } from '../abi.ts';
 
@@ -140,7 +141,7 @@ function eventOf(log: NonNullable<TraceCall['logs']>[number], abi: ContractAbi |
  * unnamed.
  */
 export async function describeTrace(root: TraceCall, stateChanges: StateChange[] | undefined, env: TraceEnv,
-  info: { source: string; agrees?: boolean; note?: string }): Promise<PreviewTrace> {
+  info: { source: string; agrees?: boolean; gasAgrees?: boolean; note?: string }): Promise<PreviewTrace> {
   const { chainId, deps } = env;
   const flat: { call: TraceCall; depth: number }[] = [];
   let total = 0;
@@ -247,7 +248,7 @@ export async function describeTrace(root: TraceCall, stateChanges: StateChange[]
   });
 
   return {
-    source: info.source, ...(info.agrees !== undefined && { agrees: info.agrees }), ...(info.note && { note: info.note }),
+    source: info.source, ...(info.agrees !== undefined && { agrees: info.agrees }), ...(info.gasAgrees !== undefined && { gasAgrees: info.gasAgrees }), ...(info.note && { note: info.note }),
     calls, ...(total > flat.length && { truncated: true, totalCalls: total }),
     ...(stateChanges?.length && { stateChanges: stateChanges.map(s => ({
       address: s.address, ...(label(s.address) && { label: label(s.address) }),
@@ -310,8 +311,14 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
     const agrees = !s || s === t ? undefined : sameRun(t, s);
     const differs = agrees === false ? `The traced run ${t.status !== s!.status ? `ended differently (${t.status === 'success' ? 'it succeeded' : `it failed${t.revertReason ? `: ${t.revertReason}` : ''}`})` : 'emitted different events'} from the simulation shown above, which the chain's own node ran: take the trace as a guide to what the transaction does, not as its record.` : undefined;
     // The simulation shown ran on another block than the trace (the node couldn't serve the one named).
-    const note = [s?.traceNote, differs].filter(Boolean).join(' ');
-    return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(note && { note }) });
+    // Two runs that did the same should have used the same gas: where they didn't, the local EVM's gas rules aren't
+    // the chain's here (a fork it wasn't checked against, an older block's rules). Compared for calls that succeeded
+    // (a failure that burns its gas limit burns each simulator's own default), and not on Arbitrum, whose node adds
+    // a charge for L1 data that no EVM run has.
+    const gasAgrees = agrees && s!.status === 'success' && s!.gasUsed !== undefined && t.gasUsed !== undefined && !NEXT_BLOCK[env.chainId]?.arbitrum && t.source !== 'mock' ? s!.gasUsed === t.gasUsed : undefined;
+    const gasDiffers = gasAgrees === false ? `The traced run used ${t.gasUsed!.toLocaleString('en-US')} gas where the simulation shown above used ${s!.gasUsed!.toLocaleString('en-US')}: the local EVM's gas rules differ from this chain's here, so the gas figures in the trace are approximate.` : undefined;
+    const note = [s?.traceNote, differs, gasDiffers, t.rulesNote].filter(Boolean).join(' ');
+    return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(gasAgrees !== undefined && { gasAgrees }), ...(note && { note }) });
   }));
 }
 

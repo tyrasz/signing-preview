@@ -199,6 +199,12 @@ export interface PreviewTrace {
   source: string;
   /** False when the run that was traced did not do what the simulation shown did (its outcome or events differ): the trace is then a guide only. */
   agrees?: boolean;
+  /**
+   * Whether the traced run used the same gas as the simulation shown, when both succeeded: false means the local
+   * EVM's gas rules aren't the chain's for this call, and the trace's gas figures are approximate. Absent when it
+   * wasn't compared (Arbitrum, whose node adds a charge for L1 data; a failed call; no second simulation).
+   */
+  gasAgrees?: boolean;
   note?: string;
   calls: TraceEntry[];
   /** The trace has more calls than are listed. */
@@ -315,6 +321,8 @@ export interface ReplayContext {
   info: Omit<ReplayInfo, 'matches' | 'differences'>;
   /** The transaction's block (hex) and its time, for prices as of then. */
   when: { block: string; time: number };
+  /** The block shares its second with its parent, and is run one second later than it was (src/block.ts, afterParent). */
+  shifted?: boolean;
 }
 
 export interface SimulationRequest {
@@ -482,6 +490,11 @@ export interface SimulationResult {
   returnData?: string;
   /** The call's logs as emitted, when the simulator reports them (native transfers aren't among them). */
   logs?: { address: string; topics: string[]; data: string }[];
+  /**
+   * Set by the local EVM when the rules it ran under may not be the chain's: the chain's node is on a fork the EVM
+   * wasn't checked against, or the block is from before the node's current fork.
+   */
+  rulesNote?: string;
   /** The amounts were read from balances before and after the call (not taken from the logs). */
   balancesRead?: boolean;
   /** The call's trace and the state it changed, when the request asked for them and the simulator can (see SimulationRequest.trace). */

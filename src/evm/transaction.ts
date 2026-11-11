@@ -288,12 +288,15 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       if (sim.coreActions?.length && !sameAddress(tx.to ?? '', HYPERLIQUID.coreWriter)) await simulatedCoreActions(sim.coreActions, tx.from, b, { deps, context });
       // A batch's call leaves the block to the batch's own note.
       b.note(replay || named ? pastNote(sim, preset ? undefined : named) : simulationNote(sim));
+      // A simulation the local EVM ran itself, under rules that may not be the chain's: it says so.
+      if (sim.rulesNote) b.note(sim.rulesNote);
     }
     // A replay against its receipt: the same outcome, events and gas say the run shown is what happened.
     if (replay) {
       const compared = compareWithReceipt(sim, replay.receipt);
       replayed = { ...replay.info, ...compared };
       const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.before.length ? `after the ${replay.before.length} transaction${replay.before.length === 1 ? '' : 's'} before it in the block` : 'first in the block'}, at the price it paid.`;
+      if (replay.shifted) b.note(SHIFTED);
       if (compared.matches) b.note(`${where} The run has the same outcome, events and gas as its receipt.`);
       else {
         b.note(where);
@@ -329,6 +332,9 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   };
 }
 
+/** A simulated block given a later second than the real one had (src/block.ts, afterParent). */
+const SHIFTED = "The block shares its second with the one before it, which this chain's node won't simulate: it was run one second later than it was, so anything that reads the block's time saw a second more.";
+
 /** How long a replay's tracing run may take: it runs the block's earlier transactions too. */
 const REPLAY_TRACE_MS = 60_000;
 
@@ -336,7 +342,7 @@ const REPLAY_TRACE_MS = 60_000;
 function pastNote(sim: Pick<SimulationResult, 'basis' | 'balancesRead'>, named: Pinned | undefined): string {
   const how = sim.basis === 'state' || sim.basis === 'fork' || sim.balancesRead ? 'Balance changes were read from the state before and after.' : 'Balance changes are derived from transfer events.';
   return named
-    ? `Simulated on the state after ${blockText(named.number, named.time)}, as the first transaction of the block that followed: what it would have done then, not now. ${how} The decoder's own lookups (names, balances and positions it describes) are of the latest block.`
+    ? `Simulated on the state after ${blockText(named.number, named.time)}, as the first transaction of the block that followed: what it would have done then, not now. ${how} The decoder's own lookups (names, balances and positions it describes) are of the latest block.${named.shifted ? ` ${SHIFTED}` : ''}`
     : how;
 }
 

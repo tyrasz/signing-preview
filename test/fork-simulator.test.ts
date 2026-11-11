@@ -10,7 +10,7 @@ import { RpcSimulator } from '../src/simulation.ts';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CHAIN_PROFILES, clearForkCaches, ForkSimulator, ForkTimeout } from '../src/fork-simulator.ts';
+import { CHAIN_PROFILES, clearForkCaches, ForkSimulator, ForkTimeout, ForkUnsupported, mainnetForkAt, nodeRulesOf } from '../src/fork-simulator.ts';
 import type { Dependencies, Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
 import { codes, NOW } from './helpers.ts';
 import { compiled, PRECOMPILE, testChain } from './evm-chain.ts';
@@ -420,6 +420,89 @@ test('A balance the caller sets for the simulation: the local EVM and the chain�
   assert.equal(p.simulation?.status, 'success');
   assert.ok(codes(p).includes('state_overridden'));
   assert.deepEqual(changes(p), [['out', '1', 'HYPE', 'simulated_state']]);
+});
+
+test('Rules that aren’t today’s or aren’t the local EVM’s: a past Ethereum block, a fork not checked, a precompile only the node has', async () => {
+  // Ethereum's fork at a block, by its number and time; the blob-parameter forks run as Osaka; nothing later than the profile's.
+  const at = (number: bigint, timestamp: bigint) => mainnetForkAt({ number, timestamp }, 'osaka');
+  assert.deepEqual([at(16_000_000n, 1_670_000_000n), at(17_500_000n, 1_690_000_000n), at(19_500_000n, 1_711_000_000n), at(22_500_000n, 1_747_000_000n), at(24_000_000n, 1_765_000_000n), at(25_000_000n, 1_770_000_000n), at(30_000_000n, 1_900_000_000n)],
+    ['paris', 'shanghai', 'cancun', 'prague', 'osaka', 'osaka', 'osaka']);
+  assert.equal(mainnetForkAt({ number: 19_500_000n, timestamp: 1_711_000_000n }, 'cancun'), 'cancun');
+  assert.throws(() => at(15_000_000n, 1_655_000_000n), (e: Error) => e instanceof ForkUnsupported && /before the Merge/.test(e.message));
+  // A contract using PUSH0 (Shanghai): invalid in a block from before it, fine after. Only a block that was asked for
+  // is run under its own rules; the latest block runs under today's.
+  const PUSH0 = '0x00000000000000000000000000000000000c0de0';
+  await chain.putCode(PUSH0, '0x5f60005260206000f3');
+  const mainnet = () => new ForkSimulator({ 1: URL_ }, { fetchImpl: chain.fetchImpl });
+  const header = (number: bigint, timestamp: bigint) => ({ number, timestamp, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex });
+  const req: SimulationRequest = { chainId: 1, from: USER, to: PUSH0, data: '0x', value: 0n };
+  const run = async (h: ReturnType<typeof header>, required = true) => (await mainnet().simulateBatch([{ ...req, at: { block: '0x10', header: h, required } }]))![0];
+  assert.match((await run(header(16_000_000n, 1_670_000_000n))).revertReason ?? '', /invalid opcode/i);
+  assert.equal((await run(header(17_500_000n, 1_690_000_000n))).status, 'success');
+  assert.equal((await run(header(16_000_000n, 1_670_000_000n), false)).status, 'success');
+  await assert.rejects(run(header(15_000_000n, 1_655_000_000n)), ForkUnsupported);
+  // Arbitrum has no BLOBBASEFEE: its node refuses the opcode, and so does the local EVM for it.
+  const BLOBFEE = '0x00000000000000000000000000000000000c0de1';
+  await chain.putCode(BLOBFEE, '0x4a60005260206000f3');
+  const blobFee = async (chainId: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: BLOBFEE, data: '0x', value: 0n }]))![0].status;
+  assert.deepEqual([await blobFee(1), await blobFee(42161), await blobFee(137)], ['success', 'reverted', 'reverted']);
+  // Polygon, which carries no blobs, has no BLOBHASH either.
+  const BLOBHASH = '0x00000000000000000000000000000000000c0de2';
+  await chain.putCode(BLOBHASH, '0x60004960005260206000f3');
+  const blobHash = async (chainId: number) => (await new ForkSimulator({ [chainId]: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId, from: USER, to: BLOBHASH, data: '0x', value: 0n }]))![0].status;
+  assert.deepEqual([await blobHash(1), await blobHash(42161), await blobHash(137)], ['success', 'success', 'reverted']);
+
+  // The point-evaluation precompile (0x0a) needs a KZG library this package doesn't carry: the chain's node answers
+  // it (a pure function of its input), at the precompile's own price. A contract that calls it and returns its answer:
+  const VERIFIER = '0x00000000000000000000000000000000000c0de3', KZG = '0x000000000000000000000000000000000000000a';
+  await chain.putCode(VERIFIER, '0x36600060003760406000366000600a5afa503d600060003e3d6000f3');
+  const answer = `0x${'00'.repeat(30)}1000${'73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001'}`;
+  const asked: string[] = [];
+  const nodeWithKzg = (ok: boolean) => (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const one = async (r: { id: number; method: string; params: [{ to?: string; data?: string }] }) => {
+      if (r.method !== 'eth_call' || r.params[0].to !== KZG) return (await chain.fetchImpl(u, { ...init, body: JSON.stringify(r) })).json();
+      asked.push(r.params[0].data!);
+      return ok ? { jsonrpc: '2.0', id: r.id, result: answer } : { jsonrpc: '2.0', id: r.id, error: { code: -32000, message: 'execution reverted', data: '0x' } };
+    };
+    return new Response(JSON.stringify(Array.isArray(body) ? await Promise.all(body.map(one)) : await one(body)));
+  }) as typeof fetch;
+  const proof = `0x${'11'.repeat(192)}` as Hex;
+  const verify = async (ok: boolean) => (await new ForkSimulator({ 1: URL_ }, { fetchImpl: nodeWithKzg(ok) }).simulateBatch([{ chainId: 1, from: USER, to: VERIFIER, data: proof, value: 0n }]))![0];
+  clearForkCaches();
+  const good = await verify(true);
+  assert.deepEqual([good.status, good.returnData, asked.includes(proof)], ['success', answer, true]);
+  assert.ok(good.gasUsed! > 21_000n + 50_000n && good.gasUsed! < 21_000n + 50_000n + 12_000n, `gas ${good.gasUsed}`);
+  // A proof the node rejects: the call to the precompile fails, and the contract returns nothing.
+  clearForkCaches();
+  assert.deepEqual([(await verify(false)).status, (await verify(false)).returnData ?? '0x'], ['success', '0x']);
+
+  // What a node says of its rules (eth_config): its fork id, when the fork took effect, its precompiles by address.
+  assert.deepEqual(nodeRulesOf({ current: { forkId: '0xAB', activationTime: 1_700_000_000, precompiles: { ECREC: '0x01', TxContext: '0x813000000000000000000000000000000000AA02' } } }),
+    { forkId: '0xab', activation: 1_700_000_000, precompiles: new Map([['0x0000000000000000000000000000000000000001', 'ECREC'], ['0x813000000000000000000000000000000000aa02', 'TxContext']]) });
+  // A node that lists no current fork (Polygon's), or has no eth_config: nothing is taken from it.
+  assert.deepEqual([nodeRulesOf({ next: { precompiles: { ECREC: '0x01' } } }), nodeRulesOf(undefined), nodeRulesOf({ current: {} })], [undefined, undefined, undefined]);
+
+  const NATIVE = '0x813000000000000000000000000000000000aa02';
+  const caller = await chain.deploy('Router'); // any contract: the request below calls the precompile directly
+  void caller;
+  try {
+    // The node lists a precompile the local EVM doesn't have: a call reaching it is refused, not run as an empty account.
+    chain.config = { current: { forkId: '0x169d85a3', activationTime: 1_793_901_600, precompiles: { ECREC: '0x0000000000000000000000000000000000000001', TxContext: NATIVE } } };
+    const base = () => new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl });
+    await assert.rejects(base().simulateBatch([{ chainId: 8453, from: USER, to: NATIVE, data: '0x', value: 0n }]), (e: Error) => e instanceof ForkUnsupported && /is TxContext, a precompile this chain's node has and the local EVM doesn't/.test(e.message));
+    // Anything else runs, and on the fork the profile was checked against nothing is said.
+    const [fine] = (await base().simulateBatch([{ chainId: 8453, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n }]))!;
+    assert.deepEqual([fine.status, fine.rulesNote], ['success', undefined]);
+    // The node has moved to another fork: the run says its rules weren't checked against it.
+    chain.config = { current: { forkId: '0xdeadbeef', activationTime: 1_796_697_000, precompiles: { ECREC: '0x0000000000000000000000000000000000000001' } } };
+    const [moved] = (await base().simulateBatch([{ chainId: 8453, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n }]))!;
+    assert.equal(moved.rulesNote, "Base's rules changed on 2026-12-08 since the local EVM here was last checked against the chain (2026-11-10), so its run may differ from the chain's, in gas above all.");
+    // A block asked for from before the node's current fork, on a chain whose past forks aren't selected between.
+    chain.config = { current: { forkId: '0x169d85a3', activationTime: 1_793_901_600, precompiles: {} } };
+    const [old] = (await base().simulateBatch([{ chainId: 8453, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n, at: { block: '0x10', header: header(40_000_000n, 1_780_000_000n), required: true } }]))!;
+    assert.match(old.rulesNote!, /^This block is from before Base's current rules took effect \(2026-11-05\)\. The local EVM runs today's rules/);
+  } finally { chain.config = undefined; }
 });
 
 test('A traced preview, sent through the HTTP server, matches the API’s schema', async () => {

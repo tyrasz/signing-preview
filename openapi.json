@@ -1082,6 +1082,10 @@
             "type": "boolean",
             "description": "False when the traced run did not do what the simulation shown did (its outcome or events differ): the trace is then a guide only."
           },
+          "gasAgrees": {
+            "type": "boolean",
+            "description": "Whether the traced run used the same gas as the simulation shown, when both succeeded. False means the local EVM's gas rules are not the chain's for this call (a fork it was not checked against, an older block's rules), and the gas figures in the trace are approximate. Absent when it was not compared."
+          },
           "note": {
             "type": "string"
           },

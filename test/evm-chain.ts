@@ -42,6 +42,8 @@ export interface TestChain {
    * on the chain's state, each block's code overrides applied before its calls, nothing kept afterwards.
    */
   simulateV1?: boolean;
+  /** The chain's answer to eth_config (EIP-7910), when it has one. */
+  config?: unknown;
 }
 
 export async function testChain(): Promise<TestChain> {
@@ -103,6 +105,7 @@ export async function testChain(): Promise<TestChain> {
           await sm.revert();
         }
       }
+      case 'eth_config': return chain.config === undefined ? { error: { code: -32601, message: 'Method not found' } } : { result: chain.config };
       case 'eth_simulateV1': {
         if (!chain.simulateV1) return { error: { code: -32601, message: 'Method not found' } };
         const [{ blockStateCalls }] = params as [{ blockStateCalls: { calls?: { from?: string; to?: string; data?: Hex; value?: string; gas?: string }[]; stateOverrides?: Record<string, { code?: Hex }> }[] }];

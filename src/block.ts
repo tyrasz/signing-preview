@@ -111,12 +111,24 @@ export async function pinLatest(rpc: RpcClient | undefined, chainId: number): Pr
  * for the chain's latest block the one that would. Throws when the chain can't be read or has no such block yet.
  * `time` is when the state's block was made, in seconds.
  */
-export async function pinBlock(rpc: RpcClient | undefined, chainId: number, number: bigint): Promise<{ at: BlockAt; time: number }> {
+export async function pinBlock(rpc: RpcClient | undefined, chainId: number, number: bigint): Promise<{ at: BlockAt; time: number; shifted?: boolean }> {
   if (!rpc?.has(chainId)) throw new Error('No RPC is configured for this chain, so a past block can\'t be read.');
   const tag = (n: bigint) => `0x${n.toString(16)}`;
   const [h, next, blobBaseFee] = await Promise.all([...[number, number + 1n].map(n => rpc.call(chainId, 'eth_getBlockByNumber', [tag(n), false]).then(r => r as RpcHeader | null, () => null)), blobBaseFeeAfter(rpc, chainId, tag(number))]) as [RpcHeader | null, RpcHeader | null, bigint | undefined];
   if (!h?.number) throw new Error(`Block ${number.toLocaleString('en-US')} isn't on this chain (yet), or its node doesn't serve it.`);
-  return { at: { block: tag(number), header: { ...(next?.number ? headerOf(chainId, next) : headerAfter(chainId, h)), ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true }, time: Number(BigInt(h.timestamp)) };
+  const { header, shifted } = afterParent(chainId, next?.number ? headerOf(chainId, next) : headerAfter(chainId, h), BigInt(h.timestamp));
+  return { at: { block: tag(number), header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true }, time: Number(BigInt(h.timestamp)), ...(shifted && { shifted }) };
+}
+
+/**
+ * A block's header given a time its chain's node will simulate: nodes refuse a simulated block that isn't later
+ * than the one it follows, and BNB Chain's blocks, several a second, often share their second with their parent.
+ * Such a block runs one second later than it did (`shifted`), in both simulators alike. Arbitrum's node takes the
+ * same second.
+ */
+export function afterParent(chainId: number, header: BlockAt['header'], parentTime: bigint): { header: BlockAt['header']; shifted: boolean } {
+  const earliest = parentTime + ((NEXT_BLOCK[chainId] ?? { blockTime: 12 }).blockTime > 0 ? 1n : 0n);
+  return header.timestamp >= earliest ? { header, shifted: false } : { header: { ...header, timestamp: earliest }, shifted: true };
 }
 
 /** A block number as PreviewContext.block gives it: a number, or one in decimal or hex. Throws when it is neither. */
@@ -127,7 +139,7 @@ export function parseBlock(v: unknown): bigint {
 }
 
 /** A past block named for a preview, as read from the chain. */
-export interface Pinned { at: BlockAt; number: bigint; time: number }
+export interface Pinned { at: BlockAt; number: bigint; time: number; /** The block that followed shares its second with this one, and runs a second later (afterParent). */ shifted?: boolean }
 
 /**
  * The block a preview's context names (PreviewContext.block), read once per preview and chain: `context.pinned`

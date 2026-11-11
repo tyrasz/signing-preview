@@ -7,7 +7,7 @@
 // node keeps all of them.
 import type { Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { blobBaseFeeAfter, headerOf, type RpcHeader } from './block.ts';
+import { afterParent, blobBaseFeeAfter, headerOf, type RpcHeader } from './block.ts';
 import { chainName, CHAINS, OP_STACK } from './chains.ts';
 import { formatUnits } from './format.ts';
 import { previewRequest } from './preview.ts';
@@ -80,7 +80,10 @@ export async function replayTransaction(input: { chainId: number; hash: string }
   const parent = `0x${(number - 1n).toString(16)}`;
   // The block's blob base fee, for a call that reads it: what follows from its parent (a blob transaction's receipt has it too).
   const blobBaseFee = await blobBaseFeeAfter(rpc, chainId, parent) ?? (receipt.blobGasPrice !== undefined ? BigInt(receipt.blobGasPrice) : undefined);
-  const at = { block: parent, header: { ...headerOf(chainId, block), ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true };
+  // A block in the same second as its parent (BNB Chain's often are) runs one second later: nodes take no other.
+  const before_ = await read<RpcHeader | null>('eth_getBlockByNumber', [parent, false]);
+  const { header, shifted } = afterParent(chainId, headerOf(chainId, block), BigInt(before_?.timestamp ?? '0x0'));
+  const at = { block: parent, header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true };
   // The block's earlier transactions, as they ran: with their own gas limits and prices. The chain's own are left
   // out, except an OP Stack block's L1 info deposit.
   const earlier = block.transactions.filter(t => Number(BigInt(t.transactionIndex)) < index && (!isSystem(chainId, t, block) || t.from.toLowerCase() === L1_INFO_DEPOSITOR));
@@ -100,7 +103,7 @@ export async function replayTransaction(input: { chainId: number; hash: string }
       hash: tx.hash, block: number.toString(), index, time: new Date(time * 1000).toISOString(),
       receipt: { status: receipt.status === '0x1' ? 'success' : 'reverted', gasUsed: gasUsed.toString(), fee: `${formatUnits(gasUsed * gasPrice + extra, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? 'native'}` },
     },
-    when: { block: tx.blockNumber, time },
+    when: { block: tx.blockNumber, time }, ...(shifted && { shifted }),
   };
   const request = {
     method: 'eth_sendTransaction',

@@ -13,7 +13,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createEVM, EVMError, getActivePrecompiles, paramsEVM, type EVM } from '@ethereumjs/evm';
-import { createCustomCommon, Mainnet } from '@ethereumjs/common';
+import { Common, createCustomCommon, Hardfork, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
 import { keccak256 } from 'viem';
@@ -34,6 +34,12 @@ const missCount = (m: Misses) => m.accounts.size + m.storage.size + m.calls.size
 export interface ChainProfile {
   /** EVM rules, e.g. 'cancun' (HyperEVM) or 'osaka' (Ethereum). */
   hardfork: string;
+  /**
+   * The chain's fork id as its node gave it (eth_config, EIP-7910) when this profile was last checked against the
+   * chain's receipts, and when that was. A node on another fork id runs rules the local EVM hasn't been checked
+   * against: its runs then say so (SimulationResult.rulesNote).
+   */
+  checked?: { forkId: string; on: string };
   /** Seconds between blocks, for the simulated next block's timestamp. */
   blockTime: number;
   /** Precompiles the local EVM doesn't have; their calls are answered by eth_call on the chain (HyperEVM's HyperCore reads). */
@@ -58,6 +64,13 @@ export interface ChainProfile {
    * which the price of changing a set slot, 5,000 less it, and the refund for clearing one follow).
    */
   storageGas?: { coldRead: number; coldWrite: number };
+  /** The chain has no point-evaluation precompile at 0x0a (it carries no blobs): the address is an empty account there. */
+  noPointEvaluation?: boolean;
+  /**
+   * Opcodes of the profile's fork that the chain's node refuses as invalid, measured by running each on the node:
+   * chains without blobs have no BLOBBASEFEE (Arbitrum, Polygon), and Polygon no BLOBHASH either.
+   */
+  missingOpcodes?: number[];
 }
 
 /** HyperEVM's read precompiles (0x…0800 onward: positions, spot balances, prices, L1 block number...). */
@@ -87,18 +100,18 @@ const BSC_PRECOMPILES = Array.from({ length: 6 }, (_, i) => low(0x64 + i));
  * seconds: chains that make several blocks a second get the next second (BNB Chain) or the same one (Arbitrum).
  */
 export const CHAIN_PROFILES: Record<number, ChainProfile> = {
-  1: { hardfork: 'osaka', ...NEXT_BLOCK[1] },
+  1: { hardfork: 'osaka', checked: { forkId: '0x07c9462e', on: '2026-11-10' }, ...NEXT_BLOCK[1] },
   11155111: { hardfork: 'osaka', ...NEXT_BLOCK[11155111] },
-  42161: { hardfork: 'osaka', ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS },
-  8453: { hardfork: 'osaka', ...NEXT_BLOCK[8453] },
-  10: { hardfork: 'osaka', ...NEXT_BLOCK[10] },
+  42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, missingOpcodes: [0x4a] },
+  8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453] },
+  10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10] },
   // Polygon prices storage its own way. Measured on its node with code overrides (2026-11-10): a cold SLOAD costs
   // 5,460; a cold SSTORE adds 2,940 (setting an empty slot 22,940, changing a set one 5,000 as on Ethereum, writing
   // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
-  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 } },
-  56: { hardfork: 'osaka', ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
+  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, missingOpcodes: [0x49, 0x4a] },
+  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
   999: { hardfork: 'cancun', ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
@@ -269,6 +282,15 @@ class StateSource {
   codeOverrides = new Map<string, Uint8Array>();
   /** Native balances set for this simulation (a request's state overrides), instead of the chain's. */
   balanceOverrides = new Map<string, bigint>();
+  /** Precompiles the chain's node lists that the local EVM neither has nor forwards (address to name): a call reaching one is refused. */
+  nodeOnly = new Map<string, string>();
+
+  /** The node's own account of the rules it runs (eth_config, EIP-7910); undefined where it gives none. */
+  async config(): Promise<unknown> {
+    let c: unknown;
+    try { await this.send([{ method: 'eth_config', params: [], done: r => { c = r; } }]); } catch { return undefined; }
+    return c;
+  }
   private url: string; private block: string; private fetchImpl: typeof fetch; private batchSize: number; private concurrency: number; private deadline: number;
   readonly chainId: number;
   constructor(chainId: number, url: string, block: string, fetchImpl: typeof fetch, batchSize: number, concurrency: number, deadline: number) {
@@ -497,6 +519,9 @@ class LazyState extends SimpleStateManager {
   }
   private async load(key: Hex): Promise<Account | undefined> {
     if (this.topAccountStack().has(key)) return this.topAccountStack().get(key);
+    // A precompile the chain's node has and this EVM doesn't would run here as an empty account: refused instead.
+    const nodeOnly = this.source.nodeOnly.get(key);
+    if (nodeOnly) throw new ForkUnsupported(`${key} is ${nodeOnly}, a precompile this chain's node has and the local EVM doesn't`);
     const a = await this.data(key);
     if (!a) return undefined;
     // Arbitrum's Stylus contracts are WASM behind a 0xEFF000 prefix, which no EVM runs: better no answer than a wrong one.
@@ -538,6 +563,56 @@ class LazyState extends SimpleStateManager {
   }
 }
 
+
+/** The rules a chain's node says it runs (eth_config): its fork id, when that fork took effect, and its precompiles (address to name). */
+export interface NodeRules { forkId?: string; activation?: number; precompiles: Map<string, string> }
+
+/** eth_config's answer as NodeRules; undefined when the node gives no current fork with its precompiles (Polygon's lists none). */
+export function nodeRulesOf(config: unknown): NodeRules | undefined {
+  const current = (config as { current?: { forkId?: unknown; activationTime?: unknown; precompiles?: unknown } } | null | undefined)?.current;
+  if (!current || typeof current !== 'object' || !current.precompiles || typeof current.precompiles !== 'object') return undefined;
+  const precompiles = new Map<string, string>();
+  for (const [name, address] of Object.entries(current.precompiles as Record<string, unknown>)) {
+    if (typeof address === 'string' && /^0x[0-9a-fA-F]{1,40}$/.test(address)) precompiles.set(`0x${address.slice(2).toLowerCase().padStart(40, '0')}`, name);
+  }
+  const activation = Number(current.activationTime);
+  return { ...(typeof current.forkId === 'string' && { forkId: current.forkId.toLowerCase() }), ...(Number.isFinite(activation) && activation > 0 && { activation }), precompiles };
+}
+
+/** Forks before Prague, of those the local EVM runs (for the transaction-level gas rules that came with it). */
+const BEFORE_PRAGUE = new Set(['paris', 'shanghai', 'cancun']);
+const MAINNET = new Common({ chain: Mainnet });
+const FORK_ORDER = Object.values(Hardfork) as string[];
+
+/**
+ * The fork Ethereum ran at a block, by its number and time (the EVM library's schedule). The blob-parameter forks
+ * change no EVM rule, so they run as the fork before them; a block after the library's last scheduled fork runs
+ * as `latest`. Blocks from before the Merge are refused: the block this EVM is given has no proof-of-work fields.
+ */
+export function mainnetForkAt(header: { number: bigint; timestamp: bigint }, latest: string): string {
+  let fork = MAINNET.getHardforkBy({ blockNumber: header.number, timestamp: header.timestamp });
+  if (fork === Hardfork.MergeNetsplitBlock) fork = Hardfork.Paris;
+  if (FORK_ORDER.indexOf(fork) < FORK_ORDER.indexOf(Hardfork.Paris)) throw new ForkUnsupported('this block is from before the Merge (September 2022), which the local EVM here is not set up to run');
+  if (/^bpo\d+$/.test(fork)) fork = Hardfork.Osaka;
+  return FORK_ORDER.indexOf(fork) >= FORK_ORDER.indexOf(latest) ? latest : fork;
+}
+
+/**
+ * What a local run says about the rules it ran under, when they may not be the chain's: the node is on a fork the
+ * profile wasn't checked against, or the block named is from before the node's current fork (on a chain whose past
+ * forks this EVM doesn't select between).
+ */
+function rulesNoteOf(chainId: number, profile: ChainProfile, rules: NodeRules | undefined, at: SimulationRequest['at']): string | undefined {
+  const name = CHAINS[chainId]?.name ?? `Chain ${chainId}`, day = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
+  if (rules?.forkId && profile.checked && rules.forkId !== profile.checked.forkId) {
+    return `${name}'s rules changed${rules.activation ? ` on ${day(rules.activation)}` : ''} since the local EVM here was last checked against the chain (${profile.checked.on}), so its run may differ from the chain's, in gas above all.`;
+  }
+  if (chainId !== 1 && at?.required && rules?.activation && Number(at.header.timestamp) < rules.activation) {
+    return `This block is from before ${name}'s current rules took effect (${day(rules.activation)}). The local EVM runs today's rules, so its run may differ from what the block's rules gave, in gas above all.`;
+  }
+  return undefined;
+}
+
 /**
  * The EVM options for a chain's own storage prices (ChainProfile.storageGas): the cold write surcharge as the
  * EIP-2929 parameter the SSTORE rules read, with what follows from it (EIP-2929's reset price, EIP-3529's refund
@@ -546,7 +621,9 @@ class LazyState extends SimpleStateManager {
  */
 function storagePricing(profile: ChainProfile) {
   const g = profile.storageGas;
-  if (!g) return {};
+  // Opcodes the chain's node doesn't have (ChainProfile.missingOpcodes) are taken out of the local EVM too.
+  const gone = (profile.missingOpcodes ?? []).map(opcode => ({ opcode }));
+  if (!g) return gone.length ? { customOpcodes: gone as never } : {};
   const params = JSON.parse(JSON.stringify(paramsEVM)) as Record<string, Record<string, number>>;
   Object.assign(params[2929], { coldsloadGas: g.coldWrite, sstoreCleanEIP2200Gas: 5000 - g.coldWrite });
   Object.assign(params[3529], { sstoreClearRefundEIP2200Gas: 5000 - g.coldWrite + 1900 });
@@ -565,9 +642,10 @@ function storagePricing(profile: ChainProfile) {
       runState.stack.push(value.length ? BigInt(bytesToHex(value)) : 0n);
     },
   };
-  return { params, customOpcodes: [sload] } as unknown as { params: never; customOpcodes: never };
+  return { params, customOpcodes: [sload, ...gone] } as unknown as { params: never; customOpcodes: never };
 }
 
+const POINT_EVALUATION = '0x000000000000000000000000000000000000000a';
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
 /** Code that is a marker for something the chain's node runs itself: it starts with 0xEF and is no delegation. */
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
@@ -616,6 +694,15 @@ const hexOf = (a: string) => a.toLowerCase();
 
 export class ForkSimulator implements Simulator {
   private urls: Record<number, string>;
+  /** Each chain's rules as its node gives them, read again every ten minutes (a fork can activate while this runs). */
+  private rules = new Map<number, { read: number; value: Promise<NodeRules | undefined> }>();
+  private rulesOf(chainId: number, source: StateSource): Promise<NodeRules | undefined> {
+    const kept = this.rules.get(chainId);
+    if (kept && Date.now() - kept.read < 600_000) return kept.value;
+    const value = source.config().then(nodeRulesOf, () => undefined);
+    this.rules.set(chainId, { read: Date.now(), value });
+    return value;
+  }
   /** Chains whose node has no eth_simulateV1: a replay's earlier transactions are run here instead. */
   private noSimulate = new Set<number>();
   private opts: Required<Omit<ForkSimulatorOptions, 'profiles' | 'block' | 'header' | 'onRound'>> & Pick<ForkSimulatorOptions, 'block' | 'header' | 'onRound'> & { profiles: Record<number, ChainProfile> };
@@ -673,7 +760,8 @@ export class ForkSimulator implements Simulator {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
-    const url = this.urls[chainId], profile = this.opts.profiles[chainId];
+    const url = this.urls[chainId];
+    let profile = this.opts.profiles[chainId];
     if (!url || !profile) return null;
     // Calls that run first in the block (SimulationRequest.at.before: the transactions before a replayed one). The
     // chain's node runs them, and this EVM starts from the state they leave (StateSource.after): running hundreds of
@@ -718,9 +806,16 @@ export class ForkSimulator implements Simulator {
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
     const prefetch = source.fetch(first);
     const fixed = at?.header ?? this.opts.header?.(chainId);
-    const [block] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number }
-      : this.blockContext(source, tag, profile), prefetch]);
+    const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number }
+      : this.blockContext(source, tag, profile), prefetch, this.rulesOf(chainId, source)]);
+    // Ethereum's past blocks run under the rules of their time; every other chain's under today's (see rulesNote).
+    const hardfork = chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
+    if (hardfork !== profile.hardfork) profile = { ...profile, hardfork };
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never });
+    // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
+    const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
+    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address)) source.nodeOnly.set(address, name);
+    const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and
     // Withdrawal, not Transfer, so logs alone miss the wrapped token.
@@ -733,7 +828,8 @@ export class ForkSimulator implements Simulator {
     const key = requestKey(reqs);
     this.seen.set(key, new Set());
     try {
-      return await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
+      const results = await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
+      return rulesNote ? results.map(r => ({ ...r, rulesNote })) : results;
     } finally {
       // Kept briefly, for a caller that gave up waiting and wants what was seen.
       setTimeout(() => this.seen.delete(key), 30_000).unref?.();
@@ -787,7 +883,10 @@ export class ForkSimulator implements Simulator {
   private async run(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, misses: Misses | null, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
     profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number) {
     const state = new LazyState(source, misses, { common });
-    const forwarded = (profile.forwardedPrecompiles ?? []).map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
+    // The point-evaluation precompile (EIP-4844's, at 0x0a) needs a KZG library and trusted setup this package doesn't
+    // carry. It is a pure function of its input, so the chain's node answers it, at the precompile's fixed price.
+    const pointEvaluation = getActivePrecompiles(common).has(POINT_EVALUATION.slice(2)) && !profile.noPointEvaluation ? [POINT_EVALUATION] : [];
+    const forwarded = [...(profile.forwardedPrecompiles ?? []), ...pointEvaluation].map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
       // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
       if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
       const key = `${address}_${bytesToHex(input.data)}`;
@@ -801,7 +900,7 @@ export class ForkSimulator implements Simulator {
         await source.fetch({ ...newMisses(), calls: new Set([key]) });
         c = source.calls.get(key)!;
       }
-      const gas = profile.precompileGas?.(input.data.length, c.data.length) ?? 2000n;
+      const gas = address === POINT_EVALUATION ? 50_000n : profile.precompileGas?.(input.data.length, c.data.length) ?? 2000n;
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
     // BLOCKHASH: the recent blocks' hashes, fetched like the rest of the state (the EVM checks the 256-block window).
@@ -974,7 +1073,7 @@ export class ForkSimulator implements Simulator {
       recording = false;
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
-      const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + authRefund, profile.hardfork !== 'cancun');
+      const gasUsed = transactionGas(req, ex.executionGasUsed, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork));
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
         results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data, ...(traced?.trace && { trace: traced.trace }) });

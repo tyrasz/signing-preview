@@ -8,14 +8,14 @@ import { readFileSync } from 'node:fs';
 import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
-import { nodeOverrides, parseBlock, pinBlock, priceFields } from '../src/block.ts';
+import { afterParent, nodeOverrides, parseBlock, pinBlock, priceFields } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { builtinTokens, StaticTokenRegistry } from '../src/chains.ts';
 import { CHAINLINK_FEEDS, ChainlinkPrices } from '../src/prices.ts';
-import type { Dependencies, SimulationRequest, SimulationResult } from '../src/types.ts';
+import type { Dependencies, SimulationRequest, SimulationResult, TraceCall } from '../src/types.ts';
 import { ALICE, BOB } from '../mocks/data.ts';
 import { codes, detail, NOW } from './helpers.ts';
 
@@ -246,6 +246,19 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   const header = { number: 100n, timestamp: 5n, coinbase: BOB, gasLimit: 1n, baseFeePerGas: 2n, prevRandao: H(1) as `0x${string}` };
   assert.deepEqual(nodeOverrides(header), { time: '0x5', feeRecipient: BOB, prevRandao: H(1), baseFeePerGas: '0x2' });
   assert.deepEqual(nodeOverrides({ ...header, arbBlockNumber: 7n }), { time: '0x5', feeRecipient: BOB, baseFeePerGas: '0x2' });
+  // A block in the same second as its parent (BNB Chain's often are) is one no node will simulate: it runs a second
+  // later, and says so. Arbitrum's node takes the same second.
+  assert.deepEqual(afterParent(56, header, 5n), { header: { ...header, timestamp: 6n }, shifted: true });
+  assert.deepEqual([afterParent(56, header, 4n).shifted, afterParent(56, header, 4n).header, afterParent(42161, header, 5n).shifted], [false, header, false]);
+  const sameSecond = chain();
+  const crowded = { has: sameSecond.rpc.has.bind(sameSecond.rpc), call: async (c: number, method: string, params: unknown[]) => {
+    const r = await sameSecond.rpc.call(c, method, params) as Record<string, unknown>;
+    return method === 'eth_getBlockByNumber' && params[0] === '0x63' ? { ...r, timestamp: hex(1_762_000_100) } : r;
+  } } as unknown as NonNullable<Dependencies['rpc']>;
+  const shiftedRuns: SimulationRequest[] = [];
+  const late = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { simulate: async r => { shiftedRuns.push(r); return ran(); } } });
+  assert.equal(shiftedRuns[0].at!.header.timestamp, 1_762_000_101n);
+  assert.match(late.decoding.notes.join(' '), /The block shares its second with the one before it, which this chain's node won't simulate: it was run one second later/);
   // Polygon's node logs native transfers and fee payments from 0x…1010; a local EVM has none. Runs are compared without them.
   const fee = { address: '0x0000000000000000000000000000000000001010', topics: ['0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63', pad(ALICE)], data: '0x' };
   assert.deepEqual([chainsOwnLog(fee), chainsOwnLog(LOG), chainsOwnLog({ ...fee, topics: [TRANSFER] })], [true, false, false]);
@@ -340,4 +353,32 @@ test('State the caller sets for a simulation reaches it, is checked, and the pre
     const refused = await fetch(`${base}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...body, context: { stateOverrides: { [ALICE]: { balance: -1 } } } }) });
     assert.equal(refused.status, 400);
   } finally { await new Promise(r => server.close(r)); }
+});
+
+test('A trace says when the local EVM’s gas, or its rules, aren’t the chain’s', async () => {
+  const root: TraceCall = { type: 'call', from: ALICE.toLowerCase(), to: USDC, input: transfer, value: 0n, gas: 100_000n, gasUsed: 30_000n, output: pad('0x01'), logs: [{ index: 0, ...LOG }] };
+  const traced = async (chainId: string, local: Partial<SimulationResult>, node: Partial<SimulationResult> = {}) => (await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId }] }, { now: NOW, trace: true },
+    { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ran(node), trace: async () => [{ ...ran({ source: 'local' }), trace: root, stateChanges: [], ...local }] } })).trace!;
+  // The same run, the same gas: nothing to say.
+  const same = await traced('0x2105', {});
+  assert.deepEqual([same.agrees, same.gasAgrees, same.note], [true, true, undefined]);
+  // The same outcome and events on different gas: the local EVM's gas rules aren't the chain's here.
+  const off = await traced('0x2105', { gasUsed: 51_000n });
+  assert.deepEqual([off.agrees, off.gasAgrees], [true, false]);
+  assert.equal(off.note, "The traced run used 51,000 gas where the simulation shown above used 51,234: the local EVM's gas rules differ from this chain's here, so the gas figures in the trace are approximate.");
+  // Not compared: Arbitrum (its node adds a charge for L1 data), a failed call (it burns each simulator's own limit), runs that differ anyway.
+  assert.deepEqual([(await traced('0xa4b1', { gasUsed: 51_000n })).gasAgrees, (await traced('0xa4b1', { gasUsed: 51_000n })).note], [undefined, undefined]);
+  const failed = { status: 'reverted' as const, logs: undefined, transfers: [] };
+  assert.equal((await traced('0x2105', { ...failed, gasUsed: 30_000_000n }, { ...failed, gasUsed: 50_000_000n })).gasAgrees, undefined);
+  assert.deepEqual([(await traced('0x2105', { logs: [], gasUsed: 1n })).agrees, (await traced('0x2105', { logs: [], gasUsed: 1n })).gasAgrees], [false, undefined]);
+  // Rules the local EVM wasn't checked against: its note is the trace's.
+  const moved = await traced('0x2105', { rulesNote: "Base's rules changed on 2026-12-08 since the local EVM here was last checked against the chain (2026-11-10), so its run may differ from the chain's, in gas above all." });
+  assert.match(moved.note!, /^Base's rules changed on 2026-12-08 since the local EVM here was last checked/);
+  // The spec has the field.
+  const Ajv2020 = (Ajv2020Module as unknown as { default?: typeof Ajv2020Module }).default ?? Ajv2020Module;
+  const spec = JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8'));
+  const ajv = new (Ajv2020 as unknown as new (o: object) => { addSchema(s: object): void; getSchema(k: string): ((d: unknown) => boolean) & { errors?: unknown[] } | undefined })({ strict: false, allErrors: true });
+  ajv.addSchema({ ...spec, $id: 'spec3' });
+  const check = ajv.getSchema('spec3#/components/schemas/PreviewTrace')!;
+  assert.ok(check(JSON.parse(JSON.stringify(off))), JSON.stringify(check.errors?.slice(0, 3)));
 });
