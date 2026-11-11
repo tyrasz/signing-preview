@@ -111,6 +111,39 @@ async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChang
 }
 
 /**
+ * A replay's earlier transactions with gas limits that add up to no more than `room`, for a node that adds the
+ * limits of a simulated block's calls up against the block's gas limit (reth's eth_simulateV1, which BNB Chain's
+ * public node runs: "Block gas limit exceeded by the block's transactions"; it takes no higher block limit either).
+ * The chain counts the gas used, and BNB Chain's transactions are given several times what they use: in every block
+ * followed, the limits passed the block's 70 million somewhere in its last third, and nothing after that point
+ * could be replayed.
+ *
+ * Each call gets what its transaction used and a margin: half as much again (a refund takes off at most a fifth of
+ * what ran, and each call a transaction makes keeps a sixty-fourth back) and 50,000, then an equal share of what
+ * room is left, never more than its own limit. What less gas can change is a call running short, so the caller
+ * checks that none did (hadRoom) and takes nothing from a run where one might have. Undefined when what a
+ * transaction used isn't known, or they can't fit.
+ */
+export function fitGas(earlier: SimulationRequest[], room: bigint): SimulationRequest[] | undefined {
+  if (!earlier.length || earlier.some(r => !r.mined || r.gas === undefined)) return undefined;
+  const needs = earlier.map(r => { const need = r.mined!.gasUsed * 3n / 2n + 50_000n; return need < r.gas! ? need : r.gas!; });
+  const spare = room - needs.reduce((a, b) => a + b, 0n);
+  if (spare < 0n) return undefined;
+  const share = spare / BigInt(earlier.length);
+  return earlier.map((r, i) => ({ ...r, gas: needs[i] + share < r.gas! ? needs[i] + share : r.gas! }));
+}
+
+/**
+ * Whether every call given less gas than its transaction had (fitGas) finished with room to spare: what it used,
+ * and three eighths more, within what it was given. A call that ran short anywhere inside would have used nearly
+ * all of it (a call passes on all but a sixty-fourth). Not whether it came out as mined: on a node that runs a
+ * same-second block a second late, calls differ from their receipts by a little on any gas limit.
+ */
+export function hadRoom(earlier: SimulationRequest[], fitted: SimulationRequest[], results: { gasUsed?: string }[] | undefined): boolean {
+  return !!results && results.length >= fitted.length && fitted.every((r, i) => r.gas === earlier[i]?.gas || (results[i].gasUsed !== undefined && BigInt(results[i].gasUsed!) * 11n / 8n <= r.gas!));
+}
+
+/**
  * EIP-7702 authorizations as a node takes them: every number without leading zeros. Wallets and signing libraries
  * write a signature's r and s as 32 padded bytes, and nodes built on go-ethereum refuse a number written so
  * ("cannot unmarshal hex number with leading zero digits": Arbitrum's and Polygon's did), which failed the whole
@@ -242,8 +275,8 @@ export class RpcSimulator implements Simulator {
     return r ? r.state : reqs[0]?.at?.state;
   }
   /** A replay's earlier calls (see RpcSimulatorOptions.replay), as eth_simulateV1 calls. */
-  private async before(chainId: number, reqs?: SimulationRequest[]): Promise<unknown[]> {
-    const before = this.replay?.(chainId)?.before ?? reqs?.[0]?.at?.before ?? [];
+  private async before(chainId: number, reqs?: SimulationRequest[], fitted?: SimulationRequest[]): Promise<unknown[]> {
+    const before = fitted ?? this.replay?.(chainId)?.before ?? reqs?.[0]?.at?.before ?? [];
     return Promise.all(before.map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(this.buildable(chainId, req)) })));
   }
   /**
@@ -281,7 +314,7 @@ export class RpcSimulator implements Simulator {
     }
     return this.simulateAt(reqs);
   }
-  private async simulateAt(reqs: SimulationRequest[]): Promise<SimulationResult[] | null> {
+  private async simulateAt(reqs: SimulationRequest[], fitted?: SimulationRequest[]): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
@@ -291,7 +324,7 @@ export class RpcSimulator implements Simulator {
     const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(this.buildable(chainId, req)) })));
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
-    const before = await this.before(chainId, reqs);
+    const before = await this.before(chainId, reqs, fitted);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
@@ -300,8 +333,17 @@ export class RpcSimulator implements Simulator {
     // A node that won't build a call with blob hashes (see buildable): asked again without them, from now on.
     if (/not buildable/i.test(body.error?.message ?? '') && !this.noBlobCalls.has(chainId) && [...reqs, ...(this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [])].some(r => r.blobVersionedHashes?.length)) {
       this.noBlobCalls.add(chainId);
-      return this.simulateAt(reqs);
+      return this.simulateAt(reqs, fitted);
     }
+    // A node that adds up the gas limits of the block's calls and won't have them pass the block's (fitGas): the
+    // earlier transactions are asked again on less gas each, and none may have run short on it (hadRoom).
+    if (/block gas limit exceeded/i.test(body.error?.message ?? '') && before.length) {
+      const earlier = this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [], limit = reqs[0]?.at?.header.gasLimit;
+      const fit = !fitted && limit !== undefined ? fitGas(earlier, limit - reqs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n)) : undefined;
+      if (fit) return this.simulateAt(reqs, fit);
+      throw new Error(`the chain's node won't run the ${before.length} transactions before this one in its block: it adds up their gas limits, which pass the block's, where the chain counts the gas they used (${body.error!.message}); a node that counts as the chain does can`);
+    }
+    if (fitted && !body.error && !hadRoom(this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [], fitted, body.result?.[0]?.calls)) throw new Error(`the chain's node won't run the ${before.length} transactions before this one in its block on their own gas limits (it adds them up, and they pass the block's), and on less gas one of them may have run short`);
     const results = body.result?.[0]?.calls?.slice(before.length);
     const source = `eth_simulateV1 @ chain ${chainId}`;
     // Errors that are the answer for a single transaction: the network would reject it the same way. Not when calls

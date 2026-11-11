@@ -22,7 +22,7 @@ import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
-import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
+import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -372,7 +372,7 @@ class StateSource {
    * Reads are of the state after these calls (the transactions before a replayed one in its block), which the node
    * runs first, in a simulated block of their own (see fetchAfter). `sent`: how many of them each address sent.
    */
-  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges };
+  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges; /** The calls on less gas each, for a node that adds their limits up against the block's (fitGas); undefined when they can't be. */ fit?: () => { requests: SimulationRequest[]; calls: unknown[] } | undefined; /** Set once the calls are the fitted ones: none may have run short on its gas (hadRoom, against `earlier`). */ fitted?: SimulationRequest[]; earlier?: SimulationRequest[] };
 
   async fetch(m: Misses): Promise<void> {
     if (!this.after) return this.fetchAt(m);
@@ -410,15 +410,25 @@ class StateSource {
     const blocks: unknown[] = [{ calls: after.calls, blockOverrides: after.blockOverrides, ...(after.state && { stateOverrides: after.state }) }];
     if (accountCalls.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE }, [CODE_READER]: { code: CODE_READER_CODE } }, calls: accountCalls });
     if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}` })) });
-    let out: { calls: { status: string; returnData: Hex }[] }[] | undefined;
+    let out: { calls: { status: string; returnData: Hex; gasUsed?: string }[] }[] | undefined;
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
       this.sendAll(nonceJobs),
       // A node that won't build a call with blob hashes (BNB Chain's: RpcSimulator.buildable) is asked again with
       // the earlier blob transactions as the plain calls they also are, at their price.
       simulate().catch(e => {
+        const message = e instanceof Error ? e.message : String(e);
+        // A node that adds up the calls' gas limits against the block's (fitGas): asked again with each on less
+        // gas, and checked below for any that may have run short.
+        if (/block gas limit exceeded/i.test(message) && !after.fitted) {
+          const fit = after.fit?.();
+          if (!fit) throw e;
+          after.calls = fit.calls; after.fitted = fit.requests;
+          (blocks[0] as { calls: unknown[] }).calls = fit.calls;
+          return simulate();
+        }
         const blobs = (after.calls as Record<string, unknown>[]).some(c => c.blobVersionedHashes);
-        if (!blobs || !/not buildable/i.test(e instanceof Error ? e.message : String(e))) throw e;
+        if (!blobs || !/not buildable/i.test(message)) throw e;
         after.calls = (after.calls as Record<string, unknown>[]).map(c => {
           if (!c.blobVersionedHashes) return c;
           const { blobVersionedHashes: _hashes, maxFeePerBlobGas: _cap, maxFeePerGas, maxPriorityFeePerGas: _tip, ...plain } = c;
@@ -430,6 +440,7 @@ class StateSource {
     ]);
     const failed = new Error('reading the state after the block\'s earlier transactions failed');
     if (!out || out.length !== blocks.length) throw failed;
+    if (after.fitted && !hadRoom(after.earlier ?? [], after.fitted, out[0].calls)) throw new Error("one of the block's earlier transactions, run on less gas each for a node that adds their limits up, may have run short");
     const words = (data: Hex, n: number) => Array.from({ length: n }, (_, i) => `0x${data.slice(2 + 64 * i, 66 + 64 * i).padEnd(64, '0')}` as Hex);
     let at = 1;
     if (accountCalls.length) {
@@ -994,8 +1005,10 @@ export class ForkSimulator implements Simulator {
         bump(hexOf(r.from), 'sent');
         for (const a of await authorizationsOf(r)) if (a.authority && a.nonce !== undefined && (a.chainId === 0n || a.chainId === BigInt(chainId))) bump(a.authority, a.nonce);
       }
-      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
-        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })) };
+      const toCall = (r: SimulationRequest) => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
+        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) });
+      const earlier = options.after;
+      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: earlier.map(toCall), earlier, fit: () => { const requests = fitGas(earlier, at.header.gasLimit); return requests && { requests, calls: requests.map(toCall) }; } };
     }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.

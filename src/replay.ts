@@ -97,7 +97,13 @@ export async function replayTransaction(input: { chainId: number; hash: string }
   const own = state && accessList && accessListChanges(accessList, index + 1, index + 1);
   const at = { block: parent, header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true, ...(state && { state }) };
   const earlier = block.transactions.filter(t => Number(BigInt(t.transactionIndex)) < index && (!isSystem(chainId, t, block) || t.from.toLowerCase() === L1_INFO_DEPOSITOR));
-  const before = state ? [] : await Promise.all(earlier.map(async t => ({ ...await requestOf(chainId, t, parent, deps), at })));
+  // Where the gas limits of the transactions up to this one add up to more than the block's (BNB Chain's blocks:
+  // each is given far more than it uses), a node that adds them up won't run them as they are. How each earlier one
+  // used goes with it, to size a run on less gas each (SimulationRequest.mined).
+  const over = !state && earlier.reduce((sum, t) => sum + BigInt(t.gas), BigInt(tx.gas)) > BigInt(block.gasLimit);
+  const receipts = over ? await rpc.call(chainId, 'eth_getBlockReceipts', [tx.blockNumber]).then(r => new Map((Array.isArray(r) ? r as (RpcReceipt & { transactionHash: string })[] : []).map(r => [r.transactionHash.toLowerCase(), r])), () => undefined) : undefined;
+  const minedOf = (t: RpcTx) => { const r = receipts?.get(t.hash.toLowerCase()); return r && { mined: { gasUsed: BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0) } }; };
+  const before = state ? [] : await Promise.all(earlier.map(async t => ({ ...await requestOf(chainId, t, parent, deps), ...minedOf(t), at })));
 
   const gasUsed = BigInt(receipt.gasUsed), gasForL1 = receipt.gasUsedForL1 !== undefined ? BigInt(receipt.gasUsedForL1) : undefined;
   const gasPrice = BigInt(receipt.effectiveGasPrice ?? tx.gasPrice ?? '0x0');

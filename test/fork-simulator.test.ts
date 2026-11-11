@@ -497,6 +497,42 @@ test('After a block’s earlier transactions, a precompile is asked for no stora
   } finally { chain.simulateV1 = false; }
 });
 
+test('A node that adds up a block’s gas limits gets the earlier transactions on less gas each, and none may run short', async () => {
+  // As in the test above, Bob's transfer of 30 USDC only works after the user's 50 to him. Here the two earlier
+  // transactions were given 20 million gas each in a block of 30 million, and the node (reth's eth_simulateV1, as
+  // BNB Chain's public node runs it) refuses calls whose limits add up past the block's.
+  const CAROL = '0xca401000000000000000000000000000000000c3';
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier = (used?: bigint): SimulationRequest[] => [50_000_000n, 1n].map(amount => ({ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, amount]), value: 0n, gas: 20_000_000n, ...(used !== undefined && { mined: { gasUsed: used } }) }));
+  const target: SimulationRequest = { chainId: 999, from: BOB, to: usdc, data: call('transfer', [CAROL, 30_000_000n]), value: 0n };
+  await chain.setBalance(BOB, E);
+  const asked: bigint[][] = [];
+  const adding = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { id: number; method: string; params: [{ blockStateCalls: { calls: { gas?: string }[] }[] }] }[];
+    const sim = Array.isArray(body) ? body.find(b => b.method === 'eth_simulateV1') : undefined;
+    const limits = sim?.params[0].blockStateCalls[0].calls.map(c => BigInt(c.gas ?? 0)) ?? [];
+    if (sim) asked.push(limits);
+    if (limits.reduce((a, b) => a + b, 0n) > header.gasLimit) return new Response(JSON.stringify(body.map(b => ({ jsonrpc: '2.0', id: b.id, error: { code: -38015, message: "Block gas limit exceeded by the block's transactions" } }))), { headers: { 'content-type': 'application/json' } });
+    return chain.fetchImpl(url, init);
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    // Each used about 60,000: it gets 140,000 and half the room left, 15 million in all.
+    const [r] = (await fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header, before: earlier(60_000n) } }]))!;
+    assert.equal(r.status, 'success');
+    assert.deepEqual([asked[0], [...new Set(asked.slice(1).map(l => l.join()))]], [[20_000_000n, 20_000_000n], ['15000000,15000000']]);
+    // A call that uses all of the little it was sized for isn't taken on trust. This one grows its memory for
+    // 92,000 gas; sized as if it had used 100, in a block of 200,000, it gets 55,075 and runs out.
+    const HEAVY = '0x00000000000000000000000000000000000c0dea';
+    await chain.putCode(HEAVY, '0x6001620300005200');
+    const heavy: SimulationRequest = { chainId: 999, from: USER, to: HEAVY, data: '0x', value: 0n, gas: 20_000_000n, mined: { gasUsed: 100n } };
+    await assert.rejects(fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header: { ...header, gasLimit: 200_000n }, before: [heavy, earlier(60_000n)[0]] } }]), /may have run short/);
+    assert.deepEqual(asked.at(-1), [55_075n, 144_925n]);
+    // Without what they used, the node's refusal stands.
+    await assert.rejects(fork({ fetchImpl: adding }).trace([{ ...target, at: { block: '0x10', header, before: earlier() } }]), /Block gas limit exceeded/);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('After a block’s earlier transactions, an account’s nonce counts its authorizations; a node that won’t build blob calls gets them plain', async () => {
   const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
   const KEY = `0x${'9a'.repeat(32)}` as Hex, sender = privateKeyToAccount(KEY).address.toLowerCase();

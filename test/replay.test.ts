@@ -13,7 +13,7 @@ import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, keepsToBlock, nod
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
-import { NATIVE_LOG_ADDRESS, parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { fitGas, hadRoom, NATIVE_LOG_ADDRESS, parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { builtinTokens, StaticTokenRegistry } from '../src/chains.ts';
 import { CHAINLINK_FEEDS, ChainlinkPrices } from '../src/prices.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, TraceCall } from '../src/types.ts';
@@ -286,6 +286,27 @@ test('A node that answers every read from its latest state, whatever block is as
   assert.equal(await keepsToBlock(silent, 8453, 90n), undefined);
 });
 
+test('Where a block’s gas limits add up past its own, a replay’s earlier transactions carry the gas they used', async () => {
+  // BNB Chain's transactions are given several times the gas they use, and its node adds the limits of a simulated
+  // block's calls up against the block's: the simulators then ask again with less each, sized by what each used
+  // (fitGas, in the test below). The replay reads that from the block's receipts, only for such a block.
+  const { deps: d, batches, calls } = deps(ran());
+  const inner = d.rpc!.call.bind(d.rpc);
+  let limit = '0x8f0d180';
+  d.rpc!.call = async (c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockReceipts') return TXS.map((t, i) => ({ ...RECEIPT, transactionHash: t.hash, gasUsed: hex(30_000 + i) }));
+    const out = await inner(c, method, params);
+    return method === 'eth_getBlockByNumber' && params[1] ? { ...(out as object), gasLimit: limit } : out;
+  };
+  // The block holds 150 million and the transactions up to Alice's were given 1.1 million: nothing more is read.
+  await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { now: NOW }, d);
+  assert.deepEqual([batches[0][0].at!.before!.map(r => r.mined), calls.some(c => c.method === 'eth_getBlockReceipts')], [[undefined, undefined], false]);
+  // In a block of a million they pass it: each earlier one goes with what its receipt says it used.
+  limit = '0xf4240';
+  await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { now: NOW }, d);
+  assert.deepEqual(batches[1][0].at!.before!.map(r => [r.gas, r.mined]), [[1_000_000n, { gasUsed: 30_000n }], [21_000n, { gasUsed: 30_002n }]]);
+});
+
 test('What chains do their own way: blob transactions, Arbitrum’s header, Polygon’s own logs, a node that refuses single receipts', async () => {
   // A blob transaction's hashes go to the node with EIP-1559 fees (it takes them no other way) at the same price.
   assert.deepEqual(priceFields({ gasPrice: 7n }), { gasPrice: '0x7' });
@@ -398,6 +419,36 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   // A refusal with no blob call in it is the node's answer, not something to ask again about.
   const never = (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Transaction is not buildable' } }))) as unknown as typeof fetch;
   await assert.rejects(new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: never }).simulateBatch([{ ...after, at: { ...at, before: undefined } }]), /not buildable/);
+
+  // BNB Chain's node also adds up the gas limits of a block's calls, and refuses when they pass the block's (the
+  // chain counts the gas used; it takes no higher block limit either). The earlier transactions are asked again on
+  // less gas each: what each used, half as much again and 50,000, and a share of the room left.
+  const summed: { gas?: string }[][] = [];
+  let ranShort = false;
+  const adding = (async (_u: string, init: { body: string }) => {
+    const calls = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: { gas?: string }[] }[] }] }).params[0].blockStateCalls[0].calls;
+    summed.push(calls);
+    if (calls.reduce((sum, c) => sum + BigInt(c.gas ?? 0), 0n) > 150_000_000n) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38015, message: "Block gas limit exceeded by the block's transactions" } }));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map((c, i) => ({ status: '0x1', gasUsed: i === 0 && ranShort ? c.gas : '0x186a0', returnData: '0x', logs: [] })) }] }));
+  }) as unknown as typeof fetch;
+  const earlierTx = (gas: bigint, used?: bigint): SimulationRequest => ({ chainId: 56, from: BOB.toLowerCase(), to: ALICE, data: '0x', value: 0n, gas, gasPrice: 5n, ...(used !== undefined && { mined: { gasUsed: used } }) });
+  // Two transactions given 100 million and 50 million that used 100,000 each, then one given 100,000: 150.1 million
+  // of limits in a block of 150 million.
+  const lateIn = (before: SimulationRequest[]) => ({ chainId: 56, from: ALICE.toLowerCase(), to: BOB, data: '0x' as const, value: 0n, gas: 100_000n, at: { ...at, header: { ...at.header, gasLimit: 150_000_000n }, before } });
+  const full = [earlierTx(100_000_000n, 100_000n), earlierTx(50_000_000n, 100_000n)];
+  assert.equal((await new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: adding }).simulateBatch([lateIn(full)]))![0].status, 'success');
+  // Each gets its 200,000 and half the room left (150,000,000 less the last one's 100,000 and their 400,000);
+  // the second would pass its own limit, and keeps that.
+  assert.deepEqual(summed.slice(0, 2).map(calls => calls.slice(0, 3).map(c => BigInt(c.gas!))), [[100_000_000n, 50_000_000n, 100_000n], [74_950_000n, 50_000_000n, 100_000n]]);
+  assert.deepEqual(fitGas(full, 149_900_000n)!.map(r => r.gas), [74_950_000n, 50_000_000n]);
+  // What less gas can change is a call running short: one that used nearly all it was given isn't taken on trust.
+  ranShort = true;
+  await assert.rejects(new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: adding }).simulateBatch([lateIn(full)]), /on less gas one of them may have run short/);
+  assert.deepEqual([hadRoom(full, fitGas(full, 149_900_000n)!, [{ gasUsed: '0x186a0' }, { gasUsed: '0x2faf080' }]), hadRoom(full, fitGas(full, 149_900_000n)!, [{ gasUsed: '0x47868c0' }, { gasUsed: '0x186a0' }])], [true, false]);
+  // Without what the earlier transactions used (their receipts weren't served), or where even that doesn't fit,
+  // the node's refusal is said for what it is.
+  await assert.rejects(new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl: adding }).simulateBatch([lateIn([earlierTx(100_000_000n), earlierTx(50_000_000n)])]), /it adds up their gas limits, which pass the block's, where the chain counts the gas they used/);
+  assert.equal(fitGas([earlierTx(100_000_000n, 60_000_000n), earlierTx(100_000_000n, 60_000_000n)], 150_000_000n), undefined);
 
   // A node that takes a past block for an archive request it won't serve: the same plain answer.
   const refusing = (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32602, message: 'Archive requests require a personal token.' } }), { status: 403 })) as unknown as typeof fetch;
