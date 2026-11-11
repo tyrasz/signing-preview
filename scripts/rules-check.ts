@@ -441,12 +441,20 @@ const beyond = (difference: bigint, slack: bigint) => (difference < 0n ? -differ
 /** Runs the programs on the chain's node and in the local EVM, sixteen to a simulated block, and notes what differs. */
 async function compare(chain: Chain, chainId: number, programs: Program[], report: Report): Promise<void> {
   const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
-  for (let i = 0; i < programs.length; i += 16) {
+  // Sixteen to a block, and no more than 60,000,000 gas of limits in one: BNB Chain's node adds up a block's gas
+  // limits and refuses a block they pass (70,000,000), which four random programs on 16,000,000 each did.
+  const batches: Program[][] = [];
+  for (const p of programs) {
+    const last = batches.at(-1), limit = (q: Program) => q.gas ?? GAS;
+    if (last && last.length < 16 && last.reduce((sum, q) => sum + limit(q), 0n) + limit(p) <= 60_000_000n) last.push(p);
+    else batches.push([p]);
+  }
+  for (const batch of batches) {
     // Arbitrum's node adds a charge for L1 data to every call's gas: the same for calls with the same calldata and
     // gas limit in one block, but for the block's first call, which pays a few gas more. So there a call that isn't
     // compared goes first, and programs sent no calldata (at the usual gas limit) are compared less that charge:
     // what most of the batch differs by.
-    const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
+    const results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
     let l1Charge: bigint | undefined;
     if (!compareGas) {
       const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && !batch[j].priced && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
@@ -454,7 +462,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
       for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
       const most = [...counts].sort((a, b) => b[1] - a[1])[0];
       if (most && most[1] * 2 > deltas.length) l1Charge = most[0];
-      if (process.env.RULES_DEBUG) console.log(`  batch ${i / 16}: L1 charge ${l1Charge}, deltas ${[...counts].map(([d, n]) => `${d}×${n}`).join(' ')}`);
+      if (process.env.RULES_DEBUG) console.log(`  batch ${batches.indexOf(batch)}: L1 charge ${l1Charge}, deltas ${[...counts].map(([d, n]) => `${d}×${n}`).join(' ')}`);
     }
     results.forEach(({ node, local }, j) => {
       // RULES_SHOW=<part of a label>: what the node and the local EVM gave for the programs it names.
