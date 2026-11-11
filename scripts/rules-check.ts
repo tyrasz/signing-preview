@@ -487,7 +487,13 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
       const said = (o: Outcome, w: bigint[] | undefined) => (w ? `, the precompile ${w[0] ? 'succeeds' : 'fails'} spending ${w[1]} gas and returning ${w[2]} bytes (hash ${w[3].toString(16).slice(0, 10)}…)` : `, returns ${o.returns.slice(0, 74)}`);
       const returns = node.kind === local.kind && node.kind !== 'invalid' && node.returns !== local.returns;
       if (node.kind !== local.kind || returns || gas || logs) {
-        const known = EXPECTED[chainId]?.[batch[j].label] ?? (report.amsterdam ? OVER_THE_CAP[batch[j].label] : undefined);
+        // Arbitrum's node takes its charge for L1 data out of the gas a call is given (see l1Charge): a program on a
+        // limit of its own that the local EVM runs on all but less than that charge runs out of gas there (one of 300
+        // random programs: 94,219 of 100,000 used locally).
+        const squeezed = !compareGas && batch[j].gas !== undefined && node.kind === 'fails' && /out of gas/i.test(node.why ?? '') && local.kind === 'runs' && local.gas !== undefined
+          && local.gas + (l1Charge !== undefined && l1Charge > 0n ? l1Charge * 2n : 20_000n) >= batch[j].gas!;
+        const known = EXPECTED[chainId]?.[batch[j].label] ?? (report.amsterdam ? OVER_THE_CAP[batch[j].label] : undefined)
+          ?? (squeezed ? `Arbitrum's node takes its charge for L1 data out of the gas the call is given: on ${batch[j].gas} it ran out where the local EVM used ${local.gas}` : undefined);
         (known ? report.expected : report.differences).push(known ? `${batch[j].label}: ${known}` : `${batch[j].label}: the node ${node.kind}${node.kind === 'fails' && node.why ? ` (${node.why.slice(0, 60)})` : ''}${node.gas !== undefined ? `, ${node.gas} gas` : ''}${returns ? said(node, nodeWords) : ''}; the local EVM ${local.kind}${local.kind !== 'runs' && local.why ? ` (${local.why.slice(0, 80)})` : ''}${local.gas !== undefined ? `, ${local.gas} gas` : ''}${returns ? said(local, localWords) : ''}${logs ? '; their events differ' : ''}${batch[j].detail ? ` [${batch[j].detail}]` : ''}`);
       }
     });

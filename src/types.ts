@@ -370,6 +370,11 @@ export interface SimulationRequest {
   watch?: string[];
   /** The transaction's gas limit, gas price and EIP-2930 access list, when the request sets them (contracts can read gasleft() and tx.gasprice). */
   gas?: bigint;
+  /**
+   * Arbitrum: the gas the chain took out of `gas` for the transaction's L1 data before running it (a replay's, from
+   * its receipt's gasUsedForL1). The chain's node works it out itself; the local EVM runs on the rest.
+   */
+  gasForL1?: bigint;
   gasPrice?: bigint;
   /**
    * The simulated block's base fee, for calls that read it (BASEFEE): eth_simulateV1 without validation otherwise

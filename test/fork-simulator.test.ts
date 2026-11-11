@@ -430,6 +430,24 @@ test('A token whose balanceOf costs over a million gas is read for what it holds
   assert.ok(read.gasUsed! > 1_000_000n && read.gasUsed! < 10_000_000n, String(read.gasUsed));
 });
 
+test('Arbitrum: a replay’s local run has the gas the chain left it after the L1 data charge', async () => {
+  // Arbitrum takes the gas for a transaction's L1 data out of its limit before running it (the receipt's
+  // gasUsedForL1). A call given just what it needs runs; the same call, with 10,000 of its gas taken for L1 data,
+  // runs out, as it would have on the chain.
+  const LOOP = '0x00000000000000000000000000000000000c0dec';
+  // i = 0x0200; loop: i--; until i == 0; STOP.
+  await chain.putCode(LOOP, `0x${'610200' + '5b' + '6001' + '90' + '03' + '80' + '6003' + '57' + '00'}`);
+  const arbitrum = fork({ profiles: { 999: { ...CHAIN_PROFILES[999], arbitrum: true } } });
+  const [free] = (await arbitrum.simulateBatch([{ chainId: 999, from: USER, to: LOOP, data: '0x', value: 0n }]))!;
+  const enough = free.gasUsed! + 2_000n;
+  const [fits] = (await arbitrum.simulateBatch([{ chainId: 999, from: USER, to: LOOP, data: '0x', value: 0n, gas: enough }]))!;
+  const [short] = (await arbitrum.simulateBatch([{ chainId: 999, from: USER, to: LOOP, data: '0x', value: 0n, gas: enough, gasForL1: 10_000n }]))!;
+  assert.deepEqual([fits.status, short.status], ['success', 'reverted']);
+  // Elsewhere the field means nothing.
+  const [elsewhere] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: LOOP, data: '0x', value: 0n, gas: enough, gasForL1: 10_000n }]))!;
+  assert.equal(elsewhere.status, 'success');
+});
+
 test('Polygon lets a contract be 32,768 bytes long: a creation Ethereum’s limit refuses succeeds there', async () => {
   // The code creates a contract of `size` zero bytes and returns its address, or zero where the creation failed.
   const creating = (size: number) => `0x6561${size.toString(16).padStart(4, '0')}6000f360d01b600052600660006000f060005260206000f3`;

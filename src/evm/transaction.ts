@@ -222,7 +222,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       if (at) request.at = at;
       // A replay runs at the price the transaction paid, after the transactions before it in its block (named with
       // the block: they run first, and only this one is reported).
-      if (replay) { request.gasPrice = replay.gasPrice; request.at = { ...replay.at, before: replay.before }; if (replay.blobVersionedHashes) { request.blobVersionedHashes = replay.blobVersionedHashes; request.maxFeePerBlobGas = replay.maxFeePerBlobGas; } }
+      if (replay) { request.gasPrice = replay.gasPrice; request.at = { ...replay.at, before: replay.before }; if (replay.receipt.gasForL1) request.gasForL1 = replay.receipt.gasForL1; if (replay.blobVersionedHashes) { request.blobVersionedHashes = replay.blobVersionedHashes; request.maxFeePerBlobGas = replay.maxFeePerBlobGas; } }
       const pending = replay ? [] : pendingRequests(tx, context).map(p => (at ? { ...p, at } : p));
       ran = [...pending, request];
       // What the transaction would pay now (or in the block named), read while the simulation runs (see the priced run below).

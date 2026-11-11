@@ -1338,7 +1338,8 @@ export class ForkSimulator implements Simulator {
       const authorized = await this.authorize(state, evm, auths[i], chainId, caller);
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
-      let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState : GAS;
+      // (Arbitrum: less the gas the chain took for the transaction's L1 data before running it, where it is known.)
+      let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS;
       // Amsterdam meters new state apart from the rest (EIP-8037). What a transaction's gas limit holds over the cap
       // on ordinary gas (EIP-7825's 16,777,216, less what it pays before its call) is a reservoir for state alone;
       // state gas is drawn from it first, then from the call's gas, and state gas given back (a slot set and cleared
