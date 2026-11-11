@@ -192,10 +192,11 @@ test('A request previewed on a past block: its state, the block that followed, p
   // The priced run is at the named block's base fee, not the latest block's.
   const priced = batches.find(b => b[0].gasPrice !== undefined);
   assert.equal(priced?.[0].baseFee, 0x5e69ec0n);
-  // The chain's latest block: the block after it doesn't exist yet, so its header is the one that would follow.
+  // The chain's latest block: the block after it doesn't exist yet, so its header is the one that would follow (on
+  // Base, which makes several blocks a second, in the same second).
   const latest = deps(ran());
   await send({ block: '0x65' }, latest.deps);
-  assert.deepEqual([latest.batches[0][0].at!.block, latest.batches[0][0].at!.header.number, latest.batches[0][0].at!.header.timestamp], ['0x65', 102n, 1_762_000_103n]);
+  assert.deepEqual([latest.batches[0][0].at!.block, latest.batches[0][0].at!.header.number, latest.batches[0][0].at!.header.timestamp], ['0x65', 102n, 1_762_000_101n]);
   // A block the chain doesn't have: no simulation, and the reason.
   const beyond = await send({ block: '500' }, deps(ran()).deps);
   assert.deepEqual([beyond.simulation!.status, codes(beyond).includes('simulation_unavailable')], ['unavailable', true]);
@@ -255,16 +256,17 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   assert.deepEqual(nodeOverrides(header), { time: '0x5', feeRecipient: BOB, prevRandao: H(1), baseFeePerGas: '0x2' });
   assert.deepEqual(nodeOverrides({ ...header, arbBlockNumber: 7n }), { time: '0x5', feeRecipient: BOB, baseFeePerGas: '0x2' });
   // A block in the same second as its parent (BNB Chain's often are) is one no node will simulate: it runs a second
-  // later, and says so. Arbitrum's node takes the same second.
+  // later, and says so. Arbitrum's node takes the same second, and so does Base's (most of its blocks share one).
   assert.deepEqual(afterParent(56, header, 5n), { header: { ...header, timestamp: 6n }, shifted: true });
-  assert.deepEqual([afterParent(56, header, 4n).shifted, afterParent(56, header, 4n).header, afterParent(42161, header, 5n).shifted], [false, header, false]);
+  assert.deepEqual([afterParent(56, header, 4n).shifted, afterParent(56, header, 4n).header, afterParent(42161, header, 5n).shifted, afterParent(8453, header, 5n).shifted, afterParent(10, header, 5n).shifted], [false, header, false, false, true]);
   const sameSecond = chain();
-  const crowded = { has: sameSecond.rpc.has.bind(sameSecond.rpc), call: async (c: number, method: string, params: unknown[]) => {
+  // (The fixture's blocks, as OP Mainnet's: its node refuses a block at its parent's time.)
+  const crowded = { has: () => true, call: async (c: number, method: string, params: unknown[]) => {
     const r = await sameSecond.rpc.call(c, method, params) as Record<string, unknown>;
     return method === 'eth_getBlockByNumber' && params[0] === '0x63' ? { ...r, timestamp: hex(1_762_000_100) } : r;
   } } as unknown as NonNullable<Dependencies['rpc']>;
   const shiftedRuns: SimulationRequest[] = [];
-  const late = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { simulate: async r => { shiftedRuns.push(r); return ran(); } } });
+  const late = await replayTransaction({ chainId: 10, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { simulate: async r => { shiftedRuns.push(r); return ran(); } } });
   assert.deepEqual([shiftedRuns[0].at!.header.timestamp, shiftedRuns[0].at!.header.ownTimestamp], [1_762_000_101n, undefined]);
   assert.match(late.decoding.notes.join(' '), /The block shares its second with the one before it, which this chain's node won't simulate: it was run one second later/);
   // Where the node's run, a second late, isn't what the receipt says (the transaction read the time), the local EVM
@@ -273,7 +275,7 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   // still run a second late on the node, and a run at their time is the better match for everything else.
   const localRuns: SimulationRequest[] = [];
   const timed = { simulate: async () => ran({ gasUsed: 60_000n }), trace: async (reqs: SimulationRequest[]) => { localRuns.push(...reqs); return [ran({ source: 'the local EVM' })]; } };
-  const own = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: timed });
+  const own = await replayTransaction({ chainId: 10, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: timed });
   assert.deepEqual([own.replay!.matches, own.simulation!.source, own.simulation!.gasUsed, localRuns.length, localRuns[0].at!.header.ownTimestamp], [true, "the local EVM, over the chain's state", '51234', 1, 1_762_000_100n]);
   assert.match(own.decoding.notes.join(' '), /run a second later there, the transaction didn't come out as its receipt says\. The run shown is the local EVM's, at the block's own time\./);
   assert.equal(codes(own).includes('replay_differs'), false);
@@ -298,7 +300,7 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   // Under the cap, or on a chain that isn't Ethereum's, the node's run stands.
   assert.deepEqual([(await over(500_000n)).simulation!.gasUsed, (await over(70_000_000n, '0x2105')).simulation!.gasUsed], ['50000000', '50000000']);
   // If the local EVM's run isn't what happened either, the node's stays, with what differs.
-  const neither = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { ...timed, trace: async () => [ran({ gasUsed: 70_000n })] } });
+  const neither = await replayTransaction({ chainId: 10, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { ...timed, trace: async () => [ran({ gasUsed: 70_000n })] } });
   assert.deepEqual([neither.replay!.matches, neither.simulation!.gasUsed, codes(neither).includes('replay_differs')], [false, '60000', true]);
   // Polygon's node logs native transfers and fee payments from 0x…1010; a local EVM has none. Runs are compared without them.
   const fee = { address: '0x0000000000000000000000000000000000001010', topics: ['0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63', pad(ALICE)], data: '0x' };

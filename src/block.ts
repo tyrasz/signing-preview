@@ -136,7 +136,10 @@ export function accessListChanges(list: unknown[], from: number, to: number): St
 export const NEXT_BLOCK: Record<number, { blockTime: number; /** What COINBASE returns where it isn't the header's miner: Polygon's blocks name none, and every one pays its fees to one address (measured on its node; an override of the fee recipient is ignored). */ coinbase?: string; /** The chain carries blobs (EIP-4844), so its blocks have a blob base fee. */ blobs?: boolean; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon); BNB Chain's read it from prevRandao. */ difficultyOverride?: boolean }> = {
   1: { blockTime: 12, blobs: true }, 11155111: { blockTime: 12, blobs: true },
   42161: { blockTime: 0, randomness: 'one', arbitrum: true }, 421614: { blockTime: 0, randomness: 'one', arbitrum: true },
-  8453: { blockTime: 2 }, 10: { blockTime: 2 },
+  // Base makes about five blocks a second (32 of 40 shared their parent's second on 2026-11-11), and its node will
+  // simulate a block at its parent's time, as Arbitrum's does: the next block is taken to be in the same second, and
+  // a replayed one keeps its own time. OP Mainnet's blocks are two seconds apart, and its node refuses the same time.
+  8453: { blockTime: 0 }, 10: { blockTime: 2 },
   137: { blockTime: 2, randomness: 'difficulty', difficultyOverride: true, coinbase: '0x7ee41d8a25641000661b1ef5e6ae8a00400466b0' },
   56: { blockTime: 1, randomness: 'difficulty' },
   999: { blockTime: 1 }, 998: { blockTime: 1 },
