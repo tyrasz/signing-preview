@@ -412,8 +412,10 @@ class StateSource {
     // none, and beside 151 code readers the one reading 152 balances got 460,526, short of what they cost.
     if (accounts.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE } }, calls: [balanceCall] });
     if (codeCalls.length) blocks.push({ stateOverrides: { [CODE_READER]: { code: CODE_READER_CODE } }, calls: codeCalls });
-    // Each slot reader with gas of its own for its slots (a cold read is 2,100), not a share of the block's.
-    if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}`, gas: `0x${(50_000 + 3_000 * slots.get(a)!.length).toString(16)}` })) });
+    // Each slot reader with gas of its own for its slots (a cold read is 2,100), not a share of the block's: unless
+    // their limits would add up to more than 30,000,000 (a node that adds them up refuses past its block's).
+    const slotGas = contracts.map(a => 50_000 + 3_000 * slots.get(a)!.length), own = slotGas.reduce((x, y) => x + y, 0) <= 30_000_000;
+    if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map((a, i) => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}`, ...(own && { gas: `0x${slotGas[i].toString(16)}` }) })) });
     let out: { calls: { status: string; returnData: Hex; gasUsed?: string }[] }[] | undefined;
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
