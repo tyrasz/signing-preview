@@ -548,6 +548,32 @@ test('A node that adds up a block’s gas limits gets the earlier transactions o
   } finally { chain.simulateV1 = false; }
 });
 
+test('After a block’s earlier transactions, the reads of many accounts aren’t starved by a node that splits a block’s gas', async () => {
+  // BNB Chain's node gives each call that sets no gas an even share of the block's: beside 151 code readers, the one
+  // reading 152 accounts' balances got 460,526 gas and ran out. A call that reads the balances of 150 accounts:
+  // 0x1000 to 0x1095, by BALANCE in a loop.
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const MANY = '0x00000000000000000000000000000000000c0deb';
+  // i = 0x1000; loop: BALANCE(i) POP; i++; until i == 0x1096; STOP.
+  await chain.putCode(MANY, `0x${'611000' + '5b' + '80' + '31' + '50' + '6001' + '01' + '80' + '611096' + '14' + '6015' + '57' + '6003' + '56' + '5b' + '00'}`);
+  for (let i = 0; i < 150; i++) await chain.putCode(`0x${(0x1000 + i).toString(16).padStart(40, '0')}` as Hex, '0x00');
+  const earlier: SimulationRequest = { chainId: 999, from: USER, to: BOB, data: '0x', value: 1n };
+  const splitting = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    for (const b of Array.isArray(body) ? body : [body]) if (b.method === 'eth_simulateV1') for (const block of b.params[0].blockStateCalls as { calls: { gas?: string }[] }[]) {
+      const set = block.calls.reduce((sum, c) => sum + (c.gas ? BigInt(c.gas) : 0n), 0n), unset = BigInt(block.calls.filter(c => !c.gas).length);
+      for (const c of block.calls) if (!c.gas && unset) c.gas = `0x${((header.gasLimit - set) / unset).toString(16)}`;
+    }
+    return chain.fetchImpl(url, { ...init, body: JSON.stringify(body) });
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    const [r] = (await fork({ fetchImpl: splitting }).trace([{ chainId: 999, from: USER, to: MANY, data: '0x', value: 0n, gas: 5_000_000n, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.equal(r.status, 'success');
+    assert.ok(r.trace);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('A node that refuses a block’s earlier transactions two ways at once gets both met: less gas each, and blob calls plain', async () => {
   // BNB Chain's node, for a replay merged with its second's earlier block: their gas limits add up past the block's,
   // and once they don't, a blob transaction among them isn't buildable.

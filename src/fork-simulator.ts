@@ -405,11 +405,15 @@ class StateSource {
     for (const a of accounts) if (!lowAddress(a)) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`)) want(a, slot);
     for (const k of m.storage) { const [a, slot] = k.split('_'); want(a, slot); }
     const needCode = accounts.filter(a => !this.codeOverrides.has(a));
-    const accountCalls = [...(accounts.length ? [{ to: BALANCE_READER, data: `0x${accounts.map(word).join('')}` }] : []), ...needCode.map(a => ({ to: CODE_READER, data: `0x${word(a)}` }))];
+    const balanceCall = { to: BALANCE_READER, data: `0x${accounts.map(word).join('')}` }, codeCalls = needCode.map(a => ({ to: CODE_READER, data: `0x${word(a)}` }));
     const contracts = [...slots.keys()];
     const blocks: unknown[] = [{ calls: after.calls, blockOverrides: after.blockOverrides, ...(after.state && { stateOverrides: after.state }) }];
-    if (accountCalls.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE }, [CODE_READER]: { code: CODE_READER_CODE } }, calls: accountCalls });
-    if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}` })) });
+    // The balance reader in a block of its own: BNB Chain's node splits a block's gas evenly among calls that set
+    // none, and beside 151 code readers the one reading 152 balances got 460,526, short of what they cost.
+    if (accounts.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE } }, calls: [balanceCall] });
+    if (codeCalls.length) blocks.push({ stateOverrides: { [CODE_READER]: { code: CODE_READER_CODE } }, calls: codeCalls });
+    // Each slot reader with gas of its own for its slots (a cold read is 2,100), not a share of the block's.
+    if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}`, gas: `0x${(50_000 + 3_000 * slots.get(a)!.length).toString(16)}` })) });
     let out: { calls: { status: string; returnData: Hex; gasUsed?: string }[] }[] | undefined;
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
@@ -448,11 +452,11 @@ class StateSource {
     if (after.fitted && !hadRoom(after.earlier ?? [], after.fitted, out[0].calls)) throw new Error("one of the block's earlier transactions, run on less gas each for a node that adds their limits up, may have run short");
     const words = (data: Hex, n: number) => Array.from({ length: n }, (_, i) => `0x${data.slice(2 + 64 * i, 66 + 64 * i).padEnd(64, '0')}` as Hex);
     let at = 1;
-    if (accountCalls.length) {
-      const r = out[at++].calls;
-      if (r.some(c => c.status !== '0x1')) throw failed;
-      const balances = words(r[0].returnData, accounts.length);
-      const code = new Map(needCode.map((a, i) => [a, hexToBytes(r[1 + i].returnData)]));
+    if (accounts.length) {
+      const rb = out[at++].calls, rc = codeCalls.length ? out[at++].calls : [];
+      if ([...rb, ...rc].some(c => c.status !== '0x1')) throw failed;
+      const balances = words(rb[0].returnData, accounts.length);
+      const code = new Map(needCode.map((a, i) => [a, hexToBytes(rc[i].returnData)]));
       accounts.forEach((a, i) => this.accounts.set(a, { balance: BigInt(balances[i]), nonce: nonces.get(a) ?? 0n, code: this.codeOverrides.get(a) ?? code.get(a) ?? new Uint8Array(0) }));
     }
     if (contracts.length) {
