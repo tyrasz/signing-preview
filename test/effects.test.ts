@@ -209,6 +209,12 @@ test('On a node that splits a block’s gas among the calls that set none, a hea
   const b = node(900_000n, 600_000n);
   const rb = (await b.simulator.simulate(request))!;
   assert.deepEqual([moved(rb), rb.balancesRead, b.bodies.length], [[[ALICE.toLowerCase(), ROUTER, 1_000n]], true, 3]);
+  // A node that refuses the reads' block outright, its calls left less than 21,000 each ("intrinsic gas too low",
+  // as BNB Chain's did for a batch's 3,897): the lean pass all the same.
+  const refusing = node(500_000n, 400_000n), inner = refusing.simulator['post'].bind(refusing.simulator);
+  let posts = 0;
+  (refusing.simulator as unknown as { post: typeof inner }).post = async (...args: Parameters<typeof inner>) => (++posts === 2 ? { error: { code: -32000, message: 'intrinsic gas too low' } } : inner(...args));
+  assert.deepEqual(moved((await refusing.simulator.simulate(request))!), [[ALICE.toLowerCase(), ROUTER, 1_000n]]);
   // Where the lean pass doesn't come out as the first run did (here: the swap can't run on what it is given), the
   // events stand.
   const c = node(1_100_000n, 600_000n);

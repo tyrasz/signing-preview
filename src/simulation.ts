@@ -112,9 +112,9 @@ async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChang
 
 /**
  * A replay's earlier transactions with gas limits that add up to no more than `room`, for a node that adds the
- * limits of a simulated block's calls up against the block's gas limit (reth's eth_simulateV1, which BNB Chain's
- * public node runs: "Block gas limit exceeded by the block's transactions"; it takes no higher block limit either).
- * The chain counts the gas used, and BNB Chain's transactions are given several times what they use: in every block
+ * limits of a simulated block's calls up against the block's gas limit (BNB Chain's public node, reth-bsc: "Block
+ * gas limit exceeded by the block's transactions"; it takes no higher block limit either; Ethereum's, Base's and OP
+ * Mainnet's, on reth, don't add them up). The chain counts the gas used, and BNB Chain's transactions are given several times what they use: in every block
  * followed, the limits passed the block's 70 million somewhere in its last third, and nothing after that point
  * could be replayed.
  *
@@ -457,7 +457,7 @@ export class RpcSimulator implements Simulator {
    * The reads come from the zero address, so they don't move the senders' nonces. If the re-run's outcomes differ
    * from the first (the state moved on), the event-based values stand.
    *
-   * A node built on reth (BNB Chain's public one) splits the block's gas evenly among the calls that set none: 22
+   * BNB Chain's public node (reth-bsc) splits the block's gas evenly among the calls that set none: 22
    * such calls got 3.2 million each of a 70 million block, and the seventy-odd reads around a swap got about a
    * million each, which one token's balanceOf (1.37 million gas: Open Genesis, on BNB Chain) ran out of, so its
    * misleading events stood (they netted to one unit where the sender's balance went down by 4.56e18). Reads of a
@@ -502,13 +502,15 @@ export class RpcSimulator implements Simulator {
     const before = await this.before(reqs[0].chainId, reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
-    if (!out || out.length !== calls.length) return;
-    // The re-run must have gone the same way, or its reads describe a different execution. On a node that splits
-    // the block's gas among the calls that set none, a call that set none may have run short among the reads: it is
-    // asked again with its own (leanReads), for the tokens its logs name.
-    if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success'))) {
+    // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the
+    // tokens the logs name are asked again in a lean pass (leanReads). On a node that splits the block's gas among
+    // the calls that set none, a call that set none may have run short among the reads, and a batch's thousands of
+    // reads can leave each less than a call's 21,000 ("intrinsic gas too low": BNB Chain's node, for 3,897 calls).
+    const starved = !out || out.length !== calls.length ? /intrinsic gas too low/i.test((body as { error?: { message?: string } }).error?.message ?? '')
+      : callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success')) ? reqs.some(r => r.gas === undefined) : undefined;
+    if (starved !== undefined) {
       const pairs = owners.flatMap(owner => [...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)).map(token => ({ owner, token })));
-      const again = pairs.length && reqs.some(r => r.gas === undefined) ? await this.leanReads(url, reqs, parsed, pairs).catch(() => undefined) : undefined;
+      const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs).catch(() => undefined) : undefined;
       if (!again) return;
       parsed.forEach((p, i) => {
         if (p.status !== 'success') return;
@@ -524,6 +526,7 @@ export class RpcSimulator implements Simulator {
       });
       return;
     }
+    if (!out) return;
     for (const { call, approval, index } of reads) {
       const r = out[index];
       if (r.status !== '0x1') continue; // non-standard token: keep the event value
@@ -560,7 +563,7 @@ export class RpcSimulator implements Simulator {
    * Balance reads asked again on their own (readState): the calls as before, with the given owners' balances of the
    * given tokens read before the first and after each, and nothing else. Each call is given its own gas (what it set,
    * else what it used and half as much again and 100,000), so a node that splits the block's gas among the calls that
-   * set none (reth's) gives the few reads a large share. Every call must come out as it did the first time: the same
+   * set none (BNB Chain's) gives the few reads a large share. Every call must come out as it did the first time: the same
    * outcome and the same gas used, or nothing is read. The values by `${callsBefore}:${owner}:${token}`.
    */
   private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[]): Promise<Map<string, bigint> | undefined> {
