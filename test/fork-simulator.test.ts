@@ -367,6 +367,11 @@ test('Chains with their own rules: Polygon’s storage prices, Arbitrum’s two 
   const r = await arbitrum.simulate({ chainId: 999, from: FROM, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: reads } }, at: { block: 'latest', header } });
   const words = r!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`));
   assert.deepEqual([words[0], words[2], words[3]], [21_000_000n, 523_000_000n, 1n]);
+  // ArbOS's precompiles at the chain's prices (measured on Arbitrum One's node): 800 to open its state, 800 a
+  // storage slot read, 3 a word given or returned. The block number reads none; getPricesInWei() reads two and
+  // returns six words; a method that isn't listed is taken to read one.
+  const price = CHAIN_PROFILES[42161].precompileGas!;
+  assert.deepEqual([price(4, 32, '0xa3b1b31d'), price(4, 192, '0x41b247a8'), price(4, 96, '0x612af178'), price(4, 32, '0xf5d6ded7'), price(36, 32, '0x12345678')], [803n, 2_418n, 2_409n, 1_603n, 1_606n]);
   // The request's block wins over the simulator's own: the same code on another header sees that one.
   const again = await arbitrum.simulate({ chainId: 999, from: FROM, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: reads } }, at: { block: 'latest', header: { ...header, number: 5n, arbBlockNumber: 9n } } });
   assert.deepEqual(again!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`)).filter((_, i) => i !== 1), [5n, 9n, 1n]);
