@@ -372,6 +372,17 @@ test('Chains with their own rules: Polygon’s storage prices, Arbitrum’s two 
   assert.deepEqual(again!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`)).filter((_, i) => i !== 1), [5n, 9n, 1n]);
 });
 
+test('HyperEVM follows an EIP-7702 delegation: a call into a delegated account runs the delegate’s code', async () => {
+  // Its rules are Cancun's, which have no such accounts, yet its node runs the delegate's code for one (measured
+  // with the code given to an account). The local EVM does the same there; on plain Cancun rules the call fails.
+  const DELEGATED = '0x00000000000000000000000000000000de1e9a7e', DELEGATE = '0x00000000000000000000000000000000c0de7704';
+  const req: SimulationRequest = { chainId: 999, from: USER, to: DELEGATED, data: '0x', value: 0n, stateOverrides: { [DELEGATE]: { code: '0x602a60005260206000f3' }, [DELEGATED]: { code: `0xef0100${DELEGATE.slice(2)}` } } };
+  const followed = await fork().simulate(req);
+  assert.deepEqual([followed!.status, BigInt(followed!.returnData!)], ['success', 42n]);
+  const { eips: _eips, ...cancun } = CHAIN_PROFILES[999];
+  assert.equal((await fork({ profiles: { 999: cancun } }).simulate(req))!.status, 'reverted');
+});
+
 test('A block given a later time for the chain’s node runs at its own time in the local EVM', async () => {
   // BNB Chain's blocks often share their second with their parent, which no node will simulate: a replay gives the
   // node the next second, and keeps the block's own for the local EVM. The code returns TIMESTAMP.
@@ -644,6 +655,12 @@ test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s n
   await chain.setBalance(sender, E);
   assert.deepEqual([await gas({ authorizationList: [await authorization(TWICE, 0), await authorization(TWICE, 1)] }), await gas({ from: sender, authorizationList: [await authorization(SENDER, 1)] }), await gas({ from: sender, authorizationList: [await authorization(SENDER, 1), await authorization(SENDER, 2)] })],
     [15_000n + 2n * 7_816n + 9_000n + 143n * 1_530n, 15_000n + 7_816n + 23n * 1_530n, 15_000n + 2n * 7_816n + 23n * 1_530n]);
+  // A call that fails changes nothing itself, but its transaction's authorizations stay applied on the chain: a
+  // trace shows them (the authority's nonce and its new code).
+  const KEPT = `0x${'f3'.repeat(32)}` as Hex, REVERTS = '0x00000000000000000000000000000000c0de0003';
+  const [failed] = (await new ForkSimulator({ 11155111: URL_ }, { fetchImpl: chain.fetchImpl }).trace([{ chainId: 11155111, from: FROM, to: REVERTS, data: '0x', value: 0n, at: { block: '0x10', header: amsterdam },
+    stateOverrides: { [REVERTS]: { code: '0x60006000fd' } }, authorizationList: [await authorization(KEPT, 0)] }]))!;
+  assert.deepEqual([failed.status, failed.stateChanges], ['reverted', [{ address: privateKeyToAccount(KEPT).address.toLowerCase(), nonce: { before: 0n, after: 1n }, code: true }]]);
   // Gas over the cap on ordinary gas (16,777,216) pays for new state only: a call given 20 million has the cap, less
   // what the transaction pays first, to run on; a new account's state comes out of the rest, and is counted.
   await chain.putCode('0x00000000000000000000000000000000000c0de8', '0x5a60005260206000f3');
