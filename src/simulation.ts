@@ -325,7 +325,7 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(chainId, reqs, fitted);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId, reqs).tag]) as { result?: { calls: RawCallResult[]; number?: string }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
       return this.withoutSimulateV1(url, chainId, reqs);
@@ -364,7 +364,11 @@ export class RpcSimulator implements Simulator {
           // Without the native transfers traceTransfers adds (logged by a pseudo-address).
           logs: (result.logs ?? []).filter(l => l.address.toLowerCase() !== NATIVE_PSEUDO_TOKEN).map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data })) };
     });
-    try { await this.readState(url, reqs, parsed); } catch { /* keep the event-based values */ }
+    // The reads on the state the run had: a request not pinned to a block ran on whichever was the latest, and on a
+    // chain of five blocks a second (Base) the next request's latest is often another (eth_simulateV1 says which
+    // block it simulated).
+    const ranOn = this.at(chainId, reqs).tag === 'latest' && body.result?.[0]?.number ? `0x${(BigInt(body.result[0].number) - 1n).toString(16)}` : undefined;
+    try { await this.readState(url, reqs, parsed, ranOn); } catch { /* keep the event-based values */ }
     return parsed;
   }
 
@@ -464,7 +468,7 @@ export class RpcSimulator implements Simulator {
    * token the logs show moving for a sender that fail, and a re-run whose outcomes differ, are asked again in a lean
    * pass (leanReads).
    */
-  private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[]) {
+  private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], tag = this.at(reqs[0].chainId, reqs).tag) {
     const owners = [...new Set(reqs.map(r => (r.account ?? r.from).toLowerCase()))];
     const touched = new Map<string, SimulatedApproval>();
     const after: SimulatedApproval[][] = [];
@@ -500,7 +504,7 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the
     // tokens the logs name are asked again in a lean pass (leanReads). On a node that splits the block's gas among
@@ -514,7 +518,7 @@ export class RpcSimulator implements Simulator {
       : callIndex.some(differs) ? reqs.some(r => r.gas === undefined) : undefined;
     if (starved !== undefined) {
       const pairs = owners.flatMap(owner => [...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)).map(token => ({ owner, token })));
-      const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs).catch(() => undefined) : undefined;
+      const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs, tag).catch(() => undefined) : undefined;
       if (!again) return;
       parsed.forEach((p, i) => {
         if (p.status !== 'success') return;
@@ -544,7 +548,7 @@ export class RpcSimulator implements Simulator {
     // asked again on their own (leanReads). One that answered nothing is a token without balanceOf, and stays so.
     const movedFor = new Set(parsed.flatMap(r => r.transfers.flatMap(t => [`${t.from}:${t.asset}`, `${t.to}:${t.asset}`])));
     const failed = balances[0].filter((b, j) => !isNft.has(b.token) && movedFor.has(`${b.owner}:${b.token}`) && balances.some(at => out[at[j].index].status !== '0x1'));
-    const again = failed.length ? await this.leanReads(url, reqs, parsed, failed.map(b => ({ owner: b.owner, token: b.token }))).catch(() => undefined) : undefined;
+    const again = failed.length ? await this.leanReads(url, reqs, parsed, failed.map(b => ({ owner: b.owner, token: b.token })), tag).catch(() => undefined) : undefined;
     const read = (at: number, j: number) => again?.get(`${at}:${balances[at][j].owner}:${balances[at][j].token}`) ?? word(out[balances[at][j].index]);
     parsed.forEach((p, i) => {
       if (p.status !== 'success') return;
@@ -570,7 +574,7 @@ export class RpcSimulator implements Simulator {
    * set none (BNB Chain's) gives the few reads a large share. Every call must come out as it did the first time: the same
    * outcome and the same gas used, or nothing is read. The values by `${callsBefore}:${owner}:${token}`.
    */
-  private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[]): Promise<Map<string, bigint> | undefined> {
+  private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[], tag: string): Promise<Map<string, bigint> | undefined> {
     const READER = '0x0000000000000000000000000000000000000000';
     const calls: unknown[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
     const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push({ from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
@@ -586,7 +590,7 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     if (!out || out.length !== calls.length) return undefined;
     if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success') || (parsed[i].gasUsed !== undefined && BigInt(out[ci].gasUsed) !== parsed[i].gasUsed))) return undefined;

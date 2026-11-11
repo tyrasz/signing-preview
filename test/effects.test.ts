@@ -230,6 +230,25 @@ test('On a node that splits a block’s gas among the calls that set none, a hea
   assert.deepEqual(moved((await c.simulator.simulate(request))!), [[OG, ALICE.toLowerCase(), 100n], [ALICE.toLowerCase(), ROUTER, 101n]]);
 });
 
+test('A request not pinned to a block has its balances read on the state its run had, not on a later latest', async () => {
+  // On Base (five blocks a second) the latest block of the next request is often another. eth_simulateV1 says which
+  // block it simulated: the read pass is asked on that block's parent.
+  const tags: unknown[] = [];
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    tags.push(body.params[1]);
+    const calls = body.params[0].blockStateCalls[0].calls as { data: string }[];
+    return new Response(JSON.stringify({ result: [{ number: '0x65', calls: calls.map(c => ({ status: '0x1', gasUsed: '0x5208', returnData: c.data.startsWith('0x70a08231') ? data(0n) : '0x', logs: [] })) }] }));
+  }) as typeof fetch;
+  await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 8453, from: ALICE, to: USDC, data: '0xdeadbeef', value: 0n });
+  assert.deepEqual(tags, ['latest', '0x64']);
+  // A request pinned to a block keeps its block.
+  tags.length = 0;
+  const header = { number: 100n, timestamp: 5n, coinbase: BOB, gasLimit: 30_000_000n, baseFeePerGas: 2n, prevRandao: `0x${'00'.repeat(32)}` as `0x${string}` };
+  await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 8453, from: ALICE, to: USDC, data: '0xdeadbeef', value: 0n, at: { block: '0x63', header } });
+  assert.deepEqual(tags, ['0x63', '0x63']);
+});
+
 test('Demo sample: a router call that buys an NFT and sets a Permit2 allowance along the way', async () => {
   const { sample } = await import('./helpers.ts');
   const p = await sample('eth-nft-buy');
