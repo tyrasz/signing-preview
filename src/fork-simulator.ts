@@ -19,7 +19,7 @@ import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft
 import { keccak256 } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
-import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields } from './block.ts';
+import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
 import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
@@ -350,7 +350,7 @@ class StateSource {
    * Reads are of the state after these calls (the transactions before a replayed one in its block), which the node
    * runs first, in a simulated block of their own (see fetchAfter). `sent`: how many of them each address sent.
    */
-  after?: { calls: unknown[]; blockOverrides: Record<string, string>; sent: Map<string, bigint> };
+  after?: { calls: unknown[]; blockOverrides: Record<string, string>; sent: Map<string, bigint>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges };
 
   async fetch(m: Misses): Promise<void> {
     if (!this.after) return this.fetchAt(m);
@@ -377,7 +377,7 @@ class StateSource {
     const needCode = accounts.filter(a => !this.codeOverrides.has(a));
     const accountCalls = [...(accounts.length ? [{ to: BALANCE_READER, data: `0x${accounts.map(word).join('')}` }] : []), ...needCode.map(a => ({ to: CODE_READER, data: `0x${word(a)}` }))];
     const contracts = [...slots.keys()];
-    const blocks: unknown[] = [{ calls: after.calls, blockOverrides: after.blockOverrides }];
+    const blocks: unknown[] = [{ calls: after.calls, blockOverrides: after.blockOverrides, ...(after.state && { stateOverrides: after.state }) }];
     if (accountCalls.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE }, [CODE_READER]: { code: CODE_READER_CODE } }, calls: accountCalls });
     if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map(a => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}` })) });
     let out: { calls: { status: string; returnData: Hex }[] }[] | undefined;
@@ -873,7 +873,7 @@ export class ForkSimulator implements Simulator {
     if (options?.after?.length && at) {
       const hex = (v: bigint) => `0x${v.toString(16)}`, sent = new Map<string, bigint>();
       for (const r of options.after) sent.set(hexOf(r.from), (sent.get(hexOf(r.from)) ?? 0n) + 1n);
-      source.after = { sent, blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
+      source.after = { sent, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
         ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })) };
     }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
