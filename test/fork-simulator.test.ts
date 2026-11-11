@@ -578,6 +578,11 @@ test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s n
   await chain.putCode(privateKeyToAccount(DELEGATED).address.toLowerCase(), `0xef0100${'11'.repeat(20)}`);
   assert.deepEqual([await gas({ authorizationList: [await authorization(NOBODY, 0)] }), await gas({ authorizationList: [await authorization(SOMEBODY, 0)] }), await gas({ authorizationList: [await authorization(DELEGATED, 0)] }), await gas({ authorizationList: [await authorization(NOBODY, 7)] })],
     [15_000n + 7_816n + 9_000n + 143n * 1_530n, 15_000n + 7_816n + 23n * 1_530n, 15_000n + 7_816n, 15_000n + 7_816n]);
+  // Gas over the cap on ordinary gas (16,777,216) pays for new state only: a call given 20 million has the cap, less
+  // what the transaction pays first, to run on; a new account's state comes out of the rest, and is counted.
+  await chain.putCode('0x00000000000000000000000000000000000c0de8', '0x5a60005260206000f3');
+  assert.equal(BigInt((await run({ to: '0x00000000000000000000000000000000000c0de8', gas: 20_000_000n })).returnData!), 16_777_216n - 15_000n - 2n);
+  assert.equal(await gas({ to: '0x00000000000000000000000000000000beef0789', value: 1n, gas: 20_000_000n }), 204_600n);
   // A gas limit leaves the call what Amsterdam leaves it: the limit less 15,000 here, not less 21,000.
   const GASLEFT = '0x00000000000000000000000000000000000c0de6';
   await chain.putCode(GASLEFT, '0x5a60005260206000f3');

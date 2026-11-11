@@ -279,11 +279,24 @@ async function check(chainId: number): Promise<Report> {
   ];
   const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
   for (let i = 0; i < programs.length; i += 16) {
-    const batch = programs.slice(i, i + 16), results = await chain.both(batch);
+    // Arbitrum's node adds a charge for L1 data to every call's gas: the same for calls with the same calldata in
+    // one block, but for the block's first call, which pays a few gas more. So there a call that isn't compared
+    // goes first, and programs sent no calldata are compared less that charge: what most of the batch differs by.
+    const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
+    let l1Charge: bigint | undefined;
+    if (!compareGas) {
+      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
+      const counts = new Map<bigint, number>();
+      for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
+      const most = [...counts].sort((a, b) => b[1] - a[1])[0];
+      if (most && most[1] * 2 > deltas.length) l1Charge = most[0];
+      if (process.env.RULES_DEBUG) console.log(`  batch ${i / 16}: L1 charge ${l1Charge}, deltas ${[...counts].map(([d, n]) => `${d}×${n}`).join(' ')}`);
+    }
     results.forEach(({ node, local }, j) => {
       if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
       report.compared++;
-      const gas = compareGas && node.gas !== undefined && local.gas !== undefined && node.gas !== local.gas;
+      const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
+        : l1Charge !== undefined && !batch[j].data && node.kind === 'runs' && local.kind === 'runs' && node.gas - local.gas !== l1Charge && !EXPECTED[chainId]?.[batch[j].label]);
       // Events are compared where the node reports them (not through eth_call).
       const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
       // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was

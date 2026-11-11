@@ -680,6 +680,10 @@ function storagePricing(profile: ChainProfile) {
 }
 
 const POINT_EVALUATION = '0x000000000000000000000000000000000000000a';
+/** EIP-7825: the most ordinary gas a transaction may use. Under Amsterdam, gas over it pays for new state only. */
+const REGULAR_GAS_CAP = 16_777_216n;
+/** The EVM library's per-transaction state-gas fields (EIP-8037), which its transaction runner sets before a call. */
+interface StateGas { stateGasReservoir: bigint; executionStateGasUsed: bigint; eip2780PrepOog: boolean; eip7928CallPostTargetOog: boolean; _stateGasSnapshots: unknown[]; createdAccountStateGas: Map<unknown, unknown>; createdAccountIntrinsicStateGas: Map<unknown, unknown> }
 /** An unused address given code that returns BLOCKHASH of a number, for chains whose BLOCKHASH only they can answer. */
 const BLOCKHASH_PROBE = '0x00000000000000000000000000000000b10c4a54';
 /** Chains that run Ethereum's own fork schedule: mainnet and Sepolia. */
@@ -1135,7 +1139,20 @@ export class ForkSimulator implements Simulator {
       const authorized = await this.authorize(state, evm, auths[i], chainId);
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
-      const gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState : GAS;
+      let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState : GAS;
+      // Amsterdam meters new state apart from the rest (EIP-8037). What a transaction's gas limit holds over the cap
+      // on ordinary gas (EIP-7825's 16,777,216, less what it pays before its call) is a reservoir for state alone;
+      // state gas is drawn from it first, then from the call's gas, and state gas given back (a slot set and cleared
+      // again) goes to it. The EVM keeps these per transaction: set afresh here, as the library's own transaction
+      // runner does, and what the reservoir gained or lost is settled after the call. Left as they were, one call's
+      // refund paid for the next call's new slots.
+      const metered = profile.hardfork === 'amsterdam' ? evm as unknown as StateGas : undefined;
+      let reservoir = 0n;
+      if (metered) {
+        const budget = REGULAR_GAS_CAP - intrinsicGas(req, true).intrinsic;
+        if (req.gas && gasLimit > budget) { reservoir = gasLimit - budget; gasLimit = budget; }
+        Object.assign(metered, { stateGasReservoir: reservoir, executionStateGasUsed: 0n, eip2780PrepOog: false, eip7928CallPostTargetOog: false, _stateGasSnapshots: [], createdAccountStateGas: new Map(), createdAccountIntrinsicStateGas: new Map() });
+      }
       callIndex = i;
       recording = true;
       if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
@@ -1144,7 +1161,9 @@ export class ForkSimulator implements Simulator {
       recording = false;
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
-      const gasUsed = transactionGas(req, ex.executionGasUsed + authState, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
+      // What the call spent, and under Amsterdam what its state took from the reservoir (less what it gave back to it).
+      const spent = ex.executionGasUsed + authState + (metered ? reservoir - metered.stateGasReservoir : 0n);
+      const gasUsed = transactionGas(req, spent > 0n ? spent : 0n, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
         results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data, ...(traced?.trace && { trace: traced.trace }) });

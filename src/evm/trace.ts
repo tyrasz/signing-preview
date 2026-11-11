@@ -53,6 +53,8 @@ const STANDARD: Abi = parseAbi([
   'function transferFrom(address from, address to, uint160 amount, address token)',
   'function approve(address token, address spender, uint160 amount, uint48 expiration)',
   'event Transfer(address indexed from, address indexed to, uint256 value)', 'event Approval(address indexed owner, address indexed spender, uint256 value)',
+  // EIP-7708 (Amsterdam): a chain's own log of native coin burnt, beside its Transfer logs of native coin moved
+  'event Burn(address indexed account, uint256 value)',
   'event ApprovalForAll(address indexed owner, address indexed operator, bool approved)',
   'event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)',
   'event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)',

@@ -148,6 +148,9 @@ async function replay(b: B, seen?: Set<string>) {
     const r = receipts.find(x => x.transactionHash === t.hash)!;
     const logs = parseLogs(r.logs);
     const logged = net(logs.transfers, from);
+    // A chain that logs its native transfers itself (EIP-7708, from Glamsterdam on) has them among the receipt's
+    // transfers: the native coin is compared apart, by the sender's balance.
+    logged.delete('native');
     // What actually moved: the sender's balance of each token across the block (it sent nothing else in it), which
     // for share-based tokens can differ from the Transfer events by a unit; the events where balanceOf can't be read.
     const balanceAt = async (token: string, tag: string) => { try { return BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: token, data: `0x70a08231${from.slice(2).padStart(64, '0')}` }, tag]))); } catch { return undefined; } };
