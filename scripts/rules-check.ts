@@ -39,7 +39,7 @@ const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, '0');
 /** The address the i-th program of a batch is placed at. */
 const place = (i: number) => `0x${(0xc0de0000 + i).toString(16).padStart(40, '0')}`;
 
-interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
+interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
 interface Outcome { kind: 'runs' | 'invalid' | 'fails' | 'refused'; returns: string; gas?: bigint; logs: string; why?: string }
 
 /** Seventeen pushes (1 on top), the opcode, then: store the top of the stack at 0, the memory size at 32, return both. */
@@ -59,7 +59,7 @@ const asm = (source: string): Hex => `0x${source.trim().split(/\s+/).map(t => {
 }).join('')}`;
 
 /** Programs that the seventeen-push form can't reach: opcodes whose arguments have to mean something. */
-function crafted(): Program[] {
+function crafted(amsterdam: boolean): Program[] {
   const RET = '00 MSTORE 20 00 RETURN'; // the top of the stack, as the 32 bytes returned
   // Initcode that returns ten bytes (of zeros) as the new contract's code, left-aligned at memory 0.
   const INIT = '600a6000f3 d8 SHL 00 MSTORE';
@@ -83,6 +83,13 @@ function crafted(): Program[] {
     { label: 'DELEGATECALL to an account with no code', code: asm(`00 00 00 00 ${EMPTY} GAS DELEGATECALL ${RET}`) },
     { label: 'SELFDESTRUCT with a balance, to the sender', code: asm('CALLER SELFDESTRUCT'), balance: 10n },
     { label: 'REVERT with a word', code: asm('2a 00 MSTORE 20 00 REVERT') },
+    // A contract that destroys itself as it is created, to itself: its 5 wei are burnt (from Amsterdam on, with a log).
+    { label: 'SELFDESTRUCT to itself by a contract being created (a burn)', code: asm(`30ff 00 MSTORE 02 1e 05 CREATE ${RET}`), balance: 10n },
+    // Sizes on either side of the limits a fork moves (EIP-7954 in Amsterdam): 25,000 bytes of code is over the
+    // 24,576 a contract could be before, 50,000 bytes of initcode over the 49,152. The code's deposit takes gas a
+    // transaction can only bring under Amsterdam above the cap on ordinary gas (its reservoir for state).
+    { label: 'CREATE of 25,000 bytes of code', code: asm(`6161a86000f3 d0 SHL 00 MSTORE 06 00 00 CREATE ${RET}`), gas: amsterdam ? 48_000_000n : 16_000_000n },
+    { label: 'CREATE from 50,000 bytes of initcode', code: asm(`c350 00 00 CREATE ${RET}`) },
     { label: 'RETURNDATASIZE after a call that returns a word', code: asm(`2a 00 MSTORE 20 00 20 00 04 GAS STATICCALL POP RETURNDATASIZE ${RET}`) },
     // Amsterdam's stack opcodes with an immediate (EIP-8024): the 17th item copied to the top, the top swapped with
     // the 18th, and two items below the top exchanged. Before Amsterdam they are no opcodes at all.
@@ -185,6 +192,8 @@ class Chain {
       // found to have no eth_simulateV1 is asked again the other way, with the block to match.
       if ((!node && attempt < 3) || hadSimulate !== this.simulateV1) continue;
       const local = await this.locally(placed, overrides, at);
+      // The same for the local EVM's reads: a backend that hasn't the named block yet, or no longer its state.
+      if (attempt < 3 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) continue;
       return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: 'the node did not answer' }, local: local[i] }));
     }
   }
@@ -199,7 +208,7 @@ class Chain {
   }
 
   private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined): Promise<Outcome[] | null> {
-    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${GAS.toString(16)}` }));
+    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}` }));
     const kind = (ok: boolean, message?: string): Outcome['kind'] => (ok ? 'runs' : INVALID.test(message ?? '') ? 'invalid' : 'fails');
     // Without the pseudo-logs traceTransfers would add, and the logs a chain writes outside the EVM (Polygon's own transfer logs).
     const logsOf = (logs: { address: string; topics: string[]; data: string }[] | undefined) => (logs ?? []).filter(l => l.address.toLowerCase() !== '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' && !chainsOwnLog(l)).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|');
@@ -217,7 +226,7 @@ class Chain {
   }
 
   private async locally(programs: (Program & { to: string })[], overrides: Record<string, { code?: string; balance?: string }>, at: BlockAt | undefined): Promise<Outcome[]> {
-    const request = (p: Program & { to: string }): SimulationRequest => ({ chainId: this.chainId, from: FROM, to: p.to, data: p.data ?? '0x', value: p.value ?? 0n, gas: GAS, stateOverrides: overrides, ...(at && { at }) });
+    const request = (p: Program & { to: string }): SimulationRequest => ({ chainId: this.chainId, from: FROM, to: p.to, data: p.data ?? '0x', value: p.value ?? 0n, gas: p.gas ?? GAS, stateOverrides: overrides, ...(at && { at }) });
     const one = async (reqs: SimulationRequest[]): Promise<Outcome[]> => (await this.fork.simulateBatch(reqs))!.map(r => ({
       kind: r.status === 'success' ? 'runs' : INVALID.test(r.revertReason ?? '') ? 'invalid' : 'fails', returns: (r.returnData ?? '0x').toLowerCase(), gas: r.gasUsed,
       logs: (r.logs ?? []).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|'), why: r.revertReason,
@@ -275,17 +284,18 @@ async function check(chainId: number): Promise<Report> {
   // and the precompiles, sixteen to a block.
   const programs: Program[] = [
     ...Array.from({ length: 256 }, (_, op) => op).filter(op => op !== 0xfe).map(op => ({ label: `opcode 0x${hex2(op)}`, code: opcodeProgram(op) })),
-    ...crafted(), ...await precompilePrograms(),
+    ...crafted(amsterdam), ...await precompilePrograms(),
   ];
   const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
   for (let i = 0; i < programs.length; i += 16) {
-    // Arbitrum's node adds a charge for L1 data to every call's gas: the same for calls with the same calldata in
-    // one block, but for the block's first call, which pays a few gas more. So there a call that isn't compared
-    // goes first, and programs sent no calldata are compared less that charge: what most of the batch differs by.
+    // Arbitrum's node adds a charge for L1 data to every call's gas: the same for calls with the same calldata and
+    // gas limit in one block, but for the block's first call, which pays a few gas more. So there a call that isn't
+    // compared goes first, and programs sent no calldata (at the usual gas limit) are compared less that charge:
+    // what most of the batch differs by.
     const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
     let l1Charge: bigint | undefined;
     if (!compareGas) {
-      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
+      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
       const counts = new Map<bigint, number>();
       for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
       const most = [...counts].sort((a, b) => b[1] - a[1])[0];
@@ -293,10 +303,12 @@ async function check(chainId: number): Promise<Report> {
       if (process.env.RULES_DEBUG) console.log(`  batch ${i / 16}: L1 charge ${l1Charge}, deltas ${[...counts].map(([d, n]) => `${d}×${n}`).join(' ')}`);
     }
     results.forEach(({ node, local }, j) => {
+      // RULES_SHOW=<part of a label>: what the node and the local EVM gave for the programs it names.
+      if (process.env.RULES_SHOW && batch[j].label.includes(process.env.RULES_SHOW)) console.log(`  ${batch[j].label}: the node ${node.kind}, ${node.gas} gas, returns ${node.returns.slice(0, 74)}, ${node.logs ? node.logs.split('|').length : 0} events; the local EVM ${local.kind}, ${local.gas} gas, returns ${local.returns.slice(0, 74)}, ${local.logs ? local.logs.split('|').length : 0} events`);
       if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
       report.compared++;
       const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
-        : l1Charge !== undefined && !batch[j].data && node.kind === 'runs' && local.kind === 'runs' && node.gas - local.gas !== l1Charge && !EXPECTED[chainId]?.[batch[j].label]);
+        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && node.kind === 'runs' && local.kind === 'runs' && node.gas - local.gas !== l1Charge && !EXPECTED[chainId]?.[batch[j].label]);
       // Events are compared where the node reports them (not through eth_call).
       const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
       // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was

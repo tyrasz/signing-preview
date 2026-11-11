@@ -73,6 +73,12 @@ export interface ChainProfile {
    * to G2 66,640 (23,800); the multi-scalar discounts are Ethereum's; blake2f 22 a round (1). Applied with `storageGas`.
    */
   precompilePrices?: Record<number, Record<string, number>>;
+  /**
+   * The longest code a contract may have, where it isn't Ethereum's 24,576 bytes (before Amsterdam). Polygon's is
+   * 32,768: measured on its node, where a creation of 32,768 bytes of code succeeds and one of 32,769 fails. (Its
+   * limit on initcode is Ethereum's 49,152.)
+   */
+  maxCodeSize?: number;
   /** The chain has no point-evaluation precompile at 0x0a (it carries no blobs): the address is an empty account there. */
   noPointEvaluation?: boolean;
   /**
@@ -125,7 +131,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
-  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true },
+  137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true, maxCodeSize: 32_768 },
   56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
   999: { hardfork: 'cancun', ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
@@ -657,8 +663,10 @@ function storagePricing(profile: ChainProfile) {
   const g = profile.storageGas;
   // Opcodes the chain's node doesn't have (ChainProfile.missingOpcodes) are taken out of the local EVM too.
   const gone = (profile.missingOpcodes ?? []).map(opcode => ({ opcode }));
-  if (!g) return gone.length ? { customOpcodes: gone as never } : {};
   const params = JSON.parse(JSON.stringify(paramsEVM)) as Record<string, Record<string, number>>;
+  // The chain's own limit on a contract's code (ChainProfile.maxCodeSize), in place of Spurious Dragon's.
+  if (profile.maxCodeSize !== undefined) params[607].maxCodeSize = profile.maxCodeSize;
+  if (!g) return { ...(profile.maxCodeSize !== undefined && { params: params as never }), ...(gone.length && { customOpcodes: gone as never }) };
   Object.assign(params[2929], { coldsloadGas: g.coldWrite, sstoreCleanEIP2200Gas: 5000 - g.coldWrite });
   Object.assign(params[3529], { sstoreClearRefundEIP2200Gas: 5000 - g.coldWrite + 1900 });
   // The chain's own prices for precompiles (ChainProfile.precompilePrices), in place of Ethereum's.

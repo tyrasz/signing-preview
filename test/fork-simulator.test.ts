@@ -372,6 +372,20 @@ test('Chains with their own rules: Polygon’s storage prices, Arbitrum’s two 
   assert.deepEqual(again!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`)).filter((_, i) => i !== 1), [5n, 9n, 1n]);
 });
 
+test('Polygon lets a contract be 32,768 bytes long: a creation Ethereum’s limit refuses succeeds there', async () => {
+  // The code creates a contract of `size` zero bytes and returns its address, or zero where the creation failed.
+  const creating = (size: number) => `0x6561${size.toString(16).padStart(4, '0')}6000f360d01b600052600660006000f060005260206000f3`;
+  const AT = '0x00000000000000000000000000000000c0de0001';
+  const created = async (simulator: ForkSimulator, size: number) => {
+    const r = await simulator.simulate({ chainId: 999, from: USER, to: AT, data: '0x', value: 0n, gas: 16_000_000n, stateOverrides: { [AT]: { code: creating(size) } } });
+    return BigInt(r!.returnData!) !== 0n;
+  };
+  const polygon = fork({ profiles: { 999: { ...CHAIN_PROFILES[137] } } });
+  // Measured on Polygon's node: 32,768 bytes of code are accepted, 32,769 are not. Elsewhere the limit is 24,576.
+  assert.deepEqual([await created(polygon, 24_577), await created(polygon, 32_768), await created(polygon, 32_769)], [true, true, false]);
+  assert.deepEqual([await created(fork(), 24_576), await created(fork(), 24_577)], [true, false]);
+});
+
 test('Calls that run first in the block: the node runs them and the local EVM starts from the state they leave', async () => {
   // Bob holds no USDC: his transfer of 30 only works after the user's transfer of 50 to him, earlier in the block.
   const CAROL = '0xca401000000000000000000000000000000000c3';
