@@ -264,8 +264,21 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   } } as unknown as NonNullable<Dependencies['rpc']>;
   const shiftedRuns: SimulationRequest[] = [];
   const late = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { simulate: async r => { shiftedRuns.push(r); return ran(); } } });
-  assert.equal(shiftedRuns[0].at!.header.timestamp, 1_762_000_101n);
+  assert.deepEqual([shiftedRuns[0].at!.header.timestamp, shiftedRuns[0].at!.header.ownTimestamp], [1_762_000_101n, undefined]);
   assert.match(late.decoding.notes.join(' '), /The block shares its second with the one before it, which this chain's node won't simulate: it was run one second later/);
+  // Where the node's run, a second late, isn't what the receipt says (the transaction read the time), the local EVM
+  // runs it at the block's own time: if that is what happened, it is the run shown, and the preview says so. (In a
+  // BNB Chain block of 73 transactions, 10 of 70 replayed needed this.) Only then: the block's earlier transactions
+  // still run a second late on the node, and a run at their time is the better match for everything else.
+  const localRuns: SimulationRequest[] = [];
+  const timed = { simulate: async () => ran({ gasUsed: 60_000n }), trace: async (reqs: SimulationRequest[]) => { localRuns.push(...reqs); return [ran({ source: 'the local EVM' })]; } };
+  const own = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: timed });
+  assert.deepEqual([own.replay!.matches, own.simulation!.source, own.simulation!.gasUsed, localRuns.length, localRuns[0].at!.header.ownTimestamp], [true, 'the local EVM', '51234', 1, 1_762_000_100n]);
+  assert.match(own.decoding.notes.join(' '), /run a second later there, the transaction didn't come out as its receipt says\. The run shown is the local EVM's, at the block's own time\./);
+  assert.equal(codes(own).includes('replay_differs'), false);
+  // If the local EVM's run isn't what happened either, the node's stays, with what differs.
+  const neither = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: crowded, simulator: { ...timed, trace: async () => [ran({ gasUsed: 70_000n })] } });
+  assert.deepEqual([neither.replay!.matches, neither.simulation!.gasUsed, codes(neither).includes('replay_differs')], [false, '60000', true]);
   // Polygon's node logs native transfers and fee payments from 0x…1010; a local EVM has none. Runs are compared without them.
   const fee = { address: '0x0000000000000000000000000000000000001010', topics: ['0x4dfe1bbbcf077ddc3e01291eea2d5c70c2b422b415d95645b9adcfd678cb1d63', pad(ALICE)], data: '0x' };
   assert.deepEqual([chainsOwnLog(fee), chainsOwnLog(LOG), chainsOwnLog({ ...fee, topics: [TRANSFER] })], [true, false, false]);

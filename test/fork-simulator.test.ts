@@ -372,6 +372,15 @@ test('Chains with their own rules: Polygon’s storage prices, Arbitrum’s two 
   assert.deepEqual(again!.returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`)).filter((_, i) => i !== 1), [5n, 9n, 1n]);
 });
 
+test('A block given a later time for the chain’s node runs at its own time in the local EVM', async () => {
+  // BNB Chain's blocks often share their second with their parent, which no node will simulate: a replay gives the
+  // node the next second, and keeps the block's own for the local EVM. The code returns TIMESTAMP.
+  const AT = '0x00000000000000000000000000000000c0de0002';
+  const header = { number: 17n, timestamp: 0x65000002n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const time = async (h: typeof header & { ownTimestamp?: bigint }) => BigInt((await fork().simulate({ chainId: 999, from: USER, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: '0x4260005260206000f3' } }, at: { block: 'latest', header: h } }))!.returnData!);
+  assert.deepEqual([await time(header), await time({ ...header, ownTimestamp: 0x65000001n })], [0x65000002n, 0x65000001n]);
+});
+
 test('Polygon lets a contract be 32,768 bytes long: a creation Ethereum’s limit refuses succeeds there', async () => {
   // The code creates a contract of `size` zero bytes and returns its address, or zero where the creation failed.
   const creating = (size: number) => `0x6561${size.toString(16).padStart(4, '0')}6000f360d01b600052600660006000f060005260206000f3`;

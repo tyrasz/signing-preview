@@ -182,6 +182,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   let outcome = preset;
   // What was simulated for the result shown (the wallet's pending transactions, then this one), for tracing it.
   let ran: SimulationRequest[] | undefined;
+  // A replay shown as the local EVM ran it, at the block's own time (see below).
+  let ownTime = false;
   let trace: PreviewTrace | undefined;
   // A mined transaction replayed where it ran (src/replay.ts), or a past block named for the simulation
   // (PreviewContext.block); else the latest block, named only when a trace has to run on the same one.
@@ -232,6 +234,14 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       } else {
         if (pending.length) b.note("Your pending transactions couldn't be simulated before this one on this chain, so the simulation runs on the latest state without them.");
         outcome = { result: await deps.simulator.simulate(request) };
+        // A replayed block in its parent's second ran a second later on the chain's node, which takes no other.
+        // Where that run isn't what the receipt says (the transaction read the time), the local EVM runs it at the
+        // block's own time, and if that is what happened, it is the run shown, and the one a trace is of.
+        if (replay?.ownTimestamp !== undefined && outcome.result && !compareWithReceipt(outcome.result, replay.receipt).matches && deps.simulator.trace) {
+          const exact: SimulationRequest = { ...request, at: { ...request.at!, header: { ...request.at!.header, ownTimestamp: replay.ownTimestamp } } };
+          const own = (await deps.simulator.trace([exact], { budgetMs: REPLAY_TRACE_MS }).catch(() => null))?.[0];
+          if (own && compareWithReceipt(own, replay.receipt).matches) { outcome = { result: own }; ran = [exact]; ownTime = true; }
+        }
       }
       // Contracts read the price the transaction pays (tx.gasprice, and the base fee): a pool taxing swaps by the
       // priority fee, a refund paid at the gas price. The first run is at no price (a price needs a gas limit the
@@ -296,7 +306,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       const compared = compareWithReceipt(sim, replay.receipt);
       replayed = { ...replay.info, ...compared };
       const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.earlier ? `after the ${replay.earlier} transaction${replay.earlier === 1 ? '' : 's'} before it in the block${replay.at.state ? " (the state they left read from the block's access list)" : ''}` : 'first in the block'}, at the price it paid.`;
-      if (replay.shifted) b.note(SHIFTED);
+      if (replay.shifted) b.note(ownTime ? OWN_TIME : SHIFTED);
       if (compared.matches) b.note(`${where} The run has the same outcome, events and gas as its receipt.`);
       else {
         b.note(where);
@@ -333,6 +343,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 }
 
 /** A simulated block given a later second than the real one had (src/block.ts, afterParent). */
+const OWN_TIME = "The block shares its second with the one before it, which this chain's node won't simulate: run a second later there, the transaction didn't come out as its receipt says. The run shown is the local EVM's, at the block's own time.";
 const SHIFTED = "The block shares its second with the one before it, which this chain's node won't simulate: it was run one second later than it was, so anything that reads the block's time saw a second more.";
 
 /** How long a replay's tracing run may take: it runs the block's earlier transactions too. */

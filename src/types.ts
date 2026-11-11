@@ -325,8 +325,12 @@ export interface ReplayContext {
   info: Omit<ReplayInfo, 'matches' | 'differences'>;
   /** The transaction's block (hex) and its time, for prices as of then. */
   when: { block: string; time: number };
-  /** The block shares its second with its parent, and is run one second later than it was (src/block.ts, afterParent). */
+  /**
+   * The block shares its second with its parent, and is run one second later than it was (src/block.ts,
+   * afterParent); `ownTimestamp` is the time it had, which the local EVM can run it at.
+   */
   shifted?: boolean;
+  ownTimestamp?: bigint;
 }
 
 export interface SimulationRequest {

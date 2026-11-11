@@ -106,7 +106,7 @@ export async function replayTransaction(input: { chainId: number; hash: string }
       hash: tx.hash, block: number.toString(), index, time: new Date(time * 1000).toISOString(),
       receipt: { status: receipt.status === '0x1' ? 'success' : 'reverted', gasUsed: gasUsed.toString(), fee: `${formatUnits(gasUsed * gasPrice + extra, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? 'native'}` },
     },
-    when: { block: tx.blockNumber, time }, ...(shifted && { shifted }),
+    when: { block: tx.blockNumber, time }, ...(shifted && { shifted, ownTimestamp: BigInt(block.timestamp) }),
   };
   const request = {
     method: 'eth_sendTransaction',

@@ -24,6 +24,13 @@ export interface BlockAt {
      */
     amsterdam?: boolean;
     /**
+     * The block's own time, where `timestamp` had to be a later one for the chain's node (afterParent: a replayed
+     * block in its parent's second). The local EVM, which takes any time, runs at this one. Set only for a run
+     * that is to be at the block's own time: the block's earlier transactions still run on the node at the later
+     * one, and a run at the same time as theirs is the better match for most transactions.
+     */
+    ownTimestamp?: bigint;
+    /**
      * The beacon slot the block is in (SLOTNUM, EIP-7843), from Amsterdam on. A block simulated after another is
      * taken to be in the next slot, as the chain's node takes it whatever time it is given.
      */
@@ -198,8 +205,7 @@ export async function pinBlock(rpc: RpcClient | undefined, chainId: number, numb
 /**
  * A block's header given a time its chain's node will simulate: nodes refuse a simulated block that isn't later
  * than the one it follows, and BNB Chain's blocks, several a second, often share their second with their parent.
- * Such a block runs one second later than it did (`shifted`), in both simulators alike. Arbitrum's node takes the
- * same second.
+ * Such a block is given one second later than it was (`shifted`). Arbitrum's node takes the same second.
  */
 export function afterParent(chainId: number, header: BlockAt['header'], parentTime: bigint): { header: BlockAt['header']; shifted: boolean } {
   const earliest = parentTime + ((NEXT_BLOCK[chainId] ?? { blockTime: 12 }).blockTime > 0 ? 1n : 0n);
