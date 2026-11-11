@@ -261,6 +261,8 @@ export class RpcSimulator implements Simulator {
         const number = /^0x[0-9a-f]+$/i.test(at.block) ? BigInt(at.block).toLocaleString('en-US') : at.block;
         throw Object.assign(new Error(`the local EVM reads the chain's state as it runs, and the chain's node didn't serve it block ${number}'s (most keep only recent blocks; an archive node keeps them all)`), { name: 'ForkUnsupported' });
       }
+      // A node that kept refusing those reads for a rate limit (a public RPC's): said as that, not as a slow run.
+      if (e instanceof Error && /HTTP 429|rate limit/i.test(e.message)) throw Object.assign(new Error("the local EVM reads the chain's state as it runs, and the chain's node rate limited those reads (a public RPC's limits: an RPC of your own has more room, or try again in a minute)"), { name: 'ForkUnsupported' });
       return null;
     } finally { clearTimeout(timer); }
   }

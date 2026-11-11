@@ -566,18 +566,26 @@ class StateSource {
   guessCall(k: string) { return GUESS_CALLS.get(`${this.chainId}:${k}`); }
 
   private async send(batch: { method: string; params: unknown[]; done: (r: unknown, e?: { message?: string; data?: Hex }) => void }[]) {
+    let throttled = false;
     for (let attempt = 0; ; attempt++) {
-      if (Date.now() > this.deadline) throw new ForkTimeout('the simulation ran out of time fetching chain state');
+      // (Said as a rate limit where the node was refusing for one: a caller can tell it from a slow EVM.)
+      if (Date.now() > this.deadline) throw new ForkTimeout(`the simulation ran out of time fetching chain state${throttled ? ' (the node rate limited its reads)' : ''}`);
       this.requests += batch.length;
       const res = await this.fetchImpl(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
         body: JSON.stringify(batch.map((j, i) => ({ jsonrpc: '2.0', id: i, method: j.method, params: j.params }))) });
       const body = res.ok ? await res.json() as unknown : undefined;
       // Rate limits, and load-balanced nodes a block behind ("invalid block height") are worth retrying.
-      const transient = /rate limit|invalid block height|header not found|unknown block/i;
-      const limited = res.status === 429 || (!Array.isArray(body) && transient.test(JSON.stringify(body ?? '')));
-      // Public RPCs rate-limit per IP: back off (up to 4 s between tries), within the simulation's deadline.
-      if ((limited || res.status >= 500) && attempt < 8) { await new Promise(r => setTimeout(r, Math.min(4000, 300 * 2 ** attempt))); continue; }
-      if (!Array.isArray(body)) throw new Error(`state fetch failed: HTTP ${res.status} ${JSON.stringify(body ?? '').slice(0, 160)}`);
+      const transient = /rate limit|too many requests|invalid block height|header not found|unknown block/i;
+      const text = Array.isArray(body) ? '' : JSON.stringify(body ?? '');
+      const limited = res.status === 429 || transient.test(text);
+      throttled = res.status === 429 || /rate limit|too many requests/i.test(text);
+      // Public RPCs rate-limit per IP: back off (as long as the node asks, else twice as long each time, up to 4 s
+      // between tries), within the simulation's deadline. (Waiting a rate limit out for all of a replay's minute
+      // rescued no trace on Arbitrum One's public node, which refused for longer: eight tries, some twenty seconds.)
+      const asked = Number(res.headers?.get?.('retry-after'));
+      const wait = () => Math.min(asked > 0 ? asked * 1000 : 300 * 2 ** attempt, 4000);
+      if ((limited || res.status >= 500) && attempt < 8) { await new Promise(r => setTimeout(r, wait())); continue; }
+      if (!Array.isArray(body)) throw new Error(`state fetch failed: HTTP ${res.status} ${text.slice(0, 160)}`);
       const byId = new Map((body as { id: number; result?: unknown; error?: { code?: number; message?: string; data?: Hex } }[]).map(r => [r.id, r]));
       const retry = batch.filter((_, i) => transient.test(byId.get(i)?.error?.message ?? ''));
       batch.forEach((j, i) => {
@@ -590,7 +598,7 @@ class StateSource {
       if (!retry.length) return;
       if (attempt >= 8) throw new Error('state fetch: rate limited');
       batch = retry;
-      await new Promise(r => setTimeout(r, Math.min(4000, 300 * 2 ** attempt)));
+      await new Promise(r => setTimeout(r, wait()));
     }
   }
 }

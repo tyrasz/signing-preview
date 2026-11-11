@@ -430,6 +430,24 @@ test('A token whose balanceOf costs over a million gas is read for what it holds
   assert.ok(read.gasUsed! > 1_000_000n && read.gasUsed! < 10_000_000n, String(read.gasUsed));
 });
 
+test('A rate limit on state reads: the node’s wait is kept to, and a trace it denies says why', async () => {
+  // A public node refusing reads for a while (HTTP 429), asking for a short wait: kept to, not the usual backoff.
+  let refused = 0;
+  const throttled = (times: number) => (async (u: string, init: RequestInit) => {
+    if (String(init.body).startsWith('[') && refused < times) { refused++; return new Response('', { status: 429, headers: { 'retry-after': '0.01' } }); }
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  const req = { chainId: 999, from: '0x00000000000000000000000000000000000fa110', to: '0x00000000000000000000000000000000000fa111', data: '0x' as const, value: 0n };
+  const started = Date.now();
+  const r = await fork({ fetchImpl: throttled(6) }).simulate(req);
+  assert.deepEqual([r?.status, refused], ['success', 6]);
+  assert.ok(Date.now() - started < 2_000, 'the backoff would have taken over 9 seconds');
+  // One that doesn't let up: a trace says the node rate limited its reads, not that it didn't finish in time.
+  refused = 0;
+  const sim = new RpcSimulator({ 999: URL_ }, { fetchImpl: chain.fetchImpl, fork: fork({ fetchImpl: throttled(Infinity) }) });
+  await assert.rejects(sim.trace([req]), (e: unknown) => e instanceof Error && e.name === 'ForkUnsupported' && /rate limited those reads/.test(e.message));
+});
+
 test('Arbitrum: a replay’s local run has the gas the chain left it after the L1 data charge', async () => {
   // Arbitrum takes the gas for a transaction's L1 data out of its limit before running it (the receipt's
   // gasUsedForL1). A call given just what it needs runs; the same call, with 10,000 of its gas taken for L1 data,
