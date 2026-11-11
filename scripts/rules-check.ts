@@ -75,7 +75,9 @@ function crafted(amsterdam: boolean): Program[] {
   const KEEPER = '00000000000000000000000000000000c0de7705';
   // Another that sets slot 8 when the second word is set: a new slot, right after the first is cleared.
   const KEEPER2 = '00000000000000000000000000000000c0de7706';
-  const keeper: StateChanges = { [`0x${KEEPER}`]: { code: '0x60003560075560203515601457600162030000525b00' }, [`0x${KEEPER2}`]: { code: '0x6000356007556020351560125760016008555b00' } };
+  // And one that reverts when the second word is set, after storing the first.
+  const KEEPER3 = '00000000000000000000000000000000c0de7708';
+  const keeper: StateChanges = { [`0x${KEEPER}`]: { code: '0x60003560075560203515601457600162030000525b00' }, [`0x${KEEPER2}`]: { code: '0x6000356007556020351560125760016008555b00' }, [`0x${KEEPER3}`]: { code: '0x6000356007556020351560125760006000fd5b00' } };
   const delegations: StateChanges = { [`0x${DELEGATE}`]: { code: '0x602a60005260206000f3' }, [`0x${DELEGATED}`]: { code: `0xef0100${DELEGATE}` }, [`0x${TO_PRECOMPILE}`]: { code: `0xef0100${'00'.repeat(19)}04` } };
   return [
     { label: 'BLOCKHASH of the block before', code: asm(`01 NUMBER SUB BLOCKHASH ${RET}`) },
@@ -98,6 +100,8 @@ function crafted(amsterdam: boolean): Program[] {
     { label: 'a slot set in one call and cleared in the next, then memory grown by the caller', code: asm(`2a 00 MSTORE 00 00 20 00 00 ${KEEPER} GAS CALL POP 00 00 MSTORE 00 00 20 00 00 ${KEEPER} GAS CALL POP 01 030000 MSTORE 00 ${RET}`), gas: 170_000n, state: keeper },
     { label: 'a slot set in one call, then cleared and memory grown in the next', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER} GAS CALL ${RET}`), gas: 170_000n, state: keeper },
     { label: 'a slot set in one call, then cleared and another set in the next', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER2} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER2} GAS CALL ${RET}`), gas: 150_000n, state: keeper },
+    // A call that clears the slot and then reverts gives nothing back: the slot is as it was.
+    { label: 'a slot set in one call, cleared in a call that then reverts, then memory grown by the caller', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER3} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER3} GAS CALL POP 01 030000 MSTORE 00 ${RET}`), gas: 170_000n, state: keeper },
     { label: 'TSTORE then TLOAD', code: asm(`2a 07 TSTORE 07 TLOAD ${RET}`) },
     { label: 'MCOPY of a word', code: asm(`2a 00 MSTORE 20 00 40 MCOPY 40 MLOAD ${RET}`) },
     { label: 'KECCAK256 of 64 bytes', code: asm(`2a 00 MSTORE 40 00 KECCAK256 ${RET}`) },
