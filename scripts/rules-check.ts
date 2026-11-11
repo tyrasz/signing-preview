@@ -445,7 +445,7 @@ for (const chainId of CHAINS_ASKED) {
 if (OUT) writeFileSync(OUT, JSON.stringify(reports, null, 2));
 if (SUMMARY_MD) {
   const lines = ['### Rules check', '', '| Chain | Fork | Compared | Differ |', '|---|---|---|---|', ...reports.map(r => `| ${r.name} | ${r.drift ? '**changed**' : r.fork[0]?.includes('the one checked') ? 'as checked' : 'not known'} | ${r.compared} | ${r.differences.length} |`), ''];
-  for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), '');
+  for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1 || r.replays) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.replays ? [`- ${r.replays}`] : []), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), '');
   appendFileSync(SUMMARY_MD, `${lines.join('\n')}\n`);
 }
 const failing = reports.filter(r => r.drift || r.differences.length);
