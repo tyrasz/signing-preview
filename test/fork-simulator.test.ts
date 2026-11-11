@@ -388,6 +388,20 @@ test('HyperEVM follows an EIP-7702 delegation: a call into a delegated account r
   assert.equal((await fork({ profiles: { 999: cancun } }).simulate(req))!.status, 'reverted');
 });
 
+test('Gas is bought before a transaction runs: its sender’s balance is lower by it while it runs, and whole again after', async () => {
+  // The code returns the caller's balance. A run with a gas limit and a price sees the balance less the gas limit
+  // at that price, as on the chain; one without sees it whole.
+  const AT = '0x00000000000000000000000000000000c0de0004';
+  const req: SimulationRequest = { chainId: 999, from: USER, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code: '0x333160005260206000f3' } } };
+  const whole = BigInt((await fork().simulate(req))!.returnData!);
+  const [priced] = (await fork().trace([{ ...req, gas: 100_000n, gasPrice: 10n ** 9n }]))!;
+  assert.equal(BigInt(priced.returnData!), whole - 100_000n * 10n ** 9n);
+  // What the run reports is the call's own: no change to the sender's balance (the fee is counted apart).
+  assert.equal(priced.stateChanges?.some(c => c.address === USER.toLowerCase() && c.balance), false);
+  // A sender that couldn't pay for the gas is left as it is (the chain would refuse the transaction).
+  assert.equal(BigInt((await fork().simulate({ ...req, gas: 100_000n, gasPrice: whole }))!.returnData!), whole);
+});
+
 test('A block given a later time for the chain’s node runs at its own time in the local EVM', async () => {
   // BNB Chain's blocks often share their second with their parent, which no node will simulate: a replay gives the
   // node the next second, and keeps the block's own for the local EVM. The code returns TIMESTAMP.

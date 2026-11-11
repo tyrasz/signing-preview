@@ -1245,6 +1245,18 @@ export class ForkSimulator implements Simulator {
       // What the transaction changes is recorded from here: its authorizations' effects (an authority's nonce and
       // code) are its own, as the call's are.
       if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
+      // Gas is bought before anything runs: while a transaction runs, its sender's balance is lower by the gas limit
+      // at the price paid (and a blob transaction's blob gas at the block's price), and what isn't used comes back
+      // after. A contract that reads the sender's balance sees it so: one on Sepolia stores it, and the trace's
+      // slot came out 0.0024 ETH higher than the block's access list has it. Taken out here and put back whole
+      // after the call, so what the run reports stays the call's own (fees are counted apart). Only for a run
+      // given both a gas limit and a price, and a sender that can pay: a replay, a preview's priced run.
+      let bought = 0n;
+      if (req.gas !== undefined && req.gasPrice) {
+        const blobs = BigInt(req.blobVersionedHashes?.length ?? 0) * 131_072n * (req.at?.header.blobBaseFee ?? 1n);
+        const upfront = req.gas * req.gasPrice + blobs, account = await state.getAccount(sender);
+        if (account && account.balance >= upfront + req.value) { account.balance -= upfront; await state.putAccount(sender, account); bought = upfront; }
+      }
       const authorized = await this.authorize(state, evm, auths[i], chainId, caller);
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
@@ -1268,6 +1280,7 @@ export class ForkSimulator implements Simulator {
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
+      if (bought) { const account = (await state.getAccount(sender)) ?? new Account(); account.balance += bought; await state.putAccount(sender, account); }
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
       // What the call spent, and under Amsterdam what its state took from the reservoir (less what it gave back to it).
