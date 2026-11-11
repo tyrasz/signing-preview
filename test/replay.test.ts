@@ -9,7 +9,7 @@ import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
 import { compareWithAccessList } from '../src/evm/trace.ts';
-import { afterParent, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
+import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
@@ -466,10 +466,10 @@ test('From Glamsterdam on, a replay starts from what the block’s access list s
   // The block's first transaction met only what the block itself did first; its last, everything before it.
   assert.deepEqual(await stateBefore(node.client, 11155111, '0x64', 0), { [HISTORY.toLowerCase()]: { stateDiff: { [H(0xaeb)]: H(0x1023) } } });
   assert.deepEqual((await stateBefore(node.client, 11155111, '0x64', 5))![BOB.toLowerCase()], { balance: '0x30', nonce: '0x9', code: '0x', stateDiff: { [H(1)]: H(9), [H(2)]: H(1) } });
-  // A node without the method (some of the backends behind Sepolia's public RPC) is asked three times, then the
+  // A node without the method (some of the backends behind Sepolia's public RPC) is asked six times, then the
   // caller runs the earlier transactions instead; so too for an answer that doesn't read as a list of changes.
   const without = serving(() => { throw new Error('the method eth_getBlockAccessListByBlockNumber does not exist/is not available'); });
-  assert.deepEqual([await stateBefore(without.client, 11155111, '0x64', 3), without.asked.length], [undefined, 3]);
+  assert.deepEqual([await stateBefore(without.client, 11155111, '0x64', 3), without.asked.length], [undefined, 6]);
   assert.equal(await stateBefore(serving(() => [{ address: BOB, balanceChanges: [{ txIndex: '0x1', value: '0x10' }], nonceChanges: [], codeChanges: [], storageChanges: [] }]).client, 11155111, '0x64', 3), undefined);
 
   // A replay in such a block: the state is read, the two transactions before it aren't run, and the note says so.
@@ -553,6 +553,15 @@ test('A replay’s trace is checked against what the block’s access list says 
   const bad = await replayed(H(51));
   assert.equal(bad.trace!.stateAgrees, false);
   assert.equal(bad.trace!.note, `The state the traced run changed isn't what the block's access list records for this transaction (${USDC} slot 0x1 is 0x32 in the list, 0x33 in the trace): the trace is a guide to what it did, not its record.`);
+  // The next block's blob base fee, which a local run needs to agree with the node's: from eth_feeHistory, and
+  // where a backend doesn't answer that, from BLOBBASEFEE run in a block the node simulates after it.
+  const fees = (history: () => unknown) => ({ has: () => true, call: async (_c: number, method: string) => {
+    if (method === 'eth_feeHistory') return history();
+    return [{ calls: [{ status: '0x1', returnData: H(2) }] }];
+  } });
+  assert.deepEqual([await blobBaseFeeAfter(fees(() => ({ baseFeePerBlobGas: ['0x1', '0x3'] })), 1, '0x64'), await blobBaseFeeAfter(fees(() => { throw new Error('method not available'); }), 1, '0x64'), await blobBaseFeeAfter(fees(() => ({})), 1, '0x64')], [3n, 2n, 2n]);
+  // A chain without blobs has none.
+  assert.equal(await blobBaseFeeAfter(fees(() => ({ baseFeePerBlobGas: ['0x1', '0x3'] })), 137, '0x64'), undefined);
   // A block without a list (before Amsterdam) has nothing to check against: the field is absent.
   const before = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { trace: true }, { ...d, simulator: { simulate: async () => ran(), trace: async () => [{ ...ran({ source: 'local' }), trace: root, stateChanges: [] }] } });
   assert.equal(before.trace!.stateAgrees, undefined);

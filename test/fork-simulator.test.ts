@@ -655,6 +655,18 @@ test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s n
   await chain.setBalance(sender, E);
   assert.deepEqual([await gas({ authorizationList: [await authorization(TWICE, 0), await authorization(TWICE, 1)] }), await gas({ from: sender, authorizationList: [await authorization(SENDER, 1)] }), await gas({ from: sender, authorizationList: [await authorization(SENDER, 1), await authorization(SENDER, 2)] })],
     [15_000n + 2n * 7_816n + 9_000n + 143n * 1_530n, 15_000n + 7_816n + 23n * 1_530n, 15_000n + 2n * 7_816n + 23n * 1_530n]);
+  // What a cleared slot gives back, across calls (no reservoir: the gas limit is under the cap). A contract sets
+  // its slot 7 in one call and clears it in the next, as a token's allowance is approved and then spent. The gas
+  // the slot's state cost comes back to the caller that paid for it, when the clearing call returns: the caller can
+  // then grow its memory by 92,160 gas on a limit that holds it only so. The call that clears can't spend it on
+  // that itself (it runs out of gas, and the caller reads 0), but can on new state (another slot). The gas figures
+  // are Sepolia's node's for the same code (scripts/rules-check.ts); by the EVM library's rule the first ran out.
+  const KEEPER = '0x00000000000000000000000000000000c0de7705', KEEPER2 = '0x00000000000000000000000000000000c0de7706', PROGRAM = '0x00000000000000000000000000000000c0de7707';
+  const keepers = { [KEEPER]: { code: '0x60003560075560203515601457600162030000525b00' }, [KEEPER2]: { code: '0x6000356007556020351560125760016008555b00' } };
+  const across = async (code: string, limit: bigint) => { const r = await run({ to: PROGRAM, gas: limit, stateOverrides: { ...keepers, [PROGRAM]: { code } } }); return [r.status, r.gasUsed, r.status === 'success' ? BigInt(r.returnData!) : undefined]; };
+  assert.deepEqual(await across('0x602a600052600060006020600060007300000000000000000000000000000000c0de77055af1506000600052600060006020600060007300000000000000000000000000000000c0de77055af15060016203000052600060005260206000f3', 170_000n), ['success', 112_637n, 0n]);
+  assert.deepEqual(await across('0x602a600052600060006040600060007300000000000000000000000000000000c0de77055af15060006000526001602052600060006040600060007300000000000000000000000000000000c0de77055af160005260206000f3', 170_000n), ['success', 169_360n, 0n]);
+  assert.deepEqual(await across('0x602a600052600060006040600060007300000000000000000000000000000000c0de77065af15060006000526001602052600060006040600060007300000000000000000000000000000000c0de77065af160005260206000f3', 150_000n), ['success', 130_477n, 1n]);
   // A call that fails changes nothing itself, but its transaction's authorizations stay applied on the chain: a
   // trace shows them (the authority's nonce and its new code).
   const KEPT = `0x${'f3'.repeat(32)}` as Hex, REVERTS = '0x00000000000000000000000000000000c0de0003';

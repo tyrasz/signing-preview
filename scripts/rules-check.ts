@@ -26,6 +26,8 @@ import { CHAIN_PROFILES, ForkSimulator, nodeRulesOf } from '../src/fork-simulato
 import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
 import { authorizationsForNode } from '../src/simulation.ts';
+import { replayTransaction } from '../src/replay.ts';
+import { liveDependencies } from '../src/server.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import type { SimulationRequest } from '../src/types.ts';
@@ -69,6 +71,11 @@ function crafted(amsterdam: boolean): Program[] {
   const INIT = '600a6000f3 d8 SHL 00 MSTORE';
   const NOBODY = '000000000000000000000000000000000beef078', EMPTY = '000000000000000000000000000000000beef079';
   const DELEGATED = '00000000000000000000000000000000de1e9a7e', TO_PRECOMPILE = '00000000000000000000000000000000de1e9a7f', DELEGATE = '00000000000000000000000000000000c0de7704';
+  // A contract that stores its first calldata word at slot 7, and grows its memory by 92,160 gas' worth when the second is set.
+  const KEEPER = '00000000000000000000000000000000c0de7705';
+  // Another that sets slot 8 when the second word is set: a new slot, right after the first is cleared.
+  const KEEPER2 = '00000000000000000000000000000000c0de7706';
+  const keeper: StateChanges = { [`0x${KEEPER}`]: { code: '0x60003560075560203515601457600162030000525b00' }, [`0x${KEEPER2}`]: { code: '0x6000356007556020351560125760016008555b00' } };
   const delegations: StateChanges = { [`0x${DELEGATE}`]: { code: '0x602a60005260206000f3' }, [`0x${DELEGATED}`]: { code: `0xef0100${DELEGATE}` }, [`0x${TO_PRECOMPILE}`]: { code: `0xef0100${'00'.repeat(19)}04` } };
   return [
     { label: 'BLOCKHASH of the block before', code: asm(`01 NUMBER SUB BLOCKHASH ${RET}`) },
@@ -76,6 +83,21 @@ function crafted(amsterdam: boolean): Program[] {
     { label: 'SLOAD of a slot twice (cold, then warm)', code: asm(`07 SLOAD POP 07 SLOAD ${RET}`) },
     { label: 'SSTORE to an empty slot, then SLOAD', code: asm(`2a 07 SSTORE 07 SLOAD ${RET}`) },
     { label: 'SSTORE set then cleared (a refund)', code: asm(`2a 07 SSTORE 00 07 SSTORE 07 SLOAD ${RET}`) },
+    // The same with little gas to spare: what a slot costs while it is set matters, not only what is left of it
+    // once it is cleared (under Amsterdam a new slot's state is paid for, and given back when the slot is cleared).
+    { label: 'SSTORE set then cleared, on 60,000 gas', code: asm(`2a 07 SSTORE 00 07 SSTORE 07 SLOAD ${RET}`), gas: 60_000n },
+    { label: 'SSTORE set then cleared, on 130,000 gas', code: asm(`2a 07 SSTORE 00 07 SSTORE 07 SLOAD ${RET}`), gas: 130_000n },
+    { label: 'two slots set then cleared, on 130,000 gas', code: asm(`2a 07 SSTORE 2a 08 SSTORE 00 07 SSTORE 00 08 SSTORE 07 SLOAD ${RET}`), gas: 130_000n },
+    { label: 'two slots set then cleared, on 250,000 gas', code: asm(`2a 07 SSTORE 2a 08 SSTORE 00 07 SSTORE 00 08 SSTORE 07 SLOAD ${RET}`), gas: 250_000n },
+    // And whether the gas a cleared slot gives back can be spent on something else: 92,160 gas of memory, on a
+    // limit that only holds it if what the slot's state cost is usable again.
+    { label: 'a slot set then cleared, then memory grown on the gas it gave back', code: asm(`2a 07 SSTORE 00 07 SSTORE 01 030000 MSTORE 07 SLOAD ${RET}`), gas: 160_000n },
+    // The same across calls, as a token's allowance is set by one call and spent by another: a slot set in one
+    // call to a contract and cleared in the next, with the memory grown afterwards by the caller, or inside the
+    // call that clears. (Under Amsterdam the gas a cleared slot gives back has to reach whoever needs it.)
+    { label: 'a slot set in one call and cleared in the next, then memory grown by the caller', code: asm(`2a 00 MSTORE 00 00 20 00 00 ${KEEPER} GAS CALL POP 00 00 MSTORE 00 00 20 00 00 ${KEEPER} GAS CALL POP 01 030000 MSTORE 00 ${RET}`), gas: 170_000n, state: keeper },
+    { label: 'a slot set in one call, then cleared and memory grown in the next', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER} GAS CALL ${RET}`), gas: 170_000n, state: keeper },
+    { label: 'a slot set in one call, then cleared and another set in the next', code: asm(`2a 00 MSTORE 00 00 40 00 00 ${KEEPER2} GAS CALL POP 00 00 MSTORE 01 20 MSTORE 00 00 40 00 00 ${KEEPER2} GAS CALL ${RET}`), gas: 150_000n, state: keeper },
     { label: 'TSTORE then TLOAD', code: asm(`2a 07 TSTORE 07 TLOAD ${RET}`) },
     { label: 'MCOPY of a word', code: asm(`2a 00 MSTORE 20 00 40 MCOPY 40 MLOAD ${RET}`) },
     { label: 'KECCAK256 of 64 bytes', code: asm(`2a 00 MSTORE 40 00 KECCAK256 ${RET}`) },
@@ -281,7 +303,7 @@ class Chain {
   }
 }
 
-interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean }
+interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** How many of `differences` are programs'. */ programsDiffer?: number; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
 
 /** Differences that are the node's way of answering, not a rule the local EVM has wrong: listed, not counted. */
 const EXPECTED: Record<number, Record<string, string>> = {
@@ -367,7 +389,44 @@ async function check(chainId: number): Promise<Report> {
       }
     });
   }
+  report.programsDiffer = report.differences.length;
+  // Where blocks carry their access lists (Amsterdam), what happened is on record down to each storage slot: recent
+  // transactions are replayed with a trace, and each must match its receipt and change exactly the state its
+  // block's list says it changed.
+  if (head.blockAccessListHash !== undefined) {
+    const { replayed, differ } = await replays(chainId, chain.url);
+    report.replays = `${replayed} recent transactions replayed with a trace: ${differ.length ? `${differ.length} differ` : "all match their receipts and change the state their block's access list records"}`;
+    report.differences.push(...differ);
+  }
   return report;
+}
+
+/**
+ * Recent transactions of a chain whose blocks carry their access lists (EIP-7928), spread through a block a few
+ * back, each replayed with a trace (src/replay.ts): the run against its receipt, the trace's state changes against
+ * the block's access list. What differs, one line each.
+ */
+async function replays(chainId: number, url: string, count = 24): Promise<{ replayed: number; differ: string[] }> {
+  const deps = liveDependencies({ [EVM_RPCS[chainId].env]: url, SIGNING_PREVIEW_FORK_CACHE: 'off', SIGNING_PREVIEW_OFFLINE_LOOKUPS: '1', SIGNING_PREVIEW_PRICES: 'off' }, { warmUp: false });
+  const head = Number(await deps.rpc!.call(chainId, 'eth_blockNumber', []));
+  const block = await deps.rpc!.call(chainId, 'eth_getBlockByNumber', [`0x${(head - 3).toString(16)}`, false]) as { transactions: string[] } | null;
+  const hashes = block?.transactions ?? [], step = Math.max(1, Math.floor(hashes.length / count));
+  const differ: string[] = [];
+  let replayed = 0;
+  for (const hash of hashes.filter((_, i) => i % step === 0).slice(0, count)) {
+    try {
+      const p = await replayTransaction({ chainId, hash }, { trace: true }, deps);
+      // A node that couldn't hold the replay (its allowance for one simulation, where the block's access list
+      // wasn't served; state it no longer keeps) leaves nothing to compare: not counted, unless most are so.
+      if (p.simulation?.status === 'unavailable') continue;
+      replayed++;
+      if (!p.replay?.matches) differ.push(`the replay of ${hash} doesn't match its receipt: ${(p.replay?.differences ?? [p.simulation?.error ?? 'no simulation']).join('; ').slice(0, 200)}`);
+      else if (p.trace?.stateAgrees === false) differ.push(`the trace of ${hash}: ${p.trace.note?.slice(0, 300)}`);
+      else if (p.trace?.gasAgrees === false) differ.push(`the trace of ${hash} used other gas than the node's run: ${p.trace.note?.slice(0, 200)}`);
+    } catch (e) { differ.push(`${hash} could not be replayed: ${(e as Error).message.slice(0, 200)}`); }
+  }
+  if (replayed * 2 < Math.min(count, hashes.length)) differ.push(`only ${replayed} of ${Math.min(count, hashes.length)} transactions could be replayed (the node didn't serve the rest)`);
+  return { replayed, differ };
 }
 
 const reports: Report[] = [];
@@ -377,7 +436,9 @@ for (const chainId of CHAINS_ASKED) {
   console.log(`\n== ${r.name} (chain ${r.chainId})${r.block ? `, block ${r.block}` : ''}`);
   for (const line of r.fork) console.log(`  ${line}`);
   if (r.nodeOnly.length) console.log(`  precompiles the node has and the local EVM doesn't (refused in a local run): ${r.nodeOnly.join(', ')}`);
-  console.log(`  ${r.compared} programs compared on the node and locally: ${r.differences.length ? `${r.differences.length} differ` : 'all the same'}`);
+  const programs = r.programsDiffer ?? r.differences.length;
+  console.log(`  ${r.compared} programs compared on the node and locally: ${programs ? `${programs} differ` : 'all the same'}`);
+  if (r.replays) console.log(`  ${r.replays}`);
   for (const d of r.differences) console.log(`    ${d}`);
   for (const d of r.expected) console.log(`    (expected) ${d}`);
 }

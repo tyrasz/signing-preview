@@ -68,7 +68,7 @@ export type StateChanges = Record<string, { balance?: string; nonce?: string; co
  * change among entries 0 to `index`.
  *
  * Undefined where the node doesn't serve the list (eth_getBlockAccessListByBlockNumber: measured on Sepolia's
- * public RPC, where some of the backends behind it lack it, hence the second and third try), or serves something
+ * public RPC, where some of the backends behind it lack it, hence the tries after the first), or serves something
  * that doesn't read as one: the caller then runs the earlier transactions instead.
  */
 export async function stateBefore(client: RpcClient, chainId: number, block: string, index: number): Promise<StateChanges | undefined> {
@@ -76,11 +76,15 @@ export async function stateBefore(client: RpcClient, chainId: number, block: str
   return list && accessListChanges(list, 0, index);
 }
 
-/** A block's access list as its node serves it (eth_getBlockAccessListByBlockNumber), asked for up to three times; undefined where it doesn't. */
+/**
+ * A block's access list as its node serves it (eth_getBlockAccessListByBlockNumber); undefined where it doesn't.
+ * Asked for up to six times, over two seconds: behind Sepolia's public RPC some backends lack the method, and three
+ * tries in a row had reached only those.
+ */
 export async function blockAccessList(client: RpcClient, chainId: number, block: string): Promise<unknown[] | undefined> {
   let list: unknown;
-  for (let attempt = 0; attempt < 3 && !Array.isArray(list); attempt++) {
-    if (attempt) await new Promise(r => setTimeout(r, 200 * attempt));
+  for (let attempt = 0; attempt < 6 && !Array.isArray(list); attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 150 * attempt));
     list = await client.call(chainId, 'eth_getBlockAccessListByBlockNumber', [block]).catch(() => undefined);
   }
   return Array.isArray(list) ? list : undefined;
@@ -180,16 +184,27 @@ export function headerOf(chainId: number, h: RpcHeader): BlockAt['header'] {
 
 /**
  * The blob base fee of the block after `block` (a number in hex), on chains with blobs: eth_feeHistory gives it,
- * whatever the fork's formula. Undefined elsewhere, or when the node doesn't say.
+ * whatever the fork's formula. Where that fails (a public RPC's backends differ), the node is asked the other way:
+ * BLOBBASEFEE run in a block simulated after `block`, which is the figure its own simulations use. Undefined
+ * elsewhere, or when the node says neither; a local run then takes the fee to be the lowest there is, 1 wei, which
+ * it was on Sepolia until its blobs filled (2 wei on 2026-11-11, where a local run then read 1).
  */
 export async function blobBaseFeeAfter(rpc: RpcClient, chainId: number, block: string): Promise<bigint | undefined> {
   if (!NEXT_BLOCK[chainId]?.blobs) return undefined;
+  const quantity = (v: unknown) => (typeof v === 'string' && /^0x[0-9a-f]+$/i.test(v) ? BigInt(v) : undefined);
   try {
     const fees = await rpc.call(chainId, 'eth_feeHistory', ['0x1', block, []]) as { baseFeePerBlobGas?: string[] } | null;
-    const next = fees?.baseFeePerBlobGas?.[1];
-    return typeof next === 'string' && /^0x[0-9a-f]+$/i.test(next) ? BigInt(next) : undefined;
+    const next = quantity(fees?.baseFeePerBlobGas?.[1]);
+    if (next !== undefined) return next;
+  } catch { /* asked the other way */ }
+  try {
+    const out = await rpc.call(chainId, 'eth_simulateV1', [{ blockStateCalls: [{ stateOverrides: { [BLOB_FEE_PROBE]: { code: '0x4a60005260206000f3' } }, calls: [{ to: BLOB_FEE_PROBE }] }] }, block]) as { calls?: { status?: string; returnData?: string }[] }[] | null;
+    const call = out?.[0]?.calls?.[0];
+    return call?.status === '0x1' ? quantity(call.returnData) : undefined;
   } catch { return undefined; }
 }
+/** An unused address given code that returns BLOBBASEFEE, for blobBaseFeeAfter. */
+const BLOB_FEE_PROBE = '0x00000000000000000000000000000000b10bfee0';
 
 /** The chain's latest block by number, and the block after it to simulate in. Undefined when it can't be read. */
 export async function pinLatest(rpc: RpcClient | undefined, chainId: number): Promise<BlockAt | undefined> {

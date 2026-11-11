@@ -697,6 +697,69 @@ function storagePricing(profile: ChainProfile) {
 }
 
 const POINT_EVALUATION = '0x000000000000000000000000000000000000000a';
+/** A call frame as the EVM library keeps it, as far as state gas goes. */
+type GasFrame = { gasLeft: bigint; stateGasSpilled: bigint; env: { depth: number }; interpreter: object; stack: { peek(n?: number): bigint[] } };
+/** What cleared slots have given back that sits in the reservoir, where a caller that paid out of its own gas can take it back. */
+type GasBack = { pool: bigint };
+const REPAYS_CALLERS = Symbol.for('signing-preview.repaysCallers');
+
+/**
+ * Amsterdam gives back what a new storage slot's state cost when the slot is cleared again in the same transaction
+ * (EIP-8037). Where that cost came out of a call's own gas (no reservoir for state: a gas limit under the cap), the
+ * EVM library gives it back to the call that clears the slot as far as that same call paid, and puts the rest in
+ * the reservoir, where only new state can spend it. On Sepolia it comes back to the caller that paid. Measured on
+ * its node, 2026-11-11, with a contract that sets a slot in one call and clears it in the next:
+ *  - the caller can then spend that gas on anything (92,160 gas of memory, on a limit that holds it only so);
+ *  - the call that clears can't (it runs out of gas growing the same memory);
+ *  - and a mined transaction that approved two tokens, then had a router spend both allowances and mint, ran on its
+ *    554,177 gas limit: the allowances' gas paid for the mint's new slots, two calls further in. By the library's
+ *    rule it ran out of gas; either way it used 413,342 given more.
+ * So: what a cleared slot gives back beyond what its own call paid goes to the reservoir, where the calls still
+ * running can use it for state, and when a call returns to a caller that paid for state out of its own gas, the
+ * caller takes back what is still there, up to what it paid. A call that fails takes its givings back with it.
+ * Approving and then spending an allowance in one transaction is the commonest shape there is: without this, its
+ * trace failed on any ordinary gas limit.
+ */
+function repayCallers(evm: EVM): GasBack {
+  const map = (evm as unknown as { _opcodeMap: ({ opHandler: (frame: GasFrame, common: unknown) => unknown } | undefined)[] })._opcodeMap;
+  const pools = evm as unknown as { stateGasReservoir: bigint; stateGasBack: GasBack };
+  const back: GasBack = { pool: 0n };
+  pools.stateGasBack = back;
+  for (const opcode of [0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xfa]) {
+    const entry = map[opcode];
+    if (!entry) continue;
+    const inner = entry.opHandler;
+    entry.opHandler = async (frame, common) => {
+      const before = back.pool;
+      await inner(frame, common);
+      // The call failed (it left 0): the library has put the reservoir back as it was, and so is this.
+      if (frame.stack.peek(1)[0] === 0n) { back.pool = before; return; }
+      let repaid = frame.stateGasSpilled < back.pool ? frame.stateGasSpilled : back.pool;
+      if (pools.stateGasReservoir < repaid) repaid = pools.stateGasReservoir;
+      if (repaid > 0n) { frame.gasLeft += repaid; frame.stateGasSpilled -= repaid; pools.stateGasReservoir -= repaid; back.pool -= repaid; }
+    };
+  }
+  const store = map[0x55];
+  if (store) {
+    const inner = store.opHandler;
+    store.opHandler = (frame, common) => {
+      const proto = Object.getPrototypeOf(frame.interpreter) as { creditStateGasRefund: (amount: bigint, context?: string) => void; [REPAYS_CALLERS]?: boolean };
+      if (!proto[REPAYS_CALLERS]) {
+        proto[REPAYS_CALLERS] = true;
+        const original = proto.creditStateGasRefund;
+        proto.creditStateGasRefund = function (this: { _evm: { stateGasBack?: GasBack; stateGasReservoir: bigint }; _runState: GasFrame }, amount: bigint, context?: string) {
+          const reservoir = this._evm.stateGasReservoir;
+          original.call(this, amount, context);
+          // What went to the reservoir rather than back to this call's own gas.
+          if (this._evm.stateGasBack) this._evm.stateGasBack.pool += this._evm.stateGasReservoir - reservoir;
+        };
+      }
+      return inner(frame, common);
+    };
+  }
+  return back;
+}
+
 /** EIP-7825: the most ordinary gas a transaction may use. Under Amsterdam, gas over it pays for new state only. */
 const REGULAR_GAS_CAP = 16_777_216n;
 /** The EVM library's per-transaction state-gas fields (EIP-8037), which its transaction runner sets before a call. */
@@ -1021,6 +1084,8 @@ export class ForkSimulator implements Simulator {
     const absent = profile.noPointEvaluation && active.has(POINT_EVALUATION.slice(2)) ? [{ address: POINT_EVALUATION as Hex }] : [];
     const precompiles = [...forwarded, ...moved, ...absent];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
+    // What a cleared slot gives back reaches the caller that paid for it, as on the chain (see repayCallers).
+    const gasBack = profile.hardfork === 'amsterdam' ? repayCallers(evm) : undefined;
     // Only the calls themselves are traced, not the balance and approval reads around them.
     let trace: StorageStep[] | undefined, callIndex = 0, recording = false;
     if (this.opts.trace) {
@@ -1180,6 +1245,7 @@ export class ForkSimulator implements Simulator {
       if (metered) {
         const budget = REGULAR_GAS_CAP - intrinsicGas(req, true).intrinsic;
         if (req.gas && gasLimit > budget) { reservoir = gasLimit - budget; gasLimit = budget; }
+        if (gasBack) gasBack.pool = 0n;
         Object.assign(metered, { stateGasReservoir: reservoir, executionStateGasUsed: 0n, eip2780PrepOog: false, eip7928CallPostTargetOog: false, _stateGasSnapshots: [], createdAccountStateGas: new Map(), createdAccountIntrinsicStateGas: new Map() });
       }
       callIndex = i;
