@@ -10,17 +10,20 @@
 //     the stack and the memory size. The node (eth_simulateV1, or eth_call where it has none) and the local EVM run
 //     the same code on the same named block: the same outcome, the same bytes returned, the same events, the same gas;
 //   - the precompiles, each called with inputs it accepts (a signature to recover, points to add, a pairing that
-//     holds, a KZG proof, a P-256 signature) and with none: the same answer at the same price.
-// Gas isn't compared on Arbitrum (its node adds a charge for L1 data) or where the node has only eth_call.
+//     holds, a KZG proof, a P-256 signature) and with none: the same answer at the same price;
+//   - crafted programs for what an opcode alone doesn't reach (storage, creations and their size limits, calls with
+//     value, SELFDESTRUCT), and EIP-7702 authorizations by accounts of each kind.
+// On Arbitrum, whose node adds a charge for L1 data, gas is compared less that charge; not where the node has only
+// eth_call.
 // --strict exits with 1 when anything differs or a chain's fork isn't the one checked. Read-only: nothing is sent.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { getActivePrecompiles } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { hashMessage, type Hex } from 'viem';
 import { CHAIN_PROFILES, ForkSimulator, nodeRulesOf } from '../src/fork-simulator.ts';
-import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader } from '../src/block.ts';
+import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
@@ -39,7 +42,7 @@ const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, '0');
 /** The address the i-th program of a batch is placed at. */
 const place = (i: number) => `0x${(0xc0de0000 + i).toString(16).padStart(40, '0')}`;
 
-interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
+interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
 interface Outcome { kind: 'runs' | 'invalid' | 'fails' | 'refused'; returns: string; gas?: bigint; logs: string; why?: string }
 
 /** Seventeen pushes (1 on top), the opcode, then: store the top of the stack at 0, the memory size at 32, return both. */
@@ -110,6 +113,31 @@ const caller = (target: number): Hex => asm(`CALLDATASIZE 00 00 CALLDATACOPY GAS
   SWAP1 00 MSTORE SWAP1 SUB 20 MSTORE RETURNDATASIZE 40 MSTORE RETURNDATASIZE 00 80 RETURNDATACOPY RETURNDATASIZE 80 KECCAK256 60 MSTORE 80 00 RETURN`);
 
 /** The precompiles, each with an input it accepts. Where an input is wrong for a chain, the node and the local EVM should refuse it alike. */
+/**
+ * EIP-7702 authorizations, signed on the spot by keys made for the run (so no authority has an account on the
+ * chain). What applying one costs depends on what the authority's account was, and forks price it their own way:
+ * before Amsterdam 25,000 each, with 12,500 back for an account that exists; under Amsterdam a charge for the write
+ * and for the state added. `state` gives an authority the account its case needs: on the node as state overrides, in
+ * the local EVM as the block's own state (BlockAt.state), since a request's code override for a signed authority
+ * is taken there for a stand-in and left out.
+ */
+async function authorizationPrograms(chainId: number): Promise<Program[]> {
+  const TO = '0x000000000000000000000000000000000000beef', FIRST = '0x00000000000000000000000000000000c0de7702', SECOND = '0x00000000000000000000000000000000c0de7703';
+  const address = (key: Hex) => privateKeyToAccount(key).address.toLowerCase();
+  const authorization = async (key: Hex, nonce: number, delegate = FIRST) => {
+    const a = await privateKeyToAccount(key).signAuthorization({ contractAddress: delegate as Hex, chainId, nonce });
+    return { address: delegate, chainId: `0x${chainId.toString(16)}`, nonce: `0x${nonce.toString(16)}`, r: a.r, s: a.s, yParity: `0x${(a.yParity ?? 0).toString(16)}` };
+  };
+  const fresh = generatePrivateKey(), existing = generatePrivateKey(), delegated = generatePrivateKey(), twice = generatePrivateKey(), wrong = generatePrivateKey();
+  return [
+    { label: 'an EIP-7702 authorization by an account that does not exist yet', to: TO, authorizationList: [await authorization(fresh, 0)] },
+    { label: 'an EIP-7702 authorization by an account that exists', to: TO, authorizationList: [await authorization(existing, 0)], state: { [address(existing)]: { balance: '0x1' } } },
+    { label: 'an EIP-7702 authorization by an account already delegated', to: TO, authorizationList: [await authorization(delegated, 5)], state: { [address(delegated)]: { nonce: '0x5', code: `0xef0100${SECOND.slice(2)}` } } },
+    { label: 'two EIP-7702 authorizations by one account', to: TO, authorizationList: [await authorization(twice, 0), await authorization(twice, 1, SECOND)] },
+    { label: 'an EIP-7702 authorization with the wrong nonce', to: TO, authorizationList: [await authorization(wrong, 3)] },
+  ];
+}
+
 async function precompilePrograms(): Promise<Program[]> {
   const zeros = (n: number) => '00'.repeat(n);
   // ecrecover: a real signature by a throwaway key.
@@ -187,11 +215,14 @@ class Chain {
       const placed = programs.map((p, i) => ({ ...p, to: p.to ?? place(i) }));
       const overrides: Record<string, { code?: string; balance?: string }> = { ...RICH };
       for (const p of placed) if (p.code) overrides[p.to] = { code: p.code, ...(p.balance !== undefined && { balance: `0x${p.balance.toString(16)}` }) };
-      const node = await this.onNode(placed, overrides, at);
+      // The accounts the programs give their authorities: overrides on the node, the block's own state locally.
+      const state: StateChanges = Object.assign({}, ...placed.map(p => p.state ?? {}));
+      const given = Object.keys(state).length > 0;
+      const node = await this.onNode(placed, given ? { ...overrides, ...state } : overrides, at);
       // A public node drops a block's state within seconds or minutes: on such an answer, another block. And a node
       // found to have no eth_simulateV1 is asked again the other way, with the block to match.
       if ((!node && attempt < 3) || hadSimulate !== this.simulateV1) continue;
-      const local = await this.locally(placed, overrides, at);
+      const local = await this.locally(placed, overrides, given && at ? { ...at, state } : at);
       // The same for the local EVM's reads: a backend that hasn't the named block yet, or no longer its state.
       if (attempt < 3 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) continue;
       return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: 'the node did not answer' }, local: local[i] }));
@@ -208,7 +239,7 @@ class Chain {
   }
 
   private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined): Promise<Outcome[] | null> {
-    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}` }));
+    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}`, ...(p.authorizationList && { authorizationList: p.authorizationList }) }));
     const kind = (ok: boolean, message?: string): Outcome['kind'] => (ok ? 'runs' : INVALID.test(message ?? '') ? 'invalid' : 'fails');
     // Without the pseudo-logs traceTransfers would add, and the logs a chain writes outside the EVM (Polygon's own transfer logs).
     const logsOf = (logs: { address: string; topics: string[]; data: string }[] | undefined) => (logs ?? []).filter(l => l.address.toLowerCase() !== '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' && !chainsOwnLog(l)).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|');
@@ -226,7 +257,7 @@ class Chain {
   }
 
   private async locally(programs: (Program & { to: string })[], overrides: Record<string, { code?: string; balance?: string }>, at: BlockAt | undefined): Promise<Outcome[]> {
-    const request = (p: Program & { to: string }): SimulationRequest => ({ chainId: this.chainId, from: FROM, to: p.to, data: p.data ?? '0x', value: p.value ?? 0n, gas: p.gas ?? GAS, stateOverrides: overrides, ...(at && { at }) });
+    const request = (p: Program & { to: string }): SimulationRequest => ({ chainId: this.chainId, from: FROM, to: p.to, data: p.data ?? '0x', value: p.value ?? 0n, gas: p.gas ?? GAS, ...(p.authorizationList && { authorizationList: p.authorizationList }), stateOverrides: overrides, ...(at && { at }) });
     const one = async (reqs: SimulationRequest[]): Promise<Outcome[]> => (await this.fork.simulateBatch(reqs))!.map(r => ({
       kind: r.status === 'success' ? 'runs' : INVALID.test(r.revertReason ?? '') ? 'invalid' : 'fails', returns: (r.returnData ?? '0x').toLowerCase(), gas: r.gasUsed,
       logs: (r.logs ?? []).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|'), why: r.revertReason,
@@ -285,6 +316,8 @@ async function check(chainId: number): Promise<Report> {
   const programs: Program[] = [
     ...Array.from({ length: 256 }, (_, op) => op).filter(op => op !== 0xfe).map(op => ({ label: `opcode 0x${hex2(op)}`, code: opcodeProgram(op) })),
     ...crafted(amsterdam), ...await precompilePrograms(),
+    // (HyperEVM runs Cancun's rules, which have no such transactions, and its node only eth_call.)
+    ...(profile.hardfork === 'cancun' ? [] : await authorizationPrograms(chainId)),
   ];
   const compareGas = !CHAIN_PROFILES[chainId]?.arbitrum;
   for (let i = 0; i < programs.length; i += 16) {
@@ -295,7 +328,7 @@ async function check(chainId: number): Promise<Report> {
     const batch = programs.slice(i, i + 16), results = compareGas ? await chain.both(batch) : (await chain.both([{ label: 'first', code: '0x00' }, ...batch])).slice(1);
     let l1Charge: bigint | undefined;
     if (!compareGas) {
-      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
+      const deltas = results.flatMap(({ node, local }, j) => (!batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && node.gas !== undefined && local.gas !== undefined ? [node.gas - local.gas] : []));
       const counts = new Map<bigint, number>();
       for (const d of deltas) counts.set(d, (counts.get(d) ?? 0) + 1);
       const most = [...counts].sort((a, b) => b[1] - a[1])[0];
@@ -308,7 +341,7 @@ async function check(chainId: number): Promise<Report> {
       if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
       report.compared++;
       const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
-        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && node.kind === 'runs' && local.kind === 'runs' && node.gas - local.gas !== l1Charge && !EXPECTED[chainId]?.[batch[j].label]);
+        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && node.kind === 'runs' && local.kind === 'runs' && node.gas - local.gas !== l1Charge && !EXPECTED[chainId]?.[batch[j].label]);
       // Events are compared where the node reports them (not through eth_call).
       const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
       // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was

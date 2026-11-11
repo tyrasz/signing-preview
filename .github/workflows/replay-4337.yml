@@ -54,6 +54,9 @@ jobs:
           - { name: 'Arbitrum One, EntryPoint v0.6', chain: '42161', entrypoint: '0.6', backfill: '0' }
           - { name: 'OP Mainnet, EntryPoint v0.7', chain: '10', entrypoint: '0.7', backfill: '0' }
           - { name: 'Arbitrum One, EntryPoint v0.9', chain: '42161', entrypoint: '0.9', backfill: '0' }
+          # Ethereum's testnet, where Glamsterdam's rules are live: its blocks carry their access lists, so each
+          # operation is replayed on the exact state it met.
+          - { name: 'Ethereum Sepolia, EntryPoint v0.7', chain: '11155111', entrypoint: '0.7', backfill: '80' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +75,7 @@ jobs:
           OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
           POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
           BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
           MINUTES: ${{ inputs.minutes || '40' }}
           CHAIN: ${{ matrix.chain }}
           ENTRYPOINT: ${{ matrix.entrypoint }}
