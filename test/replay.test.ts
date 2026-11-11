@@ -230,6 +230,13 @@ test('A node that no longer has a named block’s state is an error, not a simul
   assert.equal(p.simulation!.status, 'unavailable');
   assert.match(p.simulation!.error!, /This chain's node doesn't keep the state of block 100 \(most keep only recent blocks; an archive node keeps them all\): .*missing trie node/);
   assert.deepEqual([...new Set(tags)], ['0x64']);
+  // The same for a trace alone: a node that answers the simulation of a past block but not the local EVM's reads
+  // of its state (a public RPC's backends differ) leaves no trace, and the preview says that is why.
+  const reads = { covers: () => true, simulate: async () => null, simulateBatch: async () => null, trace: async () => { throw new Error('eth_getBalance failed: historical state 9369542c is not available'); } };
+  const partly = new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fork: reads, fetchImpl: (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: [{ status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] }] }] }))) as unknown as typeof fetch });
+  const untraced = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId: '0x2105' }] }, { now: NOW, block: 100, trace: true }, { tokens: new StaticTokenRegistry(), rpc, simulator: partly });
+  assert.deepEqual([untraced.simulation!.status, untraced.trace], ['success', undefined]);
+  assert.match(untraced.decoding.notes.join(' '), /No trace: the local EVM reads the chain's state as it runs, and the chain's node didn't serve it block 100's \(most keep only recent blocks; an archive node keeps them all\)\./);
   // Named only so that a trace matches (no block asked for): the latest block answers instead, as before.
   tags.length = 0;
   const traced = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId: '0x2105' }] }, { now: NOW, trace: true }, { tokens: new StaticTokenRegistry(), rpc, simulator });

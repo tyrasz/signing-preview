@@ -125,4 +125,9 @@ test('Signed authorizations go to eth_simulateV1 as they are, and their authorit
   const block = sent!.params[0].blockStateCalls[0];
   assert.equal(block.calls[0].authorizationList?.length, 1);
   assert.equal(block.stateOverrides?.[me.address.toLowerCase()], undefined, 'the node applies it; no override');
+  // Only the stand-in code is left out: a balance the caller sets for the authority still reaches the node.
+  sent = undefined;
+  await previewRequest({ method: 'eth_sendTransaction', params: [{ from: me.address, to: me.address, chainId: '0x1', authorizationList: [{ address: a.address, chainId: toHex(a.chainId), nonce: toHex(a.nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) }] }] },
+    { now: NOW, stateOverrides: { [me.address]: { balance: '0x5' } } }, { ...deps, simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
+  assert.deepEqual(sent!.params[0].blockStateCalls[0].stateOverrides?.[me.address.toLowerCase()], { balance: '0x5' });
 });

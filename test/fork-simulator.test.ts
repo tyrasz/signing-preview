@@ -600,10 +600,11 @@ test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s n
   await chain.putCode(SLOT, '0x4b60005260206000f3');
   assert.equal(BigInt((await run({ to: SLOT })).returnData!), 11_552_491n);
   assert.equal((await run({ to: SLOT }, osaka)).status, 'reverted');
-  // EIP-7702 authorizations under Amsterdam: 7,816 each, applied or not. One that is applied pays for the state it
-  // adds: an authority with no account yet, the account's write (9,000) and 143 bytes at 1,530; one that exists, the
-  // delegation's 23 bytes; one already delegated, nothing more. (A new authority's figure is what Sepolia's node
-  // charged; the others follow the EVM library's reference.)
+  // EIP-7702 authorizations under Amsterdam: 7,816 each, applied or not. One that is applied pays 9,000 for the first
+  // write to the authority's account, and for the state it adds: an authority with no account yet, 143 bytes at
+  // 1,530; one that exists, the delegation's 23 bytes; one already delegated, nothing more. (What Sepolia charged
+  // transactions mined by each kind of authority, and its node each of these; the EVM library's reference has the
+  // 9,000 for new accounts only.)
   const authorization = async (key: Hex, nonce: number) => {
     const a = await privateKeyToAccount(key).signAuthorization({ address: weth as Hex, chainId: 11155111, nonce });
     return { address: weth, chainId: toHex(11155111), nonce: toHex(nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) };
@@ -613,7 +614,13 @@ test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s n
   await chain.setBalance(privateKeyToAccount(DELEGATED).address.toLowerCase(), 1n);
   await chain.putCode(privateKeyToAccount(DELEGATED).address.toLowerCase(), `0xef0100${'11'.repeat(20)}`);
   assert.deepEqual([await gas({ authorizationList: [await authorization(NOBODY, 0)] }), await gas({ authorizationList: [await authorization(SOMEBODY, 0)] }), await gas({ authorizationList: [await authorization(DELEGATED, 0)] }), await gas({ authorizationList: [await authorization(NOBODY, 7)] })],
-    [15_000n + 7_816n + 9_000n + 143n * 1_530n, 15_000n + 7_816n + 23n * 1_530n, 15_000n + 7_816n, 15_000n + 7_816n]);
+    [15_000n + 7_816n + 9_000n + 143n * 1_530n, 15_000n + 7_816n + 9_000n + 23n * 1_530n, 15_000n + 7_816n + 9_000n, 15_000n + 7_816n]);
+  // The write is paid once for an account: an authority's second authorization in the transaction pays for no
+  // write, and the sender's own account, which the transaction writes anyway, for none at all.
+  const TWICE = `0x${'d1'.repeat(32)}` as Hex, SENDER = `0x${'e2'.repeat(32)}` as Hex, sender = privateKeyToAccount(SENDER).address.toLowerCase();
+  await chain.setBalance(sender, E);
+  assert.deepEqual([await gas({ authorizationList: [await authorization(TWICE, 0), await authorization(TWICE, 1)] }), await gas({ from: sender, authorizationList: [await authorization(SENDER, 1)] }), await gas({ from: sender, authorizationList: [await authorization(SENDER, 1), await authorization(SENDER, 2)] })],
+    [15_000n + 2n * 7_816n + 9_000n + 143n * 1_530n, 15_000n + 7_816n + 23n * 1_530n, 15_000n + 2n * 7_816n + 23n * 1_530n]);
   // Gas over the cap on ordinary gas (16,777,216) pays for new state only: a call given 20 million has the cap, less
   // what the transaction pays first, to run on; a new account's state comes out of the rest, and is counted.
   await chain.putCode('0x00000000000000000000000000000000000c0de8', '0x5a60005260206000f3');

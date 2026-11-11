@@ -1147,7 +1147,7 @@ export class ForkSimulator implements Simulator {
       const senderAccount = (await state.getAccount(sender)) ?? new Account();
       senderAccount.nonce++;
       await state.putAccount(sender, senderAccount);
-      const authorized = await this.authorize(state, evm, auths[i], chainId);
+      const authorized = await this.authorize(state, evm, auths[i], chainId, caller);
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
       let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState : GAS;
@@ -1237,13 +1237,15 @@ export class ForkSimulator implements Simulator {
    * Applies EIP-7702 authorizations as the chain does at the start of a transaction: each one for this chain (or
    * every chain) whose authority has no code or a delegation, and whose nonce matches the authority's (checked for
    * signed ones only), sets the authority's code and bumps its nonce. Returns the refund they earn before Amsterdam
-   * (12,500 for each whose authority already existed), and what Amsterdam charges for the state they add: for an
-   * authority with no account yet, the account's write (9,000) and its 120 bytes; for one not yet delegated, the
-   * delegation's 23 bytes; each byte 1,530. (Two mined on Sepolia, by new accounts, cost 494,493 gas each: the node's
-   * figure and, with these, the local EVM's.)
+   * (12,500 for each whose authority already existed), and what Amsterdam charges an applied one: 9,000 for the
+   * first write to the authority's account in the transaction (none for the sender's own, which the transaction
+   * has written already, nor for an authority's second authorization); for an authority with no account yet, its
+   * 120 bytes; for one not yet delegated, the delegation's 23 bytes; each byte 1,530. Measured on Sepolia: mined
+   * transactions by new, existing and delegated authorities, and each case here run on its node.
    */
-  private async authorize(state: LazyState, evm: EVM, list: Authorization[], chainId: number): Promise<{ refund: bigint; state: bigint }> {
+  private async authorize(state: LazyState, evm: EVM, list: Authorization[], chainId: number, sender: string): Promise<{ refund: bigint; state: bigint }> {
     let refund = 0n, added = 0n;
+    const written = new Set([sender]);
     for (const a of list) {
       if (!a.authority || (a.chainId !== 0n && a.chainId !== BigInt(chainId))) continue;
       const who = createAddressFromString(a.authority);
@@ -1253,7 +1255,8 @@ export class ForkSimulator implements Simulator {
       const account = await state.getAccount(who);
       if (a.nonce !== undefined && (account?.nonce ?? 0n) !== a.nonce) continue;
       if (account) refund += 12_500n;
-      added += (account ? 0n : 9_000n + 120n * 1_530n) + (isDelegation(code) || a.address === ZERO ? 0n : 23n * 1_530n);
+      added += (written.has(a.authority) ? 0n : 9_000n) + (account ? 0n : 120n * 1_530n) + (isDelegation(code) || a.address === ZERO ? 0n : 23n * 1_530n);
+      written.add(a.authority);
       const next = account ?? new Account();
       next.nonce++;
       await state.putAccount(who, next);

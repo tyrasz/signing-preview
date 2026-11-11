@@ -90,8 +90,9 @@ const simulationFields = async (req: SimulationRequest) => {
 };
 
 /**
- * The code overrides eth_simulateV1 needs: those of signed authorizations it applies natively are left out, so an
- * authority's account isn't made to exist beforehand (its refund depends on that).
+ * The state overrides eth_simulateV1 needs. The code standing in for a signed authorization, which the node applies
+ * itself, is left out, so an authority's account isn't made to exist or to be delegated beforehand (what the
+ * authorization costs depends on that); a balance or storage set for the authority stays.
  */
 async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChanges) {
   const all: Record<string, { code?: string; balance?: string; nonce?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string }> = overridesOf(reqs) ?? {};
@@ -100,7 +101,8 @@ async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChang
   for (const r of reqs) for (const a of r.authorizationList ?? []) {
     try {
       const authority = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } });
-      delete all[authority.toLowerCase()];
+      const own = all[authority.toLowerCase()];
+      if (own) { delete own.code; if (!Object.keys(own).length) delete all[authority.toLowerCase()]; }
     } catch { /* unreadable: the chain skips it, and so does the override */ }
   }
   // Beneath them, what the simulated block had already changed (BlockAt.state: a replay's earlier transactions).
@@ -206,6 +208,13 @@ export class RpcSimulator implements Simulator {
     } catch (e) {
       // Something a local EVM can't run (a contract the chain's node runs itself): the caller says so.
       if (e instanceof Error && e.name === 'ForkUnsupported') throw e;
+      // A block that was asked for, whose state the node didn't serve the local EVM's reads (a public RPC can answer
+      // a simulation from a backend that keeps it and a balance read from one that doesn't): said as that.
+      const at = reqs[0].at;
+      if (at?.required && unavailableState(e, at.block) !== e) {
+        const number = /^0x[0-9a-f]+$/i.test(at.block) ? BigInt(at.block).toLocaleString('en-US') : at.block;
+        throw Object.assign(new Error(`the local EVM reads the chain's state as it runs, and the chain's node didn't serve it block ${number}'s (most keep only recent blocks; an archive node keeps them all)`), { name: 'ForkUnsupported' });
+      }
       return null;
     } finally { clearTimeout(timer); }
   }
