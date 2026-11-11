@@ -9,7 +9,7 @@ import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
 import { compareWithAccessList } from '../src/evm/trace.ts';
-import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
+import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, keepsToBlock, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
@@ -95,7 +95,8 @@ test('A mined transaction is replayed where it ran, and the run is compared with
   // The fee is the one paid (the gas at its price, and the L1 data fee), not an estimate; nothing about inclusion now.
   assert.equal(detail(p, 'Network fee paid'), '0.0000051334 ETH (51,234 gas)');
   assert.equal(detail(p, 'Network fee'), undefined);
-  assert.equal(calls.some(c => c.method === 'eth_getTransactionCount' || c.method === 'eth_getBalance' || c.method === 'eth_maxPriorityFeePerGas'), false);
+  // (The one nonce read is the sender's before the block, to see that the node answers from that block: below.)
+  assert.deepEqual(calls.filter(c => c.method === 'eth_getTransactionCount' || c.method === 'eth_getBalance' || c.method === 'eth_maxPriorityFeePerGas').map(c => [c.method, c.params]), [['eth_getTransactionCount', [ALICE, '0x63']]]);
   // Its value then: the feed as of its block, an hour old there (a year old by now, which would be stale).
   assert.deepEqual(p.assetChanges.map(c => [c.direction, c.amount, c.symbol, c.usd, c.usdSource]), [['out', '200', 'USDC', '199.98', 'Chainlink USDC / USD']]);
   assert.equal(detail(p, 'Value then'), 'out ≈ $199.98');
@@ -244,6 +245,45 @@ test('A node that no longer has a named block’s state is an error, not a simul
   const traced = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId: '0x2105' }] }, { now: NOW, trace: true }, { tokens: new StaticTokenRegistry(), rpc, simulator });
   assert.equal(traced.simulation!.status, 'unavailable');
   assert.ok(tags.includes('latest'));
+});
+
+test('A node that answers every read from its latest state, whatever block is asked for, is told from one that keeps to the block', async () => {
+  // HyperEVM's public RPC: a state read at a past block comes back from the latest state, with no error. Run on
+  // that, a replay showed what the transaction would do today under its old block's header (0 of 12 matched their
+  // receipts). A nonce tells: Alice sent the transaction replayed with nonce 7, so before its block she had at most 7.
+  const node = (nonceThen: string, head = 101) => {
+    const { rpc, calls } = chain(head);
+    const inner = rpc.call.bind(rpc);
+    rpc.call = async (c: number, method: string, params: unknown[]) => {
+      if (method === 'eth_getTransactionCount') { calls.push({ method, params }); return nonceThen; }
+      // The latest blocks hold a transaction each (the past-block simulation's witness: it has none of its own).
+      if (method === 'eth_getBlockByNumber' && !params[1]) return { ...(await inner(c, method, params) as object), transactions: [TXS[3].hash] };
+      return inner(c, method, params);
+    };
+    return { rpc, calls };
+  };
+  const replayOn = (nonceThen: string) => { const d = deps(ran()); return replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { now: NOW }, { ...d.deps, rpc: node(nonceThen).rpc }); };
+  // The node answers 8 (her nonce now): not the state before block 100. No simulation is shown as if it were.
+  await assert.rejects(replayOn('0x8'), (e: unknown) => e instanceof ReplayError && e.code === 'UNAVAILABLE' && /Base's node answers every read from its latest state, whatever block is asked for.*takes a node that serves past blocks' state/.test(e.message));
+  // 7, or less (she sent others earlier in the block): the block's own state.
+  assert.equal((await replayOn('0x7')).replay!.matches, true);
+  assert.equal((await replayOn('0x5')).replay!.matches, true);
+
+  // A request previewed on a past block has no transaction of its own to go by: one from the chain's latest blocks
+  // is the witness (its sender's nonce at the past block can't be past that transaction's).
+  const late = node('0x8'), kept = node('0x7');
+  assert.deepEqual([await keepsToBlock(late.rpc, 8453, 90n), await keepsToBlock(kept.rpc, 8453, 90n)], [false, true]);
+  assert.deepEqual(late.calls.filter(c => c.method === 'eth_getTransactionCount').map(c => c.params), [[ALICE, '0x5a']]);
+  await assert.rejects(pinBlock(late.rpc, 8453, 90n), /answers every read from its latest state/);
+  assert.equal((await pinBlock(kept.rpc, 8453, 90n)).at.block, '0x5a');
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, chainId: '0x2105' }] }, { now: NOW, block: 90 }, { ...deps(ran()).deps, rpc: late.rpc });
+  assert.equal(p.simulation!.status, 'unavailable');
+  assert.match(p.simulation!.error!, /answers every read from its latest state/);
+  // The latest block itself has nothing after it to tell by, and needs nothing: its state is the latest. A node that
+  // doesn't answer the nonce (one that refuses a past block says so itself) isn't judged here either.
+  assert.equal(await keepsToBlock(late.rpc, 8453, 101n), undefined);
+  const silent = { has: () => true, call: async () => { throw new Error('HTTP 403'); } };
+  assert.equal(await keepsToBlock(silent, 8453, 90n), undefined);
 });
 
 test('What chains do their own way: blob transactions, Arbitrum’s header, Polygon’s own logs, a node that refuses single receipts', async () => {

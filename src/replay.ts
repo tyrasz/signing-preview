@@ -7,7 +7,7 @@
 // node keeps all of them.
 import type { Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { accessListChanges, afterParent, blobBaseFeeAfter, blockAccessList, headerOf, type RpcHeader } from './block.ts';
+import { accessListChanges, afterParent, blobBaseFeeAfter, blockAccessList, headerOf, keepsToBlock, LATEST_ONLY, type RpcHeader } from './block.ts';
 import { chainName, CHAINS, OP_STACK } from './chains.ts';
 import { formatUnits } from './format.ts';
 import { previewRequest } from './preview.ts';
@@ -78,6 +78,10 @@ export async function replayTransaction(input: { chainId: number; hash: string }
 
   const number = BigInt(tx.blockNumber), index = Number(BigInt(tx.transactionIndex));
   const parent = `0x${(number - 1n).toString(16)}`;
+  // The node has to answer from the parent block's state. One that answers from its latest whatever block is named
+  // (HyperEVM's public RPC) would run the transaction on today's state without a word: its own sender tells, whose
+  // nonce before the block can't be past the transaction's.
+  if (await keepsToBlock(rpc, chainId, number - 1n, { from: tx.from, nonce: BigInt(tx.nonce) }) === false) throw new ReplayError('UNAVAILABLE', `${chainName(chainId)}'s node ${LATEST_ONLY}`);
   // The block's blob base fee, for a call that reads it: what follows from its parent (a blob transaction's receipt has it too).
   const blobBaseFee = await blobBaseFeeAfter(rpc, chainId, parent) ?? (receipt.blobGasPrice !== undefined ? BigInt(receipt.blobGasPrice) : undefined);
   // A block in the same second as its parent (BNB Chain's often are) runs one second later: nodes take no other.

@@ -221,6 +221,42 @@ export async function pinLatest(rpc: RpcClient | undefined, chainId: number): Pr
 }
 
 /**
+ * Whether the chain's node answers a read of block `number`'s state from that block's state. HyperEVM's public RPC
+ * doesn't: it answers every state read from its latest state, whatever block is named (by number or by hash, three
+ * blocks back or a million), and says nothing of it. A replay there ran on today's state under the old block's
+ * header: 0 of 12 matched their receipts.
+ *
+ * The test is a nonce, which only goes up: an account that sent a transaction with nonce n in a later block had at
+ * most n at this one. `witness` is such a transaction where the caller has one (a replay's own); otherwise the
+ * first transaction of one of the chain's latest blocks is. True when the node kept to the block, false when it
+ * answered from a later state, undefined when it can't be told (no later transaction, or the node didn't answer:
+ * a node that refuses a past block says so itself).
+ */
+export async function keepsToBlock(rpc: RpcClient, chainId: number, number: bigint, witness?: { from: string; nonce: bigint }): Promise<boolean | undefined> {
+  const tag = (n: bigint) => `0x${n.toString(16)}`;
+  try {
+    if (!witness) {
+      const head = await rpc.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as (RpcHeader & { transactions?: string[] }) | null;
+      if (!head?.number) return undefined;
+      for (let n = BigInt(head.number), tries = 0; n > number && tries < 4 && !witness; n--, tries++) {
+        const block = tries ? await rpc.call(chainId, 'eth_getBlockByNumber', [tag(n), false]) as { transactions?: string[] } | null : head;
+        // The chain's own transactions (an OP Stack deposit, a validator's system call) come first or last in a
+        // block and may keep no ordinary nonce: one from the middle is an account's.
+        const hash = block?.transactions?.[block.transactions.length >> 1];
+        const tx = hash ? await rpc.call(chainId, 'eth_getTransactionByHash', [hash]) as { from?: string; nonce?: string; type?: string } | null : null;
+        if (tx?.from && tx.nonce !== undefined && !OWN_TYPES.has(tx.type ?? '0x0')) witness = { from: tx.from, nonce: BigInt(tx.nonce) };
+      }
+      if (!witness) return undefined;
+    }
+    return BigInt(await rpc.call(chainId, 'eth_getTransactionCount', [witness.from, tag(number)]) as string) <= witness.nonce;
+  } catch { return undefined; }
+}
+/** Transaction types that are a chain's own (OP Stack deposits, Arbitrum's internal and retryable kinds): not sent by an account with a nonce of its own. */
+const OWN_TYPES = new Set(['0x7e', '0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']);
+/** What a preview says where a node doesn't keep to the block asked for (keepsToBlock). */
+export const LATEST_ONLY = "answers every read from its latest state, whatever block is asked for (at this block, an account already has a later transaction of its own behind it), so nothing can be run on a past block's state there: a replay or a past-block simulation takes a node that serves past blocks' state.";
+
+/**
  * A past block to simulate on: the state after block `number`, in the block that followed it (its real header), or
  * for the chain's latest block the one that would. Throws when the chain can't be read or has no such block yet.
  * `time` is when the state's block was made, in seconds.
@@ -230,6 +266,7 @@ export async function pinBlock(rpc: RpcClient | undefined, chainId: number, numb
   const tag = (n: bigint) => `0x${n.toString(16)}`;
   const [h, next, blobBaseFee] = await Promise.all([...[number, number + 1n].map(n => rpc.call(chainId, 'eth_getBlockByNumber', [tag(n), false]).then(r => r as RpcHeader | null, () => null)), blobBaseFeeAfter(rpc, chainId, tag(number))]) as [RpcHeader | null, RpcHeader | null, bigint | undefined];
   if (!h?.number) throw new Error(`Block ${number.toLocaleString('en-US')} isn't on this chain (yet), or its node doesn't serve it.`);
+  if (await keepsToBlock(rpc, chainId, number) === false) throw new Error(`This chain's node ${LATEST_ONLY}`);
   const { header, shifted } = afterParent(chainId, next?.number ? headerOf(chainId, next) : headerAfter(chainId, h), BigInt(h.timestamp));
   return { at: { block: tag(number), header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true }, time: Number(BigInt(h.timestamp)), ...(shifted && { shifted }) };
 }
