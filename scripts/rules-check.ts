@@ -271,10 +271,13 @@ class Chain {
       const node = await this.onNode(placed, given ? { ...overrides, ...state } : overrides, at);
       // A public node drops a block's state within seconds or minutes: on such an answer, another block. And a node
       // found to have no eth_simulateV1 is asked again the other way, with the block to match.
-      if ((!node && attempt < 3) || hadSimulate !== this.simulateV1) continue;
+      // (Behind a public RPC some backends are a block behind the one that named the latest: asked again a little
+      // later each time. Four tries in a row had once reached only those.)
+      if (hadSimulate !== this.simulateV1) continue;
+      if (!node && attempt < 6) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
       const local = await this.locally(placed, overrides, given && at ? { ...at, state } : at);
       // The same for the local EVM's reads: a backend that hasn't the named block yet, or no longer its state.
-      if (attempt < 3 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) continue;
+      if (attempt < 6 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
       return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: 'the node did not answer' }, local: local[i] }));
     }
   }
