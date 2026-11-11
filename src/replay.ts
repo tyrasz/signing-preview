@@ -95,6 +95,9 @@ async function sameSecond(chainId: number, block: RpcBlock, index: number, heade
   return { at, before, blocks: earlierBlocks.length };
 }
 
+/** How long a replay waits before asking a node again for a transaction, block or receipt it didn't have. */
+export const REREAD_MS = 1_000;
+
 /**
  * Replays a mined transaction and previews what it did. `context.trace` adds its call trace. Throws a ReplayError
  * when there is no such transaction, it isn't mined yet, it is the chain's own, or the chain has no RPC here.
@@ -108,7 +111,11 @@ export async function replayTransaction(input: { chainId: number; hash: string }
   const read = async <T>(method: string, params: unknown[]): Promise<T> => {
     try { return await rpc.call(chainId, method, params) as T; } catch (e) { throw new ReplayError('UNAVAILABLE', `${chainName(chainId)}'s node didn't answer ${method}: ${e instanceof Error ? e.message : String(e)}`); }
   };
-  const tx = await read<RpcTx | null>('eth_getTransactionByHash', [hash]);
+  // A public node is often several behind a load balancer, one of them a moment behind the others: a transaction
+  // just mined, or its block or receipt, is asked for once more before it is said not to be there (two replays in 18
+  // at Arbitrum One's tip were told there was no such transaction).
+  const again = () => new Promise(r => setTimeout(r, REREAD_MS));
+  const tx = await read<RpcTx | null>('eth_getTransactionByHash', [hash]) ?? await again().then(() => read<RpcTx | null>('eth_getTransactionByHash', [hash]));
   if (!tx) throw new ReplayError('NOT_FOUND', `No transaction ${hash} on ${chainName(chainId)}.`);
   if (!tx.blockNumber) throw new ReplayError('PENDING', 'The transaction isn\'t mined yet: there is nothing to replay. Preview it as a request instead.');
   // Some public nodes refuse eth_getTransactionReceipt: the block's receipts have it too.
@@ -117,7 +124,9 @@ export async function replayTransaction(input: { chainId: number; hash: string }
       return (await read<(RpcReceipt & { transactionHash: string })[] | null>('eth_getBlockReceipts', [tx.blockNumber]))?.find(r => r.transactionHash.toLowerCase() === hash.toLowerCase()) ?? null;
     }
   };
-  const [block, receipt] = await Promise.all([read<RpcBlock | null>('eth_getBlockByNumber', [tx.blockNumber, true]), receiptOf()]);
+  const both = () => Promise.all([read<RpcBlock | null>('eth_getBlockByNumber', [tx.blockNumber, true]), receiptOf()]);
+  let [block, receipt] = await both();
+  if (!block?.transactions || !receipt) [block, receipt] = await again().then(both);
   if (!block?.transactions || !receipt) throw new ReplayError('UNAVAILABLE', `${chainName(chainId)}'s node has the transaction but not its block or receipt.`);
   if (isSystem(chainId, tx, block)) throw new ReplayError('UNSUPPORTED', `This is one of ${chainName(chainId)}'s own transactions (a deposit or a system call), not a call from an account, so it isn't replayed.`);
 

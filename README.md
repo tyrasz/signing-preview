@@ -67,7 +67,7 @@ curl -s localhost:8787/v1/preview -H 'content-type: application/json' -d '{
 |---|---|
 | `POST /v1/preview` | Body `{ request, context? }` returns a `Preview`. Malformed requests return `400 INVALID_REQUEST`. |
 | `GET /v1/openapi.json` | The OpenAPI 3.1 document for this API. |
-| `POST /v1/replay` | Body `{ chainId, hash, trace? }` returns a `Preview` of a mined transaction, run again where it ran (see [Replaying a mined transaction](#replaying-a-mined-transaction)). `404 NOT_FOUND`, `409 PENDING`, `422 UNSUPPORTED` (the chain's own transactions), `503 UNAVAILABLE` (no RPC for the chain). |
+| `POST /v1/replay` | Body `{ chainId, hash, trace? }` returns a `Preview` of a mined transaction, run again where it ran (see [Replaying a mined transaction](#replaying-a-mined-transaction)). `404 NOT_FOUND`, `409 PENDING`, `422 UNSUPPORTED` (the chain's own transactions), `503 UNAVAILABLE` (no RPC for the chain). A transaction, block or receipt the node didn't have is asked for once more a second later before it is said not to be there: a public node behind a load balancer can be a moment behind the newest block. |
 | `GET /v1/health` | Liveness check. |
 | `GET /v1/samples` | The demo's mock requests. |
 

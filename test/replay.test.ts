@@ -146,6 +146,32 @@ test('What can’t be replayed: no such transaction, one not mined, the chain’
   await refused({ chainId: 8453, hash: TXS[3].hash }, 'UNAVAILABLE', /No RPC/, { ...d, simulator: undefined });
 });
 
+test('A node a moment behind is asked again: a transaction, block or receipt it didn’t have yet', async () => {
+  // Behind a load balancer, a node that hasn't seen the newest block answers null for what's in it.
+  const lagging = (misses: Record<string, number>) => {
+    const { rpc } = chain();
+    const asked: string[] = [];
+    const call = async (c: number, method: string, params: unknown[]) => {
+      asked.push(method);
+      if (misses[method]) { misses[method]--; return null; }
+      return rpc.call(c, method, params);
+    };
+    return { asked, rpc: { has: rpc.has.bind(rpc), call } as unknown as NonNullable<Dependencies['rpc']> };
+  };
+  const usual = lagging({});
+  await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { ...deps(ran()).deps, rpc: usual.rpc });
+  for (const missing of ['eth_getTransactionByHash', 'eth_getTransactionReceipt', 'eth_getBlockByNumber']) {
+    const { rpc, asked } = lagging({ [missing]: 1 });
+    const p = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { ...deps(ran()).deps, rpc });
+    assert.equal(p.replay!.matches, true, missing);
+    // Asked once more than usual (the block is read for other things too).
+    assert.equal(asked.filter(m => m === missing).length, usual.asked.filter(m => m === missing).length + 1, missing);
+  }
+  // One that still hasn't it the second time: no such transaction, or not yet its block.
+  await assert.rejects(replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { ...deps(ran()).deps, rpc: lagging({ eth_getTransactionByHash: 2 }).rpc }), (e: unknown) => e instanceof ReplayError && e.code === 'NOT_FOUND');
+  await assert.rejects(replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { ...deps(ran()).deps, rpc: lagging({ eth_getTransactionReceipt: 2 }).rpc }), (e: unknown) => e instanceof ReplayError && e.code === 'UNAVAILABLE' && /not its block or receipt/.test(e.message));
+});
+
 test('The replay endpoint returns a preview that matches the spec, and says why when it can’t', async () => {
   const Ajv2020 = (Ajv2020Module as unknown as { default?: typeof Ajv2020Module }).default ?? Ajv2020Module;
   const spec = JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8'));
