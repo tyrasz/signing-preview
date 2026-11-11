@@ -169,7 +169,7 @@ test('On a node that splits a block’s gas among the calls that set none, a hea
   // block has left. A token like Open Genesis works out a holder's balance for 1.37 million gas and emits events
   // that mislead: the token "sends" Alice 100 and she sends 101, while her balance goes from 1,000 to nothing.
   const OG = '0x0e0000000000000000000000000000000000000e', LIMIT = 15_000_000n;
-  const node = (mainNeeds: bigint, mainUses: bigint) => {
+  const node = (mainNeeds: bigint, mainUses: bigint, fallsBackUnder?: bigint, readNeeds = 1_370_000n) => {
     const bodies: { from?: string; to?: string; data: string; gas?: string }[][] = [];
     const fetchImpl = (async (_url: string, init: RequestInit) => {
       const calls = JSON.parse(String(init.body)).params[0].blockStateCalls[0].calls as { from?: string; to?: string; data: string; gas?: string }[];
@@ -179,6 +179,8 @@ test('On a node that splits a block’s gas among the calls that set none, a hea
       let spent = false;
       const out = calls.map(c => {
         if (c.data === '0xdeadbeef') {
+          // An aggregator that catches its route running out of gas and takes another, which moves nothing of OG.
+          if (fallsBackUnder !== undefined && allowance(c) < fallsBackUnder) return { status: '0x1', gasUsed: '0x30d40', returnData: '0x', logs: [] };
           if (allowance(c) < mainNeeds) return { status: '0x0', gasUsed: `0x${allowance(c).toString(16)}`, returnData: '0x', logs: [] };
           spent = true;
           return { status: '0x1', gasUsed: `0x${mainUses.toString(16)}`, returnData: '0x', logs: [
@@ -187,7 +189,7 @@ test('On a node that splits a block’s gas among the calls that set none, a hea
           ] };
         }
         if (c.to === OG && c.data.startsWith('0x70a08231') && c.data.endsWith(ALICE.slice(2).toLowerCase())) {
-          return allowance(c) < 1_370_000n ? { status: '0x0', gasUsed: `0x${allowance(c).toString(16)}`, returnData: '0x', logs: [] } : { status: '0x1', gasUsed: '0x14e8c0', returnData: data(spent ? 0n : 1_000n), logs: [] };
+          return allowance(c) < readNeeds ? { status: '0x0', gasUsed: `0x${allowance(c).toString(16)}`, returnData: '0x', logs: [] } : { status: '0x1', gasUsed: '0x14e8c0', returnData: data(spent ? 0n : 1_000n), logs: [] };
         }
         return { status: c.data.startsWith('0x01ffc9a7') ? '0x0' : '0x1', gasUsed: '0x5208', returnData: c.data.startsWith('0x70a08231') ? data(0n) : '0x', logs: [] };
       });
@@ -209,6 +211,13 @@ test('On a node that splits a block’s gas among the calls that set none, a hea
   const b = node(900_000n, 600_000n);
   const rb = (await b.simulator.simulate(request))!;
   assert.deepEqual([moved(rb), rb.balancesRead, b.bodies.length], [[[ALICE.toLowerCase(), ROUTER, 1_000n]], true, 3]);
+  // A call that succeeds on its share among the reads, but by another way (it used other gas), here with a token
+  // whose reads are cheap: they describe that other way, in which nothing moved. The lean pass reads the way it went
+  // the first time; where even that can't be had, the events stand rather than the other way's reads.
+  const d = node(500_000n, 400_000n, 690_000n, 30_000n);
+  assert.deepEqual([moved((await d.simulator.simulate(request))!), d.bodies.length], [[[ALICE.toLowerCase(), ROUTER, 1_000n]], 3]);
+  const e = node(500_000n, 400_000n, 1_000_000n, 30_000n);
+  assert.deepEqual(moved((await e.simulator.simulate(request))!), [[OG, ALICE.toLowerCase(), 100n], [ALICE.toLowerCase(), ROUTER, 101n]]);
   // A node that refuses the reads' block outright, its calls left less than 21,000 each ("intrinsic gas too low",
   // as BNB Chain's did for a batch's 3,897): the lean pass all the same.
   const refusing = node(500_000n, 400_000n), inner = refusing.simulator['post'].bind(refusing.simulator);

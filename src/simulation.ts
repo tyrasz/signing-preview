@@ -506,8 +506,12 @@ export class RpcSimulator implements Simulator {
     // tokens the logs name are asked again in a lean pass (leanReads). On a node that splits the block's gas among
     // the calls that set none, a call that set none may have run short among the reads, and a batch's thousands of
     // reads can leave each less than a call's 21,000 ("intrinsic gas too low": BNB Chain's node, for 3,897 calls).
+    // A call that set no gas must also have used the same gas: on such a node it can succeed on its share and still
+    // have gone another way (an aggregator that catches a sub-swap running out).
+    const differs = (ci: number, i: number) => (out![ci].status === '0x1') !== (parsed[i].status === 'success')
+      || (reqs[i].gas === undefined && parsed[i].gasUsed !== undefined && BigInt(out![ci].gasUsed) !== parsed[i].gasUsed);
     const starved = !out || out.length !== calls.length ? /intrinsic gas too low/i.test((body as { error?: { message?: string } }).error?.message ?? '')
-      : callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success')) ? reqs.some(r => r.gas === undefined) : undefined;
+      : callIndex.some(differs) ? reqs.some(r => r.gas === undefined) : undefined;
     if (starved !== undefined) {
       const pairs = owners.flatMap(owner => [...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)).map(token => ({ owner, token })));
       const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs).catch(() => undefined) : undefined;
