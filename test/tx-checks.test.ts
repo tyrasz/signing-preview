@@ -74,6 +74,24 @@ test('A request’s access list goes to the simulation (it costs gas and warms w
   assert.equal(seen.at(-1)!.accessList, undefined);
 });
 
+test('A gas limit above the chain’s cap for one transaction: refused on the chains that have it, until Amsterdam', async () => {
+  // Ethereum, BNB Chain, Base and OP Mainnet mine nothing above 16,777,216 (EIP-7825).
+  const over = await send({ gas: toHex(30_000_000n) });
+  assert.equal(over.warnings.find(w => w.code === 'gas_limit_above_cap')!.message, 'The gas limit (30,000,000) is above the most a transaction may have on Ethereum (16,777,216): the network will reject this transaction as it is. It used 50,000 gas in the simulation, so a lower limit would do.');
+  assert.equal(over.attention, 'danger');
+  for (const chainId of ['0x38', '0x2105', '0xa']) assert.ok(codes(await send({ gas: toHex(16_777_217n), chainId })).includes('gas_limit_above_cap'), chainId);
+  // At the cap it is fine; Arbitrum One and Polygon mine transactions with more.
+  assert.equal(codes(await send({ gas: toHex(16_777_216n) })).includes('gas_limit_above_cap'), false);
+  for (const chainId of ['0xa4b1', '0x89']) assert.equal(codes(await send({ gas: toHex(30_000_000n), chainId })).includes('gas_limit_above_cap'), false, chainId);
+  // From Amsterdam on, what a limit holds above the cap pays for new state: a chain whose blocks carry an access
+  // list hash takes it.
+  const d = deps(), amsterdam = { ...d, rpc: { has: () => true, call: async (c: number, method: string, params: unknown[]) => {
+    const r = await d.rpc!.call(c, method, params);
+    return method === 'eth_getBlockByNumber' ? { ...r as object, blockAccessListHash: `0x${'09'.repeat(32)}` } : r;
+  } } } as Dependencies;
+  assert.equal(codes(await send({ gas: toHex(30_000_000n) }, amsterdam)).includes('gas_limit_above_cap'), false);
+});
+
 test('Nonces: already used, replacing a pending transaction, waiting behind a gap, or queued behind pending ones', async () => {
   assert.ok(codes(await send({ nonce: '0x3' })).includes('nonce_used'));
   assert.equal((await send({ nonce: '0x3' })).attention, 'danger');

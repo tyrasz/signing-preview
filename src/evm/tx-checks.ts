@@ -6,7 +6,7 @@
 // OP Mainnet) the L1 data fee charged on top of the gas, which the GasPriceOracle predeploy computes.
 import { decodeAbiParameters, encodeFunctionData, keccak256, parseAbi, serializeTransaction, toHex, type Hex } from 'viem';
 import { formatUnits, type PreviewBuilder } from '../format.ts';
-import { CHAINS, OP_STACK } from '../chains.ts';
+import { chainName, CHAINS, OP_STACK } from '../chains.ts';
 import type { Dependencies, PreviewContext } from '../types.ts';
 import type { Tx } from './common.ts';
 
@@ -14,6 +14,16 @@ const NODE_INTERFACE = '0x00000000000000000000000000000000000000c8';
 const L1_COMPONENT = parseAbi(['function gasEstimateL1Component(address to, bool contractCreation, bytes data) payable returns (uint64 gasEstimateForL1, uint256 baseFee, uint256 l1BaseFeeEstimate)']);
 /** Arbitrum chains: L2 gas is charged at the base fee (no tip), and the L1 data is charged as extra gas. */
 const ARBITRUM = new Set([42161, 421614]);
+/**
+ * The most gas one transaction may be given (EIP-7825, in Fusaka), and the chains that refuse more. Measured on
+ * 2026-11-11 in what each chain mines: on Ethereum and BNB Chain the highest gas limit in 40 blocks was exactly this
+ * (and BNB Chain's node refuses a higher one when it validates); on Base and OP Mainnet none of 27,555 transactions
+ * in 500 blocks was above it (the highest 16,770,000). Arbitrum One and Polygon, which mine 2-3% of their
+ * transactions above it, have no such cap. From Amsterdam on, what a limit holds above it pays for new state
+ * (EIP-8037), so a chain whose blocks are Amsterdam's (their headers carry a block access list hash) takes more:
+ * Sepolia mines such transactions.
+ */
+const TRANSACTION_GAS_CAP = 16_777_216n, GAS_CAPPED = new Set([1, 56, 8453, 10]);
 const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
 const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
 const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
@@ -83,7 +93,7 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     call<string>('eth_getTransactionCount', [tx.from, 'latest']),
     call<string>('eth_getTransactionCount', [tx.from, 'pending']),
     call<string>('eth_getBalance', [tx.from, 'latest']),
-    call<{ baseFeePerGas?: string }>('eth_getBlockByNumber', ['latest', false]),
+    call<{ baseFeePerGas?: string; blockAccessListHash?: string }>('eth_getBlockByNumber', ['latest', false]),
     tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
     arbitrum ? call<string>('eth_call', [{ to: NODE_INTERFACE, data: encodeFunctionData({ abi: L1_COMPONENT, functionName: 'gasEstimateL1Component', args: [(tx.to ?? '0x0000000000000000000000000000000000000000') as Hex, tx.to === null, tx.data] }) }, 'latest']) : Promise.resolve(undefined),
   ]);
@@ -106,6 +116,11 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
   const baseFee = block?.baseFeePerGas !== undefined ? BigInt(block.baseFeePerGas) : undefined;
   const cap = tx.maxFeePerGas ?? tx.gasPrice;
   if (cap !== undefined && baseFee !== undefined && cap < baseFee) b.warn('caution', 'fee_below_base_fee', `The fee cap (${gwei(cap)}) is below the current base fee (${gwei(baseFee)}): the transaction waits until the base fee falls that low.`);
+
+  // A gas limit above what the chain lets one transaction have: refused as it is, whatever it would have used.
+  if (tx.gas !== undefined && tx.gas > TRANSACTION_GAS_CAP && GAS_CAPPED.has(tx.chainId) && block && block.blockAccessListHash === undefined) {
+    b.warn('danger', 'gas_limit_above_cap', `The gas limit (${tx.gas.toLocaleString('en-US')}) is above the most a transaction may have on ${chainName(tx.chainId)} (${TRANSACTION_GAS_CAP.toLocaleString('en-US')}): the network will reject this transaction as it is.${gasUsed !== undefined && gasUsed <= TRANSACTION_GAS_CAP ? ` It used ${gasUsed.toLocaleString('en-US')} gas in the simulation, so a lower limit would do.` : ''}`);
+  }
 
   // The network fee: gas used at the price the transaction would pay now (Arbitrum: the base fee, plus L1 data gas).
   let l1Gas = 0n;
