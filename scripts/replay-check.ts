@@ -39,7 +39,7 @@ const call = async <T>(method: string, params: unknown[]): Promise<T | null> => 
 };
 
 type Tx = { hash: string; to: string | null; input: string; transactionIndex: string; type: string };
-type Row = { hash: string; block: number; index: number; title?: string; ms: number; kind: 'same' | 'receipt' | 'trace' | 'gas' | 'state' | 'untraced' | 'unavailable' | 'own' | 'error'; what?: string; gasCompared?: boolean; stateChecked?: boolean };
+type Row = { hash: string; block: number; index: number; title?: string; ms: number; kind: 'same' | 'receipt' | 'trace' | 'gas' | 'state' | 'untraced' | 'unavailable' | 'own' | 'error'; what?: string; gasCompared?: boolean; stateChecked?: boolean; /** A run shown in place of the node's first, which wasn't the receipt's: the merged same-second run, or the local EVM's. */ shownBy?: 'merged' | 'local' };
 const rows: Row[] = [];
 const seen = new Map<string, number>();
 
@@ -49,7 +49,9 @@ async function replay(hash: string, block: number): Promise<void> {
   try {
     const p = await replayTransaction({ chainId: CHAIN, hash }, { trace: TRACE }, deps);
     if (ONE) console.log(JSON.stringify(p, null, 1));
-    const base = { index: p.replay!.index, title: p.title, gasCompared: p.trace?.gasAgrees !== undefined, stateChecked: p.trace?.stateAgrees !== undefined };
+    const notes = p.decoding.notes.join(' ');
+    const shownBy = /It was run instead with the \d+ transactions before it in that second/.test(notes) ? 'merged' as const : /local EVM/.test(p.simulation?.source ?? '') ? 'local' as const : undefined;
+    const base = { index: p.replay!.index, title: p.title, gasCompared: p.trace?.gasAgrees !== undefined, stateChecked: p.trace?.stateAgrees !== undefined, ...(shownBy && { shownBy }) };
     // A node that didn't hold the replay (state it no longer keeps, its allowance for one simulation) leaves nothing to compare.
     if (p.simulation?.status === 'unavailable') return row('unavailable', { ...base, what: p.simulation.error?.slice(0, 200) });
     if (!p.replay!.matches) return row('receipt', { ...base, what: p.replay!.differences?.join('; ').slice(0, 300) });
@@ -110,6 +112,7 @@ const lines = [
   ] : []),
   ...(count('untraced') ? [`  no trace for ${count('untraced')}: ${[...new Set(rows.filter(r => r.kind === 'untraced').map(r => r.what))].slice(0, 3).join(' | ')}`] : []),
   ...(count('unavailable') + count('error') ? [`  not replayed: ${count('unavailable')} the node didn't hold, ${count('error')} failed${count('error') ? ` (${rows.find(r => r.kind === 'error')!.what})` : ''}`] : []),
+  ...(rows.some(r => r.shownBy) ? [`  shown by another run than the node's first, which wasn't the receipt's: ${rows.filter(r => r.shownBy === 'merged').length} by the node with the second's blocks merged, ${rows.filter(r => r.shownBy === 'local').length} by the local EVM`] : []),
   ...(count('own') ? [`  left out: ${count('own')} of the chain's own transactions`] : []),
   `  median ${[...replayed.map(r => r.ms)].sort((a, b) => a - b)[replayed.length >> 1] ?? 0} ms a replay`,
 ];
