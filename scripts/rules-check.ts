@@ -418,6 +418,10 @@ const EXPECTED: Record<number, Record<string, string>> = {
     'opcode 0x42': "TIMESTAMP: HyperEVM's node answers on its latest block, not the one named",
     'opcode 0x43': "NUMBER: HyperEVM's node answers on its latest block, not the one named",
     'BLOCKHASH of the block before': "HyperEVM's node answers on its latest block, not the one named",
+    // Its fee recipient is the zero address, whose balance goes up in nearly every block (fees are burned to it):
+    // read a block apart, as the node's run and the local EVM's state are, it isn't the same. A strict run of all
+    // eight chains failed on this alone.
+    'BALANCE of the fee recipient, in a call that pays for its gas': "HyperEVM's node answers on its latest block, not the one named: the fee recipient has been paid since",
   },
 };
 

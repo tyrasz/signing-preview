@@ -1,5 +1,5 @@
 // npm run replays -- [--chain 1|42161|8453|10|137|56|11155111] [--follow 600 | --blocks 3 | --tx 0x…] [--per-block 8]
-//   [--max 200] [--concurrency 2] [--no-trace] [--strict] [--out report.json] [--summary-md summary.md]
+//   [--max 200] [--concurrency 2] [--no-trace] [--strict [--tolerate 0]] [--out report.json] [--summary-md summary.md]
 //
 // Mined transactions put through the previewer's own replay (replayTransaction: what POST /v1/replay serves), each
 // with its call trace, and what came out against what happened:
@@ -14,7 +14,9 @@
 //
 // --follow replays each new block as it arrives (public nodes keep recent state only: Arbitrum's about 30 seconds);
 // --blocks takes the latest ones; --tx one transaction, printed in full. --strict exits with 1 when a replay doesn't
-// match its receipt, or a trace differs from the node's run, its gas or the block's access list.
+// match its receipt, or a trace differs from the node's run, its gas or the block's access list; --tolerate N lets
+// that many be (a scheduled run on a chain with a known remainder: about one replay in 140 on BNB Chain, whose
+// node runs same-second blocks a second late, and Arbitrum's events that carry the transaction's own L1 fee).
 // Read-only: nothing is signed or sent.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { replayTransaction, ReplayError } from '../src/replay.ts';
@@ -24,7 +26,7 @@ import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '3')), PER_BLOCK = Number(arg('per-block', '8')), MAX = Number(arg('max', '200'));
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '2'))), TRACE = !process.argv.includes('--no-trace'), STRICT = process.argv.includes('--strict');
-const ONE = arg('tx', ''), OUT = arg('out', ''), SUMMARY_MD = arg('summary-md', '');
+const ONE = arg('tx', ''), OUT = arg('out', ''), SUMMARY_MD = arg('summary-md', ''), TOLERATE = Number(arg('tolerate', '0'));
 const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
 // The replays' own lookups stay on the chain's node: no ABI or signature services, no prices.
 const deps = liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off', SIGNING_PREVIEW_OFFLINE_LOOKUPS: '1', SIGNING_PREVIEW_PRICES: 'off' }, { warmUp: false });
@@ -117,4 +119,4 @@ for (const r of differing) console.log(`    ${r.kind} ${r.hash} #${r.index} ${r.
 if (OUT) writeFileSync(OUT, JSON.stringify({ chainId: CHAIN, rows }, null, 1));
 if (SUMMARY_MD) appendFileSync(SUMMARY_MD, `### Replays on ${chainName(CHAIN)}\n\n${lines.map(l => `- ${l.trim()}`).join('\n')}\n${differing.map(r => `- **${r.kind}** \`${r.hash}\` ${r.title ?? ''}: ${r.what ?? ''}`).join('\n')}\n`);
 // The fork cache and lookups may hold timers open.
-process.exit(STRICT && differing.length ? 1 : 0);
+process.exit(STRICT && differing.length > TOLERATE ? 1 : 0);

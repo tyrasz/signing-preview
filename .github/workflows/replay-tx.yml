@@ -6,6 +6,9 @@ name: Transaction replays
 # Read-only: nothing is signed or sent. Public RPCs by default (EVM_RPCS in src/chains.ts); ETHEREUM_RPC_URL,
 # ARBITRUM_RPC_URL, BASE_RPC_URL, OPTIMISM_RPC_URL, POLYGON_RPC_URL, BSC_RPC_URL and SEPOLIA_RPC_URL repository
 # secrets replace them.
+# Then, for ten minutes more, transactions go through the previewer's own replay with their call traces (npm run
+# replays): the run against the receipt, the trace against the node's run and its gas, and on Sepolia the state the
+# trace changed against the block's access list. That step fails when more than five replays differ.
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
 # differences are listed in the summary.
@@ -72,6 +75,22 @@ jobs:
           [[ "$MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
           npm run accuracy -- --chain "$CHAIN" --follow $((MINUTES * 60)) --per-block 3 --max-index 8 --max 600 \
             --simulators eth_simulateV1,fork --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee replay.log
+      - name: Replay through the previewer, with traces
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+          CHAIN: ${{ matrix.chain }}
+        run: |
+          set -o pipefail
+          npm run replays -- --chain "$CHAIN" --follow 600 --max 300 --strict --tolerate 5 \
+            --summary-md "$GITHUB_STEP_SUMMARY" --out previewer.json 2>&1 | tee previewer.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -80,6 +99,8 @@ jobs:
           path: |
             report.json
             replay.log
+            previewer.json
+            previewer.log
           if-no-files-found: ignore
           retention-days: 30
 
