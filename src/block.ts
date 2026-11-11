@@ -72,21 +72,35 @@ export type StateChanges = Record<string, { balance?: string; nonce?: string; co
  * that doesn't read as one: the caller then runs the earlier transactions instead.
  */
 export async function stateBefore(client: RpcClient, chainId: number, block: string, index: number): Promise<StateChanges | undefined> {
+  const list = await blockAccessList(client, chainId, block);
+  return list && accessListChanges(list, 0, index);
+}
+
+/** A block's access list as its node serves it (eth_getBlockAccessListByBlockNumber), asked for up to three times; undefined where it doesn't. */
+export async function blockAccessList(client: RpcClient, chainId: number, block: string): Promise<unknown[] | undefined> {
   let list: unknown;
   for (let attempt = 0; attempt < 3 && !Array.isArray(list); attempt++) {
     if (attempt) await new Promise(r => setTimeout(r, 200 * attempt));
     list = await client.call(chainId, 'eth_getBlockAccessListByBlockNumber', [block]).catch(() => undefined);
   }
-  if (!Array.isArray(list)) return undefined;
+  return Array.isArray(list) ? list : undefined;
+}
+
+/**
+ * What a block's access list says its entries `from` to `to` left: each balance, nonce, code and storage slot they
+ * changed, as it stood after the last of them. Entries 0 to a transaction's index are the state it met; entry
+ * index + 1 alone is what the transaction itself changed. Undefined for a list that doesn't read as one.
+ */
+export function accessListChanges(list: unknown[], from: number, to: number): StateChanges | undefined {
   const hex = (v: unknown): string => { if (typeof v !== 'string' || !/^0x[0-9a-fA-F]*$/.test(v)) throw new Error('not hex'); return v; };
   const word = (v: unknown) => `0x${BigInt(hex(v) === '0x' ? '0x0' : hex(v)).toString(16).padStart(64, '0')}`;
-  /** An item's last change at or before the transaction: `field` of it. */
+  /** An item's last change among the entries: `field` of it. */
   const last = (changes: unknown, field: 'value' | 'code'): string | undefined => {
     if (!Array.isArray(changes)) throw new Error('not a list');
     let found: string | undefined, at = -1;
     for (const c of changes as Record<string, unknown>[]) {
       const i = Number(BigInt(hex(c.index)));
-      if (i <= index && i >= at) { found = hex(c[field]); at = i; }
+      if (i >= from && i <= to && i >= at) { found = hex(c[field]); at = i; }
     }
     return found;
   };

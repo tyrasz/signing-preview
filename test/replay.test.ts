@@ -8,6 +8,7 @@ import { readFileSync } from 'node:fs';
 import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
+import { compareWithAccessList } from '../src/evm/trace.ts';
 import { afterParent, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
@@ -500,4 +501,59 @@ test('From Glamsterdam on, a replay starts from what the block’s access list s
   await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }).simulateBatch([{ chainId: 8453, from: ALICE.toLowerCase(), to: BOB, data: '0x', value: 0n, at: { ...target.at!, state: met }, stateOverrides: { [bob]: { balance: '0x99', stateDiff: { [H(3)]: H(4) } } } }]);
   assert.equal(sent[0].calls.length, 1);
   assert.deepEqual(sent[0].stateOverrides, { [HISTORY.toLowerCase()]: met[HISTORY.toLowerCase()], [bob]: { balance: '0x99', nonce: '0x8', code: DELEGATE, stateDiff: { [H(1)]: H(0), [H(3)]: H(4) } } });
+});
+
+test('A replay’s trace is checked against what the block’s access list says the transaction changed', async () => {
+  const sender = ALICE.toLowerCase(), coinbase = BOB.toLowerCase(), MADE = '0x00000000000000000000000000000000000c0de1';
+  // The list's entry for a transaction: two of the token's slots, the sender's balance (less the 21 it paid in
+  // fees) and its nonce, the fee recipient's balance (with its tip of 5), and a contract made.
+  const recorded = { changes: { [USDC]: { stateDiff: { [H(1)]: H(50), [H(2)]: H(0) } }, [sender]: { balance: hex(900 - 21), nonce: '0x8' }, [coinbase]: { balance: hex(1_005) }, [MADE]: { nonce: '0x1', code: '0x6000' } }, sender, nonce: 7n, coinbase, fee: 21n, tip: 5n };
+  // What the traced call changed: the same slots, the 100 wei the sender sent, the contract. A traced call pays no
+  // fee and bumps no sender's nonce: those are the transaction's, and are put back or checked apart.
+  const changes = [
+    { address: USDC, storage: [{ slot: H(1), before: H(0), after: H(50) }, { slot: H(2), before: H(9), after: H(0) }] },
+    { address: sender, balance: { before: 1_000n, after: 900n } },
+    { address: MADE, nonce: { before: 0n, after: 1n }, code: true },
+  ];
+  assert.deepEqual(compareWithAccessList(changes, recorded), { agrees: true, compared: 7 });
+  // A call that fails changes nothing: the list has the fee and the nonce alone.
+  assert.equal(compareWithAccessList(undefined, { ...recorded, changes: { [sender]: { balance: hex(979), nonce: '0x8' }, [coinbase]: { balance: hex(1_005) } } }).agrees, true);
+  // What differs is said: a slot with another value, one only the trace writes, a balance, code, the sender's nonce.
+  const off = compareWithAccessList([{ address: USDC, storage: [{ slot: H(1), before: H(0), after: H(51) }, { slot: H(2), before: H(9), after: H(0) }, { slot: H(3), before: H(0), after: H(1) }] }, { address: sender, balance: { before: 1_000n, after: 901n } }],
+    { ...recorded, changes: { ...recorded.changes, [sender]: { balance: hex(879), nonce: '0x9' } } });
+  assert.deepEqual(off.differences, [
+    "the sender's nonce is 9 in the list, 8 after this transaction",
+    `${USDC} slot 0x1 is 0x32 in the list, 0x33 in the trace`,
+    `${USDC} slot 0x3 changes in the trace and not in the list`,
+    `${MADE}'s nonce is 1 in the list and unchanged in the trace`,
+    `${sender}'s balance is 900 in the list, 901 in the trace`,
+    `${MADE}'s code changes in the list and not in the trace`,
+  ]);
+
+  // Through a replay: the block's list has the transaction's own entry (the fourth transaction's is entry 4), the
+  // local EVM's traced run is checked against it, and the trace and the preview say how it came out.
+  const list = [
+    { address: USDC, balanceChanges: [], codeChanges: [], nonceChanges: [], storageChanges: [{ key: '0x1', changes: [{ index: '0x4', value: '0x32' }] }], storageReads: [] },
+    { address: ALICE, balanceChanges: [{ index: '0x4', value: '0x10' }], codeChanges: [], nonceChanges: [{ index: '0x4', value: '0x8' }], storageChanges: [], storageReads: [] },
+  ];
+  const root: TraceCall = { type: 'call', from: sender, to: USDC, input: transfer, value: 0n, gas: 100_000n, gasUsed: 30_000n, output: pad('0x01'), logs: [{ index: 0, ...LOG }] };
+  const { deps: d } = deps(ran());
+  const replayed = async (slot: string) => {
+    const rpc = { has: d.rpc!.has, call: async (c: number, method: string, params: unknown[]) => {
+      if (method === 'eth_getBlockAccessListByBlockNumber') return list;
+      const out = await d.rpc!.call(c, method, params);
+      return method === 'eth_getBlockByNumber' && out ? { ...out as object, blockAccessListHash: H(9), slotNumber: '0xb046bd' } : out;
+    } } as Dependencies['rpc'];
+    const simulator = { simulate: async () => ran(), trace: async () => [{ ...ran({ source: 'local' }), trace: root, stateChanges: [{ address: USDC, storage: [{ slot: H(1), before: H(0), after: slot }] }] }] };
+    return replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { trace: true }, { ...d, rpc, simulator });
+  };
+  const good = await replayed(H(50));
+  assert.deepEqual([good.trace!.stateAgrees, good.trace!.note], [true, undefined]);
+  assert.match(good.decoding.notes.join(' '), /The state the trace shows changing is what the block's access list records for this transaction: every storage slot, balance, nonce and code\./);
+  const bad = await replayed(H(51));
+  assert.equal(bad.trace!.stateAgrees, false);
+  assert.equal(bad.trace!.note, `The state the traced run changed isn't what the block's access list records for this transaction (${USDC} slot 0x1 is 0x32 in the list, 0x33 in the trace): the trace is a guide to what it did, not its record.`);
+  // A block without a list (before Amsterdam) has nothing to check against: the field is absent.
+  const before = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { trace: true }, { ...d, simulator: { simulate: async () => ran(), trace: async () => [{ ...ran({ source: 'local' }), trace: root, stateChanges: [] }] } });
+  assert.equal(before.trace!.stateAgrees, undefined);
 });

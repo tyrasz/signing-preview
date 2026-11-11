@@ -318,9 +318,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   // The trace of what was shown (PreviewContext.trace): the calls the transaction makes and the state it changes.
   if (context.trace && ran && outcome && 'result' in outcome && outcome.result && !outcome.result.limited) {
     // A replay's trace runs the block's earlier transactions first, in the local EVM: it is given longer.
-    const env: TraceEnv = { chainId: tx.chainId, account: tx.from, deps, ...(replay && { budgetMs: REPLAY_TRACE_MS }) };
+    const env: TraceEnv = { chainId: tx.chainId, account: tx.from, deps, ...(replay && { budgetMs: REPLAY_TRACE_MS, ...(replay.recorded && { recorded: replay.recorded }) }) };
     const traced = await tracePreviews(ran, [...ran.slice(0, -1).map(() => null), outcome.result], env);
     trace = traced?.at(-1);
+    if (trace?.stateAgrees) b.note("The state the trace shows changing is what the block's access list records for this transaction: every storage slot, balance, nonce and code.");
     if (!trace) b.note(traced ? "No trace: the run that would trace this transaction didn't produce one." : noTrace(env));
   }
   // What the network checks before including it, and the fee. A batch call's fee belongs to the whole batch.

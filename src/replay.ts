@@ -7,7 +7,7 @@
 // node keeps all of them.
 import type { Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { afterParent, blobBaseFeeAfter, headerOf, stateBefore, type RpcHeader } from './block.ts';
+import { accessListChanges, afterParent, blobBaseFeeAfter, blockAccessList, headerOf, type RpcHeader } from './block.ts';
 import { chainName, CHAINS, OP_STACK } from './chains.ts';
 import { formatUnits } from './format.ts';
 import { previewRequest } from './preview.ts';
@@ -87,7 +87,10 @@ export async function replayTransaction(input: { chainId: number; hash: string }
   // access list, EIP-7928), so the state the transaction met is read, exactly, whatever came before it. Otherwise,
   // and where the node doesn't serve the list, the block's earlier transactions are run first, as they ran: with
   // their own gas limits and prices (the chain's own left out, except an OP Stack block's L1 info deposit).
-  const state = block.blockAccessListHash !== undefined ? await stateBefore(rpc, chainId, tx.blockNumber, index) : undefined;
+  const accessList = block.blockAccessListHash !== undefined ? await blockAccessList(rpc, chainId, tx.blockNumber) : undefined;
+  const state = accessList && accessListChanges(accessList, 0, index);
+  // The list also has what the transaction itself changed (its own entry): a trace is checked against it.
+  const own = state && accessList && accessListChanges(accessList, index + 1, index + 1);
   const at = { block: parent, header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true, ...(state && { state }) };
   const earlier = block.transactions.filter(t => Number(BigInt(t.transactionIndex)) < index && (!isSystem(chainId, t, block) || t.from.toLowerCase() === L1_INFO_DEPOSITOR));
   const before = state ? [] : await Promise.all(earlier.map(async t => ({ ...await requestOf(chainId, t, parent, deps), at })));
@@ -107,6 +110,7 @@ export async function replayTransaction(input: { chainId: number; hash: string }
       receipt: { status: receipt.status === '0x1' ? 'success' : 'reverted', gasUsed: gasUsed.toString(), fee: `${formatUnits(gasUsed * gasPrice + extra, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? 'native'}` },
     },
     when: { block: tx.blockNumber, time }, ...(shifted && { shifted, ownTimestamp: BigInt(block.timestamp) }),
+    ...(own && { recorded: { changes: own, sender: tx.from.toLowerCase(), nonce: BigInt(tx.nonce), coinbase: header.coinbase.toLowerCase(), fee: gasUsed * gasPrice + extra, tip: gasUsed * (gasPrice > header.baseFeePerGas ? gasPrice - header.baseFeePerGas : 0n) } }),
   };
   const request = {
     method: 'eth_sendTransaction',

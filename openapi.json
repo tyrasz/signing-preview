@@ -1086,6 +1086,10 @@
             "type": "boolean",
             "description": "Whether the traced run used the same gas as the simulation shown, when both succeeded. False means the local EVM's gas rules are not the chain's for this call (a fork it was not checked against, an older block's rules), and the gas figures in the trace are approximate. Absent when it was not compared."
           },
+          "stateAgrees": {
+            "type": "boolean",
+            "description": "For a replay in a block that carries its access list (EIP-7928, from Amsterdam on): whether the state the traced run changed (every storage slot, balance, nonce and code) is what the list records for the transaction. False means the trace is not a record of what the transaction did to the chain's state, and the note says what differs. Absent where there is no list to check against."
+          },
           "note": {
             "type": "string"
           },

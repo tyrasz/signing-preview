@@ -80,7 +80,7 @@ const overridesOf = (reqs: SimulationRequest[]) => {
  * stand-ins for the authorizations the wallet has yet to sign (see standIns).
  */
 const simulationFields = async (req: SimulationRequest) => {
-  const authorizationList = [...(req.authorizationList ?? []), ...await standIns(req)];
+  const authorizationList = authorizationsForNode([...(req.authorizationList ?? []), ...await standIns(req)]);
   return {
     ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
     ...priceFields(req),
@@ -108,6 +108,17 @@ async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChang
   // Beneath them, what the simulated block had already changed (BlockAt.state: a replay's earlier transactions).
   for (const [a, s] of Object.entries(state ?? {})) all[a] = { ...s, ...all[a], ...((s.stateDiff || all[a]?.stateDiff) && { stateDiff: { ...s.stateDiff, ...all[a]?.stateDiff } }) };
   return Object.keys(all).length ? all : undefined;
+}
+
+/**
+ * EIP-7702 authorizations as a node takes them: every number without leading zeros. Wallets and signing libraries
+ * write a signature's r and s as 32 padded bytes, and nodes built on go-ethereum refuse a number written so
+ * ("cannot unmarshal hex number with leading zero digits": Arbitrum's and Polygon's did), which failed the whole
+ * simulation whenever r or s happened to start with a zero: about one authorization in eight.
+ */
+export function authorizationsForNode<T extends { chainId: string; nonce: string; r: string; s: string; yParity: string }>(list: T[]): T[] {
+  const quantity = (v: string) => { try { return `0x${BigInt(v).toString(16)}`; } catch { return v; } };
+  return list.map(a => ({ ...a, chainId: quantity(a.chainId), nonce: quantity(a.nonce), r: quantity(a.r), s: quantity(a.s), yParity: quantity(a.yParity) }));
 }
 
 /** A throwaway account standing in for the sender in the gas of authorizations not signed yet (see standIns). */

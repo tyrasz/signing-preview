@@ -205,6 +205,12 @@ export interface PreviewTrace {
    * wasn't compared (Arbitrum, whose node adds a charge for L1 data; a failed call; no second simulation).
    */
   gasAgrees?: boolean;
+  /**
+   * A replay in a block that carries its access list (EIP-7928, from Amsterdam on): whether the state the traced
+   * run changed (every storage slot, balance, nonce and code) is what the list records for the transaction. False
+   * means the trace isn't a record of what the transaction did to the chain's state; the note says what differs.
+   */
+  stateAgrees?: boolean;
   note?: string;
   calls: TraceEntry[];
   /** The trace has more calls than are listed. */
@@ -331,6 +337,12 @@ export interface ReplayContext {
    */
   shifted?: boolean;
   ownTimestamp?: bigint;
+  /**
+   * What the block's access list records the transaction itself changed (from Amsterdam on): a trace's state
+   * changes are checked against it. With who paid the fee and who was paid the tip, which the list counts in
+   * their balances and a traced call doesn't.
+   */
+  recorded?: { changes: import('./block.ts').StateChanges; sender: string; nonce: bigint; coinbase: string; fee: bigint; tip: bigint };
 }
 
 export interface SimulationRequest {

@@ -109,7 +109,7 @@ const values = (params: readonly AbiParameter[], decoded: readonly unknown[]): T
 
 type Named = { fn: AbiFunction; from: 'verified' | 'standard' | 'signature'; contract?: string };
 /** Whose preview the trace is for: `account` is named `accountLabel` in it ("you" unless said: a Safe, a smart account). */
-export interface TraceEnv { chainId: number; account?: string; accountLabel?: string; deps: Dependencies; /** Set by tracePreviews when the calls reach something a local EVM can't run: why. */ unsupported?: string; /** How long the tracing run may take, over the simulator's default (a replay's runs its block's earlier transactions first). */ budgetMs?: number }
+export interface TraceEnv { chainId: number; account?: string; accountLabel?: string; deps: Dependencies; /** Set by tracePreviews when the calls reach something a local EVM can't run: why. */ unsupported?: string; /** How long the tracing run may take, over the simulator's default (a replay's runs its block's earlier transactions first). */ budgetMs?: number; /** A replay's: what the block's access list records the transaction changed, to check the last call's state changes against (compareWithAccessList). */ recorded?: ReplayContext['recorded'] }
 
 /** The function `data` calls among these, if its arguments decode as that function's. */
 function match(fns: readonly AbiFunction[], data: Hex): { fn: AbiFunction; args: readonly unknown[] } | null {
@@ -144,7 +144,7 @@ function eventOf(log: NonNullable<TraceCall['logs']>[number], abi: ContractAbi |
  * unnamed.
  */
 export async function describeTrace(root: TraceCall, stateChanges: StateChange[] | undefined, env: TraceEnv,
-  info: { source: string; agrees?: boolean; gasAgrees?: boolean; note?: string }): Promise<PreviewTrace> {
+  info: { source: string; agrees?: boolean; gasAgrees?: boolean; stateAgrees?: boolean; note?: string }): Promise<PreviewTrace> {
   const { chainId, deps } = env;
   const flat: { call: TraceCall; depth: number }[] = [];
   let total = 0;
@@ -253,7 +253,7 @@ export async function describeTrace(root: TraceCall, stateChanges: StateChange[]
   });
 
   return {
-    source: info.source, ...(info.agrees !== undefined && { agrees: info.agrees }), ...(info.gasAgrees !== undefined && { gasAgrees: info.gasAgrees }), ...(info.note && { note: info.note }),
+    source: info.source, ...(info.agrees !== undefined && { agrees: info.agrees }), ...(info.gasAgrees !== undefined && { gasAgrees: info.gasAgrees }), ...(info.stateAgrees !== undefined && { stateAgrees: info.stateAgrees }), ...(info.note && { note: info.note }),
     calls, ...(total > flat.length && { truncated: true, totalCalls: total }),
     ...(stateChanges?.length && { stateChanges: stateChanges.map(s => ({
       address: s.address, ...(label(s.address) && { label: label(s.address) }),
@@ -322,9 +322,60 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
     // a charge for L1 data that no EVM run has.
     const gasAgrees = agrees && s!.status === 'success' && s!.gasUsed !== undefined && t.gasUsed !== undefined && !NEXT_BLOCK[env.chainId]?.arbitrum && t.source !== 'mock' ? s!.gasUsed === t.gasUsed : undefined;
     const gasDiffers = gasAgrees === false ? `The traced run used ${t.gasUsed!.toLocaleString('en-US')} gas where the simulation shown above used ${s!.gasUsed!.toLocaleString('en-US')}: the local EVM's gas rules differ from this chain's here, so the gas figures in the trace are approximate.` : undefined;
-    const note = [s?.traceNote, differs, gasDiffers, t.rulesNote].filter(Boolean).join(' ');
-    return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(gasAgrees !== undefined && { gasAgrees }), ...(note && { note }) });
+    // A replay in a block that carries its access list: the state the traced run changed against what the chain
+    // recorded for the transaction (the last call traced).
+    const state = env.recorded && i === traced.length - 1 ? compareWithAccessList(t.stateChanges, env.recorded) : undefined;
+    const stateDiffers = state && !state.agrees ? `The state the traced run changed isn't what the block's access list records for this transaction (${state.differences!.slice(0, 3).join('; ')}${state.differences!.length > 3 ? `; and ${state.differences!.length - 3} more` : ''}): the trace is a guide to what it did, not its record.` : undefined;
+    const note = [s?.traceNote, differs, gasDiffers, stateDiffers, t.rulesNote].filter(Boolean).join(' ');
+    return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(gasAgrees !== undefined && { gasAgrees }), ...(state && { stateAgrees: state.agrees }), ...(note && { note }) });
   }));
+}
+
+/**
+ * A traced run's state changes against what a block's access list records its transaction changed (EIP-7928, from
+ * Amsterdam on): every storage slot, nonce, balance and code, each as it stood after the transaction.
+ *
+ * Two things the list counts that a traced call doesn't are put back first. The fee: the sender's balance on the
+ * chain is lower by what was paid, the fee recipient's higher by the tip; a balance the list has for either that
+ * the trace doesn't touch is taken to be the fee alone. And the sender's nonce, which goes up by one with every
+ * transaction: checked against the transaction's own.
+ */
+export function compareWithAccessList(changes: StateChange[] | undefined, r: NonNullable<ReplayContext['recorded']>): { agrees: boolean; differences?: string[]; compared: number } {
+  const chain = { slot: new Map<string, bigint>(), nonce: new Map<string, bigint>(), balance: new Map<string, bigint>(), code: new Set<string>() };
+  for (const [address, c] of Object.entries(r.changes)) {
+    for (const [slot, value] of Object.entries(c.stateDiff ?? {})) chain.slot.set(`${address} slot 0x${BigInt(slot).toString(16)}`, BigInt(value));
+    if (c.balance !== undefined) chain.balance.set(address, BigInt(c.balance));
+    if (c.nonce !== undefined) chain.nonce.set(address, BigInt(c.nonce));
+    if (c.code !== undefined) chain.code.add(address);
+  }
+  const local = { slot: new Map<string, bigint>(), nonce: new Map<string, bigint>(), balance: new Map<string, bigint>(), code: new Set<string>() };
+  for (const c of changes ?? []) {
+    const address = c.address.toLowerCase();
+    for (const s of c.storage ?? []) local.slot.set(`${address} slot 0x${BigInt(s.slot).toString(16)}`, BigInt(s.after));
+    if (c.balance) local.balance.set(address, c.balance.after);
+    if (c.nonce) local.nonce.set(address, c.nonce.after);
+    if (c.code) local.code.add(address);
+  }
+  const differences: string[] = [];
+  let compared = chain.slot.size + chain.nonce.size + chain.balance.size + chain.code.size;
+  // The sender's nonce: the transaction's own, and one more.
+  if (!local.nonce.has(r.sender) && chain.nonce.has(r.sender)) {
+    if (chain.nonce.get(r.sender) !== r.nonce + 1n) differences.push(`the sender's nonce is ${chain.nonce.get(r.sender)} in the list, ${r.nonce + 1n} after this transaction`);
+    chain.nonce.delete(r.sender);
+  }
+  // The fee, put back; a balance of the sender's or the fee recipient's the trace doesn't touch is the fee alone.
+  if (chain.balance.has(r.sender)) { if (local.balance.has(r.sender)) chain.balance.set(r.sender, chain.balance.get(r.sender)! + r.fee); else chain.balance.delete(r.sender); }
+  if (chain.balance.has(r.coinbase) && r.coinbase !== r.sender) { if (local.balance.has(r.coinbase)) chain.balance.set(r.coinbase, chain.balance.get(r.coinbase)! - r.tip); else chain.balance.delete(r.coinbase); }
+  const both = (what: string, theirs: Map<string, bigint>, ours: Map<string, bigint>, name: (k: string) => string) => {
+    for (const [k, v] of theirs) { if (!ours.has(k)) differences.push(`${name(k)} is ${what === 'slot' ? `0x${v.toString(16)}` : v} in the list and unchanged in the trace`); else if (ours.get(k) !== v) differences.push(`${name(k)} is ${what === 'slot' ? `0x${v.toString(16)}` : v} in the list, ${what === 'slot' ? `0x${ours.get(k)!.toString(16)}` : ours.get(k)} in the trace`); }
+    for (const k of ours.keys()) if (!theirs.has(k)) differences.push(`${name(k)} changes in the trace and not in the list`);
+  };
+  both('slot', chain.slot, local.slot, k => k);
+  both('nonce', chain.nonce, local.nonce, k => `${k}'s nonce`);
+  both('balance', chain.balance, local.balance, k => `${k}'s balance`);
+  for (const a of chain.code) if (!local.code.has(a)) differences.push(`${a}'s code changes in the list and not in the trace`);
+  for (const a of local.code) if (!chain.code.has(a)) differences.push(`${a}'s code changes in the trace and not in the list`);
+  return differences.length ? { agrees: false, differences, compared } : { agrees: true, compared };
 }
 
 /**

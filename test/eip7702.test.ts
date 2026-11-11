@@ -125,6 +125,12 @@ test('Signed authorizations go to eth_simulateV1 as they are, and their authorit
   const block = sent!.params[0].blockStateCalls[0];
   assert.equal(block.calls[0].authorizationList?.length, 1);
   assert.equal(block.stateOverrides?.[me.address.toLowerCase()], undefined, 'the node applies it; no override');
+  // Its numbers go to the node without leading zeros, however the wallet wrote them: go-ethereum's nodes refuse
+  // "0x00ab…", which is how a signature's r and s are usually padded.
+  sent = undefined;
+  const padded = { address: DELEGATE, chainId: '0x01', nonce: '0x03', r: `0x00${'ab'.repeat(31)}`, s: `0x0${'1'.repeat(63)}`, yParity: '0x00' };
+  await new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 1, from: me.address.toLowerCase(), to: me.address, data: '0x', value: 0n, authorizationList: [padded] });
+  assert.deepEqual(sent!.params[0].blockStateCalls[0].calls[0].authorizationList, [{ address: DELEGATE, chainId: '0x1', nonce: '0x3', r: `0x${'ab'.repeat(31)}`, s: `0x${'1'.repeat(63)}`, yParity: '0x0' }]);
   // Only the stand-in code is left out: a balance the caller sets for the authority still reaches the node.
   sent = undefined;
   await previewRequest({ method: 'eth_sendTransaction', params: [{ from: me.address, to: me.address, chainId: '0x1', authorizationList: [{ address: a.address, chainId: toHex(a.chainId), nonce: toHex(a.nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) }] }] },

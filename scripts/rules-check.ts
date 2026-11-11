@@ -25,6 +25,7 @@ import { hashMessage, type Hex } from 'viem';
 import { CHAIN_PROFILES, ForkSimulator, nodeRulesOf } from '../src/fork-simulator.ts';
 import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
+import { authorizationsForNode } from '../src/simulation.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import type { SimulationRequest } from '../src/types.ts';
@@ -51,7 +52,7 @@ const opcodeProgram = (op: number): Hex => `0x${Array.from({ length: 17 }, (_, i
 /** A few mnemonics, enough for the crafted programs; a bare hex literal is a PUSH of it. */
 const OPS: Record<string, string> = {
   STOP: '00', SUB: '03', EXP: '0a', SHL: '1b', KECCAK256: '20', BALANCE: '31', CALLER: '33', CALLDATASIZE: '36', CALLDATACOPY: '37', RETURNDATASIZE: '3d', RETURNDATACOPY: '3e',
-  BLOCKHASH: '40', NUMBER: '43', POP: '50', MLOAD: '51', SWAP1: '90',
+  EXTCODESIZE: '3b', EXTCODEHASH: '3f', BLOCKHASH: '40', NUMBER: '43', POP: '50', MLOAD: '51', SWAP1: '90',
   MSTORE: '52', SLOAD: '54', SSTORE: '55', GAS: '5a', TLOAD: '5c', TSTORE: '5d', MCOPY: '5e', LOG2: 'a2', CREATE: 'f0', CALL: 'f1', RETURN: 'f3', DELEGATECALL: 'f4', CREATE2: 'f5',
   STATICCALL: 'fa', REVERT: 'fd', SELFDESTRUCT: 'ff',
 };
@@ -67,6 +68,8 @@ function crafted(amsterdam: boolean): Program[] {
   // Initcode that returns ten bytes (of zeros) as the new contract's code, left-aligned at memory 0.
   const INIT = '600a6000f3 d8 SHL 00 MSTORE';
   const NOBODY = '000000000000000000000000000000000beef078', EMPTY = '000000000000000000000000000000000beef079';
+  const DELEGATED = '00000000000000000000000000000000de1e9a7e', TO_PRECOMPILE = '00000000000000000000000000000000de1e9a7f', DELEGATE = '00000000000000000000000000000000c0de7704';
+  const delegations: StateChanges = { [`0x${DELEGATE}`]: { code: '0x602a60005260206000f3' }, [`0x${DELEGATED}`]: { code: `0xef0100${DELEGATE}` }, [`0x${TO_PRECOMPILE}`]: { code: `0xef0100${'00'.repeat(19)}04` } };
   return [
     { label: 'BLOCKHASH of the block before', code: asm(`01 NUMBER SUB BLOCKHASH ${RET}`) },
     { label: 'BALANCE of the sender', code: asm(`CALLER BALANCE ${RET}`) },
@@ -99,6 +102,13 @@ function crafted(amsterdam: boolean): Program[] {
     { label: 'DUPN of the 17th item', code: `0x${Array.from({ length: 20 }, (_, i) => `60${hex2(20 - i)}`).join('')}e600${asm(RET).slice(2)}` },
     { label: 'SWAPN with the 18th item', code: `0x${Array.from({ length: 20 }, (_, i) => `60${hex2(20 - i)}`).join('')}e700${asm(RET).slice(2)}` },
     { label: 'EXCHANGE of two items', code: `0x${Array.from({ length: 20 }, (_, i) => `60${hex2(20 - i)}`).join('')}e80150${asm(RET).slice(2)}` },
+    // Accounts that are delegated already (EIP-7702; their code is 0xef0100 and the delegate's address): what
+    // their code reads as, and a call into one, which runs the delegate's code and pays to reach it. One delegates
+    // to a contract that returns 42, the other to the identity precompile, whose code is none.
+    { label: 'EXTCODESIZE and EXTCODEHASH of a delegated account', code: asm(`${DELEGATED} EXTCODESIZE 00 MSTORE ${DELEGATED} EXTCODEHASH 20 MSTORE 40 00 RETURN`), state: delegations },
+    { label: 'CALL to an account delegated to a contract', code: asm(`20 00 00 00 00 ${DELEGATED} GAS CALL POP 00 MLOAD ${RET}`), state: delegations },
+    { label: 'CALL to the same delegated account twice (cold, then warm)', code: asm(`20 00 00 00 00 ${DELEGATED} GAS CALL POP 20 00 00 00 00 ${DELEGATED} GAS CALL POP 00 MLOAD ${RET}`), state: delegations },
+    { label: 'CALL to an account delegated to a precompile', code: asm(`2a 00 MSTORE 20 20 20 00 00 ${TO_PRECOMPILE} GAS CALL ${RET}`), state: delegations },
     { label: 'a plain transfer of a wei to an account', to: '0x000000000000000000000000000000000000beef', value: 1n },
     { label: 'a call with 100 bytes of calldata', to: '0x000000000000000000000000000000000000beef', data: `0x${'11'.repeat(100)}` },
   ];
@@ -239,14 +249,14 @@ class Chain {
   }
 
   private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined): Promise<Outcome[] | null> {
-    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}`, ...(p.authorizationList && { authorizationList: p.authorizationList }) }));
+    const calls = programs.map(p => ({ from: FROM, to: p.to, data: p.data ?? '0x', value: `0x${(p.value ?? 0n).toString(16)}`, gas: `0x${(p.gas ?? GAS).toString(16)}`, ...(p.authorizationList && { authorizationList: authorizationsForNode(p.authorizationList) }) }));
     const kind = (ok: boolean, message?: string): Outcome['kind'] => (ok ? 'runs' : INVALID.test(message ?? '') ? 'invalid' : 'fails');
     // Without the pseudo-logs traceTransfers would add, and the logs a chain writes outside the EVM (Polygon's own transfer logs).
     const logsOf = (logs: { address: string; topics: string[]; data: string }[] | undefined) => (logs ?? []).filter(l => l.address.toLowerCase() !== '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' && !chainsOwnLog(l)).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|');
     if (this.simulateV1) {
       const out = await this.post({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ stateOverrides: overrides, calls, ...(at && { blockOverrides: nodeOverrides(at.header) }) }], validation: false }, at?.block ?? 'latest'] });
       if (out.error && (out.error.code === -32601 || /method not found|does not exist|not supported|unsupported method/i.test(out.error.message ?? ''))) this.simulateV1 = false;
-      else if (out.error || !out.result?.[0]?.calls) return null;
+      else if (out.error || !out.result?.[0]?.calls) { if (process.env.RULES_DEBUG) console.log(`  the node: ${JSON.stringify(out.error ?? out).slice(0, 300)}`); return null; }
       else return (out.result[0].calls as { status: string; returnData: string; gasUsed: string; logs?: any[]; error?: { message?: string; data?: string } }[]).map(c => ({ kind: kind(c.status === '0x1', c.error?.message), returns: ((c.status === '0x1' ? c.returnData : c.error?.data ?? c.returnData) ?? '0x').toLowerCase(), gas: BigInt(c.gasUsed), logs: logsOf(c.logs), why: c.error?.message }));
     }
     // No eth_simulateV1: each program in an eth_call of its own (no gas figure, no events).

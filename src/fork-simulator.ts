@@ -22,7 +22,7 @@ import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { formatUnits } from './format.ts';
-import { approvalKey, decodeRevert, decodeState, ELSEWHERE, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
+import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -73,6 +73,13 @@ export interface ChainProfile {
    * to G2 66,640 (23,800); the multi-scalar discounts are Ethereum's; blake2f 22 a round (1). Applied with `storageGas`.
    */
   precompilePrices?: Record<number, Record<string, number>>;
+  /**
+   * EIPs the chain runs that its fork doesn't have. HyperEVM, on Cancun's rules, follows an EIP-7702 delegation: a
+   * call into an account whose code is 0xef0100 and an address runs that address's code (measured on its node with
+   * such code given to an account; it mined no EIP-7702 transaction in 400 blocks, so whether an account there
+   * can come to hold one wasn't seen).
+   */
+  eips?: number[];
   /**
    * The longest code a contract may have, where it isn't Ethereum's 24,576 bytes (before Amsterdam). Polygon's is
    * 32,768: measured on its node, where a creation of 32,768 bytes of code succeeds and one of 32,769 fails. (Its
@@ -133,7 +140,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // low, by a multiple of 840.
   137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true, maxCodeSize: 32_768 },
   56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES },
-  999: { hardfork: 'cancun', ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
+  999: { hardfork: 'cancun', eips: [7702], ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
 
@@ -867,7 +874,7 @@ export class ForkSimulator implements Simulator {
       const hex = (v: bigint) => `0x${v.toString(16)}`, sent = new Map<string, bigint>();
       for (const r of options.after) sent.set(hexOf(r.from), (sent.get(hexOf(r.from)) ?? 0n) + 1n);
       source.after = { sent, blockOverrides: nodeOverrides(at.header), calls: options.after.map(r => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
-        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: r.authorizationList }) })) };
+        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })) };
     }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.
@@ -900,7 +907,7 @@ export class ForkSimulator implements Simulator {
     const amsterdam = ETHEREUM_RULES.has(chainId) && !!block.amsterdam;
     const hardfork = amsterdam ? 'amsterdam' : chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
     if (hardfork !== profile.hardfork) profile = { ...profile, hardfork };
-    const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never });
+    const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never, ...(profile.eips && { eips: profile.eips }) });
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
     const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
     for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address)) source.nodeOnly.set(address, name);
@@ -1155,6 +1162,9 @@ export class ForkSimulator implements Simulator {
       const senderAccount = (await state.getAccount(sender)) ?? new Account();
       senderAccount.nonce++;
       await state.putAccount(sender, senderAccount);
+      // What the transaction changes is recorded from here: its authorizations' effects (an authority's nonce and
+      // code) are its own, as the call's are.
+      if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
       const authorized = await this.authorize(state, evm, auths[i], chainId, caller);
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
@@ -1174,7 +1184,6 @@ export class ForkSimulator implements Simulator {
       }
       callIndex = i;
       recording = true;
-      if (req.trace) state.written = { accounts: new Map(), storage: new Map() };
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
@@ -1185,7 +1194,9 @@ export class ForkSimulator implements Simulator {
       const gasUsed = transactionGas(req, spent > 0n ? spent : 0n, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
-        results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data, ...(traced?.trace && { trace: traced.trace }) });
+        results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data,
+          // A call that fails changes nothing itself; the transaction's authorizations (EIP-7702) stay as applied.
+          ...(traced?.trace && { trace: traced.trace, ...(traced.stateChanges.length && { stateChanges: traced.stateChanges }) }) });
         continue;
       }
       const logs = (ex.logs ?? []).map(([address, topics, data]) => ({ address: bytesToHex(address), topics: topics.map(t => bytesToHex(t)), data: bytesToHex(data) }));
