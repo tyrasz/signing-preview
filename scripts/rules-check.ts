@@ -357,6 +357,9 @@ class Chain {
       const local = await this.locally(placed, overrides, given && at ? { ...at, state } : at, price);
       // The same for the local EVM's reads: a backend that hasn't the named block yet, or no longer its state.
       if (attempt < 6 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
+      // And a public RPC turning the local EVM's reads away (HTTP 429: Arbitrum's, from GitHub's runners, for four
+      // programs in a scheduled run): asked again after a longer wait each time.
+      if (attempt < 6 && local.some(l => l.kind === 'refused' && RATE_LIMITED.test(l.why ?? ''))) { await new Promise(r => setTimeout(r, 10_000 * (attempt + 1))); continue; }
       return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: 'the node did not answer' }, local: local[i] }));
     }
   }
@@ -403,7 +406,10 @@ class Chain {
   }
 }
 
-interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** How many of `differences` are programs'. */ programsDiffer?: number; /** Its blocks are Amsterdam's. */ amsterdam?: boolean; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
+/** A public RPC's answer when it is turning requests away. */
+const RATE_LIMITED = /HTTP 429|rate limit|too many requests/i;
+
+interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** Programs a public RPC's rate limit kept from running, after waits: not compared. */ uncompared: string[]; /** How many of `differences` are programs'. */ programsDiffer?: number; /** Its blocks are Amsterdam's. */ amsterdam?: boolean; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
 
 /** Differences that are the node's way of answering, not a rule the local EVM has wrong: listed, not counted. */
 const EXPECTED: Record<number, Record<string, string>> = {
@@ -453,6 +459,10 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
     results.forEach(({ node, local }, j) => {
       // RULES_SHOW=<part of a label>: what the node and the local EVM gave for the programs it names.
       if (process.env.RULES_SHOW && batch[j].label.includes(process.env.RULES_SHOW)) console.log(`  ${batch[j].label}: the node ${node.kind}, ${node.gas} gas, returns ${node.returns.slice(0, 74)}, ${node.logs ? node.logs.split('|').length : 0} events; the local EVM ${local.kind}, ${local.gas} gas, returns ${local.returns.slice(0, 74)}, ${local.logs ? local.logs.split('|').length : 0} events`);
+      // A program a rate limit kept from running, after the waits above, says nothing about the EVM: not compared,
+      // and counted apart (a chain where many weren't fails the strict check all the same).
+      const limited = [node, local].find(o => o.kind === 'refused' && RATE_LIMITED.test(o.why ?? ''));
+      if (limited) { report.uncompared.push(`${batch[j].label}: ${limited.why?.slice(0, 80)}`); return; }
       if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
       report.compared++;
       const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
@@ -485,7 +495,7 @@ const OVER_THE_CAP: Record<string, string> = Object.fromEntries(['GAS, on a limi
 
 async function check(chainId: number): Promise<Report> {
   const chain = new Chain(chainId), profile = CHAIN_PROFILES[chainId];
-  const report: Report = { chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, differences: [], expected: [], drift: false };
+  const report: Report = { chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, differences: [], expected: [], drift: false, uncompared: [] };
   const head = await chain.client.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as { number: string; blockAccessListHash?: string };
   report.block = BigInt(head.number).toString();
   const amsterdam = head.blockAccessListHash !== undefined && (chainId === 1 || chainId === 11155111);
@@ -563,7 +573,7 @@ async function replays(chainId: number, url: string, count = 24): Promise<{ repl
 
 const reports: Report[] = [];
 for (const chainId of CHAINS_ASKED) {
-  try { reports.push(await check(chainId)); } catch (e) { reports.push({ chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, differences: [`the check did not run: ${(e as Error).message.slice(0, 200)}`], expected: [], drift: false }); }
+  try { reports.push(await check(chainId)); } catch (e) { reports.push({ chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, uncompared: [], differences: [`the check did not run: ${(e as Error).message.slice(0, 200)}`], expected: [], drift: false }); }
   const r = reports.at(-1)!;
   console.log(`\n== ${r.name} (chain ${r.chainId})${r.block ? `, block ${r.block}` : ''}`);
   for (const line of r.fork) console.log(`  ${line}`);
@@ -573,13 +583,15 @@ for (const chainId of CHAINS_ASKED) {
   if (r.replays) console.log(`  ${r.replays}`);
   for (const d of r.differences) console.log(`    ${d}`);
   for (const d of r.expected) console.log(`    (expected) ${d}`);
+  if (r.uncompared.length) console.log(`    not compared, rate limited: ${r.uncompared.length} (${r.uncompared.slice(0, 3).join('; ')})`);
 }
 if (OUT) writeFileSync(OUT, JSON.stringify(reports, null, 2));
 if (SUMMARY_MD) {
   const lines = ['### Rules check', '', '| Chain | Fork | Compared | Differ |', '|---|---|---|---|', ...reports.map(r => `| ${r.name} | ${r.drift ? '**changed**' : r.fork[0]?.includes('the one checked') ? 'as checked' : 'not known'} | ${r.compared} | ${r.differences.length} |`), ''];
-  for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1 || r.replays) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.replays ? [`- ${r.replays}`] : []), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), '');
+  for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1 || r.replays || r.uncompared.length) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.replays ? [`- ${r.replays}`] : []), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), ...(r.uncompared.length ? [`- Not compared, the RPC's rate limit: ${r.uncompared.length}`] : []), '');
   appendFileSync(SUMMARY_MD, `${lines.join('\n')}\n`);
 }
-const failing = reports.filter(r => r.drift || r.differences.length);
+// More than a tenth of a chain's programs kept from running by rate limits is a check that didn't run.
+const failing = reports.filter(r => r.drift || r.differences.length || r.uncompared.length * 10 > r.compared + r.uncompared.length);
 console.log(`\n${reports.length} chain${reports.length === 1 ? '' : 's'} checked; ${failing.length ? `${failing.map(r => r.name).join(', ')} need${failing.length === 1 ? 's' : ''} a look` : 'the local EVM runs each as its node does'}.`);
 if (STRICT && failing.length) process.exit(1);

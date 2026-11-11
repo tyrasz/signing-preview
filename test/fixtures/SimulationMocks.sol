@@ -132,6 +132,29 @@ contract SharesToken {
     }
 }
 
+/// A token whose balanceOf costs over a million gas (it works a holder's balance out in a loop, as Open Genesis on BNB
+/// Chain does for 1.37 million) and whose events mislead: sweep() logs the token sending the caller 100 and the caller
+/// sending 101, while the caller's whole balance goes.
+contract HeavyToken {
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    mapping(address => uint256) internal held;
+    function decimals() external pure returns (uint8) { return 18; }
+    function symbol() external pure returns (string memory) { return "HVY"; }
+    function mint(address to, uint256 amount) external { held[to] += amount; }
+    function balanceOf(address a) external view returns (uint256) {
+        uint256 x;
+        for (uint256 i = 0; i < 8000; i++) x = uint256(keccak256(abi.encode(x, i)));
+        return held[a] + (x == 1 ? 1 : 0);
+    }
+    function sweep(address to) external {
+        uint256 all = held[msg.sender];
+        held[msg.sender] = 0;
+        held[to] += all;
+        emit Transfer(address(this), msg.sender, 100);
+        emit Transfer(msg.sender, to, 101);
+    }
+}
+
 /// Reads a chain-specific precompile at 0x…0800 (HyperEVM's HyperCore reads live there).
 contract CoreReader {
     function read(uint32 x) external view returns (uint256) {

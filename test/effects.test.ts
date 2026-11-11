@@ -164,6 +164,57 @@ test('RpcSimulator reads the real allowance after each call, so a silently spent
   assert.deepEqual(p.approvals?.map(a => [a.allowance, a.revoked, a.basis]), [['none', true, 'simulated_state']], 'state after the batch');
 });
 
+test('On a node that splits a block’s gas among the calls that set none, a heavy balanceOf is read again on its own', async () => {
+  // reth's eth_simulateV1 (BNB Chain's public node) gives each call without a gas field an equal share of what the
+  // block has left. A token like Open Genesis works out a holder's balance for 1.37 million gas and emits events
+  // that mislead: the token "sends" Alice 100 and she sends 101, while her balance goes from 1,000 to nothing.
+  const OG = '0x0e0000000000000000000000000000000000000e', LIMIT = 15_000_000n;
+  const node = (mainNeeds: bigint, mainUses: bigint) => {
+    const bodies: { from?: string; to?: string; data: string; gas?: string }[][] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      const calls = JSON.parse(String(init.body)).params[0].blockStateCalls[0].calls as { from?: string; to?: string; data: string; gas?: string }[];
+      bodies.push(calls);
+      const set = calls.reduce((sum, c) => sum + (c.gas ? BigInt(c.gas) : 0n), 0n), unset = BigInt(calls.filter(c => !c.gas).length);
+      const allowance = (c: { gas?: string }) => (c.gas ? BigInt(c.gas) : (LIMIT - set) / (unset || 1n));
+      let spent = false;
+      const out = calls.map(c => {
+        if (c.data === '0xdeadbeef') {
+          if (allowance(c) < mainNeeds) return { status: '0x0', gasUsed: `0x${allowance(c).toString(16)}`, returnData: '0x', logs: [] };
+          spent = true;
+          return { status: '0x1', gasUsed: `0x${mainUses.toString(16)}`, returnData: '0x', logs: [
+            { address: OG, topics: [T.transfer, w(OG), w(ALICE)], data: data(100n) },
+            { address: OG, topics: [T.transfer, w(ALICE), w(ROUTER)], data: data(101n) },
+          ] };
+        }
+        if (c.to === OG && c.data.startsWith('0x70a08231') && c.data.endsWith(ALICE.slice(2).toLowerCase())) {
+          return allowance(c) < 1_370_000n ? { status: '0x0', gasUsed: `0x${allowance(c).toString(16)}`, returnData: '0x', logs: [] } : { status: '0x1', gasUsed: '0x14e8c0', returnData: data(spent ? 0n : 1_000n), logs: [] };
+        }
+        return { status: c.data.startsWith('0x01ffc9a7') ? '0x0' : '0x1', gasUsed: '0x5208', returnData: c.data.startsWith('0x70a08231') ? data(0n) : '0x', logs: [] };
+      });
+      return new Response(JSON.stringify({ result: [{ calls: out }] }));
+    }) as typeof fetch;
+    return { simulator: new RpcSimulator({ 56: 'http://rpc.invalid' }, { fetchImpl }), bodies };
+  };
+  const moved = (r: SimulationResult) => r.transfers.filter(t => t.asset === OG).map(t => [t.from, t.to, t.raw]);
+  const request: SimulationRequest = { chainId: 56, from: ALICE.toLowerCase(), to: ROUTER, data: '0xdeadbeef', value: 0n };
+  // The swap runs on its share of the reads' block, but the balance reads around it don't get the 1.37 million they
+  // need. Asked again on their own, with the swap given what it used and half as much again and 100,000: 1,000 left.
+  const a = node(500_000n, 400_000n);
+  const ra = (await a.simulator.simulate(request))!;
+  assert.deepEqual([moved(ra), ra.balancesRead], [[[ALICE.toLowerCase(), ROUTER, 1_000n]], true]);
+  assert.equal(a.bodies.length, 3);
+  assert.deepEqual(a.bodies[2].map(c => [c.data.slice(0, 10), c.gas]), [['0x70a08231', undefined], ['0xdeadbeef', `0x${700_000n.toString(16)}`], ['0x70a08231', undefined]]);
+  // A swap that needs more than its share among the reads fails there: asked again the same way, for the tokens
+  // its logs name.
+  const b = node(900_000n, 600_000n);
+  const rb = (await b.simulator.simulate(request))!;
+  assert.deepEqual([moved(rb), rb.balancesRead, b.bodies.length], [[[ALICE.toLowerCase(), ROUTER, 1_000n]], true, 3]);
+  // Where the lean pass doesn't come out as the first run did (here: the swap can't run on what it is given), the
+  // events stand.
+  const c = node(1_100_000n, 600_000n);
+  assert.deepEqual(moved((await c.simulator.simulate(request))!), [[OG, ALICE.toLowerCase(), 100n], [ALICE.toLowerCase(), ROUTER, 101n]]);
+});
+
 test('Demo sample: a router call that buys an NFT and sets a Permit2 allowance along the way', async () => {
   const { sample } = await import('./helpers.ts');
   const p = await sample('eth-nft-buy');

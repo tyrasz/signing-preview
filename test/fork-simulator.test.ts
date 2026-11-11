@@ -415,6 +415,21 @@ test('A block given a later time for the chain’s node runs at its own time in 
   assert.deepEqual([await time(header), await time({ ...header, ownTimestamp: 0x65000001n })], [0x65000002n, 0x65000001n]);
 });
 
+test('A token whose balanceOf costs over a million gas is read for what it holds, not for what its events say', async () => {
+  // Open Genesis, on BNB Chain, works a holder's balance out for 1.37 million gas, and its events netted to one unit
+  // where a sender's balance went down by 4.56e18. The local EVM's views had a million gas, so the read failed and
+  // the events stood.
+  const heavy = await chain.deploy('HeavyToken');
+  const H = parseAbi(['function mint(address,uint256)', 'function sweep(address)', 'function balanceOf(address) view returns (uint256)']);
+  await chain.exec(heavy, encodeFunctionData({ abi: H, functionName: 'mint', args: [USER as Hex, 1_000n] }));
+  const [r] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: heavy, data: encodeFunctionData({ abi: H, functionName: 'sweep', args: [BOB as Hex] }), value: 0n }]))!;
+  const net = r.transfers.filter(t => t.asset === heavy).reduce((sum, t) => sum + (t.to === USER ? t.raw : 0n) - (t.from === USER ? t.raw : 0n), 0n);
+  assert.deepEqual([r.status, net], ['success', -1_000n]);
+  // What its balanceOf costs, measured: over a million.
+  const [read] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: heavy, data: encodeFunctionData({ abi: H, functionName: 'balanceOf', args: [USER as Hex] }), value: 0n }]))!;
+  assert.ok(read.gasUsed! > 1_000_000n && read.gasUsed! < 10_000_000n, String(read.gasUsed));
+});
+
 test('Polygon lets a contract be 32,768 bytes long: a creation Ethereum’s limit refuses succeeds there', async () => {
   // The code creates a contract of `size` zero bytes and returns its address, or zero where the creation failed.
   const creating = (size: number) => `0x6561${size.toString(16).padStart(4, '0')}6000f360d01b600052600660006000f060005260206000f3`;

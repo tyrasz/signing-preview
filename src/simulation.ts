@@ -456,6 +456,13 @@ export class RpcSimulator implements Simulator {
    * - every permission the senders granted so far, after each call (many tokens spend allowances without an event).
    * The reads come from the zero address, so they don't move the senders' nonces. If the re-run's outcomes differ
    * from the first (the state moved on), the event-based values stand.
+   *
+   * A node built on reth (BNB Chain's public one) splits the block's gas evenly among the calls that set none: 22
+   * such calls got 3.2 million each of a 70 million block, and the seventy-odd reads around a swap got about a
+   * million each, which one token's balanceOf (1.37 million gas: Open Genesis, on BNB Chain) ran out of, so its
+   * misleading events stood (they netted to one unit where the sender's balance went down by 4.56e18). Reads of a
+   * token the logs show moving for a sender that fail, and a re-run whose outcomes differ, are asked again in a lean
+   * pass (leanReads).
    */
   private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[]) {
     const owners = [...new Set(reqs.map(r => (r.account ?? r.from).toLowerCase()))];
@@ -496,8 +503,27 @@ export class RpcSimulator implements Simulator {
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     if (!out || out.length !== calls.length) return;
-    // The re-run must have gone the same way, or its reads describe a different execution.
-    if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success'))) return;
+    // The re-run must have gone the same way, or its reads describe a different execution. On a node that splits
+    // the block's gas among the calls that set none, a call that set none may have run short among the reads: it is
+    // asked again with its own (leanReads), for the tokens its logs name.
+    if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success'))) {
+      const pairs = owners.flatMap(owner => [...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)).map(token => ({ owner, token })));
+      const again = pairs.length && reqs.some(r => r.gas === undefined) ? await this.leanReads(url, reqs, parsed, pairs).catch(() => undefined) : undefined;
+      if (!again) return;
+      parsed.forEach((p, i) => {
+        if (p.status !== 'success') return;
+        for (const { owner, token } of pairs) {
+          const x = again.get(`${i}:${owner}:${token}`), y = again.get(`${i + 1}:${owner}:${token}`);
+          if (x === undefined || y === undefined) continue;
+          const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner ? ELSEWHERE : to;
+          p.transfers = p.transfers.filter(t => t.asset !== token || (t.from !== owner && t.to !== owner));
+          if (y < x) p.transfers.push({ asset: token, from: owner, to: target, raw: x - y });
+          else if (y > x) p.transfers.push({ asset: token, from: target, to: owner, raw: y - x });
+        }
+        p.balancesRead = true;
+      });
+      return;
+    }
     for (const { call, approval, index } of reads) {
       const r = out[index];
       if (r.status !== '0x1') continue; // non-standard token: keep the event value
@@ -505,13 +531,19 @@ export class RpcSimulator implements Simulator {
       if (state) { (parsed[call].approvalState ??= []).push(state); unconfirmed.delete(approval); }
     }
     for (const p of parsed) if (p.approvals) p.approvals = p.approvals.filter(a => !unconfirmed.has(a));
-    const word = (r: RawCallResult) => r.status === '0x1' && r.returnData.length >= 66 ? BigInt(r.returnData.slice(0, 66)) : undefined;
+    const word = (r: RawCallResult | undefined) => r && r.status === '0x1' && r.returnData.length >= 66 ? BigInt(r.returnData.slice(0, 66)) : undefined;
     const isNft = new Set(tokens.filter((_, j) => word(out[nftChecks[j]]) === 1n));
+    // Reads that failed (reverted, as one that runs out of gas does) for a token the logs show moving for its owner:
+    // asked again on their own (leanReads). One that answered nothing is a token without balanceOf, and stays so.
+    const movedFor = new Set(parsed.flatMap(r => r.transfers.flatMap(t => [`${t.from}:${t.asset}`, `${t.to}:${t.asset}`])));
+    const failed = balances[0].filter((b, j) => !isNft.has(b.token) && movedFor.has(`${b.owner}:${b.token}`) && balances.some(at => out[at[j].index].status !== '0x1'));
+    const again = failed.length ? await this.leanReads(url, reqs, parsed, failed.map(b => ({ owner: b.owner, token: b.token }))).catch(() => undefined) : undefined;
+    const read = (at: number, j: number) => again?.get(`${at}:${balances[at][j].owner}:${balances[at][j].token}`) ?? word(out[balances[at][j].index]);
     parsed.forEach((p, i) => {
       if (p.status !== 'success') return;
       for (const [j, b] of balances[i + 1].entries()) {
         if (isNft.has(b.token)) continue;
-        const x = word(out[balances[i][j].index]), y = word(out[b.index]);
+        const x = read(i, j), y = read(i + 1, j);
         if (x === undefined || y === undefined) continue; // balanceOf unreadable: keep the logs
         // The balance difference replaces whatever the logs said about this token and owner.
         // A call to the account itself (an EIP-7702 account running its own batch) moved the tokens elsewhere.
@@ -522,6 +554,38 @@ export class RpcSimulator implements Simulator {
       }
       p.balancesRead = true;
     });
+  }
+
+  /**
+   * Balance reads asked again on their own (readState): the calls as before, with the given owners' balances of the
+   * given tokens read before the first and after each, and nothing else. Each call is given its own gas (what it set,
+   * else what it used and half as much again and 100,000), so a node that splits the block's gas among the calls that
+   * set none (reth's) gives the few reads a large share. Every call must come out as it did the first time: the same
+   * outcome and the same gas used, or nothing is read. The values by `${callsBefore}:${owner}:${token}`.
+   */
+  private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[]): Promise<Map<string, bigint> | undefined> {
+    const READER = '0x0000000000000000000000000000000000000000';
+    const calls: unknown[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
+    const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push({ from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
+    const fields = await Promise.all(this.warmed(reqs).map(simulationFields));
+    reads(0);
+    reqs.forEach((req, i) => {
+      const used = parsed[i].gasUsed;
+      if (req.gas === undefined && used === undefined) throw new Error('no gas to give the call');
+      callIndex.push(calls.length);
+      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...fields[i], ...(req.gas === undefined && { gas: `0x${(used! * 3n / 2n + 100_000n).toString(16)}` }) });
+      reads(i + 1);
+    });
+    const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
+    const blockOverrides = this.blockOverrides(reqs);
+    const before = await this.before(reqs[0].chainId, reqs);
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };
+    const out = body.result?.[0]?.calls?.slice(before.length);
+    if (!out || out.length !== calls.length) return undefined;
+    if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success') || (parsed[i].gasUsed !== undefined && BigInt(out[ci].gasUsed) !== parsed[i].gasUsed))) return undefined;
+    const values = new Map<string, bigint>();
+    for (const { key, index } of where) { const r = out[index]; if (r.status === '0x1' && r.returnData.length >= 66) values.set(key, BigInt(r.returnData.slice(0, 66))); }
+    return values;
   }
 }
 

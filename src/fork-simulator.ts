@@ -1247,8 +1247,11 @@ export class ForkSimulator implements Simulator {
       }
       return [...out.values()];
     };
+    // A view (a balance, an allowance) gets 10 million gas: a token whose balanceOf works out what an account holds
+    // can take more than a million (Open Genesis, on BNB Chain: 1.37 million), and with less the read fails and the
+    // token's events stand, which for that one netted to a unit where the balance went down by 4.56e18.
     const viewOn = async (on: EVM, to: string, data: Hex) => {
-      const r = await on.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 1_000_000n, isStatic: true, block });
+      const r = await on.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 10_000_000n, isStatic: true, block });
       return r.execResult.exceptionError ? undefined : r.execResult.returnValue;
     };
     const view = (to: string, data: Hex) => viewOn(evm, to, data);
