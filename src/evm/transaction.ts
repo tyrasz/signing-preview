@@ -295,7 +295,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     if (replay) {
       const compared = compareWithReceipt(sim, replay.receipt);
       replayed = { ...replay.info, ...compared };
-      const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.before.length ? `after the ${replay.before.length} transaction${replay.before.length === 1 ? '' : 's'} before it in the block` : 'first in the block'}, at the price it paid.`;
+      const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.earlier ? `after the ${replay.earlier} transaction${replay.earlier === 1 ? '' : 's'} before it in the block${replay.at.state ? " (the state they left read from the block's access list)" : ''}` : 'first in the block'}, at the price it paid.`;
       if (replay.shifted) b.note(SHIFTED);
       if (compared.matches) b.note(`${where} The run has the same outcome, events and gas as its receipt.`);
       else {

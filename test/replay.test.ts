@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs';
 import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
-import { afterParent, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields } from '../src/block.ts';
+import { afterParent, headerAfter, headerOf, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
@@ -417,4 +417,67 @@ test('Glamsterdam, as a preview sees it: the chain’s own transfer log is the n
   // Alone, the same error is the transaction's own: the network would refuse it too.
   const [alone] = (await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl: exhausted }).simulateBatch([request]))!;
   assert.match(alone.revertReason!, /the gas limit is below the minimum/);
+});
+
+test('From Glamsterdam on, a replay starts from what the block’s access list says came before it, with nothing run first', async () => {
+  // A block's access list (EIP-7928), as Sepolia's node serves it: each account the block touched, with every
+  // change to its balance, nonce, code and storage and the entry that made it. Entry 0 is the block's own calls
+  // before its transactions; entry i + 1 is transaction i.
+  const HISTORY = '0x0000F90827F1C53a10cb7A02335B175320002935', DELEGATE = `0xef0100${'ab'.repeat(20)}`;
+  const list = [
+    { address: HISTORY, balanceChanges: [], codeChanges: [], nonceChanges: [], storageChanges: [{ key: '0xaeb', changes: [{ index: '0x0', value: H(0x1023) }] }], storageReads: [] },
+    {
+      address: BOB, storageReads: ['0x5'],
+      balanceChanges: [{ index: '0x1', value: '0x10' }, { index: '0x3', value: '0x20' }, { index: '0x5', value: '0x30' }],
+      nonceChanges: [{ index: '0x1', value: '0x8' }, { index: '0x5', value: '0x9' }],
+      codeChanges: [{ index: '0x2', code: DELEGATE }, { index: '0x5', code: '0x' }],
+      storageChanges: [{ key: '0x1', changes: [{ index: '0x2', value: '0x7' }, { index: '0x3', value: '0x0' }, { index: '0x4', value: '0x9' }] }, { key: '0x2', changes: [{ index: '0x5', value: '0x1' }] }],
+    },
+    // Changed by the fourth transaction itself (entry 4) and after: no part of what it met.
+    { address: ALICE, balanceChanges: [{ index: '0x4', value: '0x1' }], codeChanges: [], nonceChanges: [{ index: '0x4', value: '0x8' }], storageChanges: [], storageReads: [] },
+  ];
+  const serving = (answer: () => unknown) => { const asked: unknown[][] = []; return { asked, client: { has: () => true, call: async (_c: number, method: string, params: unknown[]) => { asked.push([method, ...params]); return answer(); } } }; };
+  const node = serving(() => list);
+  // What the fourth transaction (index 3) met: each item's last change among entries 0 to 3. A slot cleared is zero.
+  const met = { [HISTORY.toLowerCase()]: { stateDiff: { [H(0xaeb)]: H(0x1023) } }, [BOB.toLowerCase()]: { balance: '0x20', nonce: '0x8', code: DELEGATE, stateDiff: { [H(1)]: H(0) } } };
+  assert.deepEqual(await stateBefore(node.client, 11155111, '0x64', 3), met);
+  assert.deepEqual(node.asked, [['eth_getBlockAccessListByBlockNumber', '0x64']]);
+  // The block's first transaction met only what the block itself did first; its last, everything before it.
+  assert.deepEqual(await stateBefore(node.client, 11155111, '0x64', 0), { [HISTORY.toLowerCase()]: { stateDiff: { [H(0xaeb)]: H(0x1023) } } });
+  assert.deepEqual((await stateBefore(node.client, 11155111, '0x64', 5))![BOB.toLowerCase()], { balance: '0x30', nonce: '0x9', code: '0x', stateDiff: { [H(1)]: H(9), [H(2)]: H(1) } });
+  // A node without the method (some of the backends behind Sepolia's public RPC) is asked three times, then the
+  // caller runs the earlier transactions instead; so too for an answer that doesn't read as a list of changes.
+  const without = serving(() => { throw new Error('the method eth_getBlockAccessListByBlockNumber does not exist/is not available'); });
+  assert.deepEqual([await stateBefore(without.client, 11155111, '0x64', 3), without.asked.length], [undefined, 3]);
+  assert.equal(await stateBefore(serving(() => [{ address: BOB, balanceChanges: [{ txIndex: '0x1', value: '0x10' }], nonceChanges: [], codeChanges: [], storageChanges: [] }]).client, 11155111, '0x64', 3), undefined);
+
+  // A replay in such a block: the state is read, the two transactions before it aren't run, and the note says so.
+  const { deps: d, batches, calls } = deps(ran());
+  const glam = (answer: () => unknown): Dependencies => ({ ...d, rpc: { has: d.rpc!.has, call: async (c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockAccessListByBlockNumber') { calls.push({ method, params }); return answer(); }
+    const out = await d.rpc!.call(c, method, params);
+    return method === 'eth_getBlockByNumber' && out ? { ...out as object, blockAccessListHash: H(9), slotNumber: '0xb046bd' } : out;
+  } } as Dependencies['rpc'] });
+  const p = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, glam(() => list));
+  const target = batches[0][0];
+  assert.deepEqual([target.at!.state, target.at!.before, target.at!.block, target.at!.header.amsterdam], [met, [], '0x63', true]);
+  assert.deepEqual(calls.filter(c => c.method === 'eth_getBlockAccessListByBlockNumber').map(c => c.params), [['0x64']]);
+  assert.equal(p.replay!.matches, true);
+  assert.match(p.decoding.notes.join(' '), /after the 2 transactions before it in the block \(the state they left read from the block's access list\), at the price it paid/);
+  // Where the node doesn't serve the list, they are run first, as before Glamsterdam.
+  await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, glam(() => { throw new Error('Method not found'); }));
+  assert.deepEqual([batches[1][0].at!.state, batches[1][0].at!.before!.length], [undefined, 2]);
+
+  // The node's simulation is given that state as overrides of the parent block's, beneath the request's own, and
+  // runs the one call.
+  const sent: { calls: unknown[]; stateOverrides?: Record<string, unknown> }[] = [];
+  const fetchImpl = (async (_u: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { params: [{ blockStateCalls: typeof sent }] };
+    sent.push(body.params[0].blockStateCalls[0]);
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: [{ status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] }] }] }));
+  }) as unknown as typeof fetch;
+  const bob = BOB.toLowerCase();
+  await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }).simulateBatch([{ chainId: 8453, from: ALICE.toLowerCase(), to: BOB, data: '0x', value: 0n, at: { ...target.at!, state: met }, stateOverrides: { [bob]: { balance: '0x99', stateDiff: { [H(3)]: H(4) } } } }]);
+  assert.equal(sent[0].calls.length, 1);
+  assert.deepEqual(sent[0].stateOverrides, { [HISTORY.toLowerCase()]: met[HISTORY.toLowerCase()], [bob]: { balance: '0x99', nonce: '0x8', code: DELEGATE, stateDiff: { [H(1)]: H(0), [H(3)]: H(4) } } });
 });

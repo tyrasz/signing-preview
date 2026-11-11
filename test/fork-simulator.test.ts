@@ -2,7 +2,7 @@
 // without eth_simulateV1), run against real contracts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, serializeSignature, toHex, type Hex } from 'viem';
+import { encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, serializeSignature, toHex, type Hex } from 'viem';
 import { privateKeyToAccount, sign } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { PERMIT2, StaticTokenRegistry } from '../src/chains.ts';
@@ -405,6 +405,42 @@ test('Calls that run first in the block: the node runs them and the local EVM st
     const balance = await chain.fetchImpl(URL_, { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: usdc, data: encodeFunctionData({ abi: parseAbi(['function balanceOf(address) view returns (uint256)']), functionName: 'balanceOf', args: [BOB as Hex] }) }, 'latest'] }) }).then(r => r.json()) as { result: Hex };
     assert.equal(BigInt(balance.result), 0n);
   } finally { chain.simulateV1 = false; }
+});
+
+test('A replay that starts from what its block had changed (the block’s access list): balances, nonces, code and storage', async () => {
+  // As above, Bob's transfer of 30 USDC only works after the user's 50 to him. Here nothing is run first: the state
+  // the earlier transaction left is given (BlockAt.state), as a block's access list has it from Amsterdam on.
+  const CAROL = '0xca401000000000000000000000000000000000c3', MADE = '0xca401000000000000000000000000000000000c4';
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest = { chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 50_000_000n]), value: 0n };
+  const target: SimulationRequest = { chainId: 999, from: BOB, to: usdc, data: call('transfer', [CAROL, 30_000_000n]), value: 0n };
+  // The slots the earlier transfer writes, from a traced run of it: the user's balance and Bob's.
+  const [ran] = (await fork().trace([{ ...earlier, at: { block: '0x10', header } }]))!;
+  const written = ran.stateChanges!.find(c => c.address === usdc)!.storage!;
+  assert.equal(written.length, 2);
+  const state = {
+    [usdc]: { stateDiff: Object.fromEntries(written.map(s => [s.slot, s.after])) },
+    // Bob had sent four more transactions and holds 3 HYPE by then; a contract made earlier in the block returns 42.
+    [BOB]: { nonce: '0x9', balance: toHex(3n * E) },
+    [MADE]: { nonce: '0x1', code: '0x602a60005260206000f3' },
+  };
+  const [alone] = (await fork().simulateBatch([{ ...target, at: { block: '0x10', header } }]))!;
+  assert.equal(alone.status, 'reverted');
+  const at = { block: '0x10', header, state };
+  const [there, made, creation] = (await fork().trace([{ ...target, at }, { chainId: 999, from: BOB, to: MADE, data: '0x', value: 1n, at }, { chainId: 999, from: BOB, to: null, data: '0x60646000f3', value: 0n, at }]))!;
+  assert.deepEqual([there.status, there.transfers.map(t => [t.asset, t.from, t.raw])], ['success', [[usdc, BOB, 30_000_000n]]]);
+  // What the run changed is counted from that state: Bob had 50 USDC.
+  const slots = there.stateChanges!.find(c => c.address === usdc)!.storage!;
+  assert.deepEqual(slots.map(s => [BigInt(s.before), BigInt(s.after)]).sort((a, b) => Number(b[0] - a[0])), [[50_000_000n, 20_000_000n], [0n, 30_000_000n]]);
+  // The contract made earlier in the block is there to call, and the wei sent to it leaves the 3 HYPE Bob had by then.
+  assert.deepEqual([made.status, BigInt(made.returnData!)], ['success', 42n]);
+  assert.deepEqual(made.stateChanges!.find(c => c.address === BOB.toLowerCase())!.balance, { before: 3n * E, after: 3n * E - 1n });
+  // A contract Bob creates is at the address his nonce gives it: 9 by then, and the two calls before it here.
+  assert.equal(creation.status, 'success');
+  assert.ok(creation.stateChanges!.some(c => c.address === getContractAddress({ from: BOB as Hex, nonce: 11n }).toLowerCase() && c.code));
+  // A request's own state overrides go on top of it.
+  const [over] = (await fork().simulateBatch([{ ...target, at: { block: '0x10', header, state }, stateOverrides: { [usdc]: { stateDiff: Object.fromEntries(written.map(s => [s.slot, `0x${'00'.repeat(32)}`])) } } }]))!;
+  assert.equal(over.status, 'reverted');
 });
 
 test('A balance the caller sets for the simulation: the local EVM and the chain’s own eth_call both run with it', async () => {

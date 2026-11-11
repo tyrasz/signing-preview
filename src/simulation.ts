@@ -3,7 +3,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
-import { nodeOverrides, priceFields } from './block.ts';
+import { nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates, ProbeFailed, probeSimulate, ProbeUnsupported } from './simulation-probe.ts';
 import type { SimulatedApproval, SimulatedNftTransfer, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator } from './types.ts';
 
@@ -56,7 +56,7 @@ export interface RpcSimulatorOptions {
    * transactions) whose results are dropped. `warm`: addresses the replayed transaction had warm from its start
    * (its EIP-7702 authorities), added to each request's access list.
    */
-  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[]; warm?: string[] } | undefined;
+  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[]; warm?: string[]; state?: StateChanges } | undefined;
 }
 
 /**
@@ -93,7 +93,7 @@ const simulationFields = async (req: SimulationRequest) => {
  * The code overrides eth_simulateV1 needs: those of signed authorizations it applies natively are left out, so an
  * authority's account isn't made to exist beforehand (its refund depends on that).
  */
-async function simulateV1Overrides(reqs: SimulationRequest[]) {
+async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChanges) {
   const all: Record<string, { code?: string; balance?: string; nonce?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string }> = overridesOf(reqs) ?? {};
   // The stand-in for unsigned authorizations: an existing account, without code, at nonce 0.
   if (reqs.some(r => r.unsignedAuthorizations?.length)) all[STAND_IN.address.toLowerCase()] = { balance: '0x1', nonce: '0x0', code: '0x' };
@@ -103,6 +103,8 @@ async function simulateV1Overrides(reqs: SimulationRequest[]) {
       delete all[authority.toLowerCase()];
     } catch { /* unreadable: the chain skips it, and so does the override */ }
   }
+  // Beneath them, what the simulated block had already changed (BlockAt.state: a replay's earlier transactions).
+  for (const [a, s] of Object.entries(state ?? {})) all[a] = { ...s, ...all[a], ...((s.stateDiff || all[a]?.stateDiff) && { stateDiff: { ...s.stateDiff, ...all[a]?.stateDiff } }) };
   return Object.keys(all).length ? all : undefined;
 }
 
@@ -212,6 +214,11 @@ export class RpcSimulator implements Simulator {
     const warm = reqs.length ? this.replay?.(reqs[0].chainId)?.warm : undefined;
     return warm?.length ? reqs.map(r => ({ ...r, accessList: [...(r.accessList ?? []), ...warm.map(address => ({ address, storageKeys: [] }))] })) : reqs;
   }
+  /** What the simulated block had already changed (a replay's, else the requests' own block's: BlockAt.state). */
+  private stateOf(reqs: SimulationRequest[]): StateChanges | undefined {
+    const r = reqs.length ? this.replay?.(reqs[0].chainId) : undefined;
+    return r ? r.state : reqs[0]?.at?.state;
+  }
   /** A replay's earlier calls (see RpcSimulatorOptions.replay), as eth_simulateV1 calls. */
   private async before(chainId: number, reqs?: SimulationRequest[]): Promise<unknown[]> {
     const before = this.replay?.(chainId)?.before ?? reqs?.[0]?.at?.before ?? [];
@@ -251,7 +258,7 @@ export class RpcSimulator implements Simulator {
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
     const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(req) })));
-    const stateOverrides = await simulateV1Overrides(reqs);
+    const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(chainId, reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[]; error?: { code?: number; message: string } };
@@ -405,7 +412,7 @@ export class RpcSimulator implements Simulator {
       for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: READER, to: a.emitter, data: stateCall(a) }); }
       balances.push(balanceReads());
     });
-    const stateOverrides = await simulateV1Overrides(reqs);
+    const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, this.at(reqs[0].chainId, reqs).tag]) as { result?: { calls: RawCallResult[] }[] };

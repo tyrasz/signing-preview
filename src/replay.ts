@@ -7,7 +7,7 @@
 // node keeps all of them.
 import type { Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { afterParent, blobBaseFeeAfter, headerOf, type RpcHeader } from './block.ts';
+import { afterParent, blobBaseFeeAfter, headerOf, stateBefore, type RpcHeader } from './block.ts';
 import { chainName, CHAINS, OP_STACK } from './chains.ts';
 import { formatUnits } from './format.ts';
 import { previewRequest } from './preview.ts';
@@ -83,11 +83,14 @@ export async function replayTransaction(input: { chainId: number; hash: string }
   // A block in the same second as its parent (BNB Chain's often are) runs one second later: nodes take no other.
   const before_ = await read<RpcHeader | null>('eth_getBlockByNumber', [parent, false]);
   const { header, shifted } = afterParent(chainId, headerOf(chainId, block), BigInt(before_?.timestamp ?? '0x0'));
-  const at = { block: parent, header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true };
-  // The block's earlier transactions, as they ran: with their own gas limits and prices. The chain's own are left
-  // out, except an OP Stack block's L1 info deposit.
+  // What the block had changed before this transaction. From Amsterdam on a block carries the list of it (its
+  // access list, EIP-7928), so the state the transaction met is read, exactly, whatever came before it. Otherwise,
+  // and where the node doesn't serve the list, the block's earlier transactions are run first, as they ran: with
+  // their own gas limits and prices (the chain's own left out, except an OP Stack block's L1 info deposit).
+  const state = block.blockAccessListHash !== undefined ? await stateBefore(rpc, chainId, tx.blockNumber, index) : undefined;
+  const at = { block: parent, header: { ...header, ...(blobBaseFee !== undefined && { blobBaseFee }) }, required: true, ...(state && { state }) };
   const earlier = block.transactions.filter(t => Number(BigInt(t.transactionIndex)) < index && (!isSystem(chainId, t, block) || t.from.toLowerCase() === L1_INFO_DEPOSITOR));
-  const before = await Promise.all(earlier.map(async t => ({ ...await requestOf(chainId, t, parent, deps), at })));
+  const before = state ? [] : await Promise.all(earlier.map(async t => ({ ...await requestOf(chainId, t, parent, deps), at })));
 
   const gasUsed = BigInt(receipt.gasUsed), gasForL1 = receipt.gasUsedForL1 !== undefined ? BigInt(receipt.gasUsedForL1) : undefined;
   const gasPrice = BigInt(receipt.effectiveGasPrice ?? tx.gasPrice ?? '0x0');
@@ -97,7 +100,7 @@ export async function replayTransaction(input: { chainId: number; hash: string }
   const chain = CHAINS[chainId];
   const time = Number(BigInt(block.timestamp));
   const replay: ReplayContext = {
-    at, before, gasPrice, ...(tx.blobVersionedHashes?.length && { blobVersionedHashes: tx.blobVersionedHashes, maxFeePerBlobGas: BigInt(tx.maxFeePerBlobGas ?? '0x1') }),
+    at, before, earlier: earlier.length, gasPrice, ...(tx.blobVersionedHashes?.length && { blobVersionedHashes: tx.blobVersionedHashes, maxFeePerBlobGas: BigInt(tx.maxFeePerBlobGas ?? '0x1') }),
     receipt: { status: receipt.status === '0x1' ? 'success' : 'reverted', gasUsed: gasUsed - (gasForL1 ?? 0n), ...(gasForL1 !== undefined && { gasForL1 }), logs: receipt.logs.map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data })) },
     info: {
       hash: tx.hash, block: number.toString(), index, time: new Date(time * 1000).toISOString(),

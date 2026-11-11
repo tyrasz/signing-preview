@@ -35,8 +35,9 @@ import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeFu
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
-import { RpcSimulator } from '../src/simulation.ts';
+import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
+import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
 import { okxDigest } from '../src/erc4337-sim.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
@@ -66,14 +67,19 @@ const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 30_000, retries: 6
 /**
  * A read; a block or transaction the answering backend doesn't have yet (null) is asked for again, four times, a
  * second and more apart, and one still refused for the rate after the client's own retries (HTTP 429: the
- * scheduled run lost 18 operations so) once more after ten seconds.
+ * scheduled run lost 18 operations so) once more after ten seconds. Logs asked of a backend that is behind the one
+ * that gave the head ("block range extends beyond current head block": Sepolia's public RPC) are asked for again too.
  */
 const call = async <T>(method: string, params: unknown[]): Promise<T> => {
   const ask = async () => {
     try { return await rpc.call(CHAIN, method, params) as T; }
     catch (e) { if (!/HTTP 429|rate limited/.test(String(e))) throw e; await new Promise(r => setTimeout(r, 10_000)); return await rpc.call(CHAIN, method, params) as T; }
   };
-  let out = await ask();
+  const behind = async (left: number): Promise<T> => {
+    try { return await ask(); }
+    catch (e) { if (left <= 0 || !/beyond current head/i.test(String(e))) throw e; await new Promise(r => setTimeout(r, 2000)); return behind(left - 1); }
+  };
+  let out = await behind(5);
   for (let i = 0; i < 4 && out === null && /^eth_get(Block|Transaction)/.test(method); i++) { await new Promise(r => setTimeout(r, 1000 * (i + 1))); out = await ask(); }
   return out;
 };
@@ -202,7 +208,7 @@ async function replay(item: string): Promise<void> {
   const r = await call<Receipt>('eth_getTransactionReceipt', [hash]).catch(async () => (await call<Receipt[]>('eth_getBlockReceipts', [tx.blockNumber])).find(x => x.transactionHash.toLowerCase() === hash.toLowerCase())!);
   if (!r) return skip('its receipt could not be read');
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
-  const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; difficulty?: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
+  const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; difficulty?: Hex; gasLimit: Hex; baseFeePerGas: Hex; blockAccessListHash?: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
   // Arbitrum's public RPC keeps about 30 seconds of state, OP Mainnet's and Polygon's about two minutes: an operation
   // whose block is older by the time its turn comes would lose its state partway through the replay (the stand-in's
   // shape, the operation's hash, the simulation itself), and is skipped rather than replayed on part of it.
@@ -270,7 +276,12 @@ async function replay(item: string): Promise<void> {
     : m === 'eth_getCode' && delegation && String(ps[0]).toLowerCase() === sender ? Promise.resolve(delegation) : rpc.call(c, m, ps.map(x => x === 'latest' ? parent : x)) };
   // The block's header, but not its gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on
   // publicnode, below Ethereum's 60M), and the parent's limit, the node's default, is all but the same.
-  let prefix = pricedBefore ?? before; // at no price, then dropped, if the node refuses the block with it (see below)
+  // From Amsterdam on a block carries what each of its transactions changed (its access list: src/block.ts,
+  // stateBefore). Where the node serves it, the state the bundle met is read, exactly, and only what the bundle
+  // itself does first is run: on Sepolia, 12 of 30 operations had been replayed without their block's earlier
+  // transactions, which the node's gas allowance for one simulation couldn't hold.
+  const state = PREFIX && block.blockAccessListHash !== undefined ? await stateBefore(rpc, CHAIN, r.blockNumber, Number(tx.transactionIndex)) : undefined;
+  let prefix = state ? essential : pricedBefore ?? before; // at no price, then dropped, if the node refuses the block with it (see below)
   // The block's own time; BNB Chain's node refuses a simulated block in its parent's second (its blocks come faster
   // than one a second), which then runs a second later, and its gas isn't judged (what writes once a second costs
   // more). The block's DIFFICULTY as each node takes it: BNB Chain's from prevRandao (the block's difficulty there, 2
@@ -283,7 +294,7 @@ async function replay(item: string): Promise<void> {
   }
   const difficulty = block.difficulty ?? '0x0';
   const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: block.mixHash, difficulty } : { prevRandao: block.mixHash };
-  const node = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time, feeRecipient: block.miner, ...randomness, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm }) });
+  const node = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time, feeRecipient: block.miner, ...randomness, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm, ...(state && { state }) }) });
   // The whole operation runs at the price its bundle's transaction paid (tx.gasprice), part of what it met. A preview
   // can't know it, and takes what the operation pays its bundler (src/erc4337-sim.ts); bundlers pay less (on Base, a
   // 0.001 gwei tip where operations offered 0.0015), and a swap taxed by the priority fee came out 1% apart.
@@ -432,7 +443,8 @@ async function replay(item: string): Promise<void> {
     const token = l.address.toLowerCase(), v = BigInt(l.data.slice(0, 66));
     moved.set(token, (moved.get(token) ?? 0n) + (l.topics[0] === DEPOSIT ? v : -v));
   }
-  for (const l of r.logs) if (l.topics[0] === TRANSFER && l.topics.length === 3) {
+  // (Not the chain's own log of a native transfer, from Glamsterdam on: tokens are what is compared here.)
+  for (const l of r.logs) if (l.topics[0] === TRANSFER && l.topics.length === 3 && l.address.toLowerCase() !== NATIVE_LOG_ADDRESS) {
     const from = `0x${l.topics[1].slice(26)}`, to = `0x${l.topics[2].slice(26)}`, token = l.address.toLowerCase(), v = BigInt(l.data);
     if (from === sender) { moved.set(token, (moved.get(token) ?? 0n) - v); if (to === paymaster || !fees.has(token) || v < fees.get(token)!) fees.set(token, v); }
     if (to === sender) moved.set(token, (moved.get(token) ?? 0n) + v);

@@ -39,6 +39,67 @@ export interface BlockAt {
    * a replayed one in its block. (The calls of a request's own batch are all reported.)
    */
   before?: import('./types.ts').SimulationRequest[];
+  /**
+   * What the simulated block has already changed when the calls run, as differences from `block`'s state: a replayed
+   * transaction's block as its earlier transactions left it, read from the block's access list (stateBefore) in
+   * place of running them (`before`). Simulators start from it; a request's own state overrides go on top.
+   */
+  state?: StateChanges;
+}
+
+/**
+ * State as differences from a block's, in the form eth_simulateV1's state overrides take: balances and nonces in
+ * hex, storage as 32-byte slots and values.
+ */
+export type StateChanges = Record<string, { balance?: string; nonce?: string; code?: string; stateDiff?: Record<string, string> }>;
+
+/**
+ * The state a transaction met in its block, as differences from the parent block's, from the block's access list
+ * (EIP-7928, from Amsterdam on): every balance, nonce, code and storage slot the block changed, each with the entry
+ * that changed it. Entry 0 is what the block does before its transactions (the beacon root and the parent's hash
+ * written to their contracts), entry i + 1 is transaction i. So what transaction `index` met is each item's last
+ * change among entries 0 to `index`.
+ *
+ * Undefined where the node doesn't serve the list (eth_getBlockAccessListByBlockNumber: measured on Sepolia's
+ * public RPC, where some of the backends behind it lack it, hence the second and third try), or serves something
+ * that doesn't read as one: the caller then runs the earlier transactions instead.
+ */
+export async function stateBefore(client: RpcClient, chainId: number, block: string, index: number): Promise<StateChanges | undefined> {
+  let list: unknown;
+  for (let attempt = 0; attempt < 3 && !Array.isArray(list); attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, 200 * attempt));
+    list = await client.call(chainId, 'eth_getBlockAccessListByBlockNumber', [block]).catch(() => undefined);
+  }
+  if (!Array.isArray(list)) return undefined;
+  const hex = (v: unknown): string => { if (typeof v !== 'string' || !/^0x[0-9a-fA-F]*$/.test(v)) throw new Error('not hex'); return v; };
+  const word = (v: unknown) => `0x${BigInt(hex(v) === '0x' ? '0x0' : hex(v)).toString(16).padStart(64, '0')}`;
+  /** An item's last change at or before the transaction: `field` of it. */
+  const last = (changes: unknown, field: 'value' | 'code'): string | undefined => {
+    if (!Array.isArray(changes)) throw new Error('not a list');
+    let found: string | undefined, at = -1;
+    for (const c of changes as Record<string, unknown>[]) {
+      const i = Number(BigInt(hex(c.index)));
+      if (i <= index && i >= at) { found = hex(c[field]); at = i; }
+    }
+    return found;
+  };
+  try {
+    const out: StateChanges = {};
+    for (const a of list as Record<string, unknown>[]) {
+      const entry: StateChanges[string] = {};
+      const balance = last(a.balanceChanges, 'value'), nonce = last(a.nonceChanges, 'value'), code = last(a.codeChanges, 'code');
+      if (balance !== undefined) entry.balance = `0x${BigInt(balance === '0x' ? '0x0' : balance).toString(16)}`;
+      if (nonce !== undefined) entry.nonce = `0x${BigInt(nonce === '0x' ? '0x0' : nonce).toString(16)}`;
+      if (code !== undefined) entry.code = code.toLowerCase();
+      if (!Array.isArray(a.storageChanges)) throw new Error('not a list');
+      for (const s of a.storageChanges as Record<string, unknown>[]) {
+        const value = last(s.changes, 'value');
+        if (value !== undefined) (entry.stateDiff ??= {})[word(s.key)] = word(value);
+      }
+      if (Object.keys(entry).length) out[hex(a.address).toLowerCase()] = entry;
+    }
+    return out;
+  } catch { return undefined; }
 }
 
 /**

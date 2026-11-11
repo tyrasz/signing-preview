@@ -15,4 +15,4 @@ export { UNIVERSAL_ROUTERS } from './evm/universal-router.ts';
 export { KNOWN_ERRORS, knownError } from './errors.ts';
 export { BatchSimulationUnsupported } from './simulation.ts';
 export { ChainlinkPrices, HyperliquidPrices, StaticPrices, ChainedPrices, CHAINLINK_FEEDS } from './prices.ts';
-export { pinBlock, pinLatest, type BlockAt } from './block.ts';
+export { pinBlock, pinLatest, stateBefore, type BlockAt, type StateChanges } from './block.ts';

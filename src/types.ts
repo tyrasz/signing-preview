@@ -310,8 +310,12 @@ export interface TokenRegistry {
 
 /** A mined transaction's place: its block's header on its parent's state, the block's earlier transactions, the price it paid and its receipt. */
 export interface ReplayContext {
+  /** The parent block and the block's own header; with `state`, what the block had changed before the transaction. */
   at: import('./block.ts').BlockAt;
+  /** The block's earlier transactions, to run first: none when `at.state` has what they left. */
   before: SimulationRequest[];
+  /** How many transactions the block has before this one. */
+  earlier: number;
   gasPrice: bigint;
   /** A blob transaction's blob hashes, and the most it would pay for blob gas. */
   blobVersionedHashes?: string[];

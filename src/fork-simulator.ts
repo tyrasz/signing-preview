@@ -303,6 +303,8 @@ class StateSource {
   codeOverrides = new Map<string, Uint8Array>();
   /** Native balances set for this simulation (a request's state overrides), instead of the chain's. */
   balanceOverrides = new Map<string, bigint>();
+  /** Nonces the simulated block had already moved (BlockAt.state: a replay's earlier transactions), instead of the chain's. */
+  nonceOverrides = new Map<string, bigint>();
   /** Precompiles the chain's node lists that the local EVM neither has nor forwards (address to name): a call reaching one is refused. */
   nodeOnly = new Map<string, string>();
 
@@ -530,9 +532,9 @@ class LazyState extends SimpleStateManager {
   }
 
   private async data(key: string): Promise<AccountData | undefined> {
-    const a = await this.chainData(key), balance = this.source.balanceOverrides.get(key);
-    // A balance set for the simulation stands in for the chain's, whatever else the account holds.
-    return balance === undefined ? a : { nonce: a?.nonce ?? 0n, code: a?.code ?? new Uint8Array(0), balance };
+    const a = await this.chainData(key), balance = this.source.balanceOverrides.get(key), nonce = this.source.nonceOverrides.get(key);
+    // A balance or nonce set for the simulation stands in for the chain's, whatever else the account holds.
+    return balance === undefined && nonce === undefined ? a : { nonce: nonce ?? a?.nonce ?? 0n, code: a?.code ?? new Uint8Array(0), balance: balance ?? a?.balance ?? 0n };
   }
   private async chainData(key: string): Promise<AccountData | undefined> {
     if (this.source.accounts.has(key)) return this.source.accounts.get(key);
@@ -863,11 +865,20 @@ export class ForkSimulator implements Simulator {
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.
     const auths = await Promise.all(reqs.map(authorizationsOf));
     const authorities = new Set(auths.flat().map(a => a.authority));
+    const slotKey = (a: string, slot: string) => `${hexOf(a)}_${bytesToHex(setLengthLeft(hexToBytes(slot as Hex), 32))}`;
+    // What the simulated block had already changed (BlockAt.state: a replay's earlier transactions, from the block's
+    // access list): the state this run starts from, beneath anything a request sets.
+    for (const [a, o] of Object.entries(at?.state ?? {})) {
+      if (o.code !== undefined) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
+      if (o.balance !== undefined) source.balanceOverrides.set(hexOf(a), BigInt(o.balance));
+      if (o.nonce !== undefined) source.nonceOverrides.set(hexOf(a), BigInt(o.nonce));
+      for (const [slot, value] of Object.entries(o.stateDiff ?? {})) source.storage.set(slotKey(a, slot), unpadBytes(hexToBytes(value as Hex)));
+    }
     for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
       if (o.code !== undefined && !authorities.has(hexOf(a))) source.codeOverrides.set(hexOf(a), hexToBytes(o.code as Hex));
       if (o.balance !== undefined) source.balanceOverrides.set(hexOf(a), BigInt(o.balance));
       // Storage set for the simulation: read before the chain's value, never cached as the chain's.
-      for (const [slot, value] of Object.entries(o.stateDiff ?? {})) source.storage.set(`${hexOf(a)}_${bytesToHex(setLengthLeft(hexToBytes(slot as Hex), 32))}`, unpadBytes(hexToBytes(value as Hex)));
+      for (const [slot, value] of Object.entries(o.stateDiff ?? {})) source.storage.set(slotKey(a, slot), unpadBytes(hexToBytes(value as Hex)));
     }
     // The senders and targets are certain to be read: fetch them before the first run.
     const first = newMisses();
