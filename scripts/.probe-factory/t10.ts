@@ -1,0 +1,11 @@
+import { onNode, locally, show, create, assetParams, tokenAt, SENDER, FACTORY, blockNumber, URL_ } from './lib.ts';
+const block = await blockNumber() - 2n;
+const s = (b: string) => `0x${b.repeat(32)}` as `0x${string}`;
+const salt = s('5a');
+const data = create(0, salt, assetParams('Name', 'SYM', '0x4444444444444444444444444444444444444444'));
+const r = await (await fetch(URL_, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_createAccessList', params: [{ from: SENDER, to: FACTORY, data, gas: '0x7a120' }, `0x${block.toString(16)}`] }) })).json();
+console.log(JSON.stringify(r).slice(0, 1500));
+const al = r.result?.accessList ?? [];
+console.log('token', tokenAt(0, SENDER, salt));
+const txs = [{ to: FACTORY, data, gas: 500_000n }, { to: FACTORY, data: create(0, s('5b'), assetParams('Name', 'SYM', '0x4444444444444444444444444444444444444444')), gas: 500_000n, accessList: al.map((e: any) => ({ ...e, address: e.address === tokenAt(0, SENDER, salt) ? tokenAt(0, SENDER, s('5b')) : e.address })) }, { to: FACTORY, data, gas: 500_000n, accessList: al }];
+show('access lists', await onNode(txs, block), await locally(txs, block));
