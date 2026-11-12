@@ -1048,17 +1048,34 @@ const ROLE_EVENTS = new Set([0x2f8788117e7eff1d82e926ec794901d17c78024a502709403
 const arrayLength = (data: Uint8Array, i: number) => { const at = 4 + Number(BigInt(bytesToHex(data.subarray(4 + 32 * i, 36 + 32 * i)))); return data.length >= at + 32 ? BigInt(bytesToHex(data.subarray(at, at + 32))) : 0n; };
 /**
  * Where the reference's own storage reads differ from the node's for a token's function, measured on Base with each
- * call timed from a contract: what to add to its charge, given whether it succeeded.
+ * call timed from a contract: what to add to its charge, at its first write in its own frame (so within the gas it
+ * was given, as the node's: a call given its charge less a little runs out on the node, and one given a little more
+ * than the charge succeeds; and whatever fails after it, an announce whose calls fail after its id is written).
  */
-const B20_FUNCTION_GAS: Record<string, (data: Uint8Array, ok: boolean) => bigint> = {
-  '0x1e4e0091': (_, ok) => ok ? -100n : 0n, // setRoleAdmin
-  '0x595135dd': (_, ok) => ok ? -100n : 0n, // announce
-  '0x6f79e3d7': (_, ok) => ok ? 100n : 0n, // renounceLastAdmin
-  '0x5ffe6146': (_, ok) => ok ? 100n : 0n, // updateMultiplier
-  '0x2c97a0f0': (_, ok) => ok ? 0n : 100n, // cancelUIMultiplierUpdate, when it reverts
-  '0xa290249c': (d, ok) => ok ? -200n * (arrayLength(d, 0) > 1n ? arrayLength(d, 0) - 1n : 0n) : 0n, // pause, a feature past the first
-  '0x8b93dd63': (d, ok) => ok ? -200n * (arrayLength(d, 0) > 1n ? arrayLength(d, 0) - 1n : 0n) : 0n, // unpause
-  '0x68573107': (d, ok) => ok ? 100n * arrayLength(d, 0) : 0n, // batchMint, each recipient
+const B20_WRITE_GAS: Record<string, (data: Uint8Array, call: { caller: string }) => bigint> = {
+  '0x1e4e0091': (_, call) => call.caller === B20_FACTORY ? 0n : -100n, // setRoleAdmin (as an init call, the reference reads as the node does)
+  '0x595135dd': () => -100n, // announce
+  '0x6f79e3d7': () => 200n, // renounceLastAdmin (100 over the reference, with its RoleRevoked's 100 less: ROLE_EVENTS)
+  '0x5ffe6146': () => 100n, // updateMultiplier (more when it clears a pending update: B20_ENDED_GAS)
+  '0x2c97a0f0': () => 200n, // cancelUIMultiplierUpdate
+  '0xa290249c': d => -200n * (arrayLength(d, 0) > 1n ? arrayLength(d, 0) - 1n : 0n), // pause, a feature past the first
+  '0x8b93dd63': d => -200n * (arrayLength(d, 0) > 1n ? arrayLength(d, 0) - 1n : 0n), // unpause
+  '0x68573107': d => 100n * arrayLength(d, 0), // batchMint, each recipient
+};
+/** An asset's storage (base-std's MockB20Storage): its multiplier, and a pending update to it, at these slots. */
+const ASSET_MULTIPLIER = 0xfdc6d4552d1286ade4d9facdbf0fb50d2ec9b89a90e104f26fd277585e374b01n, ASSET_PENDING = ASSET_MULTIPLIER + 3n;
+/** UIMultiplierUpdateCancelled(uint256,uint256). */
+const MULTIPLIER_CANCELLED = 0x883856335ba5f60c18b9817c4505d3c7d3f6223dcf39516b30c508c46a5e1cadn;
+/**
+ * And what to add as the call ends, given what its own frame did (measured the same way): cancelUIMultiplierUpdate
+ * with nothing pending; updateMultiplier cancelling a live update (100 more) or clearing one that took effect (200
+ * more); setRoleAdmin on a token without admins, where the node reads the role's admin before it refuses.
+ */
+type TokenFrame = { ok: boolean; returned: Uint8Array; sloads: number; stored: Set<bigint>; topics: Set<bigint> };
+const B20_ENDED_GAS: Record<string, (f: TokenFrame) => bigint> = {
+  '0x2c97a0f0': f => !f.ok && bytesToHex(f.returned.subarray(0, 4)) === '0xa7d6a5ca' ? 100n : 0n,
+  '0x5ffe6146': f => !f.ok ? 0n : f.topics.has(MULTIPLIER_CANCELLED) ? 100n : f.stored.has(ASSET_PENDING) ? 200n : 0n,
+  '0x1e4e0091': f => !f.ok && f.sloads === 1 ? 2_100n : 0n,
 };
 /** Code that returns the word 1 (the cheatcodes' answer: see VM_SOURCE in scripts/build-b20.ts). */
 const RETURN_ONE = hexToBytes('0x600160005260206000f3');
@@ -1472,8 +1489,9 @@ export class ForkSimulator implements Simulator {
     // Precompiles given code for the simulation (eth_simulateV1's movePrecompileToAddress): the code runs at the
     // precompile's address, which is no longer a precompile, and the precompile at the address it moves to.
     const active = getActivePrecompiles(common);
-    // (Base's own contracts moved away: their references run at their own addresses only, so refused.)
-    const away = chainId === BASE ? reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).find(([a, o]) => o.movePrecompileToAddress && baseNative(hexOf(a))) : undefined;
+    // (Base's factory or a registry moved away: their references run at their own addresses only, so refused. A
+    // token moved away is ignored, as on the node: it isn't one of the chain's precompiles there.)
+    const away = chainId === BASE ? reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).find(([a, o]) => o.movePrecompileToAddress && (hexOf(a) === B20_FACTORY || hexOf(a) in BASE_REGISTRIES)) : undefined;
     if (away) throw new ForkUnsupported(`${hexOf(away[0])} is one of Base's own contracts, which the local EVM runs from its Solidity reference at its own address only: it can't be moved for the simulation`);
     const moved = reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).flatMap(([a, o]) => {
       const fn = o.movePrecompileToAddress ? active.get(hexOf(a).slice(2)) : undefined;
@@ -1524,8 +1542,8 @@ export class ForkSimulator implements Simulator {
     // factory, called themselves, are charged so too, without the 100 (B20_EXISTS_GAS). A call whose charge passes
     // the gas it was given runs out there, as the node's.
     type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; looked?: boolean; hashed?: boolean; static?: boolean; hevmCold?: boolean };
-    /** A token's own call (not run as another's code, not refused): what is charged by its function (B20_FUNCTION_GAS, EIP-712). */
-    type TokenCall = { code: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean };
+    /** A token's own call (not run as another's code, not refused): what is charged by its function (B20_WRITE_GAS, EIP-712). */
+    type TokenCall = { code: string; caller: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean; written?: boolean; ended?: boolean; sloads: number; stored: Set<bigint>; topics: Set<bigint> };
     let charging: Charge | undefined;
     /** Each message's bookkeeping, popped as it ends: the charge it opened, a precompile, a token's own call. */
     const opened: { charge?: Charge; precompile?: boolean; token?: TokenCall }[] = [];
@@ -1559,6 +1577,23 @@ export class ForkSimulator implements Simulator {
       // A permit whose signature verified: the node writes the nonce, and reads it again (PERMIT_VERIFIED_GAS),
       // whatever follows (spender 0, a static call); the reference's first write is its nonce's.
       if (charging && own && t.selector === PERMIT && !t.verified && e.opcode.name === 'SSTORE') { charging.node += PERMIT_VERIFIED_GAS; t.verified = true; }
+      // The function's own correction at its first write (B20_WRITE_GAS), and what its frame reads, writes and logs
+      // (B20_ENDED_GAS); updateUIMultiplier writing the multiplier itself (a pending update that took effect) reads
+      // it once more on the node.
+      if (charging && own && !t.written && e.opcode.name === 'SSTORE') { t.written = true; const fix = B20_WRITE_GAS[t.selector]; if (fix) charging.node += fix(t.data, t); }
+      if (own && e.stack?.length) {
+        const top = e.stack[e.stack.length - 1];
+        if (e.opcode.name === 'SLOAD') t.sloads++;
+        else if (e.opcode.name === 'SSTORE') { if (charging && t.selector === '0x628e600f' && top === ASSET_MULTIPLIER && !t.stored.has(top)) charging.node += 100n; t.stored.add(top); }
+        else if (e.opcode.name.startsWith('LOG') && e.opcode.name !== 'LOG0' && e.stack.length >= 3) t.topics.add(e.stack[e.stack.length - 3]);
+      }
+      // A success's end-of-call extra (B20_ENDED_GAS) as the frame returns, within its gas: given less, it runs out
+      // there, its writes undone, as on the node.
+      if (charging && own && !t.ended && (e.opcode.name === 'RETURN' || e.opcode.name === 'STOP')) {
+        t.ended = true;
+        const ended = B20_ENDED_GAS[t.selector];
+        if (ended) charging.node += ended({ ok: true, returned: new Uint8Array(0), sloads: t.sloads, stored: t.stored, topics: t.topics });
+      }
       // A mapping's slot being found: kept, to read it after a block's earlier transactions (StateSource.preimages).
       if (e.opcode.name === 'KECCAK256' && e.stack && e.memory) {
         const n = e.stack.length, offset = Number(e.stack[n - 1]);
@@ -1572,8 +1607,8 @@ export class ForkSimulator implements Simulator {
       if (o?.precompile && charging) charging.node += r.execResult.executionGasUsed;
       if (o?.token) {
         tokenCalls.pop();
-        const fix = B20_FUNCTION_GAS[o.token.selector];
-        if (fix && charging) charging.node += fix(o.token.data, !r.execResult.exceptionError);
+        const ended = B20_ENDED_GAS[o.token.selector];
+        if (ended && charging && !o.token.ended) charging.node += ended({ ok: !r.execResult.exceptionError, returned: r.execResult.returnValue, sloads: o.token.sloads, stored: o.token.stored, topics: o.token.topics });
       }
       const c = o?.charge;
       if (c) {
@@ -1589,6 +1624,9 @@ export class ForkSimulator implements Simulator {
           // (Given less than that, it runs out on the node before its check: no data.)
           if (c.node > c.limit) { ex.exceptionError = new EVMError(EVMError.errorMessages.OUT_OF_GAS); ex.returnValue = new Uint8Array(0); }
         }
+        // What was added as the call ended (a precompile's gas, a failed function's correction) can take it past
+        // the gas it was given: it runs out, as on the node.
+        if (c.node > c.limit && ex.exceptionError?.error !== EVMError.errorMessages.OUT_OF_GAS) { ex.exceptionError = new EVMError(EVMError.errorMessages.OUT_OF_GAS); ex.returnValue = new Uint8Array(0); }
         // (The cheatcode address, which only the factory's reference calls, cold again, as it is on the chain.)
         if (c.hevmCold) (evm.journal as unknown as { journal: Map<string, unknown> }).journal.delete(HEVM.slice(2));
         if (c.refused || source.standIns.has(c.code)) ex.executionGasUsed = c.node < c.limit ? c.node : c.limit;
@@ -1666,6 +1704,9 @@ export class ForkSimulator implements Simulator {
           await state.putCode(at, m.data.slice(offset + 32, offset + 32 + length));
           // (Writing the token: B20_CREATED_GAS, charged here so that a creation short of it runs out, as the node's.)
           if (charging?.code === B20_FACTORY) charging.node += B20_CREATED_GAS[at.toString().slice(22, 24)] ?? 0n;
+          // (An asset's multiplier, which the node writes as it creates one, is warm for the rest of the transaction:
+          // an init call that reads it pays 100, not 2,100.)
+          if (at.toString().slice(22, 24) === '00') evm.journal.addWarmedStorage(at.bytes, hexToBytes(`0x${ASSET_MULTIPLIER.toString(16).padStart(64, '0')}`));
           m.code = RETURN_ONE;
         } else if (selector === '0x70ca10bb') { // store(address,bytes32,bytes32)
           m.to = at; m._codeAddress = at;
@@ -1683,7 +1724,10 @@ export class ForkSimulator implements Simulator {
       // (measured on Base: a value call's frame used no gas, the token's or a registry's, the calldata's size
       // whatever it was); the references' own functions would revert empty.
       // (Not where a precompile was moved for the simulation: that runs there, as on the node.)
-      const native = !!code && baseNative(code) && !evm.precompiles.has(code.slice(2));
+      // (A registry a token's or the factory's reference calls stays the registry, whatever was moved onto its
+      // address: on the node those are its own storage reads.)
+      const fromReference = B20_PRECOMPILE.test(m.caller.toString()) || m.caller.toString() === B20_FACTORY;
+      const native = !!code && baseNative(code) && (!evm.precompiles.has(code.slice(2)) || (code in BASE_REGISTRIES && fromReference));
       const delegated = native && !!m.to && m.to.toString() !== code, refused = native && !delegated && m.value > 0n;
       if (delegated) m.code = NO_DELEGATECALL;
       else if (refused) m.code = NON_PAYABLE;
@@ -1695,10 +1739,10 @@ export class ForkSimulator implements Simulator {
       // createB20 working out the token's address (B20_ADDRESS_GAS): after its arguments decode, as it asks the
       // activation registry, before its parameters' version and decimals are checked.
       if (charging?.code === B20_FACTORY && !charging.hashed && code === ACTIVATION_REGISTRY && m.caller.toString() === B20_FACTORY) { charging.node += B20_ADDRESS_GAS; charging.hashed = true; }
-      // A token's own call, for what its function is charged (B20_FUNCTION_GAS, EIP-712), wherever it runs.
+      // A token's own call, for what its function is charged (B20_WRITE_GAS, EIP-712), wherever it runs.
       const selector = m.data.length >= 4 ? bytesToHex(m.data.subarray(0, 4)) : '';
       const token: TokenCall | undefined = native && !delegated && !refused && !empty && B20_PRECOMPILE.test(code!)
-        ? { code: code!, depth: m.depth, selector, data: m.data, ...(EIP712_FUNCTIONS.has(selector) && { eip712: true }) } : undefined;
+        ? { code: code!, caller: m.caller.toString(), depth: m.depth, selector, data: m.data, sloads: 0, stored: new Set(), topics: new Set(), ...(EIP712_FUNCTIONS.has(selector) && { eip712: true }) } : undefined;
       if (token) tokenCalls.push(token);
       if (!charging && native) {
         // (Short of a selector, the calldata's echo is four zero bytes.)
@@ -1707,7 +1751,7 @@ export class ForkSimulator implements Simulator {
           ...(code === B20_FACTORY && { static: m.isStatic, hevmCold: !evm.journal.isWarmedAddress(hexToBytes(HEVM)) }) } });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
-      } else opened.push({ token, precompile: !!charging && !!code && (m.isCompiled || evm.precompiles.has(code.slice(2))) });
+      } else opened.push({ token, precompile: !!charging && !!code && !native && (m.isCompiled || evm.precompiles.has(code.slice(2))) });
     };
     // (The message always goes on, with what was found pushed once: a read that fails here, a block before Base's
     // upgrade, fails again as the EVM loads the code, and says why there.)
