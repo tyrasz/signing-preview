@@ -207,7 +207,8 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
       const pricedRequests = batch({ ...exec, gas: exec.gas ?? roomFor(results[0].gasUsed), gasPrice: price?.gasPrice, baseFee: price?.baseFee,
         ...(!opts.request && { stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: SUBMITTER_BALANCE } } }) });
       const again = price && await sim.simulateBatch(pricedRequests);
-      if (price && again && again[0].status === 'success' && effectOf(again[0], safe) !== effectOf(results[0], safe)) { results = again; priced = price; requests = pricedRequests; }
+      // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only that.)
+      if (price && again && again[0].status === 'success' && !(again[0].stateReadError && !results[0].stateReadError) && effectOf(again[0], safe) !== effectOf(results[0], safe)) { results = again; priced = price; requests = pricedRequests; }
     } catch { /* the node refused the priced run: the first stands */ }
   }
   const result = results[0];
