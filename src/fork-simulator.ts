@@ -75,6 +75,13 @@ export interface ChainProfile {
    */
   precompilePrices?: Record<number, Record<string, number>>;
   /**
+   * Precompiles the chain charges a multiple of Ethereum's price for (address in hex, without 0x and leading zeros:
+   * '1' for ecrecover), the formula otherwise its own (the chain's EIPs, as `eips` gives them).
+   */
+  precompileScale?: Record<string, bigint>;
+  /** What the point-evaluation precompile (0x0a, answered by the chain's node) costs there, where not Ethereum's 50,000. */
+  pointEvaluationGas?: bigint;
+  /**
    * Who is paid a transaction's tip as the block goes, where it isn't the block's fee recipient (COINBASE), which
    * a later call in a batch may read: BNB Chain collects fees at its system address and pays its validator at the
    * end of the block. (Arbitrum pays its own fee accounts, none of them COINBASE: see `arbitrum`.) Measured on
@@ -163,7 +170,12 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // low, by a multiple of 840.
   137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true, maxCodeSize: 32_768 },
   56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES, tipsTo: '0xfffffffffffffffffffffffffffffffffffffffe' },
-  999: { hardfork: 'cancun', eips: [7702], ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
+  // HyperEVM prices most precompiles its own way, measured on its node (2026-11-12; until a day before it charged
+  // Ethereum's): ecrecover 15,000; modexp ten times Osaka's formula (EIP-7883, at least 5,000, inputs to 1,024 bytes
+  // as EIP-7823 has them); bn254 and blake2f ten times Ethereum's (a pairing 450,000 and 340,000 a pair); point
+  // evaluation 2,000,000. sha256, ripemd160 and identity cost what they do on Ethereum; P256VERIFY isn't there.
+  999: { hardfork: 'cancun', eips: [7702, 7823, 7883], ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas,
+    precompileScale: { 1: 5n, 5: 10n, 6: 10n, 7: 10n, 8: 10n, 9: 10n }, pointEvaluationGas: 2_000_000n },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
 
@@ -1216,7 +1228,9 @@ export class ForkSimulator implements Simulator {
         await source.fetch({ ...newMisses(), calls: new Set([key]) });
         c = source.calls.get(key)!;
       }
-      const gas = address === POINT_EVALUATION ? 50_000n : profile.precompileGas?.(input.data.length, c.data.length, bytesToHex(input.data.subarray(0, 4))) ?? 2000n;
+      const gas = address === POINT_EVALUATION ? profile.pointEvaluationGas ?? 50_000n : profile.precompileGas?.(input.data.length, c.data.length, bytesToHex(input.data.subarray(0, 4))) ?? 2000n;
+      // (Given less than it costs, it runs out, as the node's does.)
+      if (gas > input.gasLimit) return { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) };
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
     // BLOCKHASH: the recent blocks' hashes, fetched like the rest of the state (the EVM checks the 256-block window).
@@ -1239,7 +1253,18 @@ export class ForkSimulator implements Simulator {
     });
     // A chain without the point-evaluation precompile has an ordinary empty account at 0x0a.
     const absent = profile.noPointEvaluation && active.has(POINT_EVALUATION.slice(2)) ? [{ address: POINT_EVALUATION as Hex }] : [];
-    const precompiles = [...forwarded, ...moved, ...absent];
+    // Precompiles the chain charges a multiple of Ethereum's price for (ChainProfile.precompileScale): the EVM's own,
+    // its gas multiplied, and out of gas where the multiple is more than the call was given.
+    const scaled = Object.entries(profile.precompileScale ?? {}).flatMap(([a, by]) => {
+      const key = a.padStart(40, '0'), fn = active.get(key);
+      return fn ? [{ address: `0x${key}` as Hex, function: async (input: Parameters<typeof fn>[0]) => {
+        const r = await fn(input);
+        if (r.exceptionError) return r;
+        const gas = r.executionGasUsed * by;
+        return gas <= input.gasLimit ? { ...r, executionGasUsed: gas } : { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) };
+      } }] : [];
+    });
+    const precompiles = [...scaled, ...forwarded, ...moved, ...absent];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
     // What a cleared slot gives back reaches the caller that paid for it, as on the chain (see repayCallers).
     const gasBack = profile.hardfork === 'amsterdam' ? repayCallers(evm) : undefined;

@@ -431,6 +431,21 @@ test('A token whose balanceOf costs over a million gas is read for what it holds
   assert.ok(read.gasUsed! > 1_000_000n && read.gasUsed! < 10_000_000n, String(read.gasUsed));
 });
 
+test('A chain that charges a multiple of Ethereum’s price for a precompile: charged so, and out of gas below it', async () => {
+  // HyperEVM's ecrecover costs 15,000 (Ethereum's 3,000): a call to it with no input is 21,000 and that.
+  const ECRECOVER = '0x0000000000000000000000000000000000000001';
+  assert.equal(CHAIN_PROFILES[999].precompileScale?.[1], 5n);
+  const scaled = fork({ profiles: { 999: { ...profiles[999], precompileScale: { 1: 5n } } } });
+  const [plain, five, short] = await Promise.all([
+    fork({ profiles: { 999: { ...profiles[999], precompileScale: undefined } } }).simulate({ chainId: 999, from: USER, to: ECRECOVER, data: '0x', value: 0n }),
+    scaled.simulate({ chainId: 999, from: USER, to: ECRECOVER, data: '0x', value: 0n }),
+    scaled.simulate({ chainId: 999, from: USER, to: ECRECOVER, data: '0x', value: 0n, gas: 30_000n }),
+  ]);
+  assert.deepEqual([plain!.gasUsed, five!.gasUsed], [24_000n, 36_000n]);
+  // Given what Ethereum's price needs but not five times it, it runs out, as on the chain.
+  assert.equal(short!.status, 'reverted');
+});
+
 test('Base’s B20 tokens run in the local EVM from their Solidity reference, on the token’s own storage', async () => {
   // A B20 asset token (variant byte 0) as Base keeps one: the marker code 0xef, its state in the base.b20 namespace.
   const TOKEN = '0xb200000000000000000000123456789abcdef012';
