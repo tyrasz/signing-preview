@@ -1362,10 +1362,10 @@ export class ForkSimulator implements Simulator {
     }
     if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; gasLimit: bigint; isCompiled: boolean; code?: unknown }, next?: () => void) => {
       const code = (m._codeAddress ?? m.to)?.toString();
-      // The chain's B20 token refuses to run as another contract's code (DELEGATECALL, CALLCODE): DelegateCallNotAllowed().
-      // (Its own, announce's calls to itself, run.)
-      if (code && B20.test(code) && m.to && m.to.toString() !== code) m.code = NO_DELEGATECALL;
+      // The chain's B20 tokens and registries refuse to run as another contract's code (DELEGATECALL, CALLCODE):
+      // DelegateCallNotAllowed(). (A token's own calls to itself, announce's, run.)
       const native = !!code && (B20.test(code) || code in BASE_REGISTRIES);
+      if (native && m.to && m.to.toString() !== code) m.code = NO_DELEGATECALL;
       if (native) reached.add(code!);
       if (!charging && native) {
         opened.push(charging = { code, limit: m.gasLimit, node: 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
