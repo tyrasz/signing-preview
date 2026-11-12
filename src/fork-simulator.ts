@@ -1265,7 +1265,7 @@ export class ForkSimulator implements Simulator {
     return this.simulateBatch(reqs.map(r => ({ ...r, trace: true })), options?.budgetMs !== undefined ? { timeoutMs: options.budgetMs } : undefined);
   }
 
-  async simulateBatch(reqs: SimulationRequest[], options?: { /** How long this run may take, over the simulator's own limit. */ timeoutMs?: number; /** Calls the node runs first, for the state these start from (set here, for a replay). */ after?: SimulationRequest[] }): Promise<SimulationResult[] | null> {
+  async simulateBatch(reqs: SimulationRequest[], options?: { /** How long this run may take, over the simulator's own limit. */ timeoutMs?: number; /** Calls the node runs first, for the state these start from (set here, for a replay). */ after?: SimulationRequest[]; /** The first call whose result is wanted (the ones before are a block's earlier transactions, run for their state). */ reportedFrom?: number }): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
@@ -1285,7 +1285,7 @@ export class ForkSimulator implements Simulator {
           this.noSimulate.add(chainId);
         }
       }
-      const all = await this.simulateBatch([...earlier.map(r => ({ ...r, at, trace: false })), ...reqs.map(r => ({ ...r, at }))], { timeoutMs: options?.timeoutMs });
+      const all = await this.simulateBatch([...earlier.map(r => ({ ...r, at, trace: false })), ...reqs.map(r => ({ ...r, at }))], { timeoutMs: options?.timeoutMs, reportedFrom: earlier.length });
       return all && all.slice(earlier.length);
     }
     const started = Date.now(), deadline = started + Math.max(this.opts.timeoutMs, options?.timeoutMs ?? 0);
@@ -1382,7 +1382,7 @@ export class ForkSimulator implements Simulator {
     const key = requestKey(reqs);
     this.seen.set(key, new Set());
     try {
-      const results = await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
+      const results = await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key, options?.reportedFrom ?? 0);
       // Contracts the node runs itself that ran here from their references instead: said, with each result.
       return results.map(r => {
         const stale = r.standIns?.filter(a => source.staleNative.has(a)) ?? [];
@@ -1404,7 +1404,7 @@ export class ForkSimulator implements Simulator {
   }
 
   private async rounds(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
-    profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string): Promise<SimulationResult[]> {
+    profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string, reportedFrom = 0): Promise<SimulationResult[]> {
     let watched = 0;
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
@@ -1420,12 +1420,12 @@ export class ForkSimulator implements Simulator {
       // Past the speculative rounds a run fetches what it lacks as it goes, and is the answer, unless a later call
       // showed a token or approval it wasn't watching: its amount would be its logs' (a lending pool's debt token,
       // whose mint event adds the interest accrued before; Arbitrum One, 2026-11-12, after 24 rounds). Run again
-      // with them watched, twice at most.
-      if (run && !misses && grew && watched < 2) {
+      // with them watched, twice at most, and only within the time budget (past it, this answer stands).
+      // (Not for what only a block's earlier transactions showed, run for their state: their results aren't wanted.)
+      if (run && !misses && grew && run.grewAt.some(i => i >= reportedFrom) && watched < 2 && Date.now() <= deadline) {
         watched++;
         for (const t of run.tokens) { tokens.add(t); this.seen.get(key)?.add(t); }
         for (const a of run.approvals) approvals.set(approvalKey(a), a);
-        if (Date.now() > deadline) throw new ForkTimeout(`the simulation needed more than ${this.opts.timeoutMs} ms`);
         continue;
       }
       if (run && (!misses || (!missCount(misses) && !grew))) {
@@ -1831,6 +1831,7 @@ export class ForkSimulator implements Simulator {
     const seenTokens = new Set<string>(), seenApprovals: SimulatedApproval[] = [];
     // A token or approval first seen in a later call of a batch must be read around the calls before it too.
     let rerun = false;
+    const grewAt: number[] = [];
     const touched = new Map<string, SimulatedApproval>(watchedApprovals);
     const source_ = `local EVM over chain ${chainId} state (the RPC has no eth_simulateV1)`;
     for (const [i, req] of reqs.entries()) {
@@ -1933,10 +1934,10 @@ export class ForkSimulator implements Simulator {
       for (const l of logs) if (l.topics[0] === TRANSFER && l.topics.length === 3 && hexOf(l.address) !== NATIVE_LOG_ADDRESS && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from)) {
         const t = hexOf(l.address);
         seenTokens.add(t);
-        if (i > 0 && !tokens.has(t)) rerun = true;
+        if (i > 0 && !tokens.has(t)) { rerun = true; grewAt.push(i); }
       }
       for (const a of parsed.approvals) if (a.owner === from) {
-        if (i > 0 && !watchedApprovals.has(approvalKey(a))) rerun = true;
+        if (i > 0 && !watchedApprovals.has(approvalKey(a))) { rerun = true; grewAt.push(i); }
         seenApprovals.push(a); touched.set(approvalKey(a), a);
       }
       // A call that sets a permission by name is listed even if its token emits no Approval event (non-compliant
@@ -1980,7 +1981,7 @@ export class ForkSimulator implements Simulator {
     }
     // Each result with the contracts the node runs itself that its own run reached, of those run from a reference.
     results.forEach((r, i) => { const own = byRequest[i]?.filter(a => source.standIns.has(a)); if (own?.length) r.standIns = own; });
-    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, trace };
+    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, grewAt, trace };
   }
 
   /**

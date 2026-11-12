@@ -146,7 +146,9 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
             const price = await expectedGasPrice(txs[0], deps, named?.at.header.baseFeePerGas);
             const pricedRequests = requests.map((q, i) => ({ ...q, gas: txs[i].gas ?? roomFor(results![i].gasUsed!), gasPrice: price?.gasPrice, baseFee: price?.baseFee }));
             const again = price && await deps.simulator.simulateBatch(pricedRequests);
-            if (price && again && again.length === txs.length && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
+            // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only that.)
+            const unread = again?.some((r, i) => r.stateReadError && !results![i].stateReadError);
+            if (price && again && again.length === txs.length && !unread && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
           } catch { /* the node refused the priced run: the first stands */ }
         }
         presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));

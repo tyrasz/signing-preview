@@ -524,14 +524,30 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
+    // The native coin: what the balance moved beyond the logged transfers (and the gas a priced run's sender paid,
+    // exactly its gas used at its price on every node, 2026-11-12) is added as a transfer of its own, the logged
+    // ones kept for whom they name. Not for a blob call (its blob gas is paid too), nor the block's fee recipient
+    // (paid the tips).
+    const recipient = blockOverrides?.feeRecipient?.toLowerCase();
+    const unloggedNative = (p: SimulationResult, i: number, owner: string, x: bigint, y: bigint, gasUsed = p.gasUsed) => {
+      if (reqs[i].blobVersionedHashes?.length || owner === recipient) return;
+      const fee = reqs[i].gasPrice !== undefined && reqs[i].from.toLowerCase() === owner ? (gasUsed ?? 0n) * reqs[i].gasPrice! : 0n;
+      const logged = p.transfers.reduce((sum, t) => t.asset !== 'native' ? sum : sum + (t.to === owner ? t.raw : 0n) - (t.from === owner ? t.raw : 0n), 0n);
+      const unlogged = y - x + fee - logged;
+      // (Elsewhere, too, for an account that isn't the call's sender, a UserOperation's: its call's target, the
+      // EntryPoint, is where its prefund goes, which the operation's preview leaves out as such.)
+      const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner || owner !== reqs[i].from.toLowerCase() ? ELSEWHERE : to;
+      if (unlogged < 0n) p.transfers.push({ asset: 'native', from: owner, to: target, raw: -unlogged });
+      else if (unlogged > 0n) p.transfers.push({ asset: 'native', from: target, to: owner, raw: unlogged });
+    };
     const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]);
     // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
-    // asked again after a pause, then a longer one, since without these reads the amounts are only the events'. It
-    // says so in an error or with HTTP 429, which post throws once its own retries are spent.)
+    // asked once more after a pause, since without these reads the amounts are only the events'. It says so in an
+    // error or with HTTP 429, which post throws once its own retries are spent. Once only: a preview waits on it.)
     const busy = (m?: string) => !!m && (RATE_LIMITED.test(m) || /HTTP (429|5\d\d)/.test(m));
     const patiently = () => ask().catch((e: Error) => { if (busy(e.message)) return { error: { message: e.message } }; throw e; });
     let reply = await patiently();
-    for (const pause of [3000, 8000]) { if (!busy(reply.error?.message)) break; await new Promise(r => setTimeout(r, pause)); reply = await patiently(); }
+    if (busy(reply.error?.message)) { await new Promise(r => setTimeout(r, 3000)); reply = await patiently(); }
     const body = reply as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the
@@ -545,7 +561,8 @@ export class RpcSimulator implements Simulator {
     const starved = !out || out.length !== calls.length ? /intrinsic gas too low/i.test((body as { error?: { message?: string } }).error?.message ?? '')
       : callIndex.some(differs) ? reqs.some(r => r.gas === undefined) : undefined;
     if (starved !== undefined) {
-      const pairs = owners.flatMap(owner => [...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)).map(token => ({ owner, token })));
+      // (The native coin too, as below.)
+      const pairs = owners.flatMap(owner => [...[...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)), 'native'].map(token => ({ owner, token })));
       const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs, tag).catch(() => undefined) : undefined;
       if (!again) {
         if (!out) { const why = (body as { error?: { message?: string } }).error?.message ?? 'no answer'; for (const p of parsed) p.stateReadError = why; }
@@ -556,6 +573,7 @@ export class RpcSimulator implements Simulator {
         for (const { owner, token } of pairs) {
           const x = again.get(`${i}:${owner}:${token}`), y = again.get(`${i + 1}:${owner}:${token}`);
           if (x === undefined || y === undefined) continue;
+          if (token === 'native') { unloggedNative(p, i, owner, x, y); continue; }
           const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner ? ELSEWHERE : to;
           p.transfers = p.transfers.filter(t => t.asset !== token || (t.from !== owner && t.to !== owner));
           if (y < x) p.transfers.push({ asset: token, from: owner, to: target, raw: x - y });
@@ -594,20 +612,10 @@ export class RpcSimulator implements Simulator {
         if (y < x) p.transfers.push({ asset: b.token, from: b.owner, to: target, raw: x - y });
         else if (y > x) p.transfers.push({ asset: b.token, from: target, to: b.owner, raw: y - x });
       }
-      // The native coin: what the balance moved beyond the logged transfers (and the gas a priced run's sender paid,
-      // exactly its gas used at its price on every node, 2026-11-12) is added as a transfer of its own, the logged
-      // ones kept for whom they name. Not for a blob call (its blob gas is paid too), nor the block's fee recipient
-      // (paid the tips).
-      const recipient = blockOverrides?.feeRecipient?.toLowerCase();
-      if (!reqs[i].blobVersionedHashes?.length) owners.forEach((owner, j) => {
+      // The native coin (unloggedNative).
+      owners.forEach((owner, j) => {
         const x = word(out[natives[i][j]]), y = word(out[natives[i + 1][j]]);
-        if (x === undefined || y === undefined || owner === recipient) return;
-        const fee = reqs[i].gasPrice !== undefined && reqs[i].from.toLowerCase() === owner ? BigInt(out[callIndex[i]].gasUsed) * reqs[i].gasPrice! : 0n;
-        const logged = p.transfers.reduce((sum, t) => t.asset !== 'native' ? sum : sum + (t.to === owner ? t.raw : 0n) - (t.from === owner ? t.raw : 0n), 0n);
-        const unlogged = y - x + fee - logged;
-        const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner ? ELSEWHERE : to;
-        if (unlogged < 0n) p.transfers.push({ asset: 'native', from: owner, to: target, raw: -unlogged });
-        else if (unlogged > 0n) p.transfers.push({ asset: 'native', from: target, to: owner, raw: unlogged });
+        if (x !== undefined && y !== undefined) unloggedNative(p, i, owner, x, y, BigInt(out[callIndex[i]].gasUsed));
       });
       p.balancesRead = true;
     });
@@ -623,7 +631,7 @@ export class RpcSimulator implements Simulator {
   private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[], tag: string): Promise<Map<string, bigint> | undefined> {
     const READER = '0x0000000000000000000000000000000000000000';
     const calls: unknown[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
-    const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push({ from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
+    const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push(token === 'native' ? { from: READER, to: MULTICALL3, data: `0x4d2301cc${owner.slice(2).padStart(64, '0')}` } : { from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
     const fields = await Promise.all(this.warmed(reqs).map(simulationFields));
     reads(0);
     reqs.forEach((req, i) => {

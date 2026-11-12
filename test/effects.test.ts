@@ -209,6 +209,18 @@ test('Native coin a node logs no transfer for (a SELFDESTRUCT) is read from the 
   // A node that logs it too: nothing added.
   const logged = (await node(sent, () => 10n ** 18n - 5n).simulator.simulate({ chainId: 8453, from: alice, to: ROUTER, data: '0x', value: 5n }))!;
   assert.deepEqual(natives(logged), [[alice, ROUTER, 5n]]);
+  // A UserOperation's account drained so (sent by a bundler to the EntryPoint): elsewhere, not to the EntryPoint,
+  // where the operation's preview takes a transfer for its prefund.
+  const ENTRY_POINT = '0x0000000071727de22e5e9d8baf0edac6f37da032', BUNDLER = BOB.toLowerCase();
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)), calls = body.params[0].blockStateCalls[0].calls as { from?: string; to?: string; data: string }[];
+    if (body.params[0].traceTransfers) return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0xd163', returnData: '0x', logs: [] }] }] }));
+    const at = calls.findIndex(c => c.from?.toLowerCase() === BUNDLER);
+    return new Response(JSON.stringify({ result: [{ calls: calls.map((c, i) => ({ status: '0x1', gasUsed: i === at ? '0xd163' : '0x5208', logs: [],
+      returnData: c.data.startsWith('0x4d2301cc') && c.data.endsWith(alice.slice(2)) ? data(i < at ? 10n ** 18n : 0n) : c.data.startsWith('0x4d2301cc') ? data(5n) : '0x' })) }] }));
+  }) as typeof fetch;
+  const op = (await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 8453, from: BUNDLER, account: alice, to: ENTRY_POINT, data: '0x', value: 0n }))!;
+  assert.deepEqual(natives(op), [[alice, ELSEWHERE, 10n ** 18n]]);
 });
 
 test('On a node that splits a block’s gas among the calls that set none, a heavy balanceOf is read again on its own', async () => {
