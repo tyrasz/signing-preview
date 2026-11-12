@@ -1044,8 +1044,6 @@ const B20_PARAM_ERRORS: Record<string, bigint> = { '0x997c1de8': B20_CREATED_GAS
 const PANIC_ALLOCATION = `0x4e487b71${'41'.padStart(64, '0')}`;
 /** RoleGranted, RoleRevoked: the reference reads a role's flag again to write it, the node once (100 less each). */
 const ROLE_EVENTS = new Set([0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0dn, 0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171bn]);
-/** A dynamic array's length, the call's `i`-th argument. */
-const arrayLength = (data: Uint8Array, i: number) => { const at = 4 + Number(BigInt(bytesToHex(data.subarray(4 + 32 * i, 36 + 32 * i)))); return data.length >= at + 32 ? BigInt(bytesToHex(data.subarray(at, at + 32))) : 0n; };
 /**
  * Where the reference's own storage reads differ from the node's for a token's function, measured on Base with each
  * call timed from a contract: what to add to its charge, at its first write in its own frame (so within the gas it
@@ -1055,12 +1053,8 @@ const arrayLength = (data: Uint8Array, i: number) => { const at = 4 + Number(Big
 const B20_WRITE_GAS: Record<string, (data: Uint8Array, call: { caller: string }) => bigint> = {
   '0x1e4e0091': (_, call) => call.caller === B20_FACTORY ? 0n : -100n, // setRoleAdmin (as an init call, the reference reads as the node does)
   '0x595135dd': () => -100n, // announce
-  '0x6f79e3d7': () => 200n, // renounceLastAdmin (100 over the reference, with its RoleRevoked's 100 less: ROLE_EVENTS)
   '0x5ffe6146': () => 100n, // updateMultiplier (more when it clears a pending update: B20_ENDED_GAS)
   '0x2c97a0f0': () => 200n, // cancelUIMultiplierUpdate
-  '0xa290249c': d => -200n * (arrayLength(d, 0) > 1n ? arrayLength(d, 0) - 1n : 0n), // pause, a feature past the first
-  '0x8b93dd63': d => -200n * (arrayLength(d, 0) > 1n ? arrayLength(d, 0) - 1n : 0n), // unpause
-  '0x68573107': d => 100n * arrayLength(d, 0), // batchMint, each recipient
 };
 /** An asset's storage (base-std's MockB20Storage): its multiplier, and a pending update to it, at these slots. */
 const ASSET_MULTIPLIER = 0xfdc6d4552d1286ade4d9facdbf0fb50d2ec9b89a90e104f26fd277585e374b01n, ASSET_PENDING = ASSET_MULTIPLIER + 3n;
@@ -1076,6 +1070,8 @@ const B20_ENDED_GAS: Record<string, (f: TokenFrame) => bigint> = {
   '0x2c97a0f0': f => !f.ok && bytesToHex(f.returned.subarray(0, 4)) === '0xa7d6a5ca' ? 100n : 0n,
   '0x5ffe6146': f => !f.ok ? 0n : f.topics.has(MULTIPLIER_CANCELLED) ? 100n : f.stored.has(ASSET_PENDING) ? 200n : 0n,
   '0x1e4e0091': f => !f.ok && f.sloads === 1 ? 2_100n : 0n,
+  // batchMint refusing a recipient (InvalidReceiver): its 100, charged as each recipient is reached (chargeStep).
+  '0x68573107': f => !f.ok && bytesToHex(f.returned.subarray(0, 4)) === '0x9cfea583' ? 100n : 0n,
 };
 /** Code that returns the word 1 (the cheatcodes' answer: see VM_SOURCE in scripts/build-b20.ts). */
 const RETURN_ONE = hexToBytes('0x600160005260206000f3');
@@ -1586,7 +1582,17 @@ export class ForkSimulator implements Simulator {
       // The function's own correction at its first write (B20_WRITE_GAS), and what its frame reads, writes and logs
       // (B20_ENDED_GAS); updateUIMultiplier writing the multiplier itself (a pending update that took effect) reads
       // it once more on the node.
-      if (charging && own && !t.written && e.opcode.name === 'SSTORE') { t.written = true; const fix = B20_WRITE_GAS[t.selector]; if (fix) charging.node += fix(t.data, t); }
+      if (charging && own && e.opcode.name === 'SSTORE') {
+        if (!t.written) { t.written = true; const fix = B20_WRITE_GAS[t.selector]; if (fix) charging.node += fix(t.data, t); }
+        // pause and unpause: the reference reads and writes the paused features again for each past the first, the
+        // node once (200 less each, as each is reached).
+        else if (t.selector === '0xa290249c' || t.selector === '0x8b93dd63') charging.node -= 200n;
+      }
+      // batchMint: 100 more a recipient, as each is reached (its mint asks the policy registry), the refused one too.
+      if (charging && own && t.selector === '0x68573107' && e.opcode.name === 'STATICCALL' && e.stack && `0x${e.stack[e.stack.length - 2].toString(16).padStart(40, '0')}` === '0x8453000000000000000000000000000000000002') charging.node += 100n;
+      // renounceLastAdmin: 100 over the reference, with its RoleRevoked's 100 less (ROLE_EVENTS), there: a static call,
+      // whose write fails, is charged none of it.
+      if (charging && own && t.selector === '0x6f79e3d7' && e.opcode.name === 'LOG4' && e.stack && ROLE_EVENTS.has(e.stack[e.stack.length - 3])) charging.node += 200n;
       if (own && e.stack?.length) {
         const top = e.stack[e.stack.length - 1];
         if (e.opcode.name === 'SLOAD') t.sloads++;
