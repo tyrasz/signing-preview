@@ -905,6 +905,8 @@ const BASE_DENIM = 1_793_901_600n;
 const BASE_REGISTRIES: Record<string, string> = { '0x8453000000000000000000000000000000000001': ACTIVATION_REGISTRY_CODE, '0x8453000000000000000000000000000000000002': POLICY_REGISTRY_CODE };
 /** Code that reverts with DelegateCallNotAllowed() (0x0d89438e): what a B20 token does when run as another's code. */
 const NO_DELEGATECALL = hexToBytes('0x630d89438e60e01b60005260046000fd');
+/** Code that reverts with NonPayable() (0x6fb1b0e9): what a B20 token or registry does when sent value, whatever the function. */
+const NON_PAYABLE = hexToBytes('0x636fb1b0e960e01b60005260046000fd');
 /** What a B20 token's call is charged for, as the node charges it (see rounds), and the gas it is given besides to run its reference. */
 const NATIVE_CHARGED = new Set(['SLOAD', 'SSTORE', 'LOG0', 'LOG1', 'LOG2', 'LOG3', 'LOG4']), NATIVE_SPARE_GAS = 30_000_000n;
 const STAND_IN_CODE = new Map<string, Uint8Array>();
@@ -1357,15 +1359,20 @@ export class ForkSimulator implements Simulator {
         next?.();
       });
     }
-    if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; gasLimit: bigint; isCompiled: boolean; code?: unknown }, next?: () => void) => {
+    if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; value: bigint; gasLimit: bigint; isCompiled: boolean; code?: unknown }, next?: () => void) => {
       const code = (m._codeAddress ?? m.to)?.toString();
       // The chain's B20 tokens and registries refuse to run as another contract's code (DELEGATECALL, CALLCODE):
-      // DelegateCallNotAllowed(). (A token's own calls to itself, announce's, run.)
+      // DelegateCallNotAllowed(). (A token's own calls to itself, announce's, run.) Sent value, they refuse it
+      // before anything else, whatever the function, with NonPayable(), and the node charges the call nothing
+      // (measured on Base: a value call's frame used no gas, the token's or a registry's, the calldata's size
+      // whatever it was); the references' own functions would revert empty.
       const native = !!code && (B20.test(code) || code in BASE_REGISTRIES);
-      if (native && m.to && m.to.toString() !== code) m.code = NO_DELEGATECALL;
+      const delegated = native && !!m.to && m.to.toString() !== code, refused = native && !delegated && m.value > 0n;
+      if (delegated) m.code = NO_DELEGATECALL;
+      else if (refused) m.code = NON_PAYABLE;
       if (native) reached.add(code!);
       if (!charging && native) {
-        opened.push(charging = { code, limit: m.gasLimit, node: 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
+        opened.push(charging = { code, limit: m.gasLimit, node: refused ? 0n : 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
       } else opened.push(charging && code && (m.isCompiled || evm.precompiles.has(code.slice(2))) ? 'precompile' : undefined);

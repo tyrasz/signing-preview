@@ -530,6 +530,12 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   await chain.putCode(DELEGATOR, `0x365f5f375f5f365f738453000000000000000000000000000000000000000002${'5af43d5f5f3e6029573d5ffd5b3d5ff3'}`);
   const toRegistry = (await base.simulate({ chainId: 8453, from: USER, to: DELEGATOR, data: isAuthorized, value: 0n, at: { block: 'latest', header } }))!;
   assert.deepEqual([toRegistry.status, toRegistry.returnData], ['reverted', '0x0d89438e']);
+  // Sent value, a token or registry refuses it whatever the function, NonPayable(), and is charged nothing for the
+  // call (the reference's view function would have reverted empty).
+  for (const to of [TOKEN, '0x8453000000000000000000000000000000000002']) {
+    const [paid] = (await base.trace([{ chainId: 8453, from: USER, to, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 1n, at: { block: 'latest', header } }]))!;
+    assert.deepEqual([paid.status, paid.returnData, paid.trace!.gasUsed], ['reverted', '0x6fb1b0e9', 0n]);
+  }
   // Not at a block from before that upgrade, when Base ran its tokens by other rules: refused, as before.
   await assert.rejects(base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header: { ...header, timestamp: 1_793_901_599n } } }),
     (e: unknown) => e instanceof ForkUnsupported && /from Base's upgrade of 2026-11-05 on/.test(e.message));
