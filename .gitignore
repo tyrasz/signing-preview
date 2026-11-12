@@ -1,3 +1,5 @@
 node_modules/
 dist/
 *.png
+# Throwaway probe scripts (measurements against a live node), never committed.
+scripts/.probe*/
