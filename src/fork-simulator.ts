@@ -325,7 +325,7 @@ export function saveForkCache(file: string): void {
 }
 
 const ZERO = '0x0000000000000000000000000000000000000000';
-const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', APPROVAL = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
 
 
 /**
@@ -359,6 +359,11 @@ class StateSource {
   standIns = new Set<string>();
   /** Of those whose storage was read for after a block's earlier transactions, the ones those transactions changed (fetchAfter). */
   staleNative = new Set<string>();
+  /**
+   * What the references hashed into a storage slot (each 64-byte input of a KECCAK256 they ran, by its hash): a key
+   * and the mapping's slot, which tells fetchAfter what a B20 token's slot holds (whose balance, which allowance).
+   */
+  preimages = new Map<string, Uint8Array>();
   /** The simulated block's time: which references apply (nativeStandIn). */
   time?: bigint;
   /** What the chain charges for a cold storage read (ChainProfile.storageGas): what a storage reader is given for each. */
@@ -428,18 +433,28 @@ class StateSource {
     const needCode = accounts.filter(a => !this.codeOverrides.has(a));
     const balanceCall = { to: BALANCE_READER, data: `0x${accounts.map(word).join('')}` }, codeCalls = needCode.map(a => ({ to: CODE_READER, data: `0x${word(a)}` }));
     const contracts = [...slots.keys()];
+    // A B20 token's storage can't be read through a reader (below): where the slot is one of its balances,
+    // allowances, nonces or its total supply (what the reference hashed to find it says which), the token's own view
+    // of it after the calls, a call the node runs.
+    const views = contracts.flatMap(a => {
+      const code = this.accounts.get(a)?.code;
+      if (!B20.test(a) || !code || !isNative(code)) return [];
+      return slots.get(a)!.flatMap(slot => { const data = this.b20View(slot); return data ? [{ a, slot, data }] : []; });
+    });
     const blocks: unknown[] = [{ calls: after.calls, blockOverrides: after.blockOverrides, ...(after.state && { stateOverrides: after.state }) }];
     // The balance reader in a block of its own: BNB Chain's node splits a block's gas evenly among calls that set
     // none, and beside 151 code readers the one reading 152 balances got 460,526, short of what they cost.
     if (accounts.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE } }, calls: [balanceCall] });
     if (codeCalls.length) blocks.push({ stateOverrides: { [CODE_READER]: { code: CODE_READER_CODE } }, calls: codeCalls });
+    // (Before the slot readers, whose code overrides last into later blocks.)
+    if (views.length) blocks.push({ calls: views.map(v => ({ to: v.a, data: v.data, gas: '0x30d40' })) });
     // Each slot reader with gas of its own for its slots (a cold read is 2,100 on most chains), not a share of the block's: unless
     // their limits would add up to more than 30,000,000 (a node that adds them up refuses past its block's).
     // (A cold read costs what the chain charges: Polygon 5,460, not 2,100; a reader of 65 slots on 3,000 each ran out.)
     const perSlot = this.coldRead + 900;
     const slotGas = contracts.map(a => 50_000 + perSlot * slots.get(a)!.length), own = slotGas.reduce((x, y) => x + y, 0) <= 30_000_000;
     if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map((a, i) => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}`, ...(own && { gas: `0x${slotGas[i].toString(16)}` }) })) });
-    let out: { calls: { status: string; returnData: Hex; gasUsed?: string; logs?: { address: string }[] }[] }[] | undefined;
+    let out: { calls: { status: string; returnData: Hex; gasUsed?: string; logs?: { address: string; topics?: string[] }[] }[] }[] | undefined;
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
       this.sendAll(nonceJobs),
@@ -484,6 +499,13 @@ class StateSource {
       const code = new Map(needCode.map((a, i) => [a, hexToBytes(rc[i].returnData)]));
       accounts.forEach((a, i) => this.accounts.set(a, { balance: BigInt(balances[i]), nonce: nonces.get(a) ?? 0n, code: this.codeOverrides.get(a) ?? code.get(a) ?? new Uint8Array(0) }));
     }
+    const viewed = new Set<string>();
+    if (views.length) out[at++].calls.forEach((c, i) => {
+      if (c.status !== '0x1' || c.returnData.length !== 66) return;
+      const k = `${views[i].a}_${views[i].slot}`;
+      this.storage.set(k, unpadBytes(hexToBytes(c.returnData)));
+      viewed.add(k);
+    });
     if (contracts.length) {
       const r = out[at].calls, native: string[] = [];
       contracts.forEach((a, i) => {
@@ -500,15 +522,36 @@ class StateSource {
         }
         words(r[i].returnData, slots.get(a)!.length).forEach((v, j) => this.storage.set(`${a}_${slots.get(a)![j]}`, unpadBytes(hexToBytes(v))));
       });
-      // Its storage as of the block the earlier transactions ran on (the only way the node gives it): what they left,
-      // unless one of them changed it, which its events tell (a B20 token's every change has one). Such a contract
-      // is noted (StateSource.staleNative): what it reads may not be what it held.
+      // The rest of its storage as of the block the earlier transactions ran on (the only way the node gives it):
+      // what they left, unless one of them changed it, which its events tell (a B20 token's every change has one).
+      // Transfers and approvals change only balances, allowances, nonces (a permit's) and the total supply (a mint's
+      // or a burn's), read above after the calls; any other event of the contract's, or any of a registry's, may have
+      // changed what was read here. Such a contract is noted (StateSource.staleNative): what it reads may not be what
+      // it held.
       if (native.length) {
-        const touched = new Set(out[0].calls.flatMap(c => (c.logs ?? []).map(l => l.address.toLowerCase())));
-        for (const a of native) if (touched.has(a)) this.staleNative.add(a);
-        await this.sendAll(native.flatMap(a => slots.get(a)!.map(slot => ({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: (v: unknown) => { this.storage.set(`${a}_${slot}`, unpadBytes(hexToBytes(v as Hex))); } }))));
+        const changed = new Set(out[0].calls.flatMap(c => (c.logs ?? []).filter(l => !B20.test(l.address) || ![TRANSFER, APPROVAL].includes((l.topics?.[0] ?? '').toLowerCase())).map(l => l.address.toLowerCase())));
+        const rest = native.flatMap(a => slots.get(a)!.filter(slot => !viewed.has(`${a}_${slot}`)).map(slot => [a, slot] as const));
+        for (const [a] of rest) if (changed.has(a)) this.staleNative.add(a);
+        await this.sendAll(rest.map(([a, slot]) => ({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: (v: unknown) => { this.storage.set(`${a}_${slot}`, unpadBytes(hexToBytes(v as Hex))); } })));
       }
     }
+  }
+
+  /** The call to a B20 token whose answer is what `slot` holds (see preimages), if it is one such a call answers. */
+  private b20View(slot: string): Hex | undefined {
+    if (BigInt(slot) === B20_LAYOUT + 3n) return '0x18160ddd'; // totalSupply()
+    const p = this.preimages.get(slot);
+    if (!p) return undefined;
+    const key = bytesToHex(p.subarray(0, 32)), mapping = BigInt(bytesToHex(p.subarray(32)));
+    const isAddress = (k: string) => BigInt(k) < 1n << 160n;
+    if (!isAddress(key)) return undefined;
+    if (mapping === B20_LAYOUT + 4n) return `0x70a08231${key.slice(2)}`; // balanceOf(account)
+    if (mapping === B20_LAYOUT + 13n) return `0x7ecebe00${key.slice(2)}`; // nonces(owner)
+    // allowances[owner][spender]: the spender hashed into the owner's own mapping.
+    const outer = this.preimages.get(bytesToHex(p.subarray(32)));
+    if (!outer || BigInt(bytesToHex(outer.subarray(32))) !== B20_LAYOUT + 5n) return undefined;
+    const owner = bytesToHex(outer.subarray(0, 32));
+    return isAddress(owner) ? `0xdd62ed3e${owner.slice(2)}${key.slice(2)}` : undefined; // allowance(owner, spender)
   }
 
   private async fetchAt(m: Misses): Promise<void> {
@@ -897,6 +940,8 @@ const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xe
  * replayed on 2026-11-11 reached one).
  */
 const B20 = /^0xb2000000000000000000/i;
+/** Where a B20 token keeps its state (ERC-7201 \`base.b20\`): name, symbol, URI, total supply, balances, allowances, … from here (MockB20Storage). */
+const B20_LAYOUT = 0xc78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434000n;
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
 const BASE = 8453;
 /** When Base's upgrade of 2026-11-05 (Denim) took effect: the B20 rules base-std's `main` has (its eth_config activationTime). */
@@ -1299,9 +1344,14 @@ export class ForkSimulator implements Simulator {
     const opened: (Charge | 'precompile' | undefined)[] = [];
     // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
     const reached = new Set<string>();
-    const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint } }, next?: () => void) => {
+    const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint }; stack?: bigint[]; memory?: Uint8Array }, next?: () => void) => {
       // (Less 375 an event: the node charges its topics and data, not LOG's own base.)
       if (charging && NATIVE_CHARGED.has(e.opcode.name)) charging.node += BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n);
+      // A mapping's slot being found: kept, to read it after a block's earlier transactions (StateSource.preimages).
+      if (e.opcode.name === 'KECCAK256' && e.stack && e.memory) {
+        const n = e.stack.length, offset = Number(e.stack[n - 1]);
+        if (e.stack[n - 2] === 64n && offset + 64 <= e.memory.length) { const p = e.memory.slice(offset, offset + 64); source.preimages.set(keccak256(p), p); }
+      }
       if (charging && charging.node > charging.limit) throw new EVMError(EVMError.errorMessages.OUT_OF_GAS);
       next?.();
     };

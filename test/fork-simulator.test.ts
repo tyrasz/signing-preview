@@ -504,6 +504,28 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
     }) as typeof fetch;
     const [stale] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: touching, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
     assert.deepEqual([stale.status, stale.standInsStale], ['success', [TOKEN]]);
+    // Unless what it read is a balance, an allowance, a nonce or the total supply, and what changed it a transfer or an
+    // approval: those are read after the earlier calls through the token's own views, which the node runs. Here an
+    // earlier approval (its event) let Bob spend 500 of the user's, which the parent block's storage doesn't have.
+    const approving = (async (u: string, init: RequestInit) => {
+      const res = await chain.fetchImpl(u, init), body = JSON.parse(String(init.body));
+      if (!Array.isArray(body) || body[0]?.method !== 'eth_simulateV1') return res;
+      const out = await res.json() as { result?: { calls: { status: string; returnData: string; logs: unknown[] }[] }[] }[];
+      out[0].result?.[0]?.calls[0]?.logs.push({ address: TOKEN, topics: ['0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'], data: '0x' });
+      (body[0].params[0].blockStateCalls as { calls: { to: string; data: string }[] }[]).forEach((b, i) => b.calls.forEach((c, j) => {
+        if (c.to !== TOKEN || !c.data.startsWith('0xdd62ed3e')) return;
+        assert.equal(c.data, `0xdd62ed3e${USER.slice(2).padStart(64, '0')}${BOB.slice(2).padStart(64, '0')}`);
+        out[0].result![i].calls[j] = { status: '0x1', returnData: `0x${(500).toString(16).padStart(64, '0')}`, logs: [] };
+      }));
+      return new Response(JSON.stringify(out));
+    }) as typeof fetch;
+    const transferFrom = encodeFunctionData({ abi: parseAbi(['function transferFrom(address,address,uint256) returns (bool)']), functionName: 'transferFrom', args: [USER as `0x${string}`, BOB as `0x${string}`, 100n] });
+    const spend: SimulationRequest = { chainId: 8453, from: BOB, to: TOKEN, data: transferFrom, value: 0n };
+    const [spent] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: approving, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...spend, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.deepEqual([spent.status, spent.standInsStale], ['success', undefined]);
+    // (Without it, the parent block's allowance: none, InsufficientAllowance.)
+    const [refused] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: touching, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...spend, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.deepEqual([refused.status, refused.returnData?.slice(0, 10)], ['reverted', '0x192b9e4e']);
   } finally { chain.simulateV1 = false; }
   // Given less gas than the node charges for it, the token's call runs out, as on the chain (its reference is given
   // gas to spare, which isn't the call's).
