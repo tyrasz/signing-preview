@@ -1293,19 +1293,26 @@ export class ForkSimulator implements Simulator {
     // local EVM then needs fewer rounds of reads, each a wait on the node, longer where it rate limits. (Not Base's
     // native contracts, whose storage is read their own way after a block's earlier transactions; not a chain whose
     // RPC has no such method, HyperEVM's.)
-    if (this.opts.prefetch !== false && !NO_ACCESS_LIST.has(chainId)) {
+    // (Both at once: the senders and targets are read while the node is asked, then what it named. Not after a
+    // block's earlier transactions, which each read runs again on the node first: there, one read of it all.)
+    const together = !!source.after;
+    const known = together ? Promise.resolve() : source.fetch(first);
+    const listed = this.opts.prefetch === false || NO_ACCESS_LIST.has(chainId) ? (together ? source.fetch(first) : Promise.resolve()) : (async () => {
       const hex = (v: bigint) => `0x${v.toString(16)}`;
+      const named = newMisses();
       const lists = await Promise.all(reqs.slice(0, 4).map(r => source.accessList({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
         ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })));
       for (const e of lists.flat()) {
         if (!e?.address) continue;
         const a = hexOf(e.address);
         if (chainId === BASE && (B20_PRECOMPILE.test(a) || a in BASE_REGISTRIES || a === B20_FACTORY)) continue;
-        first.accounts.add(a);
-        if (!lowAddress(a)) for (const k of e.storageKeys ?? []) first.storage.add(slotKey(a, k));
+        if (!first.accounts.has(a)) named.accounts.add(a);
+        if (!lowAddress(a)) for (const k of e.storageKeys ?? []) named.storage.add(slotKey(a, k));
       }
-    }
-    const prefetch = source.fetch(first);
+      if (together) { for (const a of named.accounts) first.accounts.add(a); for (const k of named.storage) first.storage.add(k); await source.fetch(first); }
+      else if (named.accounts.size || named.storage.size) await source.fetch(named);
+    })();
+    const prefetch = Promise.all([known, listed]);
     const fixed = at?.header ?? this.opts.header?.(chainId);
     const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, timestamp: at?.header.ownTimestamp ?? fixed.timestamp, ...(at?.header.ownTimestamp !== undefined && at.header.ownMilliseconds !== undefined && { milliseconds: at.header.ownMilliseconds }), coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam }
       : this.blockContext(source, tag, profile), prefetch, this.rulesOf(chainId, source)]);
