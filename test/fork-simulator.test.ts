@@ -633,13 +633,17 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   // Not at a block from before that upgrade, when Base ran its tokens by other rules: refused, as before.
   await assert.rejects(base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header: { ...header, timestamp: 1_793_901_599n } } }),
     (e: unknown) => e instanceof ForkUnsupported && /from Base's upgrade of 2026-11-05 on/.test(e.message));
-  // Only on Base, only behind the marker, only the variants and registries it has references for.
+  // Only on Base, only the variants and contracts it has references for.
   assert.ok(nativeStandIn(8453, TOKEN, new Uint8Array([0xef])));
   assert.ok(nativeStandIn(8453, '0xb200000000000000000001123456789abcdef012', new Uint8Array([0xef])));
   assert.equal(nativeStandIn(8453, '0xb200000000000000000002123456789abcdef012', new Uint8Array([0xef])), undefined);
   assert.equal(nativeStandIn(10, TOKEN, new Uint8Array([0xef])), undefined);
-  assert.equal(nativeStandIn(8453, TOKEN, new Uint8Array([0x60, 0x00])), undefined);
-  assert.equal(nativeStandIn(8453, '0xb20f000000000000000000000000000000000000', new Uint8Array([0xef])), undefined);
+  // By address, as Base's node chooses: a token wherever there is code (an override's too, which the node ignores),
+  // none where there is none; the factory and registries whatever code there is.
+  assert.ok(nativeStandIn(8453, TOKEN, new Uint8Array([0x60, 0x00])));
+  assert.equal(nativeStandIn(8453, TOKEN, new Uint8Array(0)), undefined);
+  assert.ok(nativeStandIn(8453, '0xb20f000000000000000000000000000000000000', new Uint8Array(0)));
+  assert.ok(nativeStandIn(8453, '0x8453000000000000000000000000000000000002', new Uint8Array([0x60, 0x00])));
 });
 
 test('A rate limit on state reads: the node’s wait is kept to, and a trace it denies says why', async () => {

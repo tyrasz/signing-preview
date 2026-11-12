@@ -33,7 +33,8 @@
 //     only to the token it is creating, as it creates it: on the chain, the same. The factory writes no flag, and
 //     answers isB20Initialized by whether the token exists, as the chain does (measured: true for a created token,
 //     false for an address with none). It etches the chain's marker, not the reference's code.
-//   - permit to spender 0 (after the signature checks): the chain refuses it (InvalidSpender), the reference didn't;
+//   - permit to spender 0 (after the nonce is written, as the chain writes it once the signature verifies): the
+//     chain refuses it (InvalidSpender), the reference didn't;
 //   - MAX_SUPPLY_CAP() and the policy registry's ALWAYS_ALLOW_ID() and ALWAYS_BLOCK_ID() are the references' own:
 //     the chain has no such functions;
 //   - a call to no function of the token's: the chain reverts with the call's first four bytes (0x00000000 when it
@@ -89,7 +90,8 @@ const ACTIVATION_ADMIN = getAddress('0xce3a3bee7e72e2a24079f3c0cb3b97740ed425a9'
 const PATCHES: Record<string, [string, string][]> = {
   'test/lib/mocks/MockB20.sol': [
     ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return msg.sender == FACTORY;\n'],
-    ['            revert InvalidSigner(recovered, owner);\n        }\n', '            revert InvalidSigner(recovered, owner);\n        }\n        if (spender == address(0)) revert InvalidSpender(spender);\n'],
+    // (After the nonce is written: the node writes it, and charges it, once the signature verifies.)
+    ['            $.nonces[owner] = nonce + 1;\n        }\n', '            $.nonces[owner] = nonce + 1;\n        }\n        if (spender == address(0)) revert InvalidSpender(spender);\n'],
     ['    uint256 public constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;', '    uint256 internal constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;'],
     ['    function _isPrivileged() internal view returns (bool) {', `    fallback() external payable {
         assembly {
@@ -114,6 +116,10 @@ const PATCHES: Record<string, [string, string][]> = {
     // once it exists.
     ['        _writeUint(token, MockB20Storage.initializedSlot(), 1);', '        // (The chain stores no initialized flag: the window closes as the factory never calls the token again.)'],
     ['        return uint256(vm.load(token, MockB20Storage.initializedSlot())) != 0;', '        return token.code.length != 0;'],
+    // A stablecoin's currency is checked after the factory finds whether the token exists (measured: re-creating one
+    // with a bad currency fails TokenAlreadyExists on the chain), not before it works out the address.
+    ['            bytes memory cb = bytes(p.currency);\n            if (cb.length == 0) revert MissingRequiredField("currency");\n            // Format check: every byte must be an uppercase ASCII letter (A-Z).\n            for (uint256 i = 0; i < cb.length; ++i) {\n                if (cb[i] < 0x41 || cb[i] > 0x5A) revert InvalidCurrency(p.currency);\n            }\n', ''],
+    ['        if (token.code.length != 0) revert TokenAlreadyExists(token);\n', '        if (token.code.length != 0) revert TokenAlreadyExists(token);\n        if (variant == B20Variant.STABLECOIN) {\n            bytes memory cb = bytes(currency_);\n            if (cb.length == 0) revert MissingRequiredField("currency");\n            for (uint256 i = 0; i < cb.length; ++i) {\n                if (cb[i] < 0x41 || cb[i] > 0x5A) revert InvalidCurrency(currency_);\n            }\n        }\n'],
     // An init call the token can't dispatch (a function it hasn't, or calldata too short for a selector) fails the
     // creation with InitCallFailed(i) on the chain, where the reference passed on the token's answer, the selector
     // (measured: 0xdeadbeef, 0x12; an error the token raises, SupplyCapExceeded, is passed on by both).
