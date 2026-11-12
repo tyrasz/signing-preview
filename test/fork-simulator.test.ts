@@ -94,6 +94,26 @@ test('Batches run in order with approvals read back; signatures, NFTs and EOA-on
   assert.ok(!(nftApprove.approvals ?? []).some(a => a.kind === 'erc20'), JSON.stringify(nftApprove.approvals));
 });
 
+test('What a simulation sets in storage is not read over by the slots the node says a call touches', async () => {
+  // A contract that returns its slot 0, which holds 0 on the chain; the simulation sets it to 7, and the node's
+  // access list (eth_createAccessList, read to prefetch) names it. A Sepolia replay's earlier transactions, from the
+  // block's access list, are set the same way: six started from the parent block's value instead (2026-11-12).
+  const reader = '0x5100000000000000000000000000000000000051', SLOT0 = `0x${'00'.repeat(32)}`;
+  await chain.putCode(reader, '0x60005460005260206000f3');
+  const listing = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)), reqs = (Array.isArray(body) ? body : [body]) as { id: number; method: string }[];
+    if (!reqs.some(r => r.method === 'eth_createAccessList')) return chain.fetchImpl(u, init);
+    const out = await Promise.all(reqs.map(async r => r.method === 'eth_createAccessList'
+      ? { jsonrpc: '2.0', id: r.id, result: { accessList: [{ address: reader, storageKeys: [SLOT0] }], gasUsed: '0x0' } }
+      : (await chain.fetchImpl(u, { ...init, body: JSON.stringify(r) })).json()));
+    return new Response(JSON.stringify(Array.isArray(body) ? out : out[0]));
+  }) as typeof fetch;
+  // (As Ethereum: HyperEVM's RPC has no eth_createAccessList, so nothing is prefetched there.)
+  const ethereum = new ForkSimulator({ 1: URL_ }, { fetchImpl: listing });
+  const [r] = (await ethereum.simulateBatch([{ chainId: 1, from: USER, to: reader, data: '0x', value: 0n, stateOverrides: { [reader]: { stateDiff: { [SLOT0]: `0x${'00'.repeat(31)}07` } } } }]))!;
+  assert.equal(BigInt(r.returnData!), 7n);
+});
+
 test('Failures: revert reasons, insufficient funds; a chain precompile is answered by the chain', async () => {
   const fail = await send(reverter, call('fail'));
   assert.deepEqual([fail.simulation?.status, fail.simulation?.revertReason], ['reverted', 'nope']);

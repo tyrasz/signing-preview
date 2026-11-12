@@ -440,6 +440,10 @@ class StateSource {
   after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges; /** The calls on less gas each, for a node that adds their limits up against the block's (fitGas); undefined when they can't be. */ fit?: () => Promise<{ requests: SimulationRequest[]; calls: unknown[] } | undefined>; /** Set once the calls are the fitted ones: none may have run short on its gas (hadRoom, against `earlier`). */ fitted?: SimulationRequest[]; earlier?: SimulationRequest[] };
 
   async fetch(m: Misses): Promise<void> {
+    // What is already set isn't read over: a simulation's storage overrides, or what a block's earlier transactions
+    // left (its access list). The node's access list names slots whatever they hold (prefetching read them over,
+    // 2026-11-12: six Sepolia replays started a slot from the parent block's value).
+    if ([...m.storage].some(k => this.storage.has(k))) m = { ...m, storage: new Set([...m.storage].filter(k => !this.storage.has(k))) };
     if (!this.after) return this.fetchAt(m);
     await Promise.all([this.fetchAfter(m), this.fetchAt({ accounts: new Set(), storage: new Set(), calls: m.calls, blocks: m.blocks })]);
   }
