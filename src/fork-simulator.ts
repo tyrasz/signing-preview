@@ -988,7 +988,8 @@ const HEVM = '0x7109709ecfa91a80626ff3989d68f67f5b1dd12d';
  * What Base's node charges a creation beyond the storage it writes and the events it emits (which are charged as
  * a token's are), measured on its node by creations of each kind beside the local EVM's, each call's own gas timed
  * by a contract calling the factory (a transaction's gas hides a cheap one under the calldata floor). A call to the
- * factory is charged 6 a word of its input, not a token's 100 besides, and the factory is warm from the start. It
+ * factory, as one to a registry, is charged 6 a word of its input, not a token's 100 besides (isAuthorized(0, …)
+ * 18, isActivated 2,118 with its cold read), and the factory is warm from the start, as the registries are. It
  * works out the token's address (a hash, 42) before it checks the parameters' version and decimals, which fail with
  * that much more; finding whether the token exists is a cold account read (2,600): a creation that would overwrite
  * one fails with both more (TokenAlreadyExists). Writing the token costs 34,436 more for an asset, 32,236 for a
@@ -1440,8 +1441,9 @@ export class ForkSimulator implements Simulator {
     // or for asking the registry (measured on Base: name() 2,206, balanceOf 2,212, a transfer 37,374). So the call
     // is given gas to spare, and charged what the node would: the SLOADs, SSTOREs and LOGs it runs (those of the
     // registry's reference under it included) and its precompiles' gas, on top of that 100 and 6 a word. Without
-    // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries, called
-    // themselves, are charged so too. A call whose charge passes the gas it was given runs out there, as the node's.
+    // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries and the
+    // factory, called themselves, are charged so too, without the 100 (B20_EXISTS_GAS). A call whose charge passes
+    // the gas it was given runs out there, as the node's.
     type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; admin?: boolean; looked?: boolean; eip712?: boolean };
     let charging: Charge | undefined;
     const opened: (Charge | 'precompile' | undefined)[] = [];
@@ -1572,7 +1574,7 @@ export class ForkSimulator implements Simulator {
       if (!delegated && !refused && native) { const ref = await standInFor(state, chainId, code!, source.time); if (ref) { m.code = ref; source.standIns.add(code!); } else if (B20_PRECOMPILE.test(code!) && (await state.getCode(createAddressFromString(code!))).length === 0) { m.code = NO_TOKEN; empty = true; } }
       if (native) reached.add(code!);
       if (!charging && native) {
-        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : (code === B20_FACTORY ? 0n : 100n) + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated || empty, ...(m.data.length >= 4 && !empty && { selector: m.data.slice(0, 4) }), ...(code === B20_FACTORY && { admin: namesAdmin(m.data) }), ...(B20_PRECOMPILE.test(code) && m.data.length >= 4 && EIP712_FUNCTIONS.has(bytesToHex(m.data.subarray(0, 4))) && { eip712: true }) });
+        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : (B20_PRECOMPILE.test(code) ? 100n : 0n) + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated || empty, ...(m.data.length >= 4 && !empty && { selector: m.data.slice(0, 4) }), ...(code === B20_FACTORY && { admin: namesAdmin(m.data) }), ...(B20_PRECOMPILE.test(code) && m.data.length >= 4 && EIP712_FUNCTIONS.has(bytesToHex(m.data.subarray(0, 4))) && { eip712: true }) });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
       } else opened.push(charging && code && (m.isCompiled || evm.precompiles.has(code.slice(2))) ? 'precompile' : undefined);

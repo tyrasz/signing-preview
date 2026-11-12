@@ -270,6 +270,54 @@ function arbosPrograms(): Program[] {
   ];
 }
 
+/**
+ * Base's own contracts, which its node runs in Rust and the local EVM from their Solidity references (B20 tokens,
+ * their registries and factory: src/fork-simulator.ts, nativeStandIn), each called from a contract that reports the
+ * gas the call spent, whether it succeeded and what it returned (called directly, a cheap call's price hides under
+ * the calldata floor): a live token's reads and its EIP-712 functions, calls that fail each way, value sent, the
+ * token's code as other contracts read it, an account delegated to one, the registries, and creations through the
+ * factory. So a change Base makes to them shows here, as a price change on HyperEVM did.
+ */
+function b20Programs(): Program[] {
+  const TOKEN = 'b200000000000000000000397293cb8cda9a10c5', POLICY = '8453000000000000000000000000000000000002', ACTIVATION = '8453000000000000000000000000000000000001', FACTORY = 'b20f000000000000000000000000000000000000';
+  const callOf = (to: string, value = '00') => asm(`CALLDATASIZE 00 00 CALLDATACOPY GAS 00 00 CALLDATASIZE 00 ${value} ${to} GAS CALL GAS
+    SWAP1 00 MSTORE SWAP1 SUB 20 MSTORE RETURNDATASIZE 40 MSTORE RETURNDATASIZE 00 80 RETURNDATACOPY RETURNDATASIZE 80 KECCAK256 60 MSTORE 80 00 RETURN`);
+  const sel = (signature: string) => toFunctionSelector(`function ${signature}`);
+  const addressWord = (a: string) => word(BigInt(`0x${a}`));
+  const someone = FROM.slice(2), token = (label: string, data: Hex, value?: string): Program => ({ label: `B20 token ${label}`, code: callOf(TOKEN, value), data, ...(value && { balance: 1n }) });
+  // createB20(variant, salt, params, initCalls), params an asset's or a stablecoin's (version 1).
+  const text = (t: string) => `${word(t.length)}${Buffer.from(t).toString('hex').padEnd(Math.ceil(t.length / 32) * 64, '0')}`;
+  const asset = (name: string, symbol: string, decimals: number) => `${word(32)}${word(1)}${word(160)}${word(160 + 32 + Math.ceil(name.length / 32) * 32)}${word(0)}${word(decimals)}${text(name)}${text(symbol)}`;
+  const stablecoin = (name: string, symbol: string, currency: string) => { const n = 160 + 32 + Math.ceil(name.length / 32) * 32, c = n + 32 + Math.ceil(symbol.length / 32) * 32; return `${word(32)}${word(1)}${word(160)}${word(n)}${word(0)}${word(c)}${text(name)}${text(symbol)}${text(currency)}`; };
+  const bytes = (hex: string) => `${word(hex.length / 2)}${hex.padEnd(Math.ceil(hex.length / 64) * 64, '0')}`;
+  const create = (variant: number, params: string, initCalls: string[]) => {
+    const p = bytes(params), offsets = initCalls.reduce<{ at: number[]; next: number }>((o, c) => ({ at: [...o.at, o.next], next: o.next + 32 + Math.ceil(c.length / 2 / 32) * 32 }), { at: [], next: 32 * initCalls.length });
+    return `${sel('createB20(uint8,bytes32,bytes,bytes[])')}${word(variant)}${word(0x5a17n)}${word(128)}${word(128 + p.length / 2)}${p}${word(initCalls.length)}${offsets.at.map(word).join('')}${initCalls.map(bytes).join('')}` as Hex;
+  };
+  const mint = `${sel('mint(address,uint256)').slice(2)}${addressWord(someone)}${word(1000)}`;
+  return [
+    ...(['decimals()', 'name()', 'symbol()', 'totalSupply()', 'DOMAIN_SEPARATOR()', 'eip712Domain()', 'supplyCap()', 'pausedFeatures()'] as const).map(f => token(f, sel(f))),
+    token('balanceOf (an address with none)', `${sel('balanceOf(address)')}${addressWord(someone)}` as Hex),
+    token('allowance', `${sel('allowance(address,address)')}${addressWord(someone)}${addressWord(someone)}` as Hex),
+    token('nonces', `${sel('nonces(address)')}${addressWord(someone)}` as Hex),
+    token('hasRole', `${sel('hasRole(bytes32,address)')}${word(0)}${addressWord(someone)}` as Hex),
+    token('transfer with no balance', `${sel('transfer(address,uint256)')}${addressWord(someone)}${word(1)}` as Hex),
+    token('transfer to itself', `${sel('transfer(address,uint256)')}${addressWord(TOKEN)}${word(0)}` as Hex),
+    token('permit, a signature that recovers to no one', `${sel('permit(address,address,uint256,uint256,uint8,bytes32,bytes32)')}${addressWord(someone)}${addressWord(someone)}${word(1)}${word(2n ** 40n)}${word(27)}${word(1)}${word(1)}` as Hex),
+    token('permit, expired', `${sel('permit(address,address,uint256,uint256,uint8,bytes32,bytes32)')}${addressWord(someone)}${addressWord(someone)}${word(1)}${word(1)}${word(27)}${word(1)}${word(1)}` as Hex),
+    token('a function it lacks', '0xdeadbeef'), token('calldata too short for a selector', '0x12'), token('transfer short of its arguments', sel('transfer(address,uint256)')),
+    token('sent value', sel('decimals()'), '01'),
+    { label: 'B20 token code as others read it (EXTCODESIZE, EXTCODEHASH)', code: asm(`${TOKEN} EXTCODESIZE 00 MSTORE ${TOKEN} EXTCODEHASH 20 MSTORE 40 00 RETURN`) },
+    { label: 'B20 an account delegated to a token (EIP-7702) called', code: `0xef0100${TOKEN}` as Hex, data: sel('decimals()') },
+    { label: 'B20 policy registry isAuthorized(0, someone)', code: callOf(POLICY), data: `${sel('isAuthorized(uint64,address)')}${word(0)}${addressWord(someone)}` as Hex },
+    { label: 'B20 activation registry isActivated(B20 asset)', code: callOf(ACTIVATION), data: `${sel('isActivated(bytes32)')}cdcc772fe4cbdb1029f822861176d09e646db96723d4c1e82ddfdeb8163ef54c` as Hex },
+    { label: 'B20 factory creating an asset, minted', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 18), [mint]) },
+    { label: 'B20 factory creating a stablecoin', code: callOf(FACTORY), data: create(1, stablecoin('Rules Dollar', 'RUSD', 'USD'), []) },
+    { label: 'B20 factory, decimals out of range', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 5), []) },
+    { label: 'B20 factory, an init call the token lacks', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 18), ['deadbeef']) },
+  ];
+}
+
 async function precompilePrograms(): Promise<Program[]> {
   const zeros = (n: number) => '00'.repeat(n);
   // ecrecover: a real signature by a throwaway key.
@@ -580,6 +628,7 @@ async function check(chainId: number): Promise<Report> {
     // (HyperEVM runs Cancun's rules, which have no such transactions, and its node only eth_call.)
     ...(profile.hardfork === 'cancun' ? [] : await authorizationPrograms(chainId)),
     ...(profile.arbitrum ? arbosPrograms() : []),
+    ...(chainId === 8453 ? b20Programs() : []),
   ];
   if (!ONLY_FUZZ) await compare(chain, chainId, programs, report);
   // --fuzz N: as many random programs again (see fuzzPrograms), from --seed.
