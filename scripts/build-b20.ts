@@ -92,6 +92,28 @@ const PATCHES: Record<string, [string, string][]> = {
     ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return msg.sender == FACTORY;\n'],
     // (After the nonce is written: the node writes it, and charges it, once the signature verifies.)
     ['            $.nonces[owner] = nonce + 1;\n        }\n', '            $.nonces[owner] = nonce + 1;\n        }\n        if (spender == address(0)) revert InvalidSpender(spender);\n'],
+    // The default admin role granted under the factory's bootstrap (an init call): the chain reads the admin count
+    // first, and refuses it on a token without admins (measured: a creation with no admin whose init call grants it
+    // fails AccessControlUnauthorizedAccount(factory, 0); with an admin, such a grant costs one read more). The
+    // factory's own grant of the initial admin, which the chain's creation writes itself, goes another way.
+    ['    function grantRole(bytes32 role, address account) external onlyRoleAdmin(role) {\n        _grantRole(role, account);\n    }\n',
+      `    function grantRole(bytes32 role, address account) external onlyRoleAdmin(role) {
+        if (role == DEFAULT_ADMIN_ROLE && _isPrivileged() && MockB20Storage.layout().adminCount == 0) {
+            revert AccessControlUnauthorizedAccount(msg.sender, DEFAULT_ADMIN_ROLE);
+        }
+        _grantRole(role, account);
+    }
+
+    function grantInitialAdmin(address account) external {
+        bool done;
+        assembly { done := tload(0x5f0b4a63c4f34c1c1b0e3f6b9b9d0b6b2f2f8f6f0e3c1a7a2b6d5e4c3b2a1900) }
+        if (msg.sender != FACTORY || done) {
+            assembly { mstore(0, shl(224, 0x62a80d42)) revert(0, 4) }
+        }
+        assembly { tstore(0x5f0b4a63c4f34c1c1b0e3f6b9b9d0b6b2f2f8f6f0e3c1a7a2b6d5e4c3b2a1900, 1) }
+        if (account != address(0)) _grantRole(DEFAULT_ADMIN_ROLE, account);
+    }
+`],
     ['    uint256 public constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;', '    uint256 internal constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;'],
     ['    function _isPrivileged() internal view returns (bool) {', `    fallback() external payable {
         assembly {
@@ -124,8 +146,9 @@ const PATCHES: Record<string, [string, string][]> = {
     // creation with InitCallFailed(i) on the chain, where the reference passed on the token's answer, the selector
     // (measured: 0xdeadbeef, 0x12; an error the token raises, SupplyCapExceeded, is passed on by both).
     ['                if (reason.length > 0) {', '                if (reason.length > 0 && !(reason.length == 4 && (initCalls[i].length < 4 || bytes4(reason) == bytes4(initCalls[i])))) {'],
-    // (The token's patched fallback is payable: the cast says so.)
-    ['            MockB20(token).grantRole(DEFAULT_ADMIN_ROLE, admin);', '            MockB20(payable(token)).grantRole(DEFAULT_ADMIN_ROLE, admin);'],
+    // (The token's patched fallback is payable: the cast says so. Its initial admin, as the chain's creation writes
+    // it, through grantInitialAdmin: see the token's patches.)
+    ['        if (admin != address(0)) {\n            MockB20(token).grantRole(DEFAULT_ADMIN_ROLE, admin);\n        }\n', '        MockB20(payable(token)).grantInitialAdmin(admin);\n'],
   ],
   'test/lib/mocks/MockActivationRegistry.sol': [
     ['    address internal constant ADMIN = 0xCB00000000000000000000000000000000000000;', `    address internal constant ADMIN = ${ACTIVATION_ADMIN};`],
