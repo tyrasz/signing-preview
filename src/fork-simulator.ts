@@ -907,6 +907,9 @@ const codeOf = (hex: string) => { let c = STAND_IN_CODE.get(hex); if (!c) STAND_
  * are base-std's `main`, what Base runs from its upgrade of 2026-11-05 (Denim): a block before it ran B20 tokens by
  * other rules (v1.1.0's from 2026-09-30, v1.0.0's before), and isn't given them.
  */
+/** Whether a precompile the chain's node lists is one the local EVM runs from its Solidity reference (Base's registries). */
+export const hasReference = (chainId: number, address: string) => chainId === BASE && address.toLowerCase() in BASE_REGISTRIES;
+
 export function nativeStandIn(chainId: number, address: string, code: Uint8Array, time?: bigint): Uint8Array | undefined {
   if (chainId !== BASE || code.length !== 1 || code[0] !== 0xef || (time !== undefined && time < BASE_DENIM)) return undefined;
   const key = address.toLowerCase(), registry = BASE_REGISTRIES[key];
@@ -1125,7 +1128,7 @@ export class ForkSimulator implements Simulator {
     source.time = block.header.timestamp;
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
     const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
-    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !(chainId === BASE && BASE_REGISTRIES[address])) source.nodeOnly.set(address, name);
+    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !hasReference(chainId, address)) source.nodeOnly.set(address, name);
     const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and

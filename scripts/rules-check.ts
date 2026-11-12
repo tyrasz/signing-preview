@@ -22,7 +22,7 @@ import { getActivePrecompiles } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { hashMessage, toFunctionSelector, type Hex } from 'viem';
-import { CHAIN_PROFILES, ForkSimulator, nodeRulesOf } from '../src/fork-simulator.ts';
+import { CHAIN_PROFILES, ForkSimulator, hasReference, nodeRulesOf } from '../src/fork-simulator.ts';
 import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
 import { authorizationsForNode } from '../src/simulation.ts';
@@ -46,7 +46,7 @@ const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, '0');
 /** The address the i-th program of a batch is placed at. */
 const place = (i: number) => `0x${(0xc0de0000 + i).toString(16).padStart(40, '0')}`;
 
-interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** Slots the program's own account holds beforehand. */ storage?: Record<string, string>; /** One of fuzzPrograms'. */ random?: boolean; /** Sent at a price (a gwei over the block's base fee), as a transaction is: its gas is bought before it runs. */ priced?: boolean; /** Said with a difference: what it takes to run the program again. */ detail?: string; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
+interface Program { label: string; code?: Hex; to?: string; data?: Hex; value?: bigint; balance?: bigint; /** The gas the call is given, where GAS isn't enough. */ gas?: bigint; /** Slots the program's own account holds beforehand. */ storage?: Record<string, string>; /** One of fuzzPrograms'. */ random?: boolean; /** Sent at a price (a gwei over the block's base fee), as a transaction is: its gas is bought before it runs. */ priced?: boolean; /** First in its simulated block: what the calls before it there did can't move what it reads. */ first?: boolean; /** Said with a difference: what it takes to run the program again. */ detail?: string; /** EIP-7702 authorizations the call carries, and the accounts their authorities are given (see authorizationPrograms). */ authorizationList?: NonNullable<SimulationRequest['authorizationList']>; state?: StateChanges; /** The code is `caller`: it returns whether the precompile's call succeeded, the gas it spent, and what came back. */ precompile?: boolean }
 interface Outcome { kind: 'runs' | 'invalid' | 'fails' | 'refused'; returns: string; gas?: bigint; logs: string; why?: string }
 
 /** Seventeen pushes (1 on top), the opcode, then: store the top of the stack at 0, the memory size at 32, return both. */
@@ -111,7 +111,9 @@ function crafted(amsterdam: boolean): Program[] {
     // the gas limit at that price while it runs; what the code reads of the price, and the fee recipient's balance.
     { label: 'BALANCE of the sender, in a call that pays for its gas', code: asm(`CALLER BALANCE ${RET}`), priced: true },
     { label: 'GASPRICE and BASEFEE, in a call that pays for its gas', code: asm('GASPRICE 00 MSTORE BASEFEE 20 MSTORE 40 00 RETURN'), priced: true },
-    { label: "BALANCE of the fee recipient, in a call that pays for its gas", code: asm(`COINBASE BALANCE ${RET}`), priced: true },
+    // (First in its block: Polygon's node pays the fee recipient the base fee of a call sent at no price, which no
+    // transaction is, before the next call in the block reads it; a program burning 19,687,885 gas so moved it.)
+    { label: "BALANCE of the fee recipient, in a call that pays for its gas", code: asm(`COINBASE BALANCE ${RET}`), priced: true, first: true },
     { label: 'TSTORE then TLOAD', code: asm(`2a 07 TSTORE 07 TLOAD ${RET}`) },
     { label: 'MCOPY of a word', code: asm(`2a 00 MSTORE 20 00 40 MCOPY 40 MLOAD ${RET}`) },
     { label: 'KECCAK256 of 64 bytes', code: asm(`2a 00 MSTORE 40 00 KECCAK256 ${RET}`) },
@@ -409,7 +411,7 @@ class Chain {
 /** A public RPC's answer when it is turning requests away. */
 const RATE_LIMITED = /HTTP 429|rate limit|too many requests/i;
 
-interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** Programs a public RPC's rate limit kept from running, after waits: not compared. */ uncompared: string[]; /** How many of `differences` are programs'. */ programsDiffer?: number; /** Its blocks are Amsterdam's. */ amsterdam?: boolean; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
+interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; /** Precompiles the node lists that the local EVM runs from their Solidity references. */ referenced: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** Programs a public RPC's rate limit kept from running, after waits: not compared. */ uncompared: string[]; /** How many of `differences` are programs'. */ programsDiffer?: number; /** Its blocks are Amsterdam's. */ amsterdam?: boolean; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
 
 /** Differences that are the node's way of answering, not a rule the local EVM has wrong: listed, not counted. */
 const EXPECTED: Record<number, Record<string, string>> = {
@@ -448,7 +450,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
   const batches: Program[][] = [];
   for (const p of programs) {
     const last = batches.at(-1), limit = (q: Program) => q.gas ?? GAS;
-    if (last && last.length < 16 && last.reduce((sum, q) => sum + limit(q), 0n) + limit(p) <= 30_000_000n) last.push(p);
+    if (last && !p.first && last.length < 16 && last.reduce((sum, q) => sum + limit(q), 0n) + limit(p) <= 30_000_000n) last.push(p);
     else batches.push([p]);
   }
   for (const batch of batches) {
@@ -511,7 +513,7 @@ const OVER_THE_CAP: Record<string, string> = Object.fromEntries(['GAS, on a limi
 
 async function check(chainId: number): Promise<Report> {
   const chain = new Chain(chainId), profile = CHAIN_PROFILES[chainId];
-  const report: Report = { chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, differences: [], expected: [], drift: false, uncompared: [] };
+  const report: Report = { chainId, name: chainName(chainId), fork: [], nodeOnly: [], referenced: [], compared: 0, differences: [], expected: [], drift: false, uncompared: [] };
   const head = await chain.client.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as { number: string; blockAccessListHash?: string };
   report.block = BigInt(head.number).toString();
   const amsterdam = head.blockAccessListHash !== undefined && (chainId === 1 || chainId === 11155111);
@@ -527,7 +529,8 @@ async function check(chainId: number): Promise<Report> {
     if (profile?.checked && !same) report.drift = true;
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: (amsterdam ? 'amsterdam' : profile.hardfork) as never });
     const own = new Set([...getActivePrecompiles(common).keys()].map(k => `0x${k}`)), forwards = new Set((profile.forwardedPrecompiles ?? []).map(a => a.toLowerCase()));
-    for (const [address, name] of rules.precompiles) if (!own.has(address) && !forwards.has(address)) report.nodeOnly.push(`${name} ${address}`);
+    // (Base's registries run from their Solidity references: said apart.)
+    for (const [address, name] of rules.precompiles) if (!own.has(address) && !forwards.has(address)) (hasReference(chainId, address) ? report.referenced : report.nodeOnly).push(`${name} ${address}`);
     const next = config?.next;
     if (next?.forkId) {
       const now = new Set(rules.precompiles.keys()), added = Object.entries(next.precompiles ?? {}).filter(([, a]) => !now.has(`0x${a.slice(2).toLowerCase().padStart(40, '0')}`)).map(([n, a]) => `${n} ${a}`);
@@ -589,11 +592,12 @@ async function replays(chainId: number, url: string, count = 24): Promise<{ repl
 
 const reports: Report[] = [];
 for (const chainId of CHAINS_ASKED) {
-  try { reports.push(await check(chainId)); } catch (e) { reports.push({ chainId, name: chainName(chainId), fork: [], nodeOnly: [], compared: 0, uncompared: [], differences: [`the check did not run: ${(e as Error).message.slice(0, 200)}`], expected: [], drift: false }); }
+  try { reports.push(await check(chainId)); } catch (e) { reports.push({ chainId, name: chainName(chainId), fork: [], nodeOnly: [], referenced: [], compared: 0, uncompared: [], differences: [`the check did not run: ${(e as Error).message.slice(0, 200)}`], expected: [], drift: false }); }
   const r = reports.at(-1)!;
   console.log(`\n== ${r.name} (chain ${r.chainId})${r.block ? `, block ${r.block}` : ''}`);
   for (const line of r.fork) console.log(`  ${line}`);
   if (r.nodeOnly.length) console.log(`  precompiles the node has and the local EVM doesn't (refused in a local run): ${r.nodeOnly.join(', ')}`);
+  if (r.referenced.length) console.log(`  precompiles the node has that the local EVM runs from their Solidity references: ${r.referenced.join(', ')}`);
   const programs = r.programsDiffer ?? r.differences.length;
   console.log(`  ${r.compared} programs compared on the node and locally: ${programs ? `${programs} differ` : 'all the same'}`);
   if (r.replays) console.log(`  ${r.replays}`);
@@ -604,7 +608,7 @@ for (const chainId of CHAINS_ASKED) {
 if (OUT) writeFileSync(OUT, JSON.stringify(reports, null, 2));
 if (SUMMARY_MD) {
   const lines = ['### Rules check', '', '| Chain | Fork | Compared | Differ |', '|---|---|---|---|', ...reports.map(r => `| ${r.name} | ${r.drift ? '**changed**' : r.fork[0]?.includes('the one checked') ? 'as checked' : 'not known'} | ${r.compared} | ${r.differences.length} |`), ''];
-  for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1 || r.replays || r.uncompared.length) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.replays ? [`- ${r.replays}`] : []), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), ...(r.uncompared.length ? [`- Not compared, the RPC's rate limit: ${r.uncompared.length}`] : []), '');
+  for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1 || r.replays || r.uncompared.length) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.replays ? [`- ${r.replays}`] : []), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...(r.referenced.length ? [`- Precompiles run from their Solidity references: ${r.referenced.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), ...(r.uncompared.length ? [`- Not compared, the RPC's rate limit: ${r.uncompared.length}`] : []), '');
   appendFileSync(SUMMARY_MD, `${lines.join('\n')}\n`);
 }
 // More than a tenth of a chain's programs kept from running by rate limits is a check that didn't run.
