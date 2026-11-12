@@ -505,6 +505,22 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
     const [stale] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: touching, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
     assert.deepEqual([stale.status, stale.standInsStale], ['success', [TOKEN]]);
   } finally { chain.simulateV1 = false; }
+  // Given less gas than the node charges for it, the token's call runs out, as on the chain (its reference is given
+  // gas to spare, which isn't the call's).
+  const short = (await base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, gas: 22_000n, at: { block: 'latest', header } }))!;
+  assert.equal(short.status, 'reverted');
+  // In a batch, each result names the stand-ins its own call reached.
+  const [toToken, toBob] = (await base.simulateBatch([
+    { chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header } },
+    { chainId: 8453, from: USER, to: BOB, data: '0x', value: 0n, at: { block: 'latest', header } },
+  ]))!;
+  assert.deepEqual([toToken.standIns, toBob.standIns], [[TOKEN], undefined]);
+  // A registry called itself is charged as the node charges it: isAuthorized(0, …), the always-allow policy, reads
+  // nothing: 100 and 6 a word of its input (three), and the transaction's own.
+  const isAuthorized = encodeFunctionData({ abi: parseAbi(['function isAuthorized(uint64,address) view returns (bool)']), functionName: 'isAuthorized', args: [0n, BOB] });
+  // (The call's own gas, in its trace: the transaction's is the calldata floor's, EIP-7623, so little does it use.)
+  const [asked] = (await base.trace([{ chainId: 8453, from: USER, to: '0x8453000000000000000000000000000000000002', data: isAuthorized, value: 0n, at: { block: 'latest', header } }]))!;
+  assert.deepEqual([asked.status, asked.trace!.gasUsed, BigInt(asked.returnData!)], ['success', 118n, 1n]);
   // Run as another contract's code (DELEGATECALL), the chain's token refuses: DelegateCallNotAllowed().
   const DELEGATOR = '0x00000000000000000000000000000000000de1e9';
   await chain.putCode(DELEGATOR, `0x365f5f375f5f365f73${TOKEN.slice(2)}5af43d5f5f3e6029573d5ffd5b3d5ff3`);

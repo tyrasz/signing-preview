@@ -906,7 +906,7 @@ const BASE_REGISTRIES: Record<string, string> = { '0x845300000000000000000000000
 /** Code that reverts with DelegateCallNotAllowed() (0x0d89438e): what a B20 token does when run as another's code. */
 const NO_DELEGATECALL = hexToBytes('0x630d89438e60e01b60005260046000fd');
 /** What a B20 token's call is charged for, as the node charges it (see rounds), and the gas it is given besides to run its reference. */
-const NATIVE_CHARGED = new Set(['SLOAD', 'SSTORE', 'LOG0', 'LOG1', 'LOG2', 'LOG3', 'LOG4']), NATIVE_SPARE_GAS = 300_000n;
+const NATIVE_CHARGED = new Set(['SLOAD', 'SSTORE', 'LOG0', 'LOG1', 'LOG2', 'LOG3', 'LOG4']), NATIVE_SPARE_GAS = 30_000_000n;
 const STAND_IN_CODE = new Map<string, Uint8Array>();
 const codeOf = (hex: string) => { let c = STAND_IN_CODE.get(hex); if (!c) STAND_IN_CODE.set(hex, c = hexToBytes(hex as Hex)); return c; };
 /**
@@ -1156,8 +1156,10 @@ export class ForkSimulator implements Simulator {
     try {
       const results = await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
       // Contracts the node runs itself that ran here from their references instead: said, with each result.
-      const standIns = source.standIns.size ? [...source.standIns] : undefined, standInsStale = [...source.staleNative].filter(a => source.standIns.has(a));
-      return rulesNote || standIns ? results.map(r => ({ ...r, ...(rulesNote && { rulesNote }), ...(standIns && { standIns }), ...(standInsStale.length && { standInsStale }) })) : results;
+      return results.map(r => {
+        const stale = r.standIns?.filter(a => source.staleNative.has(a)) ?? [];
+        return rulesNote || stale.length ? { ...r, ...(rulesNote && { rulesNote }), ...(stale.length && { standInsStale: stale }) } : r;
+      });
     } finally {
       // Kept briefly, for a caller that gave up waiting and wants what was seen.
       setTimeout(() => this.seen.delete(key), 30_000).unref?.();
@@ -1288,13 +1290,17 @@ export class ForkSimulator implements Simulator {
     // or for asking the registry (measured on Base: name() 2,206, balanceOf 2,212, a transfer 37,374). So the call
     // is given gas to spare, and charged what the node would: the SLOADs, SSTOREs and LOGs it runs (those of the
     // registry's reference under it included) and its precompiles' gas, on top of that 100 and 6 a word. Without
-    // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66).
+    // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries, called
+    // themselves, are charged so too. A call whose charge passes the gas it was given runs out there, as the node's.
     type Charge = { code: string; limit: bigint; node: bigint };
     let charging: Charge | undefined;
     const opened: (Charge | 'precompile' | undefined)[] = [];
+    // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
+    const reached = new Set<string>();
     const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint } }, next?: () => void) => {
       // (Less 375 an event: the node charges its topics and data, not LOG's own base.)
       if (charging && NATIVE_CHARGED.has(e.opcode.name)) charging.node += BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n);
+      if (charging && charging.node > charging.limit) throw new EVMError(EVMError.errorMessages.OUT_OF_GAS);
       next?.();
     };
     if (chainId === BASE) evm.events!.on('afterMessage', (r: { execResult: { executionGasUsed: bigint } }, next?: () => void) => {
@@ -1356,7 +1362,9 @@ export class ForkSimulator implements Simulator {
       // The chain's B20 token refuses to run as another contract's code (DELEGATECALL, CALLCODE): DelegateCallNotAllowed().
       // (Its own, announce's calls to itself, run.)
       if (code && B20.test(code) && m.to && m.to.toString() !== code) m.code = NO_DELEGATECALL;
-      if (!charging && code && B20.test(code)) {
+      const native = !!code && (B20.test(code) || code in BASE_REGISTRIES);
+      if (native) reached.add(code!);
+      if (!charging && native) {
         opened.push(charging = { code, limit: m.gasLimit, node: 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
@@ -1422,7 +1430,7 @@ export class ForkSimulator implements Simulator {
       return nft.get(t)!;
     };
 
-    const results: SimulationResult[] = [];
+    const results: SimulationResult[] = [], byRequest: string[][] = [];
     const seenTokens = new Set<string>(), seenApprovals: SimulatedApproval[] = [];
     // A token or approval first seen in a later call of a batch must be read around the calls before it too.
     let rerun = false;
@@ -1445,7 +1453,7 @@ export class ForkSimulator implements Simulator {
       await evm.journal.cleanup();
       state.originalStorageCache.clear();
       // (An address that isn't a precompile on this chain is an account like any other: cold until touched.)
-      for (const a of [caller, target, block.header.coinbase.toString(), ...[...evm.precompiles.keys()].filter(k => !absent.some(x => x.address.slice(2) === k))]) evm.journal.addAlwaysWarmAddress(a);
+      for (const a of [caller, target, block.header.coinbase.toString(), ...(chainId === BASE ? Object.keys(BASE_REGISTRIES).map(r => r.slice(2)) : []), ...[...evm.precompiles.keys()].filter(k => !absent.some(x => x.address.slice(2) === k))]) evm.journal.addAlwaysWarmAddress(a);
       for (const e of req.accessList ?? []) { evm.journal.addAlwaysWarmAddress(e.address); for (const k of e.storageKeys) evm.journal.addAlwaysWarmSlot(e.address, k); }
       // The sender's nonce goes up first, then the EIP-7702 authorizations apply (and stay, whatever the call does).
       const sender = createAddressFromString(caller);
@@ -1490,10 +1498,11 @@ export class ForkSimulator implements Simulator {
       recording = true;
       // (A run that stopped inside a B20 token's call leaves nothing behind for this one.)
       if (charging) { evm.events!.removeListener('step', chargeStep); charging = undefined; }
-      opened.length = 0;
+      opened.length = 0; reached.clear();
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
+      byRequest[i] = [...reached];
       if (bought) { const account = (await state.getAccount(sender)) ?? new Account(); account.balance += bought; await state.putAccount(sender, account); }
       const ex = res.execResult;
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
@@ -1572,6 +1581,8 @@ export class ForkSimulator implements Simulator {
         ...(traced?.trace && { trace: traced.trace, stateChanges: traced.stateChanges }) });
       await settle();
     }
+    // Each result with the contracts the node runs itself that its own run reached, of those run from a reference.
+    results.forEach((r, i) => { const own = byRequest[i]?.filter(a => source.standIns.has(a)); if (own?.length) r.standIns = own; });
     return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, trace };
   }
 
