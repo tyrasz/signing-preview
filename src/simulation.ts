@@ -544,7 +544,7 @@ export class RpcSimulator implements Simulator {
     // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
     // asked once more after a pause, since without these reads the amounts are only the events'. It says so in an
     // error or with HTTP 429, which post throws once its own retries are spent. Once only: a preview waits on it.)
-    const busy = (m?: string) => !!m && (RATE_LIMITED.test(m) || /HTTP (429|5\d\d)/.test(m));
+    const busy = (m?: string) => !!m && (RATE_LIMITED.test(m) || /HTTP 429/.test(m));
     const patiently = () => ask().catch((e: Error) => { if (busy(e.message)) return { error: { message: e.message } }; throw e; });
     let reply = await patiently();
     if (busy(reply.error?.message)) { await new Promise(r => setTimeout(r, 3000)); reply = await patiently(); }

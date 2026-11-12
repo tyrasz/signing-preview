@@ -1405,13 +1405,18 @@ export class ForkSimulator implements Simulator {
 
   private async rounds(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
     profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string, reportedFrom = 0): Promise<SimulationResult[]> {
-    let watched = 0;
+    let watched = 0, answer: Awaited<ReturnType<ForkSimulator['run']>> | undefined;
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
       let run: Awaited<ReturnType<ForkSimulator['run']>>;
       try {
         run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId);
       } catch (e) {
+        // (An extra run, with a later-seen token watched, out of time: the answer it was to improve stands.)
+        if (e instanceof ForkTimeout && answer) {
+          this.last = { rounds: round - 1, requests: source.requests, ms: Date.now() - started, ...(answer.trace && { trace: answer.trace }) };
+          return answer.results;
+        }
         if (e instanceof ForkTimeout || e instanceof ForkUnsupported || !misses || !missCount(misses)) throw e;
         run = undefined as never; // a speculative run broke on made-up values: fetch what it asked for and retry
       }
@@ -1424,6 +1429,7 @@ export class ForkSimulator implements Simulator {
       // (Not for what only a block's earlier transactions showed, run for their state: their results aren't wanted.)
       if (run && !misses && grew && run.grewAt.some(i => i >= reportedFrom) && watched < 2 && Date.now() <= deadline) {
         watched++;
+        answer = run;
         for (const t of run.tokens) { tokens.add(t); this.seen.get(key)?.add(t); }
         for (const a of run.approvals) approvals.set(approvalKey(a), a);
         continue;
