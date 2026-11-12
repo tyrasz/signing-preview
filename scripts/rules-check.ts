@@ -349,6 +349,8 @@ class Chain {
   async both(programs: Program[]): Promise<{ node: Outcome; local: Outcome }[]> {
     for (let attempt = 0; ; attempt++) {
       const hadSimulate = this.simulateV1;
+      // --next needs the node to run a block at the fork's time: eth_call runs in the named block, at its own.
+      if (this.time !== undefined && !this.simulateV1) throw new Error("--next: the node has no eth_simulateV1, so it can't run a block at the fork's time: not checked ahead");
       const pinned = this.simulateV1 ? await pinLatest(this.client, this.chainId) : await this.inBlock();
       const at = pinned && this.time !== undefined ? { ...pinned, header: { ...pinned.header, timestamp: this.time } } : pinned;
       const placed = programs.map((p, i) => ({ ...p, to: p.to ?? place(i) }));
@@ -547,6 +549,13 @@ async function check(chainId: number): Promise<Report> {
     if (NEXT) {
       if (!next?.forkId || !Number(next.activationTime)) { report.fork.push('--next: no fork scheduled: nothing to run'); return report; }
       const time = BigInt(next.activationTime!), checked = profile?.checked?.next;
+      // Ethereum's next fork may be Amsterdam's (Glamsterdam, live on Sepolia): the local EVM takes those rules from a
+      // block's header, which a block at the fork's time named here doesn't carry, so the programs would differ for
+      // that alone. Said, not compared: the fork isn't checked ahead. (Whether the node runs Amsterdam then: SLOTNUM.)
+      if ((chainId === 1 || chainId === 11155111) && !amsterdam) {
+        const slot = await chain.client.call(chainId, 'eth_simulateV1', [{ blockStateCalls: [{ blockOverrides: { time: `0x${time.toString(16)}` }, stateOverrides: { [place(0)]: { code: '0x4b60005260206000f3' } }, calls: [{ from: FROM, to: place(0), data: '0x' }] }], validation: false }, 'latest']).then(r => (r as { calls: { status: string }[] }[])[0]?.calls[0]?.status, () => undefined);
+        if (slot === '0x1') { report.fork.push(`--next: the fork scheduled for ${day(Number(time))} (fork id ${next.forkId}) runs Amsterdam's rules, which the local EVM takes from a block's header: not checked ahead by --next (check it on its testnet, or once its blocks carry their access lists)`); report.drift = true; return report; }
+      }
       chain.time = time;
       report.fork.push(`--next: every program in a block at ${day(Number(time))}, when the fork with id ${next.forkId} takes effect: ${checked?.forkId === next.forkId ? `the fork checked ahead on ${checked.on}` : 'NOT yet checked ahead'}`);
       if (checked?.forkId !== next.forkId) report.drift = true;

@@ -29,6 +29,7 @@
 // overrides and the request's unsignedAuthorizations), which is how a preview before signing sees them.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { ForkSimulator } from '../src/fork-simulator.ts';
+import { millisecondsOf } from '../src/block.ts';
 import { parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import type { SimulationRequest, SimulationResult, Simulator } from '../src/types.ts';
@@ -115,11 +116,12 @@ async function replay(b: B, seen?: Set<string>) {
   // order"), and the block then runs a second later (bumped below). A contract can work differently a second later:
   // one on Base wrote 23,578 gas more of storage.
   let time = b.timestamp;
-  // The block's DIFFICULTY (opcode 0x44), which MEV bots check: on BNB Chain it is the block's difficulty (2 when its
-  // validator was in turn), which BNB Chain's node takes from the prevRandao override (mixHash there holds the
-  // block's milliseconds); Polygon's takes a difficulty override. Elsewhere it is PREVRANDAO, the block's mixHash.
+  // The block's DIFFICULTY (opcode 0x44), which MEV bots check: on BNB Chain and Polygon the block's difficulty (2 on
+  // BNB Chain when its validator was in turn), which both nodes take as a difficulty override. BNB Chain's isn't
+  // given prevRandao: it would take one as the block's milliseconds (its mixHash holds them, BEP-520) and answer
+  // 0x44 with it (src/block.ts). Elsewhere 0x44 is PREVRANDAO, the block's mixHash.
   const difficulty = (b as B & { difficulty?: Hex }).difficulty ?? '0x0';
-  const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: b.mixHash, difficulty } : { prevRandao: b.mixHash };
+  const randomness: Record<string, string> = CHAIN === 56 ? { difficulty } : CHAIN === 137 ? { prevRandao: b.mixHash, difficulty } : { prevRandao: b.mixHash };
   const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
   // The local EVM's block: opcode 0x44 as the chain answers it (above; 1 on Arbitrum), and on Arbitrum NUMBER as the
   // L1 block the chain had seen, with the chain's own number for ArbSys.
@@ -128,6 +130,8 @@ async function replay(b: B, seen?: Set<string>) {
   const glam = b as B & { blockAccessListHash?: Hex; slotNumber?: Hex };
   const forkAt = (trace = false) => new ForkSimulator({ [CHAIN]: URL_ }, { block: () => parent, header: () => ({ number: CHAIN === 42161 && l1Number ? BigInt(l1Number) : BigInt(n), arbBlockNumber: BigInt(n), timestamp: BigInt(b.timestamp), coinbase: b.miner,
     prevRandao: CHAIN === 42161 ? word32(1n) : CHAIN === 56 || CHAIN === 137 ? word32(BigInt(difficulty)) : b.mixHash, gasLimit: BigInt(b.gasLimit), baseFeePerGas: BigInt(b.baseFeePerGas),
+    // (BNB Chain's milliseconds, which its MILLI_TIMESTAMP precompile adds from its fork of 2026-12-08.)
+    ...(CHAIN === 56 && { milliseconds: millisecondsOf(b.mixHash) }),
     // An Amsterdam (Glamsterdam) block says so in its header, and has a slot number: the local EVM runs its rules.
     ...(glam.blockAccessListHash !== undefined && { amsterdam: true }), ...(glam.slotNumber !== undefined && { slotNumber: BigInt(glam.slotNumber) }) }), timeoutMs: 120_000, trace });
   const simulators = ([

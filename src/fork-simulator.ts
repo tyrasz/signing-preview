@@ -225,7 +225,7 @@ export interface ForkSimulatorOptions {
    * The simulated block's header. By default, the next block after `block`: its number + 1, its timestamp plus the
    * chain's block time, and its fee recipient, randomness and base fee. Replays pass the real block's header.
    */
-  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint; /** The block's blob base fee (BLOBBASEFEE). */ blobBaseFee?: bigint; /** The block is one of Amsterdam's. */ amsterdam?: boolean; /** The beacon slot (SLOTNUM), from Amsterdam on. */ slotNumber?: bigint } | undefined;
+  header?: (chainId: number) => { number: bigint; timestamp: bigint; coinbase: string; prevRandao: Hex; gasLimit: bigint; baseFeePerGas: bigint; /** Arbitrum: the chain's own block number (`number` is then the L1 block's). */ arbBlockNumber?: bigint; /** The block's blob base fee (BLOBBASEFEE). */ blobBaseFee?: bigint; /** The block is one of Amsterdam's. */ amsterdam?: boolean; /** The beacon slot (SLOTNUM), from Amsterdam on. */ slotNumber?: bigint ; /** The milliseconds of the block's time (BNB Chain: its mixHash, BEP-520). */ milliseconds?: bigint } | undefined;
   profiles?: Record<number, ChainProfile>;
   /**
    * A file to keep the caches shared by all simulations in (contract code and the last value seen of each slot), so
@@ -1263,7 +1263,7 @@ export class ForkSimulator implements Simulator {
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
     const prefetch = source.fetch(first);
     const fixed = at?.header ?? this.opts.header?.(chainId);
-    const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, timestamp: at?.header.ownTimestamp ?? fixed.timestamp, coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam }
+    const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, timestamp: at?.header.ownTimestamp ?? fixed.timestamp, ...(at?.header.ownTimestamp !== undefined && at.header.ownMilliseconds !== undefined && { milliseconds: at.header.ownMilliseconds }), coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam }
       : this.blockContext(source, tag, profile), prefetch, this.rulesOf(chainId, source)]);
     // Ethereum's past blocks run under the rules of their time; every other chain's under today's (see rulesNote).
     // A block of Amsterdam's (Glamsterdam: its header says so) runs Amsterdam's rules, on Ethereum and its testnet.
@@ -1274,7 +1274,9 @@ export class ForkSimulator implements Simulator {
     source.time = block.header.timestamp;
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
     const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
-    for (const p of timedPrecompilesAt(profile, block.header.timestamp)) forwards.add(p.address);
+    // (The chain's own precompiles a fork adds the local EVM has on both sides of it, an empty account before: none
+    // is refused, whatever the node's current fork lists.)
+    for (const p of profile.timedPrecompiles ?? []) forwards.add(p.address);
     for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !hasReference(chainId, address)) source.nodeOnly.set(address, name);
     const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the

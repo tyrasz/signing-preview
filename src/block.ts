@@ -20,6 +20,8 @@ export interface BlockAt {
      * none, as the chain's node simulates it. The node isn't given them: it would answer opcode 0x44 with them.
      */
     milliseconds?: bigint;
+    /** A block run a second late's own milliseconds (afterParent), for a run at its own time (ownTimestamp). */
+    ownMilliseconds?: bigint;
     /** Arbitrum: the chain's own block number (`number` is then the L1 block the chain last saw, which NUMBER returns). */
     arbBlockNumber?: bigint;
     /** The block's blob base fee (BLOBBASEFEE), on chains with blobs: a rollup's batch poster reads it. */
@@ -165,9 +167,10 @@ export interface RpcHeader { number: string; timestamp: string; miner: string; m
 
 const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
 
-/** The header of the block after `h`: the next number and time, the same fee recipient, base fee and gas limit, and the chain's own answer to opcode 0x44. */
 /** The milliseconds a BNB Chain block's mixHash carries (BEP-520: under 1,000), or none where it carries other. */
-const millisecondsOf = (mixHash?: string) => { const ms = BigInt(mixHash ?? '0x0'); return ms < 1000n ? ms : 0n; };
+export const millisecondsOf = (mixHash?: string) => { const ms = BigInt(mixHash ?? '0x0'); return ms < 1000n ? ms : 0n; };
+
+/** The header of the block after `h`: the next number and time, the same fee recipient, base fee and gas limit, and the chain's own answer to opcode 0x44. */
 
 export function headerAfter(chainId: number, h: RpcHeader): BlockAt['header'] {
   const rules = NEXT_BLOCK[chainId] ?? { blockTime: 12 };
@@ -299,7 +302,9 @@ export async function pinBlock(rpc: RpcClient | undefined, chainId: number, numb
  */
 export function afterParent(chainId: number, header: BlockAt['header'], parentTime: bigint): { header: BlockAt['header']; shifted: boolean } {
   const earliest = parentTime + ((NEXT_BLOCK[chainId] ?? { blockTime: 12 }).blockTime > 0 ? 1n : 0n);
-  return header.timestamp >= earliest ? { header, shifted: false } : { header: { ...header, timestamp: earliest }, shifted: true };
+  // (A BNB Chain block run a second late runs as its node simulates it, with no milliseconds; its own are kept for a
+  // run at its own time, ownTimestamp.)
+  return header.timestamp >= earliest ? { header, shifted: false } : { header: { ...header, timestamp: earliest, ...(header.milliseconds !== undefined && { milliseconds: 0n, ownMilliseconds: header.milliseconds }) }, shifted: true };
 }
 
 /** A block number as PreviewContext.block gives it: a number, or one in decimal or hex. Throws when it is neither. */
@@ -346,7 +351,8 @@ export function priceFields(req: { gasPrice?: bigint; blobVersionedHashes?: stri
 /**
  * eth_simulateV1's blockOverrides for this header. The number is left to the node (the block after the one it starts
  * from; on Arbitrum the node maps it to the L1 block itself), and the gas limit too: public nodes refuse a simulated
- * block above their own cap. BNB Chain's node takes opcode 0x44 from prevRandao; Polygon's takes a difficulty.
+ * block above their own cap. Polygon's and BNB Chain's nodes take opcode 0x44 from a difficulty override; BNB Chain's
+ * isn't given prevRandao, which it would take as the block's milliseconds (BEP-520) and answer 0x44 with too.
  * Arbitrum's is left alone: its headers keep the ArbOS version in that field (overridden, the node runs the block by
  * the first version's rules, without PUSH0), and opcode 0x44 is 1 there whatever it holds.
  */

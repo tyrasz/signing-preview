@@ -286,16 +286,16 @@ async function replay(item: string): Promise<void> {
   let prefix = state ? essential : pricedBefore ?? before; // at no price, then dropped, if the node refuses the block with it (see below)
   // The block's own time; BNB Chain's node refuses a simulated block in its parent's second (its blocks come faster
   // than one a second), which then runs a second later, and its gas isn't judged (what writes once a second costs
-  // more). The block's DIFFICULTY as each node takes it: BNB Chain's from prevRandao (the block's difficulty there, 2
-  // when its validator was in turn; mixHash holds milliseconds), Polygon's from a difficulty override (see
-  // scripts/accuracy.ts).
+  // more). The block's DIFFICULTY as each node takes it: BNB Chain's and Polygon's from a difficulty override (BNB
+  // Chain's 2 when its validator was in turn; its node isn't given prevRandao, which it would take as the block's
+  // milliseconds: see scripts/accuracy.ts).
   let time: string = block.timestamp, timeBumped = false;
   if (CHAIN === 56) {
     const parentTime = BigInt((await call<{ timestamp: Hex }>('eth_getBlockByNumber', [parent, false])).timestamp);
     if (BigInt(block.timestamp) <= parentTime) { time = hex(parentTime + 1n); timeBumped = true; }
   }
   const difficulty = block.difficulty ?? '0x0';
-  const randomness: Record<string, string> = CHAIN === 56 ? { prevRandao: `0x${BigInt(difficulty).toString(16).padStart(64, '0')}` } : CHAIN === 137 ? { prevRandao: block.mixHash, difficulty } : { prevRandao: block.mixHash };
+  const randomness: Record<string, string> = CHAIN === 56 ? { difficulty } : CHAIN === 137 ? { prevRandao: block.mixHash, difficulty } : { prevRandao: block.mixHash };
   const node = new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: block.number, time, feeRecipient: block.miner, ...randomness, baseFeePerGas: block.baseFeePerGas }, before: prefix, warm, ...(state && { state }) }) });
   // The whole operation runs at the price its bundle's transaction paid (tx.gasprice), part of what it met. A preview
   // can't know it, and takes what the operation pays its bundler (src/erc4337-sim.ts); bundlers pay less (on Base, a
