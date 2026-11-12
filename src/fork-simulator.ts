@@ -219,6 +219,11 @@ export interface ForkSimulatorOptions {
    * moved (scripts/rules-check.ts): each token read is state to fetch.
    */
   watchTokens?: boolean;
+  /**
+   * Ask the node what the calls will touch (eth_createAccessList) and read it before the first run (default true):
+   * fewer rounds of reads. SIGNING_PREVIEW_FORK_PREFETCH=off turns it off.
+   */
+  prefetch?: boolean;
   /** The state to simulate on: 'latest' (default), or a block number to replay a transaction at its pre-state. */
   block?: (chainId: number) => string;
   /**
@@ -392,6 +397,16 @@ class StateSource {
   time?: bigint;
   /** What the chain charges for a cold storage read (ChainProfile.storageGas): what a storage reader is given for each. */
   coldRead = 2_100;
+
+  /**
+   * What the node says a call will touch (eth_createAccessList, on the block the reads are of): the accounts and
+   * slots to read before the first run. Undefined where it won't say (no such method, an error).
+   */
+  async accessList(call: Record<string, unknown>): Promise<{ address: string; storageKeys: string[] }[] | undefined> {
+    let out: { accessList?: { address: string; storageKeys: string[] }[] } | undefined;
+    try { await this.send([{ method: 'eth_createAccessList', params: [call, this.block], done: r => { out = r as typeof out; } }]); } catch { return undefined; }
+    return Array.isArray(out?.accessList) ? out.accessList : undefined;
+  }
 
   /** The node's own account of the rules it runs (eth_config, EIP-7910); undefined where it gives none. */
   async config(): Promise<unknown> {
@@ -709,6 +724,9 @@ class StateSource {
     }
   }
 }
+
+/** Chains whose RPC has no eth_createAccessList (HyperEVM's answers eth_call and state reads only). */
+const NO_ACCESS_LIST = new Set([999, 998]);
 
 /** An address in the range chains keep for precompiles and their own contracts (under 0x10000): its proxy slots aren't read ahead. */
 const lowAddress = (a: string) => BigInt(a) < 0x10000n;
@@ -1168,7 +1186,7 @@ export class ForkSimulator implements Simulator {
   constructor(urls: Record<number, string>, options: ForkSimulatorOptions = {}) {
     this.urls = urls;
     this.opts = { fetchImpl: options.fetchImpl ?? fetch, batchSize: options.batchSize ?? 20, concurrency: options.concurrency ?? 4, maxRounds: options.maxRounds ?? 24,
-      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', trace: options.trace ?? false, watchTokens: options.watchTokens ?? true, profiles: { ...CHAIN_PROFILES, ...options.profiles } };
+      timeoutMs: options.timeoutMs ?? 20_000, block: options.block, header: options.header, onRound: options.onRound, cacheFile: options.cacheFile ?? '', trace: options.trace ?? false, watchTokens: options.watchTokens ?? true, prefetch: options.prefetch ?? process.env.SIGNING_PREVIEW_FORK_PREFETCH !== 'off', profiles: { ...CHAIN_PROFILES, ...options.profiles } };
     if (this.opts.cacheFile) this.loaded = loadForkCache(this.opts.cacheFile);
   }
 
@@ -1271,6 +1289,22 @@ export class ForkSimulator implements Simulator {
     // The senders and targets are certain to be read: fetch them before the first run.
     const first = newMisses();
     for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
+    // And what the node says the calls will touch (eth_createAccessList, for the first few), read with them: the
+    // local EVM then needs fewer rounds of reads, each a wait on the node, longer where it rate limits. (Not Base's
+    // native contracts, whose storage is read their own way after a block's earlier transactions; not a chain whose
+    // RPC has no such method, HyperEVM's.)
+    if (this.opts.prefetch !== false && !NO_ACCESS_LIST.has(chainId)) {
+      const hex = (v: bigint) => `0x${v.toString(16)}`;
+      const lists = await Promise.all(reqs.slice(0, 4).map(r => source.accessList({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
+        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })));
+      for (const e of lists.flat()) {
+        if (!e?.address) continue;
+        const a = hexOf(e.address);
+        if (chainId === BASE && (B20_PRECOMPILE.test(a) || a in BASE_REGISTRIES || a === B20_FACTORY)) continue;
+        first.accounts.add(a);
+        if (!lowAddress(a)) for (const k of e.storageKeys ?? []) first.storage.add(slotKey(a, k));
+      }
+    }
     const prefetch = source.fetch(first);
     const fixed = at?.header ?? this.opts.header?.(chainId);
     const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, timestamp: at?.header.ownTimestamp ?? fixed.timestamp, ...(at?.header.ownTimestamp !== undefined && at.header.ownMilliseconds !== undefined && { milliseconds: at.header.ownMilliseconds }), coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam }
