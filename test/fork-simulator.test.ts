@@ -656,6 +656,28 @@ test('A node that adds up a block’s gas limits gets the earlier transactions o
   } finally { chain.simulateV1 = false; }
 });
 
+test('After a block’s earlier transactions, each storage reader is given gas for the chain’s price of a cold read', async () => {
+  // Polygon charges 5,460 for a cold read, not 2,100: a reader of 65 slots on 3,000 each ran out there.
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest = { chainId: 999, from: USER, to: BOB, data: '0x', value: 1n };
+  const given: [number, number][] = [];
+  const node = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string; params: [{ blockStateCalls: { stateOverrides?: Record<string, unknown>; calls: { to: string; data: string; gas?: string }[] }[] }] }[];
+    const sim = Array.isArray(body) ? body.find(b => b.method === 'eth_simulateV1') : undefined;
+    const storage = sim?.params[0].blockStateCalls.at(-1);
+    if (storage && storage.calls.every(c => Object.keys(storage.stateOverrides ?? {}).includes(c.to))) for (const c of storage.calls) given.push([(c.data.length - 2) / 64, Number(c.gas)]);
+    return chain.fetchImpl(url, init);
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    const polygonLike = fork({ fetchImpl: node, profiles: { 999: { ...profiles[999], storageGas: { coldRead: 5460, coldWrite: 2940 } } } });
+    const [r] = (await polygonLike.trace([{ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.equal(r.status, 'success');
+    assert.ok(given.length > 0);
+    for (const [slots, gas] of given) assert.equal(gas, 50_000 + 6_360 * slots);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('After a block’s earlier transactions, the reads of many accounts aren’t starved by a node that splits a block’s gas', async () => {
   // BNB Chain's node gives each call that sets no gas an even share of the block's: beside 151 code readers, the one
   // reading 152 accounts' balances got 460,526 gas and ran out. A call that reads the balances of 150 accounts:

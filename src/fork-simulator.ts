@@ -349,6 +349,8 @@ class StateSource {
   staleNative = new Set<string>();
   /** The simulated block's time: which references apply (nativeStandIn). */
   time?: bigint;
+  /** What the chain charges for a cold storage read (ChainProfile.storageGas): what a storage reader is given for each. */
+  coldRead = 2_100;
 
   /** The node's own account of the rules it runs (eth_config, EIP-7910); undefined where it gives none. */
   async config(): Promise<unknown> {
@@ -419,9 +421,11 @@ class StateSource {
     // none, and beside 151 code readers the one reading 152 balances got 460,526, short of what they cost.
     if (accounts.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE } }, calls: [balanceCall] });
     if (codeCalls.length) blocks.push({ stateOverrides: { [CODE_READER]: { code: CODE_READER_CODE } }, calls: codeCalls });
-    // Each slot reader with gas of its own for its slots (a cold read is 2,100), not a share of the block's: unless
+    // Each slot reader with gas of its own for its slots (a cold read is 2,100 on most chains), not a share of the block's: unless
     // their limits would add up to more than 30,000,000 (a node that adds them up refuses past its block's).
-    const slotGas = contracts.map(a => 50_000 + 3_000 * slots.get(a)!.length), own = slotGas.reduce((x, y) => x + y, 0) <= 30_000_000;
+    // (A cold read costs what the chain charges: Polygon 5,460, not 2,100; a reader of 65 slots on 3,000 each ran out.)
+    const perSlot = this.coldRead + 900;
+    const slotGas = contracts.map(a => 50_000 + perSlot * slots.get(a)!.length), own = slotGas.reduce((x, y) => x + y, 0) <= 30_000_000;
     if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map((a, i) => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}`, ...(own && { gas: `0x${slotGas[i].toString(16)}` }) })) });
     let out: { calls: { status: string; returnData: Hex; gasUsed?: string; logs?: { address: string }[] }[] }[] | undefined;
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
@@ -1071,6 +1075,7 @@ export class ForkSimulator implements Simulator {
     const tag = at?.block ?? this.opts.block?.(chainId) ?? 'latest';
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
     source.historic = !!at?.required;
+    source.coldRead = profile.storageGas?.coldRead ?? 2_100;
     if (options?.after?.length && at) {
       const hex = (v: bigint) => `0x${v.toString(16)}`, bumps = new Map<string, (bigint | 'sent')[]>();
       const bump = (a: string, by: bigint | 'sent') => { const l = bumps.get(a) ?? []; l.push(by); bumps.set(a, l); };
