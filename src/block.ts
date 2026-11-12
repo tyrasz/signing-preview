@@ -12,8 +12,14 @@ export interface BlockAt {
     number: bigint; timestamp: bigint; coinbase: string; gasLimit: bigint; baseFeePerGas: bigint;
     /** What opcode 0x44 returns (PREVRANDAO; on chains whose blocks still carry a difficulty, that). */
     prevRandao: Hex;
-    /** The block's difficulty, where the chain's nodes take it apart from prevRandao (Polygon). */
+    /** The block's difficulty, where the chain's nodes take it apart from prevRandao (Polygon, BNB Chain). */
     difficulty?: bigint;
+    /**
+     * The milliseconds of the block's time, on a chain whose blocks carry them (BNB Chain: its mixHash, BEP-520):
+     * what its MILLI_TIMESTAMP precompile adds to the time, from its fork of 2026-12-08. A simulated next block has
+     * none, as the chain's node simulates it. The node isn't given them: it would answer opcode 0x44 with them.
+     */
+    milliseconds?: bigint;
     /** Arbitrum: the chain's own block number (`number` is then the L1 block the chain last saw, which NUMBER returns). */
     arbBlockNumber?: bigint;
     /** The block's blob base fee (BLOBBASEFEE), on chains with blobs: a rollup's batch poster reads it. */
@@ -139,7 +145,7 @@ export function accessListChanges(list: unknown[], from: number, to: number): St
  * returns, the block's mixHash unless said (its difficulty on BNB Chain and Polygon, 1 on Arbitrum); and Arbitrum's
  * two block numbers.
  */
-export const NEXT_BLOCK: Record<number, { blockTime: number; /** What COINBASE returns where it isn't the header's miner: Polygon's blocks name none, and every one pays its fees to one address (measured on its node; an override of the fee recipient is ignored). */ coinbase?: string; /** The chain carries blobs (EIP-4844), so its blocks have a blob base fee. */ blobs?: boolean; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon); BNB Chain's read it from prevRandao. */ difficultyOverride?: boolean }> = {
+export const NEXT_BLOCK: Record<number, { blockTime: number; /** What COINBASE returns where it isn't the header's miner: Polygon's blocks name none, and every one pays its fees to one address (measured on its node; an override of the fee recipient is ignored). */ coinbase?: string; /** The chain carries blobs (EIP-4844), so its blocks have a blob base fee. */ blobs?: boolean; randomness?: 'difficulty' | 'one'; arbitrum?: boolean; /** The chain's nodes take the difficulty as an override of its own (Polygon, BNB Chain). */ difficultyOverride?: boolean; /** The block's mixHash carries the milliseconds of its time (BNB Chain): BlockAt's `milliseconds`. */ milliseconds?: boolean }> = {
   1: { blockTime: 12, blobs: true }, 11155111: { blockTime: 12, blobs: true },
   42161: { blockTime: 0, randomness: 'one', arbitrum: true }, 421614: { blockTime: 0, randomness: 'one', arbitrum: true },
   // Base makes about five blocks a second (32 of 40 shared their parent's second on 2026-11-11), and its node will
@@ -147,7 +153,10 @@ export const NEXT_BLOCK: Record<number, { blockTime: number; /** What COINBASE r
   // a replayed one keeps its own time. OP Mainnet's blocks are two seconds apart, and its node refuses the same time.
   8453: { blockTime: 0 }, 10: { blockTime: 2 },
   137: { blockTime: 2, randomness: 'difficulty', difficultyOverride: true, coinbase: '0x7ee41d8a25641000661b1ef5e6ae8a00400466b0' },
-  56: { blockTime: 1, randomness: 'difficulty' },
+  // BNB Chain's mixHash carries the milliseconds of the block's time (BEP-520): its node takes a prevRandao override
+  // as them, and answers opcode 0x44 with it too, where a mined block answers with its difficulty (measured: 2, its
+  // mixHash 50, 400, 750 and 100 in four blocks). So its node is given the difficulty, as a difficulty.
+  56: { blockTime: 1, randomness: 'difficulty', difficultyOverride: true, milliseconds: true },
   999: { blockTime: 1 }, 998: { blockTime: 1 },
 };
 
@@ -157,6 +166,9 @@ export interface RpcHeader { number: string; timestamp: string; miner: string; m
 const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
 
 /** The header of the block after `h`: the next number and time, the same fee recipient, base fee and gas limit, and the chain's own answer to opcode 0x44. */
+/** The milliseconds a BNB Chain block's mixHash carries (BEP-520: under 1,000), or none where it carries other. */
+const millisecondsOf = (mixHash?: string) => { const ms = BigInt(mixHash ?? '0x0'); return ms < 1000n ? ms : 0n; };
+
 export function headerAfter(chainId: number, h: RpcHeader): BlockAt['header'] {
   const rules = NEXT_BLOCK[chainId] ?? { blockTime: 12 };
   const difficulty = BigInt(h.difficulty ?? '0x0');
@@ -168,6 +180,8 @@ export function headerAfter(chainId: number, h: RpcHeader): BlockAt['header'] {
     coinbase: rules.coinbase ?? h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
     prevRandao: rules.randomness === 'one' ? word(1n) : rules.randomness === 'difficulty' ? word(difficulty) : (h.mixHash ?? word(0n)) as Hex,
     ...(rules.difficultyOverride && { difficulty }),
+    // (The next block's milliseconds aren't known: none, as its node simulates it.)
+    ...(rules.milliseconds && { milliseconds: 0n }),
     ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
     ...(h.slotNumber !== undefined && { slotNumber: BigInt(h.slotNumber) + 1n }),
   };
@@ -186,6 +200,7 @@ export function headerOf(chainId: number, h: RpcHeader): BlockAt['header'] {
     timestamp: BigInt(h.timestamp), coinbase: rules.coinbase ?? h.miner.toLowerCase(), gasLimit: BigInt(h.gasLimit), baseFeePerGas: h.baseFeePerGas ? BigInt(h.baseFeePerGas) : 0n,
     prevRandao: rules.randomness === 'one' ? word(1n) : rules.randomness === 'difficulty' ? word(difficulty) : (h.mixHash ?? word(0n)) as Hex,
     ...(rules.difficultyOverride && { difficulty }),
+    ...(rules.milliseconds && { milliseconds: millisecondsOf(h.mixHash) }),
     ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
     ...(h.slotNumber !== undefined && { slotNumber: BigInt(h.slotNumber) }),
   };
@@ -337,7 +352,7 @@ export function priceFields(req: { gasPrice?: bigint; blobVersionedHashes?: stri
  */
 export function nodeOverrides(h: BlockAt['header']): Record<string, string> {
   return {
-    time: `0x${h.timestamp.toString(16)}`, feeRecipient: h.coinbase, ...(h.arbBlockNumber === undefined && { prevRandao: h.prevRandao }), baseFeePerGas: `0x${h.baseFeePerGas.toString(16)}`,
+    time: `0x${h.timestamp.toString(16)}`, feeRecipient: h.coinbase, ...(h.arbBlockNumber === undefined && h.milliseconds === undefined && { prevRandao: h.prevRandao }), baseFeePerGas: `0x${h.baseFeePerGas.toString(16)}`,
     ...(h.difficulty !== undefined && { difficulty: `0x${h.difficulty.toString(16)}` }),
   };
 }

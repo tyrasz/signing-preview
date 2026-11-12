@@ -446,6 +446,21 @@ test('A chain that charges a multiple of Ethereum’s price for a precompile: ch
   assert.equal(short!.status, 'reverted');
 });
 
+test('A precompile a fork adds, from its time on: BNB Chain’s MILLI_TIMESTAMP', async () => {
+  const milli = CHAIN_PROFILES[56].timedPrecompiles![0];
+  assert.deepEqual([milli.name, milli.address, milli.from, milli.gas], ['MILLI_TIMESTAMP', '0x0000000000000000000000000000000000000070', 1_796_697_000n, 20n]);
+  const sim = fork({ profiles: { 999: { ...profiles[999], timedPrecompiles: [milli] } } });
+  const header = (timestamp: bigint, milliseconds?: bigint) => ({ number: 100n, timestamp, coinbase: BOB, prevRandao: `0x${'00'.repeat(32)}` as Hex, gasLimit: 30_000_000n, baseFeePerGas: 0n, ...(milliseconds !== undefined && { milliseconds }) });
+  const call = (timestamp: bigint, milliseconds?: bigint, gas?: bigint) => sim.simulate({ chainId: 999, from: USER, to: milli.address, data: '0x', value: 0n, ...(gas && { gas }), at: { block: 'latest', header: header(timestamp, milliseconds) } });
+  const [at, later, before, short] = await Promise.all([call(1_796_697_000n, 550n), call(1_796_697_001n), call(1_796_696_999n), call(1_796_697_000n, 0n, 21_019n)]);
+  // The block's time in milliseconds (its seconds, and the milliseconds its mixHash carries), for 20 gas.
+  assert.deepEqual([at!.status, BigInt(at!.returnData!), at!.gasUsed], ['success', 1_796_697_000_550n, 21_020n]);
+  assert.equal(BigInt(later!.returnData!), 1_796_697_001_000n);
+  // Before the fork, an empty account; given less than its price, out of gas.
+  assert.deepEqual([before!.status, before!.returnData ?? '0x', before!.gasUsed], ['success', '0x', 21_000n]);
+  assert.equal(short!.status, 'reverted');
+});
+
 test('Base’s B20 tokens run in the local EVM from their Solidity reference, on the token’s own storage', async () => {
   // A B20 asset token (variant byte 0) as Base keeps one: the marker code 0xef, its state in the base.b20 namespace.
   const TOKEN = '0xb200000000000000000000123456789abcdef012';

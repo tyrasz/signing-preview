@@ -78,8 +78,12 @@ test('The block a simulation names: each chain’s next block, and what the node
   assert.deepEqual(headerAfter(1, h), { number: 101n, timestamp: 1012n, coinbase: '0x00000000000000000000000000000000000000aa', gasLimit: 30_000_000n, baseFeePerGas: 7n, prevRandao: `0x${'ab'.repeat(32)}` });
   // Arbitrum: NUMBER is the L1 block, the chain's own kept apart; the same second; opcode 0x44 is 1.
   assert.deepEqual(headerAfter(42161, h), { number: 16n, arbBlockNumber: 101n, timestamp: 1000n, coinbase: '0x00000000000000000000000000000000000000aa', gasLimit: 30_000_000n, baseFeePerGas: 7n, prevRandao: `0x${'00'.repeat(31)}01` });
-  // BNB Chain and Polygon: opcode 0x44 is the difficulty; only Polygon's node takes it as an override of its own.
-  assert.deepEqual([headerAfter(56, h).prevRandao, headerAfter(56, h).difficulty, headerAfter(56, h).timestamp], [`0x${'00'.repeat(31)}02`, undefined, 1001n]);
+  // BNB Chain and Polygon: opcode 0x44 is the difficulty, which both nodes are given as an override of its own.
+  assert.deepEqual([headerAfter(56, h).prevRandao, headerAfter(56, h).difficulty, headerAfter(56, h).timestamp], [`0x${'00'.repeat(31)}02`, 2n, 1001n]);
+  // BNB Chain's mixHash carries the milliseconds of a block's time (BEP-520): a block's own, none for the next.
+  assert.deepEqual([headerOf(56, { ...h, mixHash: `0x${(750).toString(16).padStart(64, '0')}` }).milliseconds, headerOf(56, h).milliseconds, headerAfter(56, h).milliseconds, headerAfter(1, h).milliseconds], [750n, 0n, 0n, undefined]);
+  // Its node isn't given them as prevRandao, which it would answer 0x44 with: the difficulty, as a difficulty.
+  assert.deepEqual(nodeOverrides(headerAfter(56, h)), { time: '0x3e9', feeRecipient: '0x00000000000000000000000000000000000000aa', baseFeePerGas: '0x7', difficulty: '0x2' });
   assert.deepEqual([headerAfter(137, h).prevRandao, headerAfter(137, h).difficulty, headerAfter(137, h).timestamp], [`0x${'00'.repeat(31)}02`, 2n, 1002n]);
   // A block as it was (a replay): its own number and time.
   assert.deepEqual([headerOf(8453, h).number, headerOf(8453, h).timestamp, headerOf(42161, h).number, headerOf(42161, h).arbBlockNumber], [100n, 1000n, 16n, 100n]);

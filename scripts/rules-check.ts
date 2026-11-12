@@ -16,13 +16,16 @@
 // On Arbitrum, whose node adds a charge for L1 data, gas is compared less that charge; not where the node has only
 // eth_call.
 // --strict exits with 1 when anything differs or a chain's fork isn't the one checked. Read-only: nothing is sent.
+// --next runs it all at the fork a chain has scheduled (eth_config's next): in a block at the fork's time, which a
+// node's eth_simulateV1 runs under the fork's rules (BNB Chain's does), so the local EVM can be checked before the
+// fork takes effect. A chain with none scheduled is passed over.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { getActivePrecompiles } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { hashMessage, toFunctionSelector, type Hex } from 'viem';
-import { CHAIN_PROFILES, ForkSimulator, hasReference, nodeRulesOf } from '../src/fork-simulator.ts';
+import { CHAIN_PROFILES, ForkSimulator, hasReference, nodeRulesOf, timedPrecompilesAt } from '../src/fork-simulator.ts';
 import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
 import { authorizationsForNode } from '../src/simulation.ts';
@@ -33,7 +36,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import type { SimulationRequest } from '../src/types.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
-const STRICT = process.argv.includes('--strict'), SUMMARY_MD = arg('summary-md', ''), OUT = arg('out', '');
+const STRICT = process.argv.includes('--strict'), SUMMARY_MD = arg('summary-md', ''), OUT = arg('out', ''), NEXT = process.argv.includes('--next');
 const FUZZ = Number(arg('fuzz', '0')), SEED = Number(arg('seed', String(Date.now() % 1_000_000))), ONLY_FUZZ = process.argv.includes('--only-fuzz');
 const CHAINS_ASKED = arg('chain', 'all') === 'all' ? Object.keys(EVM_RPCS).map(Number) : arg('chain', '1').split(',').map(Number);
 
@@ -309,6 +312,10 @@ async function precompilePrograms(): Promise<Program[]> {
   ];
   // And each low address with no input: a precompile that fails on it, or an account that isn't one.
   for (const n of [...Array.from({ length: 0x20 }, (_, i) => i + 1), 0x100, 0x101]) programs.push({ precompile: true, label: `0x${n.toString(16)} with no input`, code: caller(n), data: '0x' });
+  // And the chains' own precompiles that a fork adds (ChainProfile.timedPrecompiles: BNB Chain's MILLI_TIMESTAMP),
+  // with no input and with some: before the fork, an empty account on both sides.
+  const timed = new Map(Object.values(CHAIN_PROFILES).flatMap(p => p.timedPrecompiles ?? []).map(p => [p.address, p.name]));
+  for (const [address, name] of timed) for (const n of [0, 40]) programs.push({ precompile: true, label: `${address.replace(/^0x0+/, '0x')} ${name}, ${n} bytes in`, code: caller(Number(address)), data: `0x${'ab'.repeat(n)}` });
   // And a few more points and pairs, where a price follows a discount table.
   for (const [name, n, unit] of [['G1 multi-scalar', 12, 160], ['G2 multi-scalar', 14, 288], ['pairing', 15, 384]] as const) for (const k of [2, 3, 8]) programs.push({ precompile: true, label: `0x${n.toString(16).padStart(2, '0')} bls12-381 ${name}, ${k}`, code: caller(n), data: `0x${zeros(unit * k)}` });
   return programs;
@@ -317,6 +324,8 @@ async function precompilePrograms(): Promise<Program[]> {
 class Chain {
   readonly chainId: number; readonly url: string; readonly client: JsonRpcClient; readonly fork: ForkSimulator;
   simulateV1 = true;
+  /** The time the programs' block is given (--next: the scheduled fork's), in place of the next block's own. */
+  time?: bigint;
   constructor(chainId: number) {
     this.chainId = chainId;
     this.url = rpcUrlFor(chainId, process.env) ?? (() => { throw new Error(`no RPC for chain ${chainId}`); })();
@@ -340,7 +349,8 @@ class Chain {
   async both(programs: Program[]): Promise<{ node: Outcome; local: Outcome }[]> {
     for (let attempt = 0; ; attempt++) {
       const hadSimulate = this.simulateV1;
-      const at = this.simulateV1 ? await pinLatest(this.client, this.chainId) : await this.inBlock();
+      const pinned = this.simulateV1 ? await pinLatest(this.client, this.chainId) : await this.inBlock();
+      const at = pinned && this.time !== undefined ? { ...pinned, header: { ...pinned.header, timestamp: this.time } } : pinned;
       const placed = programs.map((p, i) => ({ ...p, to: p.to ?? place(i) }));
       const overrides: Record<string, { code?: string; balance?: string }> = { ...RICH };
       for (const p of placed) if (p.code) overrides[p.to] = { code: p.code, ...(p.balance !== undefined && { balance: `0x${p.balance.toString(16)}` }), ...(p.storage && { stateDiff: p.storage }) };
@@ -514,7 +524,7 @@ const OVER_THE_CAP: Record<string, string> = Object.fromEntries(['GAS, on a limi
 async function check(chainId: number): Promise<Report> {
   const chain = new Chain(chainId), profile = CHAIN_PROFILES[chainId];
   const report: Report = { chainId, name: chainName(chainId), fork: [], nodeOnly: [], referenced: [], compared: 0, differences: [], expected: [], drift: false, uncompared: [] };
-  const head = await chain.client.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as { number: string; blockAccessListHash?: string };
+  const head = await chain.client.call(chainId, 'eth_getBlockByNumber', ['latest', false]) as { number: string; timestamp: string; blockAccessListHash?: string };
   report.block = BigInt(head.number).toString();
   const amsterdam = head.blockAccessListHash !== undefined && (chainId === 1 || chainId === 11155111);
   report.amsterdam = amsterdam;
@@ -522,19 +532,34 @@ async function check(chainId: number): Promise<Report> {
   // The node's own account of its rules.
   const config = await chain.client.call(chainId, 'eth_config', []).then(c => c as { next?: { activationTime?: number; forkId?: string; precompiles?: Record<string, string> } }, () => undefined);
   const rules = nodeRulesOf(config), day = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
-  if (!rules) report.fork.push('the node gives no account of its current fork (no eth_config, or none listed)');
+  if (!rules) { report.fork.push('the node gives no account of its current fork (no eth_config, or none listed)'); if (NEXT) return report; }
   else {
-    const same = profile?.checked && rules.forkId === profile.checked.forkId;
-    report.fork.push(`fork id ${rules.forkId}${rules.activation ? `, active since ${day(rules.activation)}` : ''}: ${same ? `the one checked on ${profile!.checked!.on}` : profile?.checked ? `NOT the one checked on ${profile.checked.on} (${profile.checked.forkId})` : 'no fork recorded as checked for this chain'}`);
+    // (A fork checked ahead, --next, counts once it takes effect.)
+    const same = profile?.checked && (rules.forkId === profile.checked.forkId || rules.forkId === profile.checked.next?.forkId);
+    report.fork.push(`fork id ${rules.forkId}${rules.activation ? `, active since ${day(rules.activation)}` : ''}: ${same ? `the one checked on ${rules.forkId === profile!.checked!.forkId ? profile!.checked!.on : `${profile!.checked!.next!.on}, ahead`}` : profile?.checked ? `NOT the one checked on ${profile.checked.on} (${profile.checked.forkId})` : 'no fork recorded as checked for this chain'}`);
     if (profile?.checked && !same) report.drift = true;
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: (amsterdam ? 'amsterdam' : profile.hardfork) as never });
     const own = new Set([...getActivePrecompiles(common).keys()].map(k => `0x${k}`)), forwards = new Set((profile.forwardedPrecompiles ?? []).map(a => a.toLowerCase()));
+    for (const p of timedPrecompilesAt(profile, BigInt(head.timestamp))) own.add(p.address);
     // (Base's registries run from their Solidity references: said apart.)
     for (const [address, name] of rules.precompiles) if (!own.has(address) && !forwards.has(address)) (hasReference(chainId, address) ? report.referenced : report.nodeOnly).push(`${name} ${address}`);
     const next = config?.next;
-    if (next?.forkId) {
+    if (NEXT) {
+      if (!next?.forkId || !Number(next.activationTime)) { report.fork.push('--next: no fork scheduled: nothing to run'); return report; }
+      const time = BigInt(next.activationTime!), checked = profile?.checked?.next;
+      chain.time = time;
+      report.fork.push(`--next: every program in a block at ${day(Number(time))}, when the fork with id ${next.forkId} takes effect: ${checked?.forkId === next.forkId ? `the fork checked ahead on ${checked.on}` : 'NOT yet checked ahead'}`);
+      if (checked?.forkId !== next.forkId) report.drift = true;
+      // What the node will list then, against the local EVM's (its own precompiles in effect at that time included).
+      const then = new Set([...own, ...timedPrecompilesAt(profile, time).map(p => p.address)]);
+      report.nodeOnly = []; report.referenced = [];
+      for (const [name, a] of Object.entries(next.precompiles ?? {})) {
+        const address = `0x${a.slice(2).toLowerCase().padStart(40, '0')}`;
+        if (!then.has(address) && !forwards.has(address)) (hasReference(chainId, address) ? report.referenced : report.nodeOnly).push(`${name} ${address}`);
+      }
+    } else if (next?.forkId) {
       const now = new Set(rules.precompiles.keys()), added = Object.entries(next.precompiles ?? {}).filter(([, a]) => !now.has(`0x${a.slice(2).toLowerCase().padStart(40, '0')}`)).map(([n, a]) => `${n} ${a}`);
-      report.fork.push(`a fork is scheduled${Number(next.activationTime) ? ` for ${day(Number(next.activationTime))}` : ''} (fork id ${next.forkId})${added.length ? `, adding ${added.join(', ')}` : ''}: the local EVM will need checking against it`);
+      report.fork.push(`a fork is scheduled${Number(next.activationTime) ? ` for ${day(Number(next.activationTime))}` : ''} (fork id ${next.forkId})${added.length ? `, adding ${added.join(', ')}` : ''}: ${profile?.checked?.next?.forkId === next.forkId ? `checked ahead on ${profile.checked.next.on} (--next)` : 'the local EVM will need checking against it (--next)'}`);
     }
   }
 
@@ -554,7 +579,7 @@ async function check(chainId: number): Promise<Report> {
   // Where blocks carry their access lists (Amsterdam), what happened is on record down to each storage slot: recent
   // transactions are replayed with a trace, and each must match its receipt and change exactly the state its
   // block's list says it changed.
-  if (head.blockAccessListHash !== undefined) {
+  if (head.blockAccessListHash !== undefined && !NEXT) {
     const { replayed, differ } = await replays(chainId, chain.url);
     report.replays = `${replayed} recent transactions replayed with a trace: ${differ.length ? `${differ.length} differ` : "all match their receipts and change the state their block's access list records"}`;
     report.differences.push(...differ);
@@ -607,7 +632,7 @@ for (const chainId of CHAINS_ASKED) {
 }
 if (OUT) writeFileSync(OUT, JSON.stringify(reports, null, 2));
 if (SUMMARY_MD) {
-  const lines = ['### Rules check', '', '| Chain | Fork | Compared | Differ |', '|---|---|---|---|', ...reports.map(r => `| ${r.name} | ${r.drift ? '**changed**' : r.fork[0]?.includes('the one checked') ? 'as checked' : 'not known'} | ${r.compared} | ${r.differences.length} |`), ''];
+  const lines = [NEXT ? '### Rules check at each scheduled fork' : '### Rules check', '', '| Chain | Fork | Compared | Differ |', '|---|---|---|---|', ...reports.map(r => `| ${r.name} | ${r.drift ? '**changed**' : r.fork[0]?.includes('the one checked') ? 'as checked' : 'not known'} | ${r.compared} | ${r.differences.length} |`), ''];
   for (const r of reports) if (r.differences.length || r.drift || r.nodeOnly.length || r.fork.length > 1 || r.replays || r.uncompared.length) lines.push(`**${r.name}**`, '', ...r.fork.map(f => `- ${f}`), ...(r.replays ? [`- ${r.replays}`] : []), ...(r.nodeOnly.length ? [`- Precompiles only the node has: ${r.nodeOnly.join(', ')}`] : []), ...(r.referenced.length ? [`- Precompiles run from their Solidity references: ${r.referenced.join(', ')}`] : []), ...r.differences.map(d => `- ${d}`), ...(r.uncompared.length ? [`- Not compared, the RPC's rate limit: ${r.uncompared.length}`] : []), '');
   appendFileSync(SUMMARY_MD, `${lines.join('\n')}\n`);
 }

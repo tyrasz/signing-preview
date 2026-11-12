@@ -40,7 +40,7 @@ export interface ChainProfile {
    * chain's receipts, and when that was. A node on another fork id runs rules the local EVM hasn't been checked
    * against: its runs then say so (SimulationResult.rulesNote).
    */
-  checked?: { forkId: string; on: string };
+  checked?: { forkId: string; on: string; /** The fork the chain has scheduled, checked ahead: its programs run on the node in a block at the fork's time (npm run rules -- --next). */ next?: { forkId: string; on: string } };
   /** Seconds between blocks, for the simulated next block's timestamp. */
   blockTime: number;
   /** Precompiles the local EVM doesn't have; their calls are answered by eth_call on the chain (HyperEVM's HyperCore reads). */
@@ -104,11 +104,33 @@ export interface ChainProfile {
   /** The chain has no point-evaluation precompile at 0x0a (it carries no blobs): the address is an empty account there. */
   noPointEvaluation?: boolean;
   /**
+   * Precompiles of the chain's own that a fork adds, from its time on (seconds): before it, the address is an empty
+   * account. Each costs a fixed price, whatever its input, and answers from the block.
+   */
+  timedPrecompiles?: TimedPrecompile[];
+  /**
    * Opcodes of the profile's fork that the chain's node refuses as invalid, measured by running each on the node:
    * chains without blobs have no BLOBBASEFEE (Arbitrum, Polygon), and Polygon no BLOBHASH either.
    */
   missingOpcodes?: number[];
 }
+
+export interface TimedPrecompile { name: string; address: string; from: bigint; gas: bigint; answer: (block: { timestamp: bigint; milliseconds: bigint }) => Uint8Array }
+
+/**
+ * BNB Chain's fork of 2026-12-08 (its eth_config's next: fork id 0x23d35e07, activation 1,796,697,000): one precompile,
+ * MILLI_TIMESTAMP at 0x70, which returns the block's time in milliseconds, its seconds times 1,000 and the
+ * milliseconds its mixHash carries (BEP-520), as a 32-byte word. Measured on its node, whose eth_simulateV1 runs a
+ * block at the fork's time under the fork's rules: 20 gas whatever the input (none, 1, 32, 33 or 1,000 bytes), warm
+ * from the start, given 19 it runs out; with a prevRandao override of 550 it answers 1,796,697,000,550. Before the
+ * fork the address is an empty account (a call to it 2,600, cold).
+ */
+const BNB_MILLI_TIMESTAMP: TimedPrecompile = {
+  name: 'MILLI_TIMESTAMP', address: '0x0000000000000000000000000000000000000070', from: 1_796_697_000n, gas: 20n,
+  answer: b => hexToBytes(`0x${(b.timestamp * 1000n + b.milliseconds).toString(16).padStart(64, '0')}`),
+};
+/** The chain's own precompiles in effect at `time` (ChainProfile.timedPrecompiles). */
+export const timedPrecompilesAt = (profile: ChainProfile | undefined, time: bigint) => (profile?.timedPrecompiles ?? []).filter(p => time >= p.from);
 
 /** HyperEVM's read precompiles (0x…0800 onward: positions, spot balances, prices, L1 block number...). */
 const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).toString(16).padStart(40, '0')}`);
@@ -169,7 +191,9 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
   137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true, maxCodeSize: 32_768 },
-  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10' }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES, tipsTo: '0xfffffffffffffffffffffffffffffffffffffffe' },
+  // (Its fork of 2026-12-08 checked ahead: the rules check's 370 programs alike on its node at the fork's time.)
+  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10', next: { forkId: '0x23d35e07', on: '2026-11-12' } }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES, tipsTo: '0xfffffffffffffffffffffffffffffffffffffffe',
+    timedPrecompiles: [BNB_MILLI_TIMESTAMP] },
   // HyperEVM prices most precompiles its own way, measured on its node (2026-11-12; until a day before it charged
   // Ethereum's): ecrecover 15,000; modexp ten times Osaka's formula (EIP-7883, at least 5,000, inputs to 1,024 bytes
   // as EIP-7823 has them); bn254 and blake2f ten times Ethereum's (a pairing 450,000 and 340,000 a pair); point
@@ -824,7 +848,7 @@ export function mainnetForkAt(header: { number: bigint; timestamp: bigint }, lat
  */
 function rulesNoteOf(chainId: number, profile: ChainProfile, rules: NodeRules | undefined, at: SimulationRequest['at']): string | undefined {
   const name = CHAINS[chainId]?.name ?? `Chain ${chainId}`, day = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
-  if (rules?.forkId && profile.checked && rules.forkId !== profile.checked.forkId) {
+  if (rules?.forkId && profile.checked && rules.forkId !== profile.checked.forkId && rules.forkId !== profile.checked.next?.forkId) {
     return `${name}'s rules changed${rules.activation ? ` on ${day(rules.activation)}` : ''} since the local EVM here was last checked against the chain (${profile.checked.on}), so its run may differ from the chain's, in gas above all.`;
   }
   if (chainId !== 1 && at?.required && rules?.activation && Number(at.header.timestamp) < rules.activation) {
@@ -1198,6 +1222,7 @@ export class ForkSimulator implements Simulator {
     source.time = block.header.timestamp;
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
     const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
+    for (const p of timedPrecompilesAt(profile, block.header.timestamp)) forwards.add(p.address);
     for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !hasReference(chainId, address)) source.nodeOnly.set(address, name);
     const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
@@ -1264,7 +1289,7 @@ export class ForkSimulator implements Simulator {
     // a block time later, with opcode 0x44 as the chain answers it (src/block.ts).
     const next = headerAfter(source.chainId, await source.header(tag));
     return { header: { number: next.number, coinbase: createAddressFromString(next.coinbase), timestamp: next.timestamp, difficulty: 0n, prevRandao: hexToBytes(next.prevRandao),
-      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n, ...(next.slotNumber !== undefined && { slotNumber: next.slotNumber }) }, arbBlockNumber: next.arbBlockNumber ?? next.number, amsterdam: next.amsterdam };
+      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n, ...(next.slotNumber !== undefined && { slotNumber: next.slotNumber }), ...(next.milliseconds !== undefined && { milliseconds: next.milliseconds }) }, arbBlockNumber: next.arbBlockNumber ?? next.number, amsterdam: next.amsterdam };
   }
 
   /** One run of the calls, in order, on a fresh state over `source`. */
@@ -1324,7 +1349,11 @@ export class ForkSimulator implements Simulator {
         return gas <= input.gasLimit ? { ...r, executionGasUsed: gas } : { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) };
       } }] : [];
     });
-    const precompiles = [...scaled, ...forwarded, ...moved, ...absent];
+    // The chain's own precompiles a fork added, as of the block's time (ChainProfile.timedPrecompiles).
+    const timed = timedPrecompilesAt(profile, block.header.timestamp).map(p => ({ address: p.address as Hex, function: async (input: { gasLimit: bigint }) =>
+      p.gas > input.gasLimit ? { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) }
+        : { executionGasUsed: p.gas, returnValue: p.answer({ timestamp: block.header.timestamp, milliseconds: block.header.milliseconds ?? 0n }) } }));
+    const precompiles = [...scaled, ...timed, ...forwarded, ...moved, ...absent];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
     // What a cleared slot gives back reaches the caller that paid for it, as on the chain (see repayCallers).
     const gasBack = profile.hardfork === 'amsterdam' ? repayCallers(evm) : undefined;

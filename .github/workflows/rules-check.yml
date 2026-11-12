@@ -8,7 +8,10 @@ name: Rules check
 # access lists, recent transactions replayed against their receipts and those lists.
 # Read-only: nothing is signed or sent. Public RPCs by default (EVM_RPCS in src/chains.ts); the chains' *_RPC_URL
 # repository secrets replace them.
-# Fails when a chain's fork isn't the one checked, or anything differs (scripts/rules-check.ts --strict).
+# Then the same at each fork a chain has scheduled (--next: in a block at the fork's time, which its node simulates
+# under the fork's rules), so the local EVM is checked before the fork takes effect.
+# Fails when a chain's fork isn't the one checked, a scheduled fork hasn't been checked ahead, or anything differs
+# (scripts/rules-check.ts --strict).
 
 on:
   schedule:
@@ -51,6 +54,21 @@ jobs:
         run: |
           set -o pipefail
           npm run rules -- --chain all --strict --fuzz 48 --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee rules.log
+      - name: The same at each chain's scheduled fork
+        if: success() || failure()
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          HYPEREVM_RPC_URL: ${{ secrets.HYPEREVM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+        run: |
+          set -o pipefail
+          npm run rules -- --chain all --next --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report-next.json 2>&1 | tee rules-next.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -59,6 +77,8 @@ jobs:
           path: |
             report.json
             rules.log
+            report-next.json
+            rules-next.log
           if-no-files-found: ignore
           retention-days: 30
 
@@ -86,6 +106,9 @@ jobs:
             echo
             echo '```'
             grep -a -v '^> \|^$\|UNDICI\|trace-warnings' report/rules.log | tail -n 80 || echo "(No log.)"
+            echo
+            echo 'At each scheduled fork (--next):'
+            grep -a -v '^> \|^$\|UNDICI\|trace-warnings' report/rules-next.log | tail -n 40 || echo "(No log.)"
             echo '```'
           } > body.md
           if [ -n "$existing" ]; then
