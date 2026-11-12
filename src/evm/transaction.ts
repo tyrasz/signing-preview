@@ -329,6 +329,8 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       b.note(replay || named ? pastNote(sim, preset ? undefined : named) : simulationNote(sim));
       // A simulation the local EVM ran itself, under rules that may not be the chain's: it says so.
       if (sim.rulesNote) b.note(sim.rulesNote);
+      // And one that ran contracts the node runs itself (Base's B20 tokens) from their Solidity references.
+      if (sim.standIns?.length) b.note(`The simulation ran ${sim.standIns.length === 1 ? `${sim.standIns[0]}, which this chain's node runs itself,` : `${sim.standIns.length} contracts this chain's node runs itself (${sim.standIns.join(', ')})`} from the Base Standard Library's Solidity reference, which keeps its state where the node does, charged the gas the node charges.`);
     }
     // A replay against its receipt: the same outcome, events and gas say the run shown is what happened.
     if (replay) {

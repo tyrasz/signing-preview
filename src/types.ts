@@ -527,6 +527,17 @@ export interface SimulationResult {
    * wasn't checked against, or the block is from before the node's current fork.
    */
   rulesNote?: string;
+  /**
+   * Set by the local EVM: contracts the chain's node runs itself (Base's B20 tokens and the registries they call)
+   * that the run ran from their Solidity references instead. They do what the node's do, and are charged the gas the
+   * node charges for them.
+   */
+  standIns?: string[];
+  /**
+   * Of standIns, those a replay's earlier transactions in the block changed: their storage could be read only as of
+   * the block before (the node runs them whatever code is put in their place), so what they read may not be what they held.
+   */
+  standInsStale?: string[];
   /** The amounts were read from balances before and after the call (not taken from the logs). */
   balancesRead?: boolean;
   /** The call's trace and the state it changed, when the request asked for them and the simulator can (see SimulationRequest.trace). */

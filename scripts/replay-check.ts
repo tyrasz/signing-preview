@@ -1,5 +1,6 @@
 // npm run replays -- [--chain 1|42161|8453|10|137|56|11155111] [--follow 600 | --blocks 3 | --tx 0x…] [--per-block 8]
-//   [--max 200] [--concurrency 2] [--no-trace] [--strict [--tolerate 0]] [--out report.json] [--summary-md summary.md]
+//   [--max 200] [--concurrency 2] [--no-trace] [--strict [--tolerate 0]] [--logs-from 0xb2000000000000000000]
+//   [--out report.json] [--summary-md summary.md]
 //
 // Mined transactions put through the previewer's own replay (replayTransaction: what POST /v1/replay serves), each
 // with its call trace, and what came out against what happened:
@@ -12,6 +13,8 @@
 // block's earlier ones, senders seen once). This goes through the product's path, and takes transactions from all
 // through a block, preferring calls it hasn't seen (a contract and function at most three times in a run).
 //
+// --logs-from takes only transactions whose receipts have a log from an address starting so (0xb2000000000000000000:
+// Base's B20 tokens, which the local EVM runs from their Solidity references; such replays are counted apart).
 // --follow replays each new block as it arrives (public nodes keep recent state only: Arbitrum's about 30 seconds);
 // --blocks takes the latest ones; --tx one transaction, printed in full. --strict exits with 1 when a replay doesn't
 // match its receipt, or a trace differs from the node's run, its gas or the block's access list; --tolerate N lets
@@ -26,7 +29,7 @@ import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '3')), PER_BLOCK = Number(arg('per-block', '8')), MAX = Number(arg('max', '200'));
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '2'))), TRACE = !process.argv.includes('--no-trace'), STRICT = process.argv.includes('--strict');
-const ONE = arg('tx', ''), OUT = arg('out', ''), SUMMARY_MD = arg('summary-md', ''), TOLERATE = Number(arg('tolerate', '0'));
+const ONE = arg('tx', ''), OUT = arg('out', ''), SUMMARY_MD = arg('summary-md', ''), TOLERATE = Number(arg('tolerate', '0')), LOGS_FROM = arg('logs-from', '').toLowerCase();
 const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
 // The replays' own lookups stay on the chain's node: no ABI or signature services, no prices.
 const deps = liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off', SIGNING_PREVIEW_OFFLINE_LOOKUPS: '1', SIGNING_PREVIEW_PRICES: 'off' }, { warmUp: false });
@@ -39,7 +42,7 @@ const call = async <T>(method: string, params: unknown[]): Promise<T | null> => 
 };
 
 type Tx = { hash: string; to: string | null; input: string; transactionIndex: string; type: string };
-type Row = { hash: string; block: number; index: number; title?: string; ms: number; kind: 'same' | 'receipt' | 'trace' | 'gas' | 'state' | 'untraced' | 'unavailable' | 'own' | 'error'; what?: string; gasCompared?: boolean; stateChecked?: boolean; /** A run shown in place of the node's first, which wasn't the receipt's: the merged same-second run, or the local EVM's. */ shownBy?: 'merged' | 'local' };
+type Row = { hash: string; block: number; index: number; title?: string; ms: number; kind: 'same' | 'receipt' | 'trace' | 'gas' | 'state' | 'untraced' | 'unavailable' | 'own' | 'error'; what?: string; gasCompared?: boolean; stateChecked?: boolean; standIn?: boolean; /** A run shown in place of the node's first, which wasn't the receipt's: the merged same-second run, or the local EVM's. */ shownBy?: 'merged' | 'local' };
 const rows: Row[] = [];
 const seen = new Map<string, number>();
 
@@ -51,7 +54,9 @@ async function replay(hash: string, block: number): Promise<void> {
     if (ONE) console.log(JSON.stringify(p, null, 1));
     const notes = p.decoding.notes.join(' ');
     const shownBy = /It was run instead with the \d+ transactions before it in that second/.test(notes) ? 'merged' as const : /local EVM/.test(p.simulation?.source ?? '') ? 'local' as const : undefined;
-    const base = { index: p.replay!.index, title: p.title, gasCompared: p.trace?.gasAgrees !== undefined, stateChecked: p.trace?.stateAgrees !== undefined, ...(shownBy && { shownBy }) };
+    // A trace that ran a contract the node runs itself from its Solidity reference (Base's B20 tokens) says so.
+    const standIn = /ran in the trace from (its|their) Solidity reference/.test(p.trace?.note ?? '');
+    const base = { index: p.replay!.index, title: p.title, gasCompared: p.trace?.gasAgrees !== undefined, stateChecked: p.trace?.stateAgrees !== undefined, ...(shownBy && { shownBy }), ...(standIn && { standIn }) };
     // A node that didn't hold the replay (state it no longer keeps, its allowance for one simulation) leaves nothing to compare.
     if (p.simulation?.status === 'unavailable') return row('unavailable', { ...base, what: p.simulation.error?.slice(0, 200) });
     if (!p.replay!.matches) return row('receipt', { ...base, what: p.replay!.differences?.join('; ').slice(0, 300) });
@@ -84,7 +89,13 @@ async function block(n: number): Promise<void> {
   // A node that is turning requests away (HTTP 429 on a busy public endpoint) costs this block, not the run.
   const b = await call<{ transactions: Tx[] }>('eth_getBlockByNumber', [`0x${n.toString(16)}`, true]).catch(() => null);
   if (!b) return void await new Promise(r => setTimeout(r, 3000));
-  const hashes = pick(b?.transactions ?? []).slice(0, Math.max(0, MAX - rows.length));
+  let txs = b.transactions ?? [];
+  if (LOGS_FROM) {
+    const receipts = await call<{ transactionHash: string; logs: { address: string }[] }[]>('eth_getBlockReceipts', [`0x${n.toString(16)}`]).catch(() => null);
+    const touching = new Set((receipts ?? []).filter(r => r.logs.some(l => l.address.toLowerCase().startsWith(LOGS_FROM))).map(r => r.transactionHash.toLowerCase()));
+    txs = txs.filter(t => touching.has(t.hash.toLowerCase()));
+  }
+  const hashes = pick(txs).slice(0, Math.max(0, MAX - rows.length));
   for (let i = 0; i < hashes.length; i += CONCURRENCY) await Promise.all(hashes.slice(i, i + CONCURRENCY).map(h => replay(h, n)));
 }
 
@@ -103,13 +114,14 @@ else if (FOLLOW) {
 const count = (k: Row['kind']) => rows.filter(r => r.kind === k).length;
 const replayed = rows.filter(r => !['own', 'unavailable', 'error'].includes(r.kind)), traced = replayed.filter(r => r.kind !== 'untraced');
 const lines = [
-  `${replayed.length} ${chainName(CHAIN)} transactions replayed through the previewer${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
+  `${replayed.length} ${chainName(CHAIN)} transactions${LOGS_FROM ? ` with a log from ${LOGS_FROM}…` : ''} replayed through the previewer${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
   `  against their receipts: ${replayed.length - count('receipt')} of ${replayed.length} match${count('receipt') ? `, ${count('receipt')} differ` : ''}`,
   ...(TRACE ? [
     `  traces: ${traced.length} of ${replayed.length} traced; ${traced.length - count('trace') - count('receipt')} agree with the node's run${count('trace') ? `, ${count('trace')} differ` : ''}`,
     `  gas, where the trace's and the node's are comparable: the same in ${rows.filter(r => r.gasCompared && r.kind !== 'gas').length} of ${rows.filter(r => r.gasCompared).length}`,
     ...(rows.some(r => r.stateChecked) ? [`  state changes against the block's access list: the same in ${rows.filter(r => r.stateChecked && r.kind !== 'state').length} of ${rows.filter(r => r.stateChecked).length}`] : []),
   ] : []),
+  ...(rows.some(r => r.standIn) ? [`  ${rows.filter(r => r.standIn).length} traces ran a contract the node runs itself from its Solidity reference: ${rows.filter(r => r.standIn && ['same', 'gas', 'state'].includes(r.kind)).length} agree with the node's run, ${rows.filter(r => r.standIn && r.kind === 'same' && r.gasCompared).length} with its gas too`] : []),
   ...(count('untraced') ? [`  no trace for ${count('untraced')}: ${[...new Set(rows.filter(r => r.kind === 'untraced').map(r => r.what))].slice(0, 3).join(' | ')}`] : []),
   ...(count('unavailable') + count('error') ? [`  not replayed: ${count('unavailable')} the node didn't hold, ${count('error')} failed${count('error') ? ` (${rows.find(r => r.kind === 'error')!.what})` : ''}`] : []),
   ...(rows.some(r => r.shownBy) ? [`  shown by another run than the node's first, which wasn't the receipt's: ${rows.filter(r => r.shownBy === 'merged').length} by the node with the second's blocks merged, ${rows.filter(r => r.shownBy === 'local').length} by the local EVM`] : []),
@@ -120,6 +132,6 @@ console.log(`\n${lines.join('\n')}`);
 const differing = rows.filter(r => ['receipt', 'trace', 'gas', 'state'].includes(r.kind));
 for (const r of differing) console.log(`    ${r.kind} ${r.hash} #${r.index} ${r.title ?? ''}: ${r.what ?? ''}`);
 if (OUT) writeFileSync(OUT, JSON.stringify({ chainId: CHAIN, rows }, null, 1));
-if (SUMMARY_MD) appendFileSync(SUMMARY_MD, `### Replays on ${chainName(CHAIN)}\n\n${lines.map(l => `- ${l.trim()}`).join('\n')}\n${differing.map(r => `- **${r.kind}** \`${r.hash}\` ${r.title ?? ''}: ${r.what ?? ''}`).join('\n')}\n`);
+if (SUMMARY_MD) appendFileSync(SUMMARY_MD, `### Replays on ${chainName(CHAIN)}${LOGS_FROM ? ` (transactions with a log from ${LOGS_FROM}…)` : ''}\n\n${lines.map(l => `- ${l.trim()}`).join('\n')}\n${differing.map(r => `- **${r.kind}** \`${r.hash}\` ${r.title ?? ''}: ${r.what ?? ''}`).join('\n')}\n`);
 // The fork cache and lookups may hold timers open.
 process.exit(STRICT && differing.length > TOLERATE ? 1 : 0);

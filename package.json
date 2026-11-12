@@ -74,7 +74,8 @@
     "accuracy:4337": "NODE_USE_ENV_PROXY=1 node scripts/accuracy-4337.ts",
     "rules": "NODE_USE_ENV_PROXY=1 node scripts/rules-check.ts",
     "replays": "NODE_USE_ENV_PROXY=1 node scripts/replay-check.ts",
-    "build:entrypoints": "NODE_USE_ENV_PROXY=1 node scripts/build-entrypoint-simulations.ts"
+    "build:entrypoints": "NODE_USE_ENV_PROXY=1 node scripts/build-entrypoint-simulations.ts",
+    "build:b20": "NODE_USE_ENV_PROXY=1 node scripts/build-b20.ts"
   },
   "dependencies": {
     "@ethereumjs/common": "10.1.3",

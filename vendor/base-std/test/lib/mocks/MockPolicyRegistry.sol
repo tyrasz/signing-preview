@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IPolicyRegistry} from "base-std/interfaces/IPolicyRegistry.sol";
+
+import {MockPolicyRegistryStorage} from "base-std-test/lib/mocks/MockPolicyRegistryStorage.sol";
+
+/// @notice Canonical built-in policy ID constants. Declared as a library
+///         so tests can reference them at compile time via
+///         `PolicyRegistryConstants.ALWAYS_ALLOW_ID` — Solidity's
+///         `public constant` on a contract is only accessible via instance
+///         call, which doesn't work for compile-time constant contexts.
+/// @dev    `MockPolicyRegistry` re-exposes each value as `uint64 public
+///         constant` to satisfy the runtime-getter contract; this library
+///         is the single source of truth.
+library PolicyRegistryConstants {
+    /// @notice Built-in policy ID that always authorizes any account.
+    /// @dev    Encodes as a BLOCKLIST at counter 0 (empty blocklist → allow all).
+    uint64 internal constant ALWAYS_ALLOW_ID = 0;
+
+    /// @notice Built-in policy ID that always rejects any account.
+    /// @dev    Encodes as an ALLOWLIST at counter 1 (empty allowlist → block all).
+    uint64 internal constant ALWAYS_BLOCK_ID = (uint64(uint8(IPolicyRegistry.PolicyType.ALLOWLIST)) << 56) | 1;
+
+    /// @notice High bit of a `uint64` policy ID that inverts the base policy.
+    /// @dev    All view functions see an inverted ID as an extension of the base — policy ID
+    uint64 internal constant INVERTED_POLICY_BIT = uint64(1) << 63;
+
+    /// @notice Number of built-in policies the registry initializes on
+    ///         first use. The global counter is advanced to this value
+    ///         once both sentinels are populated, so custom policies
+    ///         start at counter `BUILTIN_POLICY_COUNT`.
+    /// @dev    Library `internal constant` so callers (tests + the Rust
+    ///         impl validator) can reference it at compile time without
+    ///         routing through a runtime getter — important because the
+    ///         live Rust precompile does NOT expose this value via its
+    ///         dispatch ABI.
+    uint56 internal constant BUILTIN_POLICY_COUNT = 2;
+}
+
+/// @title MockPolicyRegistry
+/// @notice Reference implementation of the `IPolicyRegistry` precompile.
+///         Etched at the canonical policy-registry address via `vm.etch`
+///         from `BaseTest.setUp`.
+///
+/// @dev    Solidity-as-if-Rust: spec-correspondence with the production
+///         Rust precompile, not gas-optimal Solidity. All mutable state
+///         lives in `MockPolicyRegistryStorage.layout()` at a single
+///         ERC-7201-namespaced root; see that library for the layout.
+///
+///         Policy ID encoding: top byte = `uint8(PolicyType)`; low 56
+///         bits = counter. Type is recoverable from the ID alone (no
+///         SLOAD), so the packed storage slot stores only admin + an
+///         exists flag, not the type.
+///
+///         Built-in IDs (short-circuited in `isAuthorized` before any
+///         SLOAD): `ALWAYS_ALLOW_ID` (empty BLOCKLIST → allow all) and
+///         `ALWAYS_BLOCK_ID` (empty ALLOWLIST → block all). The values
+///         are chosen so the encoding reads as the natural degenerate
+///         form of each list type.
+contract MockPolicyRegistry is IPolicyRegistry {
+    // ============================================================
+    //                         CONSTANTS
+    // ============================================================
+
+    /// @notice Built-in policy ID that always authorizes any account.
+    /// @dev    The default value for an unconfigured policy slot.
+    uint64 public constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;
+
+    /// @notice Built-in policy ID that always rejects any account.
+    /// @dev    Useful as an explicit hard-deny on a slot.
+    uint64 public constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;
+
+    // Policy ID encoding: top byte = uint8(PolicyType), low 56 bits = counter.
+    uint64 internal constant POLICY_ID_TYPE_SHIFT = 56;
+
+    /// @notice Invert flag on a policy ID: bit 63.
+    /// @dev    Sourced from `PolicyRegistryConstants` so the mock and tests share one
+    ///         definition of the bit.
+    uint64 internal constant INVERTED_POLICY_BIT = PolicyRegistryConstants.INVERTED_POLICY_BIT;
+
+    /// @notice Per-call membership-batch limit. `createPolicyWithAccounts`,
+    ///         `updateAllowlist`, and `updateBlocklist` revert with
+    ///         `BatchSizeTooLarge(MAX_BATCH_SIZE)` when `accounts.length`
+    ///         exceeds this value. Mirrors the Rust PolicyRegistry
+    ///         precompile.
+    uint256 internal constant MAX_BATCH_SIZE = 64;
+
+    /// @notice Minimum number of child policies a composite must reference.
+    ///         `createCompositePolicy` and `updateComposite` revert with
+    ///         `ChildPoliciesOutsideOfRange` when `childPolicyIds.length` is below this value.
+    uint256 public constant MIN_COMPOSITE_CHILD_POLICIES = 2;
+
+    /// @notice Maximum number of child policies a composite may reference.
+    ///         `createCompositePolicy` and `updateComposite` revert with
+    ///         `ChildPoliciesOutsideOfRange` when `childPolicyIds.length` is outside
+    ///         `[MIN_COMPOSITE_CHILD_POLICIES, MAX_COMPOSITE_CHILD_POLICIES]`.
+    ///         Distinct from `MAX_BATCH_SIZE` (64), which caps account-membership batches.
+    ///         Mirrors the Rust PolicyRegistry precompile.
+    uint256 public constant MAX_COMPOSITE_CHILD_POLICIES = 4;
+
+    // ============================================================
+    //                       POLICY CREATION
+    // ============================================================
+
+    /// @inheritdoc IPolicyRegistry
+    function createPolicy(address admin, PolicyType policyType) external returns (uint64 newPolicyId) {
+        // ZeroAddress precedes IncompatiblePolicyType (see interface natspec). `_create`
+        // re-checks zero-admin, but the hoisted copy pins the precedence.
+        if (admin == address(0)) revert ZeroAddress();
+        if (_isCompositeType(policyType)) revert IncompatiblePolicyType();
+        newPolicyId = _create(admin, policyType);
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function createPolicyWithAccounts(address admin, PolicyType policyType, address[] calldata accounts)
+        external
+        returns (uint64 newPolicyId)
+    {
+        // Match the Rust precompile's check precedence:
+        //   validate_create_policy_inputs (zero-admin → composite-type) → require_account_batch_size →
+        //   create_policy_inner → write members
+        // Both zero-admin and batch-size are duplicated downstream (`_create` re-checks
+        // zero-admin for direct `createPolicy` callers, `_batchSetMembers` re-checks batch
+        // size for `updateAllowlist` / `updateBlocklist` callers). The hoisted entry-point
+        // copies ensure we revert before any `_create` mutation on the failing path AND pin
+        // the same revert-selector precedence Rust enforces (see Rust test
+        // `create_policy_with_accounts_zero_admin_precedes_batch_size_revert`). A composite
+        // `policyType` is rejected here — this is a simple-policy constructor.
+        if (admin == address(0)) revert ZeroAddress();
+        if (_isCompositeType(policyType)) revert IncompatiblePolicyType();
+        if (accounts.length > MAX_BATCH_SIZE) revert BatchSizeTooLarge(MAX_BATCH_SIZE);
+        newPolicyId = _create(admin, policyType);
+        _batchSetMembers({policyId: newPolicyId, policyType: policyType, value: true, accounts: accounts});
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function createCompositePolicy(address admin, PolicyType policyType, uint64[] calldata childPolicyIds)
+        external
+        returns (uint64 newPolicyId)
+    {
+        if (admin == address(0)) revert ZeroAddress();
+        if (!_isCompositeType(policyType)) revert IncompatiblePolicyType();
+        if (
+            childPolicyIds.length < MIN_COMPOSITE_CHILD_POLICIES || childPolicyIds.length > MAX_COMPOSITE_CHILD_POLICIES
+        ) {
+            revert ChildPoliciesOutsideOfRange();
+        }
+        _requireCreatedSimplePolicies(childPolicyIds);
+
+        newPolicyId = _create(admin, policyType);
+        MockPolicyRegistryStorage.layout().children[newPolicyId] = childPolicyIds;
+        emit CompositePolicyUpdated(newPolicyId, msg.sender, childPolicyIds);
+    }
+
+    // ============================================================
+    //                     POLICY ADMINISTRATION
+    // ============================================================
+
+    /// @inheritdoc IPolicyRegistry
+    function stageUpdateAdmin(uint64 policyId, address newAdmin) external {
+        uint256 packed = _requireCustom(policyId);
+        if (_decodeAdmin(packed) != msg.sender) revert Unauthorized();
+        MockPolicyRegistryStorage.layout().pendingAdmins[policyId] = newAdmin;
+        emit PolicyAdminStaged(policyId, msg.sender, newAdmin);
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function finalizeUpdateAdmin(uint64 policyId) external {
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        uint256 packed = $.policies[policyId];
+        if (packed == 0) revert PolicyNotFound();
+        address pending = $.pendingAdmins[policyId];
+        if (pending == address(0)) revert NoPendingAdmin();
+        if (pending != msg.sender) revert Unauthorized();
+        address previousAdmin = _decodeAdmin(packed);
+        $.policies[policyId] = _encode(msg.sender);
+        delete $.pendingAdmins[policyId];
+        emit PolicyAdminUpdated(policyId, previousAdmin, msg.sender);
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function renounceAdmin(uint64 policyId) external {
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        uint256 packed = $.policies[policyId];
+        if (packed == 0) revert PolicyNotFound();
+        if (_decodeAdmin(packed) != msg.sender) revert Unauthorized();
+        // Admin lane cleared, exists flag (bit 160) survives so the
+        // policy stays observable via `policyExists` and the existence
+        // check on subsequent mutating calls still passes (with
+        // `Unauthorized` taking over as the rejection reason).
+        $.policies[policyId] = _encode(address(0));
+        delete $.pendingAdmins[policyId];
+        emit PolicyAdminUpdated(policyId, msg.sender, address(0));
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function updateAllowlist(uint64 policyId, bool allowed, address[] calldata accounts) external {
+        uint256 packed = _requireCustom(policyId);
+        if (_typeOf(policyId) != PolicyType.ALLOWLIST) revert IncompatiblePolicyType();
+        if (_decodeAdmin(packed) != msg.sender) revert Unauthorized();
+        _batchSetMembers({policyId: policyId, policyType: PolicyType.ALLOWLIST, value: allowed, accounts: accounts});
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function updateBlocklist(uint64 policyId, bool blocked, address[] calldata accounts) external {
+        uint256 packed = _requireCustom(policyId);
+        if (_typeOf(policyId) != PolicyType.BLOCKLIST) revert IncompatiblePolicyType();
+        if (_decodeAdmin(packed) != msg.sender) revert Unauthorized();
+        _batchSetMembers({policyId: policyId, policyType: PolicyType.BLOCKLIST, value: blocked, accounts: accounts});
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function updateComposite(uint64 policyId, uint64[] calldata childPolicyIds) external {
+        // Canonical check precedence (see updateComposite_revertOrder test):
+        //   self-not-found → incompatible-type → unauthorized → too-few → batch-size →
+        //   child-not-found → invalid-child. The type guard precedes the auth guard, and
+        //   a renounced composite (admin zero) fails the auth guard for every caller.
+        uint256 packed = _requireCustom(policyId);
+        if (!_isComposite(policyId)) revert IncompatiblePolicyType();
+        if (_decodeAdmin(packed) != msg.sender) revert Unauthorized();
+        if (
+            childPolicyIds.length < MIN_COMPOSITE_CHILD_POLICIES || childPolicyIds.length > MAX_COMPOSITE_CHILD_POLICIES
+        ) {
+            revert ChildPoliciesOutsideOfRange();
+        }
+        _requireCreatedSimplePolicies(childPolicyIds);
+
+        // Full replacement: assigning a memory array to the storage array resets its
+        // length and overwrites elements. Child sets are ≤ MAX_COMPOSITE_CHILD_POLICIES, so there
+        // is no stale-tail concern.
+        MockPolicyRegistryStorage.layout().children[policyId] = childPolicyIds;
+        emit CompositePolicyUpdated(policyId, msg.sender, childPolicyIds);
+    }
+
+    // ============================================================
+    //                    AUTHORIZATION QUERIES
+    // ============================================================
+
+    /// @inheritdoc IPolicyRegistry
+    function isAuthorized(uint64 policyId, address account) external view returns (bool) {
+        return _isAuthorized(policyId, account);
+    }
+
+    // ============================================================
+    //                       POLICY QUERIES
+    // ============================================================
+
+    /// @inheritdoc IPolicyRegistry
+    /// @dev An inverted ID resolves to the existence of its base: `policyExists(~id)`
+    ///      equals `policyExists(id)`, so a token may store and later re-validate an
+    ///      inverted policy exactly as it would a plain one.
+    function policyExists(uint64 policyId) external view returns (bool) {
+        return _policyExists(policyId);
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    /// @dev An inverted ID has no record of its own; it resolves to its base's admin,
+    ///      matching `policyExists` (`policyAdmin(~id) == policyAdmin(id)`).
+    function policyAdmin(uint64 policyId) external view returns (address) {
+        policyId = _basePolicyId(policyId);
+        if (!_isWellFormed(policyId)) return address(0);
+        // No fast path for built-in IDs needed: lazy init writes them with
+        // a zero admin, so the normal storage read returns address(0) for
+        // them just like for renounced policies and uncreated IDs.
+        //
+        // No explicit `exists()` gate either: the Rust impl reads `packed`,
+        // checks `exists()`, and returns `None` (→ `address(0)` on the ABI
+        // boundary) for non-existent slots. The Solidity encoding invariant
+        // makes the gate unobservable — a never-written `policies[id]` slot
+        // reads as `packed == 0`, so `_decodeAdmin` recovers `address(0)`
+        // with no SLOAD overhead vs. the gated implementation.
+        return _decodeAdmin(MockPolicyRegistryStorage.layout().policies[policyId]);
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    function pendingPolicyAdmin(uint64 policyId) external view returns (address) {
+        // Defense-in-depth short-circuit for built-in IDs. The Rust impl
+        // gates pending-admin reads on the ID being non-built-in (see
+        // `crates/common/precompiles/src/policy/storage.rs` `pending_policy_admin`),
+        // so a corrupted `pendingAdmins[builtin]` slot can never leak a
+        // non-zero address through the view. The default-zero storage read
+        // below would also return `address(0)` for built-ins in normal
+        // operation (they never have a pending admin staged), but the
+        // explicit branch removes that assumption from the trust boundary.
+        policyId = _basePolicyId(policyId);
+        if (policyId == ALWAYS_ALLOW_ID || policyId == ALWAYS_BLOCK_ID) return address(0);
+        if (!_isWellFormed(policyId)) return address(0);
+        return MockPolicyRegistryStorage.layout().pendingAdmins[policyId];
+    }
+
+    /// @inheritdoc IPolicyRegistry
+
+    function compositePolicyChildIds(uint64 policyId) external view returns (uint64[] memory) {
+        policyId = _basePolicyId(policyId);
+        if (!_isWellFormed(policyId)) return new uint64[](0);
+        if (!_isComposite(policyId)) return new uint64[](0);
+        return MockPolicyRegistryStorage.layout().children[policyId];
+    }
+
+    /// @inheritdoc IPolicyRegistry
+    /// @dev Pure toggle of the invert flag on a policy ID; never reverts and reads no state.
+    function invertedPolicyId(uint64 policyId) external pure returns (uint64) {
+        return policyId ^ INVERTED_POLICY_BIT;
+    }
+
+    // ============================================================
+    //                       INTERNAL HELPERS
+    // ============================================================
+
+    function _create(address admin, PolicyType policyType) internal returns (uint64 newPolicyId) {
+        if (admin == address(0)) revert ZeroAddress();
+        // Out-of-range `policyType` rejected by ABI decoding before this body runs.
+        // Lazy-init the built-in policies on the first create. `_writeBuiltins`
+        // is idempotent, so calls after init are a cheap conditional return.
+        _writeBuiltins();
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        uint56 counter = $.nextCounter;
+        // Solidity checked arithmetic panics with Panic(0x11) on uint56 overflow,
+        // matching the Rust precompile which reverts with Panic(UnderOverflow) at COUNTER_MASK.
+        $.nextCounter = counter + 1;
+        newPolicyId = _makeId({policyType: policyType, counter: counter});
+        $.policies[newPolicyId] = _encode(admin);
+        emit PolicyCreated(newPolicyId, msg.sender, policyType);
+        emit PolicyAdminUpdated(newPolicyId, address(0), admin);
+    }
+
+    /// @dev Writes the two built-in policies into the `policies` mapping and
+    ///      advances `nextCounter` past them so custom policies start at
+    ///      `PolicyRegistryConstants.BUILTIN_POLICY_COUNT`. Both built-ins are
+    ///      written with a renounced (zero) admin, so any later `require_admin`
+    ///      check against them rejects with `Unauthorized`.
+    ///
+    ///      Idempotent: re-entry with `nextCounter >= BUILTIN_POLICY_COUNT` is
+    ///      a no-op, so `_create` can call this on every entry. Internal /
+    ///      not exposed in the ABI to mirror `PolicyRegistryStorage::write_builtins`
+    ///      in the Rust precompile, which is `pub` in-crate but absent from
+    ///      the dispatched `PolicyRegistry` trait.
+    function _writeBuiltins() internal {
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        if ($.nextCounter >= PolicyRegistryConstants.BUILTIN_POLICY_COUNT) return;
+        uint256 packed = _encode(address(0));
+        $.policies[PolicyRegistryConstants.ALWAYS_ALLOW_ID] = packed;
+        $.policies[PolicyRegistryConstants.ALWAYS_BLOCK_ID] = packed;
+        $.nextCounter = PolicyRegistryConstants.BUILTIN_POLICY_COUNT;
+    }
+
+    function _batchSetMembers(uint64 policyId, PolicyType policyType, bool value, address[] calldata accounts)
+        internal
+    {
+        if (accounts.length > MAX_BATCH_SIZE) revert BatchSizeTooLarge(MAX_BATCH_SIZE);
+        mapping(address => bool) storage members = MockPolicyRegistryStorage.layout().members[policyId];
+        for (uint256 i = 0; i < accounts.length; ++i) {
+            members[accounts[i]] = value;
+        }
+        if (policyType == PolicyType.ALLOWLIST) {
+            emit AllowlistUpdated(policyId, msg.sender, value, accounts);
+        } else {
+            emit BlocklistUpdated(policyId, msg.sender, value, accounts);
+        }
+    }
+
+    function _requireCustom(uint64 policyId) internal view returns (uint256 packed) {
+        packed = MockPolicyRegistryStorage.layout().policies[policyId];
+        if (packed == 0) revert PolicyNotFound();
+    }
+
+    /// @dev Existence predicate shared by the external `policyExists` view and the
+    ///      fail-closed guard in `_isAuthorized`.
+    function _policyExists(uint64 policyId) internal view returns (bool) {
+        policyId = _basePolicyId(policyId);
+        if (policyId == ALWAYS_ALLOW_ID || policyId == ALWAYS_BLOCK_ID) return true;
+        if (!_isWellFormed(policyId)) return false;
+
+        return MockPolicyRegistryStorage.policyExistsFromPacked(MockPolicyRegistryStorage.layout().policies[policyId]);
+    }
+
+    /// @dev Core authorization logic shared by the external view and composite
+    ///      child evaluation. Never reverts.
+    ///
+    ///      Composites evaluate their children LIVE (reading each child's current
+    ///      membership, not a snapshot). Children are validated to be simple at
+    ///      write time, so the recursion terminates at depth 1: a composite calls
+    ///      `_isAuthorized` per child, each of which resolves via the simple path
+    ///      (or a built-in short-circuit).
+    function _isAuthorized(uint64 policyId, address account) internal view returns (bool) {
+        // Built-in short-circuits precede any SLOAD; sentinels have no
+        // storage entry. Invert runs after: a negated ALWAYS_ALLOW is a
+        // different ID and must not take this short-circuit.
+        if (policyId == ALWAYS_ALLOW_ID) return true;
+        if (policyId == ALWAYS_BLOCK_ID) return false;
+
+        bool isInverted = policyId & INVERTED_POLICY_BIT != 0;
+        if (isInverted) {
+            uint64 base = _basePolicyId(policyId);
+            if (!_policyExists(base)) return false;
+            return !_isAuthorized(base, account);
+        }
+
+        // Short-circuit malformed IDs so the `_typeOf` enum cast can't panic.
+        if (!_isWellFormed(policyId)) return false;
+
+        PolicyType policyType = _typeOf(policyId);
+        if (policyType == PolicyType.UNION) return _isAuthorizedUnion(policyId, account);
+        if (policyType == PolicyType.INTERSECT) return _isAuthorizedIntersect(policyId, account);
+
+        // Simple hot path: one SLOAD (the membership bit). No existence check —
+        // callers pre-validate via `policyExists` at write time. For non-existent
+        // IDs the result collapses to empty-member-set semantics (ALLOWLIST →
+        // false, BLOCKLIST → true).
+        bool member = MockPolicyRegistryStorage.layout().members[policyId][account];
+        return policyType == PolicyType.ALLOWLIST ? member : !member;
+    }
+
+    /// @dev Evaluates a UNION (OR) composite over its LIVE child set: authorized if ANY
+    ///      child authorizes;
+    function _isAuthorizedUnion(uint64 policyId, address account) internal view returns (bool) {
+        uint64[] storage childPolicyIds = MockPolicyRegistryStorage.layout().children[policyId];
+        uint256 childCount = childPolicyIds.length;
+        for (uint256 i = 0; i < childCount; ++i) {
+            if (_isAuthorized(childPolicyIds[i], account)) return true;
+        }
+        return false;
+    }
+
+    /// @dev Evaluates an INTERSECT (AND) composite over its LIVE child set: authorized only
+    ///      if EVERY child authorizes;
+    function _isAuthorizedIntersect(uint64 policyId, address account) internal view returns (bool) {
+        uint64[] storage childPolicyIds = MockPolicyRegistryStorage.layout().children[policyId];
+        uint256 childCount = childPolicyIds.length;
+        for (uint256 i = 0; i < childCount; ++i) {
+            if (!_isAuthorized(childPolicyIds[i], account)) return false;
+        }
+        return true;
+    }
+
+    /// @dev Requires every composite child to be a created, custom, SIMPLE policy:
+    ///      it must exist, must not be a built-in sentinel (ALWAYS_ALLOW / ALWAYS_BLOCK),
+    ///      and must not itself be a composite. Two passes so `PolicyNotFound` takes
+    ///      precedence over `InvalidChildPolicy` across the whole set (matches the
+    ///      canonical revert order the Rust precompile mirrors).
+    /// @dev An inverted valid policy ID counts as a valid composite child.
+    function _requireCreatedSimplePolicies(uint64[] calldata childPolicyIds) internal view {
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        // Pass 1: existence of the base (an inverted child references its base's members).
+        for (uint256 i = 0; i < childPolicyIds.length; ++i) {
+            if ($.policies[_basePolicyId(childPolicyIds[i])] == 0) revert PolicyNotFound();
+        }
+        // Pass 2: the base must be a simple policy (never a sentinel or a composite).
+        for (uint256 i = 0; i < childPolicyIds.length; ++i) {
+            uint64 base = _basePolicyId(childPolicyIds[i]);
+            if (_isBuiltin(base) || _isComposite(base)) revert InvalidChildPolicy(childPolicyIds[i]);
+        }
+    }
+
+    /// @dev True iff `policyType` is a composite gate (UNION or INTERSECT).
+    function _isCompositeType(PolicyType policyType) internal pure returns (bool) {
+        return policyType == PolicyType.UNION || policyType == PolicyType.INTERSECT;
+    }
+
+    /// @dev True iff `policyId`'s top byte encodes a composite gate (UNION or INTERSECT).
+    ///      Assumes a well-formed ID; composite children come from stored/created policies.
+    function _isComposite(uint64 policyId) internal pure returns (bool) {
+        return _isCompositeType(_typeOf(policyId));
+    }
+
+    /// @dev True iff `policyId` is a built-in (ALWAYS_ALLOW / ALWAYS_BLOCK).
+    ///      Sentinels are reserved and may not be used as composite children.
+    function _isBuiltin(uint64 policyId) internal pure returns (bool) {
+        return policyId == ALWAYS_ALLOW_ID || policyId == ALWAYS_BLOCK_ID;
+    }
+
+    /// @dev Strips the invert flag from the policy ID.
+    function _basePolicyId(uint64 policyId) internal pure returns (uint64) {
+        return policyId & ~INVERTED_POLICY_BIT;
+    }
+
+    function _makeId(PolicyType policyType, uint56 counter) internal pure returns (uint64) {
+        return (uint64(uint8(policyType)) << POLICY_ID_TYPE_SHIFT) | uint64(counter);
+    }
+
+    /// @dev Composes a packed slot value. Always sets the exists bit; pass
+    ///      `address(0)` to encode the post-renounce slot.
+    function _encode(address admin) internal pure returns (uint256) {
+        return (uint256(1) << MockPolicyRegistryStorage.EXISTS_BIT) | uint256(uint160(admin));
+    }
+
+    function _decodeAdmin(uint256 packed) internal pure returns (address) {
+        return address(uint160(packed));
+    }
+
+    /// @dev Recovers the `PolicyType` from a well-formed `policyId`'s top byte.
+    ///      Caller MUST ensure `_isWellFormed(policyId)`; otherwise the cast panics.
+    function _typeOf(uint64 policyId) internal pure returns (PolicyType) {
+        return PolicyType(uint8(policyId >> POLICY_ID_TYPE_SHIFT));
+    }
+
+    /// @dev True iff `policyId`'s top byte is within the `PolicyType` enum range.
+    function _isWellFormed(uint64 policyId) internal pure returns (bool) {
+        return uint8(policyId >> POLICY_ID_TYPE_SHIFT) <= uint8(type(PolicyType).max);
+    }
+}

@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IB20} from "base-std/interfaces/IB20.sol";
+import {IB20Asset} from "base-std/interfaces/IB20Asset.sol";
+import {IERC165} from "base-std/interfaces/IERC165.sol";
+import {
+    IScaledUIAmount,
+    IScaledUIAmountNewUIMultiplier,
+    IScaledUIAmountBalances,
+    IScaledUIAmountConversion
+} from "base-std/interfaces/IERC8056.sol";
+
+import {MockB20} from "base-std-test/lib/mocks/MockB20.sol";
+import {MockB20AssetStorage, MockB20Storage} from "base-std-test/lib/mocks/MockB20Storage.sol";
+
+/// @title MockB20Asset
+/// @author Coinbase
+/// @notice Reference implementation of the `IB20Asset` variant.
+///         Extends `MockB20` with the announcement bracket,
+///         multiplier-based scaling, batched issuance, and
+///         extra-metadata surfaces; all base behavior is
+///         inherited unchanged.
+///
+/// @dev    Variant-specific state lives in `MockB20AssetStorage`'s
+///         own ERC-7201 namespace (`base.b20.asset`), disjoint from
+///         the base `MockB20Storage` namespace (`base.b20`), so the
+///         variant composes additively without touching the base's
+///         slot layout. The Rust precompile mirrors both namespaces
+///         the same way.
+///
+///         **Announcement bracketing.** `announce(...)` is the
+///         canonical disclosure-and-execute primitive: it emits
+///         `Announcement(...)`, runs the operator's `internalCalls`
+///         in-order via self-`delegatecall` (so `msg.sender` stays
+///         the operator and the inner functions' role checks pass
+///         normally), and emits `EndAnnouncement(id)`. Any inner
+///         revert unwinds the entire transaction, so an
+///         `Announcement` log is never observable without its
+///         matching `EndAnnouncement`. `_checkSelector` rejects
+///         recursive `announce` invocations (`AnnouncementInProgress`)
+///         to keep the bracket exactly one level deep. The Rust impl
+///         needs to mirror EVM `delegatecall` semantics exactly
+///         (caller and storage preserved); a plain `call` to self
+///         would change `msg.sender` to the contract address and
+///         break the inner role checks.
+///
+///         **Multiplier default.** A stored `multiplier` of zero is
+///         interpreted by the read surface as `WAD_PRECISION`, so a
+///         freshly-etched token reports a 1:1 multiplier without
+///         requiring the factory to write the default. The Rust impl
+///         applies the same fallback so on-chain reads agree.
+///
+///         **Factory bootstrap.** Operator and admin gates honor
+///         `_isPrivileged()` so the factory can stage initial
+///         announcements, batched issuance, multipliers, and extra-metadata
+///         entries during the bootstrap window without first granting
+///         itself roles. Token invariants (supply-cap math, balance
+///         accounting) are NOT bypassed anywhere.
+contract MockB20Asset is MockB20, IB20Asset {
+    // ============================================================
+    //                          CONSTANTS
+    // ============================================================
+
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    /// @notice Fixed-point precision for the multiplier. `1e18` (one
+    ///         WAD) is the standard DeFi convention; `toScaledBalance`
+    ///         and `scaledBalanceOf` divide by this after multiplying
+    ///         by the stored multiplier, and `toRawBalance` multiplies
+    ///         by this before dividing.
+    uint256 public constant WAD_PRECISION = 1e18;
+
+    /// @notice The maximum multiplier the setters accept: `type(uint128).max`, the overflow guard.
+    ///         Single source of truth for the setter guards, exposed via its auto-generated getter.
+    uint256 public constant MAX_UI_MULTIPLIER = type(uint128).max;
+
+    // ============================================================
+    //                           DECIMALS
+    // ============================================================
+
+    /// @notice Asset-variant decimals are chosen at creation from
+    ///         `B20AssetCreateParams.decimals` (validated to
+    ///         `[B20Constants.MIN_ASSET_DECIMALS, B20Constants.MAX_ASSET_DECIMALS]`
+    ///         by the factory) and stored at
+    ///         `MockB20AssetStorage.decimalsSlot()`. Overrides the
+    ///         base `MockB20.decimals()` (which returns 18 for the
+    ///         default variant) per the `IB20Asset` convention.
+    function decimals() external view override(MockB20, IB20) returns (uint8) {
+        return MockB20AssetStorage.layout().decimals;
+    }
+
+    // ============================================================
+    //                        ANNOUNCEMENTS
+    // ============================================================
+
+    function announce(
+        bytes[] calldata internalCalls,
+        string calldata id,
+        string calldata description,
+        string calldata uri
+    ) external onlyRole(OPERATOR_ROLE) {
+        MockB20AssetStorage.Layout storage $ = MockB20AssetStorage.layout();
+        if ($.usedAnnouncementIds[id]) revert AnnouncementIdAlreadyUsed(id);
+        // Mark consumed BEFORE the emit and BEFORE any inner calls so
+        // a delegatecall back into `announce` (defended-against by
+        // `_checkSelector`) would fail this guard even if the
+        // selector check were ever weakened.
+        $.usedAnnouncementIds[id] = true;
+
+        emit Announcement(msg.sender, id, description, uri);
+
+        for (uint256 i = 0; i < internalCalls.length; i++) {
+            _checkSelector(internalCalls[i]);
+            (bool success, bytes memory ret) = address(this).delegatecall(internalCalls[i]);
+            if (!success) {
+                // Match the Rust precompile's is_system_error(): a Solidity Panic propagates
+                // unwrapped; only ordinary reverts wrap as InternalCallFailed.
+                if (ret.length >= 4 && bytes4(ret) == bytes4(0x4e487b71)) {
+                    // Re-raise the exact returndata; offset 0x20 skips the length word.
+                    assembly {
+                        revert(add(ret, 0x20), mload(ret))
+                    }
+                }
+                revert InternalCallFailed(internalCalls[i]);
+            }
+        }
+
+        emit EndAnnouncement(id);
+    }
+
+    function isAnnouncementIdUsed(string calldata id) external view returns (bool) {
+        return MockB20AssetStorage.layout().usedAnnouncementIds[id];
+    }
+
+    // ============================================================
+    //                          MULTIPLIER
+    // ============================================================
+
+    function multiplier() external view returns (uint256) {
+        return _multiplier();
+    }
+
+    /// @dev ERC-8056 alias of `multiplier()`.
+    function uiMultiplier() external view returns (uint256) {
+        return _multiplier();
+    }
+
+    /// @dev ERC-8056 pending target view function
+    function newUIMultiplier() external view returns (uint256) {
+        MockB20AssetStorage.PendingMultiplier storage pending = MockB20AssetStorage.layout().pending;
+        if (pending.effectiveAt > block.timestamp) return pending.multiplier;
+        return _multiplier();
+    }
+
+    /// @dev ERC-8056 pending effective time
+    function effectiveAt() external view returns (uint256) {
+        return MockB20AssetStorage.layout().pending.effectiveAt;
+    }
+
+    /// @dev ERC-8056 Conversion extension: raw -> UI amount.
+    function toUIAmount(uint256 rawAmount) external view returns (uint256) {
+        return _toUIAmount(rawAmount);
+    }
+
+    /// @dev ERC-8056 Conversion extension: UI -> raw amount.
+    function fromUIAmount(uint256 uiAmount) external view returns (uint256) {
+        return _fromUIAmount(uiAmount);
+    }
+
+    /// @dev Deprecated alias of `toUIAmount` with identical behavior; declared deprecated in
+    ///      `IB20Asset` but kept in the interface for backward compatibility.
+    function toScaledBalance(uint256 rawBalance) external view returns (uint256) {
+        return _toUIAmount(rawBalance);
+    }
+
+    /// @dev Deprecated alias of `fromUIAmount` with identical behavior; declared deprecated in
+    ///      `IB20Asset` but kept in the interface for backward compatibility.
+    function toRawBalance(uint256 scaledBalance) external view returns (uint256) {
+        return _fromUIAmount(scaledBalance);
+    }
+
+    function scaledBalanceOf(address account) external view returns (uint256) {
+        return (MockB20Storage.layout().balances[account] * _multiplier()) / WAD_PRECISION;
+    }
+
+    /// @dev ERC-8056 Balances extension. Alias of `scaledBalanceOf`.
+    function balanceOfUI(address account) external view returns (uint256) {
+        return (MockB20Storage.layout().balances[account] * _multiplier()) / WAD_PRECISION;
+    }
+
+    /// @dev ERC-8056 Balances extension. View function for scaled total supply.
+    function totalSupplyUI() external view returns (uint256) {
+        return (MockB20Storage.layout().totalSupply * _multiplier()) / WAD_PRECISION;
+    }
+
+    /// @notice Schedules a single pending multiplier update. Standard corporate-action path.
+    /// @dev Factors a matured-but-uncancelled pending into the current multiplier first, so a
+    ///      scheduled change is never silently lost (deliberately unlike the ERC-8056 reference
+    ///      setter, which overwrites). A *live* pending (`effectiveAt > block.timestamp`) blocks and
+    ///      must be cancelled first.
+    function updateUIMultiplier(uint256 newMultiplier, uint256 effectiveAt_) external onlyRole(OPERATOR_ROLE) {
+        if (newMultiplier == 0 || newMultiplier > MAX_UI_MULTIPLIER) revert InvalidMultiplier();
+        if (effectiveAt_ <= block.timestamp) revert EffectiveAtInPast(effectiveAt_);
+        if (effectiveAt_ > type(uint64).max) revert EffectiveAtTooFar(effectiveAt_);
+
+        MockB20AssetStorage.Layout storage $ = MockB20AssetStorage.layout();
+        uint256 pendingEff = $.pending.effectiveAt;
+        // A live pending blocks a new schedule.
+        if (pendingEff > block.timestamp) revert UIMultiplierUpdateExists(pendingEff);
+        // A matured-but-uncancelled pending is folded into the current multiplier before the
+        // overwrite below so it is never lost.
+        if (pendingEff != 0) $.multiplier = $.pending.multiplier;
+
+        uint256 old = _currentMultiplier();
+        $.pending = MockB20AssetStorage.PendingMultiplier({
+            multiplier: uint128(newMultiplier), effectiveAt: uint64(effectiveAt_)
+        });
+
+        emit UIMultiplierUpdated(old, newMultiplier, effectiveAt_);
+    }
+
+    /// @notice Cancels the single live pending update, restoring the no-pending state.
+    function cancelUIMultiplierUpdate() external onlyRole(OPERATOR_ROLE) {
+        MockB20AssetStorage.Layout storage $ = MockB20AssetStorage.layout();
+        uint256 pendingMult = $.pending.multiplier;
+        uint256 pendingEff = $.pending.effectiveAt;
+        // Only a live pending can be cancelled
+        if (pendingEff <= block.timestamp) revert UIMultiplierUpdateDoesNotExist();
+        delete $.pending;
+
+        emit UIMultiplierUpdateCancelled(pendingMult, pendingEff);
+    }
+
+    /// @notice DEPRECATED instant failsafe: sets the current multiplier immediately and clears any
+    ///         pending, emitting both `MultiplierUpdated` and `UIMultiplierUpdated`. Declared
+    ///         deprecated in `IB20Asset` but kept (dialable) for backward compatibility; prefer the
+    ///         scheduled `updateUIMultiplier`.
+    function updateMultiplier(uint256 newMultiplier) external onlyRole(OPERATOR_ROLE) {
+        _updateMultiplierNow(newMultiplier);
+    }
+
+    // ============================================================
+    //                          ERC-165
+    // ============================================================
+
+    /// @dev Advertises ERC-165 itself plus the four claimed ERC-8056 interfaces (core, pending,
+    ///      Balances, and Conversion). The Conversion extension (`0x57854fc3`) is claimed after the
+    ///      interface review: `toUIAmount` / `fromUIAmount` are the canonical converters, with the
+    ///      legacy `toScaledBalance` / `toRawBalance` retained (deprecated) as aliases.
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == type(IERC165).interfaceId || interfaceId == type(IScaledUIAmount).interfaceId
+            || interfaceId == type(IScaledUIAmountNewUIMultiplier).interfaceId
+            || interfaceId == type(IScaledUIAmountBalances).interfaceId
+            || interfaceId == type(IScaledUIAmountConversion).interfaceId;
+    }
+
+    // ============================================================
+    //                       BATCHED ISSUANCE
+    // ============================================================
+
+    /// @dev Pause + role enforced ONCE for the entire batch via the
+    ///      entrypoint modifiers. Per-element valid-receiver guard is
+    ///      inlined in the loop since `_mint` no longer carries an
+    ///      input check.
+    function batchMint(address[] calldata recipients, uint256[] calldata amounts)
+        external
+        whenNotPaused(PausableFeature.MINT)
+        onlyRole(MINT_ROLE)
+    {
+        if (recipients.length != amounts.length) revert LengthMismatch(recipients.length, amounts.length);
+        if (recipients.length == 0) revert EmptyBatch();
+        for (uint256 i = 0; i < recipients.length; i++) {
+            if (_isContractAddressOrZero(recipients[i])) revert InvalidReceiver(recipients[i]);
+            _mint(recipients[i], amounts[i]);
+        }
+    }
+
+    // ============================================================
+    //                       EXTRA METADATA
+    // ============================================================
+
+    function extraMetadata(string calldata key) external view returns (string memory) {
+        return MockB20AssetStorage.layout().extraMetadata[key];
+    }
+
+    function updateExtraMetadata(string calldata key, string calldata value) external onlyRole(METADATA_ROLE) {
+        if (bytes(key).length == 0) revert InvalidMetadataKey();
+        MockB20AssetStorage.layout().extraMetadata[key] = value;
+        emit ExtraMetadataUpdated(key, value);
+    }
+
+    // ============================================================
+    //                       INTERNAL HELPERS
+    // ============================================================
+
+    /// @dev Shared body for `updateUIMultiplier` / `updateMultiplier`: sets the current multiplier
+    ///      immediately, clears any pending update, and emits the ERC-8056 events (a
+    ///      `UIMultiplierUpdateCancelled` when it clears a live pending, then `UIMultiplierUpdated`).
+    function _updateMultiplierNow(uint256 newMultiplier) internal {
+        if (newMultiplier == 0 || newMultiplier > MAX_UI_MULTIPLIER) revert InvalidMultiplier();
+        MockB20AssetStorage.Layout storage $ = MockB20AssetStorage.layout();
+        uint256 pendingMult = $.pending.multiplier;
+        uint256 pendingEff = $.pending.effectiveAt;
+        bool livePending = pendingEff > block.timestamp;
+
+        uint256 old = _multiplier();
+        $.multiplier = newMultiplier;
+        if (pendingEff != 0) delete $.pending;
+        if (livePending) emit UIMultiplierUpdateCancelled(pendingMult, pendingEff);
+        // Emit the deprecated V1 event alongside the ERC-8056 event for backward compatibility.
+        emit MultiplierUpdated(newMultiplier);
+        emit UIMultiplierUpdated(old, newMultiplier, block.timestamp);
+    }
+
+    /// @dev raw -> UI amount at the effective multiplier: `rawAmount * multiplier / WAD_PRECISION`.
+    ///      Shared body for `toUIAmount` and the deprecated `toScaledBalance` alias.
+    function _toUIAmount(uint256 rawAmount) internal view returns (uint256) {
+        return (rawAmount * _multiplier()) / WAD_PRECISION;
+    }
+
+    /// @dev UI -> raw amount at the effective multiplier: `uiAmount * WAD_PRECISION / multiplier`.
+    ///      Shared body for `fromUIAmount` and the deprecated `toRawBalance` alias.
+    function _fromUIAmount(uint256 uiAmount) internal view returns (uint256) {
+        return (uiAmount * WAD_PRECISION) / _multiplier();
+    }
+
+    /// @dev The effective multiplier: returns the pending slot's value if live,
+    ///      otherwise returns the current multiplier.
+    function _multiplier() internal view returns (uint256) {
+        MockB20AssetStorage.PendingMultiplier storage pending = MockB20AssetStorage.layout().pending;
+        if (pending.effectiveAt != 0 && block.timestamp >= pending.effectiveAt) {
+            return pending.multiplier;
+        }
+        return _currentMultiplier();
+    }
+
+    /// @dev The current multiplier. If `multiplier` is unset, stored `0` resolves to `WAD_PRECISION`
+    ///      so a fresh deploy reports a 1:1 multiplier.
+    function _currentMultiplier() internal view returns (uint256) {
+        uint256 stored = MockB20AssetStorage.layout().multiplier;
+        return stored == 0 ? WAD_PRECISION : stored;
+    }
+
+    /// @dev Validates a single `internalCalls[i]` blob before
+    ///      `announce` issues the inner `delegatecall`. Two checks:
+    ///      (1) the blob carries at least four bytes (a function
+    ///      selector), else `InternalCallMalformed` — a too-short
+    ///      payload would otherwise hit the contract's fallback
+    ///      surface, which is not what an "internal call" is supposed
+    ///      to mean; (2) the selector is not `announce` itself, else
+    ///      `AnnouncementInProgress` — keeps the bracket one level
+    ///      deep so indexers can rely on `Announcement` /
+    ///      `EndAnnouncement` pairing without nesting.
+    ///
+    ///      The check is a denylist (only `announce` is blocked), not
+    ///      an allowlist of approved corp-action functions: the
+    ///      operator already needs both `OPERATOR_ROLE` to
+    ///      call `announce` AND whatever role each inner function
+    ///      requires (e.g. `MINT_ROLE` for `batchMint`), so the
+    ///      authorization story is already enforced by the inner
+    ///      functions' own gates. The recursion guard exists to
+    ///      protect the EVENT topology (no nested brackets), not the
+    ///      authorization topology.
+    function _checkSelector(bytes calldata call) internal pure {
+        if (call.length < 4) revert InternalCallMalformed(call);
+        bytes4 sel = bytes4(call[:4]);
+        if (sel == IB20Asset.announce.selector) revert AnnouncementInProgress();
+    }
+}

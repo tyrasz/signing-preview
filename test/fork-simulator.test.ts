@@ -10,7 +10,8 @@ import { RpcSimulator } from '../src/simulation.ts';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CHAIN_PROFILES, clearForkCaches, ForkSimulator, ForkTimeout, ForkUnsupported, mainnetForkAt, nodeRulesOf } from '../src/fork-simulator.ts';
+import { CHAIN_PROFILES, clearForkCaches, ForkSimulator, ForkTimeout, ForkUnsupported, mainnetForkAt, nativeStandIn, nodeRulesOf } from '../src/fork-simulator.ts';
+import { createAddressFromString, hexToBytes, setLengthLeft } from '@ethereumjs/util';
 import type { Dependencies, Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
 import { codes, NOW } from './helpers.ts';
 import { compiled, PRECOMPILE, testChain } from './evm-chain.ts';
@@ -428,6 +429,77 @@ test('A token whose balanceOf costs over a million gas is read for what it holds
   // What its balanceOf costs, measured: over a million.
   const [read] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: heavy, data: encodeFunctionData({ abi: H, functionName: 'balanceOf', args: [USER as Hex] }), value: 0n }]))!;
   assert.ok(read.gasUsed! > 1_000_000n && read.gasUsed! < 10_000_000n, String(read.gasUsed));
+});
+
+test('Base’s B20 tokens run in the local EVM from their Solidity reference, on the token’s own storage', async () => {
+  // A B20 asset token (variant byte 0) as Base keeps one: the marker code 0xef, its state in the base.b20 namespace.
+  const TOKEN = '0xb200000000000000000000123456789abcdef012';
+  const LOC = 0xc78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434000n, ASSET = 0xfdc6d4552d1286ade4d9facdbf0fb50d2ec9b89a90e104f26fd277585e374b00n;
+  const word = (n: bigint) => setLengthLeft(hexToBytes(toHex(n)), 32);
+  const put = (slot: bigint | Hex, value: bigint) => chain.evm.stateManager.putStorage(createAddressFromString(TOKEN), typeof slot === 'bigint' ? word(slot) : hexToBytes(slot), word(value));
+  const shortString = (text: string) => BigInt(`0x${Buffer.from(text).toString('hex').padEnd(62, '0')}${(text.length * 2).toString(16).padStart(2, '0')}`);
+  const balanceSlot = (who: string) => keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [who as Hex, LOC + 4n]));
+  await chain.putCode(TOKEN, '0xef');
+  for (const registry of ['0x8453000000000000000000000000000000000001', '0x8453000000000000000000000000000000000002']) await chain.putCode(registry, '0xef');
+  await put(LOC, shortString('Test Asset'));
+  await put(LOC + 1n, shortString('TA'));
+  await put(LOC + 3n, 1_000_000n);
+  await put(balanceSlot(USER), 1_000_000n);
+  await put(ASSET, 6n);
+  const base = new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl, profiles: { 8453: CHAIN_PROFILES[8453] } });
+  // A block from after Base's upgrade of 2026-11-05, whose B20 rules the references have.
+  const header = { number: 17n, timestamp: 1_800_000_000n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const call = (data: Hex) => base.simulate({ chainId: 8453, from: USER, to: TOKEN, data, value: 0n, at: { block: 'latest', header } });
+  const erc20 = parseAbi(['function transfer(address,uint256) returns (bool)', 'function decimals() view returns (uint8)', 'function symbol() view returns (string)']);
+  const sent = (await call(encodeFunctionData({ abi: erc20, functionName: 'transfer', args: [BOB, 250n] })))!;
+  assert.equal(sent.status, 'success');
+  // The sender's balance, read back, is 250 down; the token says so to Bob (Transfer).
+  assert.deepEqual(sent.transfers.map(t => [t.asset.toLowerCase(), t.from.toLowerCase(), t.raw]), [[TOKEN, USER, 250n]]);
+  assert.deepEqual(sent.logs!.map(l => [l.address, l.topics[0].slice(0, 10), `0x${l.topics[2].slice(26)}`, BigInt(l.data)]), [[TOKEN, '0xddf252ad', BOB, 250n]]);
+  // The token, and the policy registry it asked whether the two may send and receive.
+  assert.deepEqual(sent.standIns, [TOKEN, '0x8453000000000000000000000000000000000002']);
+  // What it reads is the chain's: its decimals (the asset variant's own slot) and symbol.
+  const decimals = (await call(encodeFunctionData({ abi: erc20, functionName: 'decimals' })))!;
+  assert.equal(BigInt(decimals.returnData!), 6n);
+  // Charged as Base's node charges it, not what the reference's code burns: 100 and 6 a word of input, and one cold
+  // read (2,100), on top of the transaction's 21,064.
+  assert.equal(decimals.gasUsed, 21_064n + 106n + 2_100n);
+  // As on Base, a token won't be sent to itself (InvalidReceiver).
+  const self = (await call(encodeFunctionData({ abi: erc20, functionName: 'transfer', args: [TOKEN, 1n] })))!;
+  assert.equal(self.status, 'reverted');
+  assert.match(self.returnData!, /^0x9cfea583/);
+  // A call to no function of the token's reverts as the chain's does: with its first four bytes, or zeros.
+  assert.deepEqual([(await call('0xdeadbeef00'))!.returnData, (await call('0x12'))!.returnData], ['0xdeadbeef', '0x00000000']);
+  // After a block's earlier transactions: the node runs the token itself whatever code is put in its place, so its
+  // storage is read as of the block before them, and said to be stale where one of them changed it (its events).
+  const earlier: SimulationRequest = { chainId: 8453, from: BOB, to: BOB, data: '0x', value: 0n };
+  const target: SimulationRequest = { chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'transfer', args: [BOB, 100n] }), value: 0n };
+  chain.simulateV1 = true;
+  try {
+    const [after] = (await base.trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.deepEqual([after.status, after.standInsStale], ['success', undefined]);
+    assert.deepEqual(after.logs!.map(l => [l.address, BigInt(l.data)]), [[TOKEN, 100n]]);
+    // An earlier call that emitted an event from the token changed it.
+    const touching = (async (u: string, init: RequestInit) => {
+      const res = await chain.fetchImpl(u, init), body = JSON.parse(String(init.body));
+      if (!Array.isArray(body) || body[0]?.method !== 'eth_simulateV1') return res;
+      const out = await res.json() as { result?: { calls: { logs: unknown[] }[] }[] }[];
+      out[0].result?.[0]?.calls[0]?.logs.push({ address: TOKEN, topics: [], data: '0x' });
+      return new Response(JSON.stringify(out));
+    }) as typeof fetch;
+    const [stale] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: touching, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.deepEqual([stale.status, stale.standInsStale], ['success', [TOKEN]]);
+  } finally { chain.simulateV1 = false; }
+  // Not at a block from before that upgrade, when Base ran its tokens by other rules: refused, as before.
+  await assert.rejects(base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header: { ...header, timestamp: 1_793_901_599n } } }),
+    (e: unknown) => e instanceof ForkUnsupported && /from Base's upgrade of 2026-11-05 on/.test(e.message));
+  // Only on Base, only behind the marker, only the variants and registries it has references for.
+  assert.ok(nativeStandIn(8453, TOKEN, new Uint8Array([0xef])));
+  assert.ok(nativeStandIn(8453, '0xb200000000000000000001123456789abcdef012', new Uint8Array([0xef])));
+  assert.equal(nativeStandIn(8453, '0xb200000000000000000002123456789abcdef012', new Uint8Array([0xef])), undefined);
+  assert.equal(nativeStandIn(10, TOKEN, new Uint8Array([0xef])), undefined);
+  assert.equal(nativeStandIn(8453, TOKEN, new Uint8Array([0x60, 0x00])), undefined);
+  assert.equal(nativeStandIn(8453, '0xb20f000000000000000000000000000000000000', new Uint8Array([0xef])), undefined);
 });
 
 test('A rate limit on state reads: the node’s wait is kept to, and a trace it denies says why', async () => {

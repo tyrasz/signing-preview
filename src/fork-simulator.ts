@@ -21,6 +21,7 @@ import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
+import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
 import { formatUnits } from './format.ts';
 import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
@@ -342,6 +343,12 @@ class StateSource {
   nonceOverrides = new Map<string, bigint>();
   /** Precompiles the chain's node lists that the local EVM neither has nor forwards (address to name): a call reaching one is refused. */
   nodeOnly = new Map<string, string>();
+  /** Contracts the chain's node runs itself that this simulation ran from a Solidity reference instead (nativeStandIn). */
+  standIns = new Set<string>();
+  /** Of those whose storage was read for after a block's earlier transactions, the ones those transactions changed (fetchAfter). */
+  staleNative = new Set<string>();
+  /** The simulated block's time: which references apply (nativeStandIn). */
+  time?: bigint;
 
   /** The node's own account of the rules it runs (eth_config, EIP-7910); undefined where it gives none. */
   async config(): Promise<unknown> {
@@ -416,7 +423,7 @@ class StateSource {
     // their limits would add up to more than 30,000,000 (a node that adds them up refuses past its block's).
     const slotGas = contracts.map(a => 50_000 + 3_000 * slots.get(a)!.length), own = slotGas.reduce((x, y) => x + y, 0) <= 30_000_000;
     if (contracts.length) blocks.push({ stateOverrides: Object.fromEntries(contracts.map(a => [a, { code: SLOT_READER_CODE }])), calls: contracts.map((a, i) => ({ to: a, data: `0x${slots.get(a)!.map(word).join('')}`, ...(own && { gas: `0x${slotGas[i].toString(16)}` }) })) });
-    let out: { calls: { status: string; returnData: Hex; gasUsed?: string }[] }[] | undefined;
+    let out: { calls: { status: string; returnData: Hex; gasUsed?: string; logs?: { address: string }[] }[] }[] | undefined;
     const simulate = () => this.send([{ method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, this.block], done: r => { out = r as typeof out; } }]);
     await Promise.all([
       this.sendAll(nonceJobs),
@@ -462,21 +469,29 @@ class StateSource {
       accounts.forEach((a, i) => this.accounts.set(a, { balance: BigInt(balances[i]), nonce: nonces.get(a) ?? 0n, code: this.codeOverrides.get(a) ?? code.get(a) ?? new Uint8Array(0) }));
     }
     if (contracts.length) {
-      const r = out[at].calls;
+      const r = out[at].calls, native: string[] = [];
       contracts.forEach((a, i) => {
-        // A contract the node runs itself keeps its own code whatever the override says, so its storage can't be
-        // read this way: left unread, and running it is refused (LazyState.load).
+        // A contract the node runs itself keeps its own code whatever the override says (Base's B20 tokens: an
+        // override moving the precompile away is ignored too), so its storage can't be read this way: below.
         // So does a precompile, wherever its address is: an account with no code that won't run the reader has no
         // storage to read.
         if (r[i].status !== '0x1') {
           const code = this.accounts.get(a)?.code;
-          if (code && isNative(code)) return;
+          if (code && isNative(code)) { native.push(a); return; }
           if (code?.length !== 0) throw failed;
           for (const slot of slots.get(a)!) this.storage.set(`${a}_${slot}`, new Uint8Array(0));
           return;
         }
         words(r[i].returnData, slots.get(a)!.length).forEach((v, j) => this.storage.set(`${a}_${slots.get(a)![j]}`, unpadBytes(hexToBytes(v))));
       });
+      // Its storage as of the block the earlier transactions ran on (the only way the node gives it): what they left,
+      // unless one of them changed it, which its events tell (a B20 token's every change has one). Such a contract
+      // is noted (StateSource.staleNative): what it reads may not be what it held.
+      if (native.length) {
+        const touched = new Set(out[0].calls.flatMap(c => (c.logs ?? []).map(l => l.address.toLowerCase())));
+        for (const a of native) if (touched.has(a)) this.staleNative.add(a);
+        await this.sendAll(native.flatMap(a => slots.get(a)!.map(slot => ({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: (v: unknown) => { this.storage.set(`${a}_${slot}`, unpadBytes(hexToBytes(v as Hex))); } }))));
+      }
     }
   }
 
@@ -658,14 +673,18 @@ class LazyState extends SimpleStateManager {
     // Arbitrum's Stylus contracts are WASM behind a 0xEFF000 prefix, which no EVM runs: better no answer than a wrong one.
     if (NEXT_BLOCK[this.source.chainId]?.arbitrum && a.code.length > 3 && a.code[0] === 0xef && a.code[1] === 0xf0 && a.code[2] === 0x00) throw new ForkUnsupported(`${key} is a Stylus (WASM) contract, which the local EVM can't run`);
     // Any other code that starts with 0xEF and isn't an EIP-7702 delegation is a marker, not EVM code (none can be
-    // deployed since London): a contract the chain's node runs itself, as Base does its B20 tokens.
-    if (isNative(a.code)) throw new ForkUnsupported(B20.test(key)
-      ? `${key} is a B20 token (Base's native token standard: its node runs the token itself, behind the marker code 0xef), which the local EVM can't run`
-      : `${key} is a contract this chain's node runs itself (its code is a marker, not EVM code), which the local EVM can't run`);
+    // deployed since London): a contract the chain's node runs itself, as Base does its B20 tokens. Base's are run
+    // from their Solidity references, on the chain's storage (nativeStandIn); any other is refused.
+    const standIn = nativeStandIn(this.source.chainId, key, a.code, this.source.time);
+    if (standIn) this.source.standIns.add(key);
+    else if (isNative(a.code)) throw new ForkUnsupported(!B20.test(key) ? `${key} is a contract this chain's node runs itself (its code is a marker, not EVM code), which the local EVM can't run`
+      : this.source.time !== undefined && this.source.time < BASE_DENIM ? `${key} is a B20 token (Base's native token standard, which its node runs itself), and the local EVM runs B20 tokens as they are from Base's upgrade of 2026-11-05 on, not as they were at this block`
+      : `${key} is a B20 token of a kind the local EVM has no reference for (Base's native token standard: its node runs the token itself, behind the marker code 0xef)`);
     const exists = a.balance > 0n || a.nonce > 0n || a.code.length > 0;
+    // (A stand-in keeps the chain's code hash: EXTCODEHASH reads what the chain has.)
     const make = () => exists ? new Account(a.nonce, a.balance, undefined, hexToBytes(keccak256(a.code))) : undefined;
     for (const layer of this.accountStack) if (!layer.has(key)) layer.set(key, make());
-    for (const layer of this.codeStack) if (!layer.has(key)) layer.set(key, a.code);
+    for (const layer of this.codeStack) if (!layer.has(key)) layer.set(key, standIn ?? a.code);
     return this.topAccountStack().get(key);
   }
 
@@ -857,12 +876,39 @@ const ETHEREUM_RULES = new Set([1, 11155111]);
 const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xef && code[1] === 0x01 && code[2] === 0x00;
 /** Code that is a marker for something the chain's node runs itself: it starts with 0xEF and is no delegation. */
 /**
- * A B20 token's address (Base, from its fork of 2026-11-05): the ten-byte prefix 0xb2 00…00, a variant byte, and nine
- * bytes of a hash. Its node runs the token in Rust; what it stores where isn't published here, and its access list
- * shows none of it, so the local EVM can't run one (6% of Base transactions replayed on 2026-11-11 reached one).
+ * A B20 token's address (Base, from its upgrade of June 2026): the ten-byte prefix 0xb2 00…00, a variant byte (0 an
+ * asset, 1 a stablecoin), and nine bytes of a hash. Its node runs the token in Rust (6% of Base transactions
+ * replayed on 2026-11-11 reached one).
  */
 const B20 = /^0xb2000000000000000000/i;
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
+const BASE = 8453;
+/** When Base's upgrade of 2026-11-05 (Denim) took effect: the B20 rules base-std's `main` has (its eth_config activationTime). */
+const BASE_DENIM = 1_793_901_600n;
+/** Base's registries a B20 token asks on its transfers: who may send and receive (policies), and what is switched on. */
+const BASE_REGISTRIES: Record<string, string> = { '0x8453000000000000000000000000000000000001': ACTIVATION_REGISTRY_CODE, '0x8453000000000000000000000000000000000002': POLICY_REGISTRY_CODE };
+/** What a B20 token's call is charged for, as the node charges it (see rounds), and the gas it is given besides to run its reference. */
+const NATIVE_CHARGED = new Set(['SLOAD', 'SSTORE', 'LOG0', 'LOG1', 'LOG2', 'LOG3', 'LOG4']), NATIVE_SPARE_GAS = 300_000n;
+const STAND_IN_CODE = new Map<string, Uint8Array>();
+const codeOf = (hex: string) => { let c = STAND_IN_CODE.get(hex); if (!c) STAND_IN_CODE.set(hex, c = hexToBytes(hex as Hex)); return c; };
+/**
+ * Code to run for a contract the chain's node runs itself (its code the marker 0xef), where there is a reference for
+ * it: Base's B20 tokens, by variant, and the registries they call. The references are the Base Standard Library's
+ * Solidity ones (src/b20-reference.ts, scripts/build-b20.ts), which keep their state in the slots the Rust
+ * precompiles do (checked on Base: a token's name, symbol, total supply and balances are where they say), so they
+ * run on the chain's own storage. What they do is the precompiles'; what they cost is what the node charges, not
+ * what their code burns (see rounds: their calls are charged their storage and events, as the node's are). They
+ * are base-std's `main`, what Base runs from its upgrade of 2026-11-05 (Denim): a block before it ran B20 tokens by
+ * other rules (v1.1.0's from 2026-09-30, v1.0.0's before), and isn't given them.
+ */
+export function nativeStandIn(chainId: number, address: string, code: Uint8Array, time?: bigint): Uint8Array | undefined {
+  if (chainId !== BASE || code.length !== 1 || code[0] !== 0xef || (time !== undefined && time < BASE_DENIM)) return undefined;
+  const key = address.toLowerCase(), registry = BASE_REGISTRIES[key];
+  if (registry) return codeOf(registry);
+  if (!B20.test(key)) return undefined;
+  const variant = key.slice(22, 24);
+  return variant === '00' ? codeOf(B20_ASSET_CODE) : variant === '01' ? codeOf(B20_STABLECOIN_CODE) : undefined;
+}
 
 /** An EIP-7702 authorization: signed (its authority recovered, null if the signature can't be read), or for the sender, to be signed by the wallet (no nonce to check). */
 interface Authorization { authority: string | null; address: string; chainId: bigint; nonce?: bigint }
@@ -1069,9 +1115,10 @@ export class ForkSimulator implements Simulator {
     const hardfork = amsterdam ? 'amsterdam' : chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
     if (hardfork !== profile.hardfork) profile = { ...profile, hardfork };
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never, ...(profile.eips && { eips: profile.eips }) });
+    source.time = block.header.timestamp;
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
     const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
-    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address)) source.nodeOnly.set(address, name);
+    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !(chainId === BASE && BASE_REGISTRIES[address])) source.nodeOnly.set(address, name);
     const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and
@@ -1086,7 +1133,9 @@ export class ForkSimulator implements Simulator {
     this.seen.set(key, new Set());
     try {
       const results = await this.rounds(reqs, auths, source, common, block, profile, tokens, approvals, chainId, started, deadline, key);
-      return rulesNote ? results.map(r => ({ ...r, rulesNote })) : results;
+      // Contracts the node runs itself that ran here from their references instead: said, with each result.
+      const standIns = source.standIns.size ? [...source.standIns] : undefined, standInsStale = [...source.staleNative].filter(a => source.standIns.has(a));
+      return rulesNote || standIns ? results.map(r => ({ ...r, ...(rulesNote && { rulesNote }), ...(standIns && { standIns }), ...(standInsStale.length && { standInsStale }) })) : results;
     } finally {
       // Kept briefly, for a caller that gave up waiting and wants what was seen.
       setTimeout(() => this.seen.delete(key), 30_000).unref?.();
@@ -1198,6 +1247,31 @@ export class ForkSimulator implements Simulator {
         next?.();
       });
     }
+    // Base's B20 tokens run here from their Solidity references, whose code costs gas the node's doesn't: the node
+    // charges a token's call 100 and 6 a word of its input, then what its storage reads and writes and its events
+    // cost (cold or warm, as an EVM's), the policy registry's storage it reads included, and nothing for computation
+    // or for asking the registry (measured on Base: name() 2,206, balanceOf 2,212, a transfer 37,374). So the call
+    // is given gas to spare, and charged what the node would: the SLOADs, SSTOREs and LOGs it runs (those of the
+    // registry's reference under it included) and its precompiles' gas, on top of that 100 and 6 a word. Without
+    // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66).
+    type Charge = { code: string; limit: bigint; node: bigint };
+    let charging: Charge | undefined;
+    const opened: (Charge | 'precompile' | undefined)[] = [];
+    const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint } }, next?: () => void) => {
+      // (Less 375 an event: the node charges its topics and data, not LOG's own base.)
+      if (charging && NATIVE_CHARGED.has(e.opcode.name)) charging.node += BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n);
+      next?.();
+    };
+    if (chainId === BASE) evm.events!.on('afterMessage', (r: { execResult: { executionGasUsed: bigint } }, next?: () => void) => {
+      const c = opened.pop();
+      if (c === 'precompile' && charging) charging.node += r.execResult.executionGasUsed;
+      else if (c && typeof c === 'object') {
+        evm.events!.removeListener('step', chargeStep);
+        charging = undefined;
+        if (source.standIns.has(c.code)) r.execResult.executionGasUsed = c.node < c.limit ? c.node : c.limit;
+      }
+      next?.();
+    });
     // The call tree of each traced call (SimulationRequest.trace): a frame opens at each message and closes with its
     // result. A frame's own events are those in its result that none of the calls under it returned; the events of a
     // call that failed aren't in any result, as on the chain.
@@ -1233,12 +1307,24 @@ export class ForkSimulator implements Simulator {
             owned.set(f.call, (ex.logs ?? []).filter(l => !f.under.has(l)));
             if (parent) for (const l of ex.logs ?? []) parent.under.add(l);
           }
-          if (parent) (parent.call.calls ??= []).push(f.call);
-          else root = f;
+          // A B20 token asking a registry (its reference calls it; the node's token reads the registry's storage
+          // itself, with no call) is left out of the tree: the chain's own trace has no such call.
+          const inToken = !!parent && chainId === BASE && !!parent.call.to && B20.test(parent.call.to) && !!f.call.to && f.call.to in BASE_REGISTRIES;
+          if (parent && !inToken) (parent.call.calls ??= []).push(f.call);
+          else if (!parent) root = f;
         }
         next?.();
       });
     }
+    if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; gasLimit: bigint; isCompiled: boolean }, next?: () => void) => {
+      const code = (m._codeAddress ?? m.to)?.toString();
+      if (!charging && code && B20.test(code)) {
+        opened.push(charging = { code, limit: m.gasLimit, node: 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
+        m.gasLimit += NATIVE_SPARE_GAS;
+        evm.events!.on('step', chargeStep);
+      } else opened.push(charging && code && (m.isCompiled || evm.precompiles.has(code.slice(2))) ? 'precompile' : undefined);
+      next?.();
+    });
     /** The finished trace of the call just run: each frame's events numbered by their place among the call's. */
     const traceOf = (logs: unknown[]): TraceCall | undefined => {
       const done = root?.call;
@@ -1364,6 +1450,9 @@ export class ForkSimulator implements Simulator {
       }
       callIndex = i;
       recording = true;
+      // (A run that stopped inside a B20 token's call leaves nothing behind for this one.)
+      if (charging) { evm.events!.removeListener('step', chargeStep); charging = undefined; }
+      opened.length = 0;
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;

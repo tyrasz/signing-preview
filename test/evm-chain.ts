@@ -113,12 +113,15 @@ export async function testChain(): Promise<TestChain> {
         try {
           const blocks = [];
           for (const b of blockStateCalls) {
-            for (const [a, o] of Object.entries(b.stateOverrides ?? {})) if (o.code) await sm.putCode(at(a), hexToBytes(o.code));
+            // A contract behind a marker (code 0xef: one the node runs itself, as Base's B20 tokens) keeps running as
+            // itself whatever code an override puts there, as on Base.
+            for (const [a, o] of Object.entries(b.stateOverrides ?? {})) if (o.code) { const now = await sm.getCode(at(a)); if (!(now.length === 1 && now[0] === 0xef)) await sm.putCode(at(a), hexToBytes(o.code)); }
             const calls = [];
             for (const c of b.calls ?? []) {
               const from = c.from ?? '0x0000000000000000000000000000000000000000';
               const res = await evm.runCall({ caller: at(from), origin: at(from), ...(c.to && { to: at(c.to) }), data: hexToBytes(c.data ?? '0x'), value: BigInt(c.value ?? 0), gasLimit: BigInt(c.gas ?? 30_000_000) });
-              calls.push({ status: res.execResult.exceptionError ? '0x0' : '0x1', returnData: bytesToHex(res.execResult.returnValue), gasUsed: `0x${res.execResult.executionGasUsed.toString(16)}`, logs: [] });
+              const logs = (res.execResult.logs ?? []).map(([address, topics, data]) => ({ address: bytesToHex(address), topics: topics.map(t => bytesToHex(t)), data: bytesToHex(data) }));
+              calls.push({ status: res.execResult.exceptionError ? '0x0' : '0x1', returnData: bytesToHex(res.execResult.returnValue), gasUsed: `0x${res.execResult.executionGasUsed.toString(16)}`, logs });
             }
             blocks.push({ calls });
           }

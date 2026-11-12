@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { encodeAbiParameters, encodeFunctionData, parseAbi, toFunctionSelector, type Hex } from 'viem';
-import { describeTrace, sameRun } from '../src/evm/trace.ts';
+import { describeTrace, sameRun, tracePreviews } from '../src/evm/trace.ts';
 import { headerAfter, headerOf, nodeOverrides, pinLatest } from '../src/block.ts';
 import { previewRequest } from '../src/preview.ts';
 import { RpcSimulator } from '../src/simulation.ts';
@@ -167,4 +167,23 @@ test('A trace is checked against the simulation shown: the same outcome and even
   traced.length = 0;
   const plain = await send(simulator({ ...node, trace: root(5n) }), {});
   assert.deepEqual([plain.trace, traced.length], [undefined, 0]);
+});
+
+test('A trace through a B20 token run from its reference: said so, its gas compared, and the registries it asked counted', async () => {
+  // The token's calls to the policy registry are left out of the tree (the chain's token makes none), so a registry
+  // an earlier transaction in the block changed is still said to have been read stale.
+  const TOKEN = '0xb200000000000000000000123456789abcdef012', REGISTRY = '0x8453000000000000000000000000000000000002';
+  const call: TraceCall = { type: 'call', from: ALICE.toLowerCase(), to: TOKEN, value: 0n, input: '0xa9059cbb', gas: 60_000n, gasUsed: 30_000n };
+  const traced: SimulationResult = { status: 'success', source: 'local EVM', gasUsed: 51_000n, transfers: [], logs: [], trace: call, standIns: [TOKEN, REGISTRY], standInsStale: [REGISTRY] };
+  const shown: SimulationResult = { status: 'success', source: 'eth_simulateV1', gasUsed: 51_000n, transfers: [], logs: [] };
+  const deps = { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => shown, trace: async () => [traced] } } as unknown as Dependencies;
+  const req: SimulationRequest = { chainId: 8453, from: ALICE, to: TOKEN, data: '0xa9059cbb', value: 0n };
+  const [t] = (await tracePreviews([req], [shown], { chainId: 8453, deps }))!;
+  assert.equal(t!.gasAgrees, true);
+  assert.match(t!.note!, /2 contracts this chain's node runs itself \(0xb200000000000000000000123456789abcdef012, 0x8453000000000000000000000000000000000002\) ran in the trace from their Solidity reference/);
+  assert.match(t!.note!, /An earlier transaction in the block changed 0x8453000000000000000000000000000000000002/);
+  // A trace that never reached the token says nothing of it.
+  const elsewhere = { ...traced, trace: { ...call, to: BOB.toLowerCase() } };
+  const [u] = (await tracePreviews([req], [shown], { chainId: 8453, deps: { ...deps, simulator: { ...deps.simulator, trace: async () => [elsewhere] } } as unknown as Dependencies }))!;
+  assert.doesNotMatch(u!.note ?? '', /Solidity reference/);
 });

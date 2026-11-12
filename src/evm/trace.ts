@@ -293,6 +293,14 @@ export function sameRun(a: { status: string; logs?: { address: string; topics: s
   return x.length === y.length && x.every((k, i) => k === y[i]);
 }
 
+/** A B20 token's address (Base: the stand-ins that aren't one are the registries its tokens ask). */
+const B20_TOKEN = /^0xb2000000000000000000/i;
+
+/** Whether a call in the tree runs `address`'s code (the call itself, or one under it). */
+function reaches(call: TraceCall, address: string): boolean {
+  return call.to?.toLowerCase() === address || (call.calls ?? []).some(c => reaches(c, address));
+}
+
 /**
  * The traces of `requests` (run in order, where they can be traced: Simulator.trace), each checked against the
  * simulation the preview shows for that call. Null when nothing can trace calls on this chain, or the tracing run
@@ -320,13 +328,20 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
     // the chain's here (a fork it wasn't checked against, an older block's rules). Compared for calls that succeeded
     // (a failure that burns its gas limit burns each simulator's own default), and not on Arbitrum, whose node adds
     // a charge for L1 data that no EVM run has.
+    // A run that reached a contract the node runs itself from its Solidity reference (Base's B20 tokens) is compared
+    // too: the reference's calls are charged what the node charges (see ForkSimulator's rounds), and say so.
+    // (A registry a B20 token asked is left out of the tree, as the chain's token reads it with no call: it counts as
+    // reached when such a token is.)
+    const tokenReached = !!t.trace && !!t.standIns?.some(a => B20_TOKEN.test(a) && reaches(t.trace!, a));
+    const standIns = t.standIns && t.trace ? t.standIns.filter(a => reaches(t.trace!, a) || (tokenReached && !B20_TOKEN.test(a))) : [], stale = standIns.filter(a => t.standInsStale?.includes(a));
     const gasAgrees = agrees && s!.status === 'success' && s!.gasUsed !== undefined && t.gasUsed !== undefined && !NEXT_BLOCK[env.chainId]?.arbitrum && t.source !== 'mock' ? s!.gasUsed === t.gasUsed : undefined;
+    const standInNote = standIns.length ? `${standIns.length === 1 ? `${standIns[0]}, which this chain's node runs itself,` : `${standIns.length} contracts this chain's node runs itself (${standIns.join(', ')})`} ran in the trace from ${standIns.length === 1 ? 'its' : 'their'} Solidity reference (the Base Standard Library's), which keeps its state where the node does, charged the gas the node charges.${stale.length ? ` An earlier transaction in the block changed ${stale.join(', ')}, whose state could be read only as of the block before: the trace ran on that, and may not be what happened.` : ''}` : undefined;
     const gasDiffers = gasAgrees === false ? `The traced run used ${t.gasUsed!.toLocaleString('en-US')} gas where the simulation shown above used ${s!.gasUsed!.toLocaleString('en-US')}: the local EVM's gas rules differ from this chain's here, so the gas figures in the trace are approximate.` : undefined;
     // A replay in a block that carries its access list: the state the traced run changed against what the chain
     // recorded for the transaction (the last call traced).
     const state = env.recorded && i === traced.length - 1 ? compareWithAccessList(t.stateChanges, env.recorded) : undefined;
     const stateDiffers = state && !state.agrees ? `The state the traced run changed isn't what the block's access list records for this transaction (${state.differences!.slice(0, 3).join('; ')}${state.differences!.length > 3 ? `; and ${state.differences!.length - 3} more` : ''}): the trace is a guide to what it did, not its record.` : undefined;
-    const note = [s?.traceNote, differs, gasDiffers, stateDiffers, t.rulesNote].filter(Boolean).join(' ');
+    const note = [s?.traceNote, differs, gasDiffers, stateDiffers, standInNote, t.rulesNote].filter(Boolean).join(' ');
     return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(gasAgrees !== undefined && { gasAgrees }), ...(state && { stateAgrees: state.agrees }), ...(note && { note }) });
   }));
 }
