@@ -36,6 +36,8 @@ const NATIVE_PSEUDO_TOKEN = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
  * native coin moving, not a token at that address.
  */
 export const NATIVE_LOG_ADDRESS = '0xfffffffffffffffffffffffffffffffffffffffe';
+/** Multicall3, at this address on every chain the previewer simulates on: getEthBalance(address) reads a native balance. */
+const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11';
 
 type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
 
@@ -502,6 +504,11 @@ export class RpcSimulator implements Simulator {
     const balanceReads = () => owners.flatMap(o => tokens.map(t => { calls.push({ from: READER, to: t, data: `0x70a08231${o.slice(2).padStart(64, '0')}` }); return { owner: o, token: t, index: calls.length - 1 }; }));
     // ERC-721 contracts count NFTs in balanceOf: those are shown per token ID instead.
     const nftChecks = tokens.map(t => { calls.push({ from: READER, to: t, data: `0x01ffc9a780ac58cd${'00'.repeat(28)}` }); return calls.length - 1; });
+    // The native coin too (Multicall3's getEthBalance): what moves it without a call isn't always logged. OP
+    // Mainnet's, Base's and BNB Chain's nodes log no transfer for a SELFDESTRUCT (2026-11-12), so neither a payout
+    // to a sender nor an account delegated (EIP-7702) to code that selfdestructs, its whole balance gone, showed.
+    const nativeReads = () => owners.map(o => { calls.push({ from: READER, to: MULTICALL3, data: `0x4d2301cc${o.slice(2).padStart(64, '0')}` }); return calls.length - 1; });
+    const natives: number[][] = [nativeReads()];
     const balances: { owner: string; token: string; index: number }[][] = [balanceReads()];
     const reads: { call: number; approval: SimulatedApproval; index: number }[] = [];
     const callIndex: number[] = [];
@@ -510,6 +517,7 @@ export class RpcSimulator implements Simulator {
       calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...fields[i] });
       callIndex.push(calls.length - 1);
       for (const a of after[i]) { reads.push({ call: i, approval: a, index: calls.length }); calls.push({ from: READER, to: a.emitter, data: stateCall(a) }); }
+      natives.push(nativeReads());
       balances.push(balanceReads());
     });
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
@@ -582,6 +590,21 @@ export class RpcSimulator implements Simulator {
         if (y < x) p.transfers.push({ asset: b.token, from: b.owner, to: target, raw: x - y });
         else if (y > x) p.transfers.push({ asset: b.token, from: target, to: b.owner, raw: y - x });
       }
+      // The native coin: what the balance moved beyond the logged transfers (and the gas a priced run's sender paid,
+      // exactly its gas used at its price on every node, 2026-11-12) is added as a transfer of its own, the logged
+      // ones kept for whom they name. Not for a blob call (its blob gas is paid too), nor the block's fee recipient
+      // (paid the tips).
+      const recipient = blockOverrides?.feeRecipient?.toLowerCase();
+      if (!reqs[i].blobVersionedHashes?.length) owners.forEach((owner, j) => {
+        const x = word(out[natives[i][j]]), y = word(out[natives[i + 1][j]]);
+        if (x === undefined || y === undefined || owner === recipient) return;
+        const fee = reqs[i].gasPrice !== undefined && reqs[i].from.toLowerCase() === owner ? BigInt(out[callIndex[i]].gasUsed) * reqs[i].gasPrice! : 0n;
+        const logged = p.transfers.reduce((sum, t) => t.asset !== 'native' ? sum : sum + (t.to === owner ? t.raw : 0n) - (t.from === owner ? t.raw : 0n), 0n);
+        const unlogged = y - x + fee - logged;
+        const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner ? ELSEWHERE : to;
+        if (unlogged < 0n) p.transfers.push({ asset: 'native', from: owner, to: target, raw: -unlogged });
+        else if (unlogged > 0n) p.transfers.push({ asset: 'native', from: target, to: owner, raw: unlogged });
+      });
       p.balancesRead = true;
     });
   }

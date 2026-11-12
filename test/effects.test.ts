@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { PERMIT2, StaticTokenRegistry } from '../src/chains.ts';
-import { parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { ELSEWHERE, parseLogs, RpcSimulator } from '../src/simulation.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, Simulator, TokenRegistry } from '../src/types.ts';
 import { ALICE, BOB, ROUTER, SPENDER } from '../mocks/data.ts';
 import { codes, NOW } from './helpers.ts';
@@ -158,7 +158,7 @@ test('RpcSimulator reads the real allowance after each call, so a silently spent
   const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [ROUTER, 10_000_000n] });
   const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [{ to: USDC, data: approve }, { to: ROUTER, data: '0xdeadbeef' }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
   assert.equal(bodies.length, 2, 'the simulation, then the state read back');
-  const reads = new Set(['0x70a08231', '0x01ffc9a7']); // balances and NFT checks, around the calls
+  const reads = new Set(['0x70a08231', '0x01ffc9a7', '0x4d2301cc']); // balances, NFT checks and native balances, around the calls
   assert.deepEqual(bodies[1].params[0].blockStateCalls[0].calls.map(c => c.data.slice(0, 10)).filter(s => !reads.has(s)), [approve.slice(0, 10), '0xdd62ed3e', '0xdeadbeef', '0xdd62ed3e']);
   assert.deepEqual(p.calls?.[0].approvals?.map(a => [a.allowance, a.basis]), [['10 USDC', 'simulated_state']], 'state after call 1');
   assert.deepEqual(p.approvals?.map(a => [a.allowance, a.revoked, a.basis]), [['none', true, 'simulated_state']], 'state after the batch');
@@ -174,6 +174,37 @@ test('When the node won’t answer the reads after a call, its result says why, 
   }) as typeof fetch;
   const r = await new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 42161, from: ALICE, to: ROUTER, data: '0xdeadbeef', value: 0n });
   assert.deepEqual([r?.status, r?.balancesRead, r?.stateReadError, r?.transfers.map(t => t.raw)], ['success', undefined, 'execution aborted (timeout = 5s)', [10_000_000n]]);
+});
+
+test('Native coin a node logs no transfer for (a SELFDESTRUCT) is read from the balance; a priced run’s gas is not a transfer', async () => {
+  // OP Mainnet's, Base's and BNB Chain's nodes log no transfer for a SELFDESTRUCT: an account delegated (EIP-7702)
+  // to code that selfdestructs loses its whole balance with no log. Alice's own call to herself: 1 ETH gone.
+  const node = (logs: { address: string; topics: string[]; data: string }[], after: (gasUsed: bigint) => bigint) => {
+    const bodies: { from?: string; to?: string; data: string }[][] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      const calls = body.params[0].blockStateCalls[0].calls as { from?: string; to?: string; data: string }[];
+      bodies.push(calls);
+      if (body.params[0].traceTransfers) return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x1', gasUsed: '0xd163', returnData: '0x', logs }] }] }));
+      const at = calls.findIndex(c => c.from?.toLowerCase() === ALICE.toLowerCase());
+      return new Response(JSON.stringify({ result: [{ calls: calls.map((c, i) => ({ status: '0x1', gasUsed: i === at ? '0xd163' : '0x5208', logs: [],
+        returnData: c.data.startsWith('0x4d2301cc') && c.to === '0xca11bde05977b3631167028862be2a173976ca11' ? data(i < at ? 10n ** 18n : after(0xd163n)) : '0x' })) }] }));
+    }) as typeof fetch;
+    return { simulator: new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }), bodies };
+  };
+  const natives = (r: SimulationResult) => r.transfers.filter(t => t.asset === 'native').map(t => [t.from, t.to, t.raw]);
+  const alice = ALICE.toLowerCase();
+  const drained = node([], () => 0n);
+  const r = (await drained.simulator.simulate({ chainId: 8453, from: alice, to: alice, data: '0x', value: 0n }))!;
+  assert.deepEqual([natives(r), r.balancesRead], [[[alice, ELSEWHERE, 10n ** 18n]], true]);
+  assert.equal(drained.bodies[1].filter(c => c.data.startsWith('0x4d2301cc')).length, 2, 'read before and after the call');
+  // A call that sends 5 wei, logged, at a price of 10 wei a gas: the balance falls by the 5 and its gas, nothing more.
+  const sent = [{ address: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', topics: [T.transfer, w(ALICE), w(ROUTER)], data: data(5n) }];
+  const priced = (await node(sent, gas => 10n ** 18n - 5n - gas * 10n).simulator.simulate({ chainId: 8453, from: alice, to: ROUTER, data: '0x', value: 5n, gasPrice: 10n }))!;
+  assert.deepEqual(natives(priced), [[alice, ROUTER, 5n]]);
+  // A node that logs it too: nothing added.
+  const logged = (await node(sent, () => 10n ** 18n - 5n).simulator.simulate({ chainId: 8453, from: alice, to: ROUTER, data: '0x', value: 5n }))!;
+  assert.deepEqual(natives(logged), [[alice, ROUTER, 5n]]);
 });
 
 test('On a node that splits a block’s gas among the calls that set none, a heavy balanceOf is read again on its own', async () => {

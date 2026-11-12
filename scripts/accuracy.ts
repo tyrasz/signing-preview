@@ -254,6 +254,14 @@ async function replay(b: B, seen?: Set<string>) {
             }
           } catch (e) { cell.nativeLaterError = String(e).slice(0, 120); }
         }
+        // The local EVM reads each call's own sender's balance only, so what the node's run found the block's other
+        // transactions moved for this sender is left out the same way (a contract created just before that
+        // selfdestructs to the sender: OP Mainnet, 2026-11-12, 31,579,834,178 wei, no log on the node either; its
+        // run reads the balances now).
+        const node = row.eth_simulateV1 as Record<string, any> | undefined;
+        if (!cell.native && name === 'fork' && res.status === 'success' && (node?.nativeEarlier || node?.nativeLater)) {
+          cell.native = nativeGot === nativeActual + paidIn - BigInt(node.nativeEarlier ?? 0) - BigInt(node.nativeLater ?? 0);
+        }
         // A fork gas difference: keep the call's storage writes, each with its slot's value before the block, to
         // find the one priced differently (while the RPC still has the state).
         if (name === 'fork' && String(res.gasUsed) !== row.receiptGas) {
