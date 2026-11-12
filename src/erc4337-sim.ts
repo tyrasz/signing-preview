@@ -16,7 +16,7 @@ import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResul
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
-import { ecrecoverPrice } from './fork-simulator.ts';
+import { ecrecoverPrice } from './chains.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 

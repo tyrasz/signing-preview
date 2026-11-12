@@ -18,7 +18,7 @@ import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
 import { keccak256 } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
-import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
+import { builtinTokens, CHAINS, PERMIT2, PRECOMPILE_SCALE } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
 import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
@@ -175,7 +175,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // as EIP-7823 has them); bn254 and blake2f ten times Ethereum's (a pairing 450,000 and 340,000 a pair); point
   // evaluation 2,000,000. sha256, ripemd160 and identity cost what they do on Ethereum; P256VERIFY isn't there.
   999: { hardfork: 'cancun', eips: [7702, 7823, 7883], ...NEXT_BLOCK[999], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas,
-    precompileScale: { 1: 5n, 5: 10n, 6: 10n, 7: 10n, 8: 10n, 9: 10n }, pointEvaluationGas: 2_000_000n },
+    precompileScale: PRECOMPILE_SCALE[999], pointEvaluationGas: 2_000_000n },
   998: { hardfork: 'cancun', ...NEXT_BLOCK[998], forwardedPrecompiles: HYPERCORE_READS, precompileGas: hyperCoreReadGas },
 };
 
@@ -919,9 +919,6 @@ const codeOf = (hex: string) => { let c = STAND_IN_CODE.get(hex); if (!c) STAND_
  * are base-std's `main`, what Base runs from its upgrade of 2026-11-05 (Denim): a block before it ran B20 tokens by
  * other rules (v1.1.0's from 2026-09-30, v1.0.0's before), and isn't given them.
  */
-/** What ecrecover costs on the chain: Ethereum's 3,000, or the multiple its profile charges (HyperEVM: 15,000). */
-export const ecrecoverPrice = (chainId: number) => 3_000 * Number(CHAIN_PROFILES[chainId]?.precompileScale?.[1] ?? 1n);
-
 /** Whether a precompile the chain's node lists is one the local EVM runs from its Solidity reference (Base's registries). */
 export const hasReference = (chainId: number, address: string) => chainId === BASE && address.toLowerCase() in BASE_REGISTRIES;
 

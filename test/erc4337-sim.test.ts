@@ -277,7 +277,7 @@ test('The ecrecover stand-in: each stand-in signature recovers as its signer for
   }
   assert.notEqual(STUB_COSIGNATURE.slice(2, 66), STUB_SIGNATURE.slice(2, 66));
   // On a chain that charges its own price (HyperEVM's 15,000), the stand-in costs that.
-  const { ecrecoverPrice } = await import('../src/fork-simulator.ts');
+  const { ecrecoverPrice } = await import('../src/chains.ts');
   assert.deepEqual([ecrecoverPrice(1), ecrecoverPrice(999)], [3000, 15_000]);
   for (const [code, d] of [[ecrecoverAs(OWNER, undefined, [], 15_000), undefined], [ecrecoverAs(OWNER, digest, [{ signature: STUB_COSIGNATURE, signer: COSIGNER }], 15_000), digest]] as const) {
     await chain.putCode(where, code);

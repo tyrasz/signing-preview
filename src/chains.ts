@@ -3,6 +3,14 @@ import type { TokenInfo, TokenRegistry } from './types.ts';
 // Addresses below are public deployment addresses. Verify them against the
 // official sources listed in README.md before relying on them in production.
 
+/**
+ * Precompiles a chain charges a multiple of Ethereum's price for, by address ('1' for ecrecover): HyperEVM's, measured
+ * on its node on 2026-11-12 (src/fork-simulator.ts, its profile, has the rest of its prices).
+ */
+export const PRECOMPILE_SCALE: Record<number, Record<string, bigint>> = { 999: { 1: 5n, 5: 10n, 6: 10n, 7: 10n, 8: 10n, 9: 10n } };
+/** What ecrecover costs on the chain: Ethereum's 3,000, or the multiple it charges (HyperEVM: 15,000). */
+export const ecrecoverPrice = (chainId: number) => 3_000 * Number(PRECOMPILE_SCALE[chainId]?.[1] ?? 1n);
+
 export const CHAINS: Record<number, { name: string; nativeSymbol: string; nativeDecimals: number }> = {
   1: { name: 'Ethereum', nativeSymbol: 'ETH', nativeDecimals: 18 },
   42161: { name: 'Arbitrum One', nativeSymbol: 'ETH', nativeDecimals: 18 },
