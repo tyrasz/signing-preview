@@ -381,7 +381,8 @@ export class RpcSimulator implements Simulator {
     // chain of five blocks a second (Base) the next request's latest is often another (eth_simulateV1 says which
     // block it simulated).
     const ranOn = this.at(chainId, reqs).tag === 'latest' && body.result?.[0]?.number ? `0x${(BigInt(body.result[0].number) - 1n).toString(16)}` : undefined;
-    try { await this.readState(url, reqs, parsed, ranOn); } catch { /* keep the event-based values */ }
+    // Whatever stops the reads, the event-based values stand, and the results say why.
+    try { await this.readState(url, reqs, parsed, ranOn); } catch (e) { for (const p of parsed) p.stateReadError ??= String((e as Error)?.message ?? e).slice(0, 200); }
     return parsed;
   }
 
@@ -525,9 +526,12 @@ export class RpcSimulator implements Simulator {
     const before = await this.before(reqs[0].chainId, reqs);
     const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]);
     // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
-    // asked once more after a pause, since without these reads the amounts are only the events'.)
-    let reply = await ask();
-    if (reply.error && RATE_LIMITED.test(reply.error.message ?? '')) { await new Promise(r => setTimeout(r, 3000)); reply = await ask(); }
+    // asked again after a pause, then a longer one, since without these reads the amounts are only the events'. It
+    // says so in an error or with HTTP 429, which post throws once its own retries are spent.)
+    const busy = (m?: string) => !!m && (RATE_LIMITED.test(m) || /HTTP (429|5\d\d)/.test(m));
+    const patiently = () => ask().catch((e: Error) => { if (busy(e.message)) return { error: { message: e.message } }; throw e; });
+    let reply = await patiently();
+    for (const pause of [3000, 8000]) { if (!busy(reply.error?.message)) break; await new Promise(r => setTimeout(r, pause)); reply = await patiently(); }
     const body = reply as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the

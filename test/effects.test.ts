@@ -174,6 +174,10 @@ test('When the node won’t answer the reads after a call, its result says why, 
   }) as typeof fetch;
   const r = await new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 42161, from: ALICE, to: ROUTER, data: '0xdeadbeef', value: 0n });
   assert.deepEqual([r?.status, r?.balancesRead, r?.stateReadError, r?.transfers.map(t => t.raw)], ['success', undefined, 'execution aborted (timeout = 5s)', [10_000_000n]]);
+  // A node that refuses the reads outright (HTTP 403 here; HTTP 429 once its retries are spent): the same.
+  const refusing = (async (_url: string, init: RequestInit) => JSON.parse(String(init.body)).params[0].traceTransfers ? fetchImpl(_url, init) : new Response(JSON.stringify({ error: { message: 'blocked' } }), { status: 403 })) as typeof fetch;
+  const q = await new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl: refusing }).simulate({ chainId: 42161, from: ALICE, to: ROUTER, data: '0xdeadbeef', value: 0n });
+  assert.deepEqual([q?.status, q?.balancesRead, q?.stateReadError], ['success', undefined, 'RPC HTTP 403: blocked']);
 });
 
 test('Native coin a node logs no transfer for (a SELFDESTRUCT) is read from the balance; a priced run’s gas is not a transfer', async () => {
