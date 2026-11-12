@@ -999,6 +999,15 @@ const HEVM = '0x7109709ecfa91a80626ff3989d68f67f5b1dd12d';
  * contract.
  */
 const B20_ADDRESS_GAS = 42n, B20_EXISTS_GAS = B20_ADDRESS_GAS + 2_600n, B20_CREATED_GAS: Record<string, bigint> = { '00': 34_436n, '01': 32_236n }, B20_ADMIN_GAS = -100n;
+/**
+ * What the node charges a token's EIP-712 hashing, which its storage and events don't cover, measured on Base with
+ * each call timed from a contract: DOMAIN_SEPARATOR() 132 more than those (the name's hash, 36 for an 18-byte
+ * name; the version's, 36; the domain's, 60: the hashes the reference computes as it runs), a permit with a bad
+ * signature 246 (those, the struct's hash and the digest's), a permit that succeeds 100 more besides. Hashes are
+ * keccak's price, 30 and 6 a word; a slot's (32 or 64 bytes) isn't charged, as anywhere in a token (a string's
+ * own hash, for a mapping keyed by one, isn't either: isAnnouncementIdUsed and extraMetadata cost the same).
+ */
+const EIP712_FUNCTIONS = new Set(['0xd505accf', '0x3644e515']), PERMIT_SUCCESS_GAS = 100n;
 const B20_PARAM_ERRORS: Record<string, bigint> = {
   '0xc0d8b4e0': B20_ADDRESS_GAS, '0xca950391': B20_ADDRESS_GAS, // UnsupportedVersion, InvalidDecimals
   '0x997c1de8': B20_EXISTS_GAS + B20_CREATED_GAS['01'], '0x4a43ae87': B20_EXISTS_GAS + B20_CREATED_GAS['01'], // InvalidCurrency, MissingRequiredField
@@ -1433,7 +1442,7 @@ export class ForkSimulator implements Simulator {
     // registry's reference under it included) and its precompiles' gas, on top of that 100 and 6 a word. Without
     // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries, called
     // themselves, are charged so too. A call whose charge passes the gas it was given runs out there, as the node's.
-    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; admin?: boolean; looked?: boolean };
+    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; admin?: boolean; looked?: boolean; eip712?: boolean };
     let charging: Charge | undefined;
     const opened: (Charge | 'precompile' | undefined)[] = [];
     // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
@@ -1444,6 +1453,11 @@ export class ForkSimulator implements Simulator {
       // The factory finding whether the token it is to create exists (B20_EXISTS_GAS).
       // (Once: the reference looks again before it calls the token, for its admin.)
       if (charging?.code === B20_FACTORY && !charging.looked && e.opcode.name === 'EXTCODESIZE' && e.address?.toString() === B20_FACTORY && e.stack?.length && B20_PRECOMPILE.test(`0x${e.stack[e.stack.length - 1].toString(16).padStart(40, '0')}`)) { charging.node += B20_EXISTS_GAS; charging.looked = true; }
+      // A permit's or the domain separator's hashing (EIP712_FUNCTIONS), in the token's own frame.
+      if (charging?.eip712 && e.opcode.name === 'KECCAK256' && e.stack && e.address?.toString() === charging.code) {
+        const length = e.stack[e.stack.length - 2];
+        if (length !== 32n && length !== 64n) charging.node += 30n + 6n * ((length + 31n) / 32n);
+      }
       // A mapping's slot being found: kept, to read it after a block's earlier transactions (StateSource.preimages).
       if (e.opcode.name === 'KECCAK256' && e.stack && e.memory) {
         const n = e.stack.length, offset = Number(e.stack[n - 1]);
@@ -1460,6 +1474,7 @@ export class ForkSimulator implements Simulator {
         charging = undefined;
         // (Parameters the factory's reference checks before what the node charges first: B20_PARAM_ERRORS.)
         if (c.code === B20_FACTORY && r.execResult.exceptionError?.error === EVMError.errorMessages.REVERT) c.node += B20_PARAM_ERRORS[bytesToHex(r.execResult.returnValue.subarray(0, 4))] ?? 0n;
+        if (c.eip712 && !r.execResult.exceptionError && c.selector && bytesToHex(c.selector) === '0xd505accf') c.node += PERMIT_SUCCESS_GAS;
         if (c.refused || source.standIns.has(c.code)) r.execResult.executionGasUsed = c.node < c.limit ? c.node : c.limit;
         // Calldata a function of the token's can't decode: the chain reverts with the call's selector, the reference
         // empty (its only empty revert: base-std's references revert with an error everywhere else). Measured on
@@ -1557,7 +1572,7 @@ export class ForkSimulator implements Simulator {
       if (!delegated && !refused && native) { const ref = await standInFor(state, chainId, code!, source.time); if (ref) { m.code = ref; source.standIns.add(code!); } else if (B20_PRECOMPILE.test(code!) && (await state.getCode(createAddressFromString(code!))).length === 0) { m.code = NO_TOKEN; empty = true; } }
       if (native) reached.add(code!);
       if (!charging && native) {
-        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : (code === B20_FACTORY ? 0n : 100n) + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated || empty, ...(m.data.length >= 4 && !empty && { selector: m.data.slice(0, 4) }), ...(code === B20_FACTORY && { admin: namesAdmin(m.data) }) });
+        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : (code === B20_FACTORY ? 0n : 100n) + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated || empty, ...(m.data.length >= 4 && !empty && { selector: m.data.slice(0, 4) }), ...(code === B20_FACTORY && { admin: namesAdmin(m.data) }), ...(B20_PRECOMPILE.test(code) && m.data.length >= 4 && EIP712_FUNCTIONS.has(bytesToHex(m.data.subarray(0, 4))) && { eip712: true }) });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
       } else opened.push(charging && code && (m.isCompiled || evm.precompiles.has(code.slice(2))) ? 'precompile' : undefined);

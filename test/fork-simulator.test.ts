@@ -599,6 +599,10 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   await chain.putCode(DELEGATED, `0xef0100${TOKEN.slice(2)}`);
   const halted = (await base.simulate({ chainId: 8453, from: USER, to: DELEGATED, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, gas: 100_000n, at: { block: 'latest', header } }))!;
   assert.deepEqual([halted.status, halted.gasUsed], ['reverted', 100_000n]);
+  // Its EIP-712 hashing is charged as the node charges it: DOMAIN_SEPARATOR() is 100 and 6 a word of input, the
+  // name's cold read (2,100), and the hashes of the name (10 bytes: 36), the version (36) and the domain (60).
+  const [separator] = (await base.trace([{ chainId: 8453, from: USER, to: TOKEN, data: '0x3644e515', value: 0n, at: { block: 'latest', header } }]))!;
+  assert.deepEqual([separator.status, separator.trace!.gasUsed], ['success', 106n + 2_100n + 36n + 36n + 60n]);
   // Base's factory (no code on the chain, listed as a precompile) runs its reference too: a token it creates is
   // written where the chain's factory writes it, with the marker for code, and answers as the chain's would.
   const FACTORY = '0xb20f000000000000000000000000000000000000', ACTIVATION = '0x8453000000000000000000000000000000000001';
