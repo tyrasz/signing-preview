@@ -500,6 +500,8 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   assert.match(self.returnData!, /^0x9cfea583/);
   // A call to no function of the token's reverts as the chain's does: with its first four bytes, or zeros.
   assert.deepEqual([(await call('0xdeadbeef00'))!.returnData, (await call('0x12'))!.returnData], ['0xdeadbeef', '0x00000000']);
+  // And one of its functions given calldata it can't decode: the selector too, where the reference reverts empty.
+  assert.deepEqual([(await call('0xa9059cbb'))!.returnData, (await call(`0x70a08231${'ff'.repeat(32)}`))!.returnData], ['0xa9059cbb', '0x70a08231']);
   // After a block's earlier transactions: the node runs the token itself whatever code is put in its place, so its
   // storage is read as of the block before them, and said to be stale where one of them changed it (its events).
   const earlier: SimulationRequest = { chainId: 8453, from: BOB, to: BOB, data: '0x', value: 0n };
@@ -586,6 +588,17 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
     const [paid] = (await base.trace([{ chainId: 8453, from: USER, to, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 1n, at: { block: 'latest', header } }]))!;
     assert.deepEqual([paid.status, paid.returnData, paid.trace!.gasUsed], ['reverted', '0x6fb1b0e9', 0n]);
   }
+  // The account keeps the chain's code, the marker: EXTCODESIZE 1, EXTCODECOPY 0xef, as on Base's node.
+  const READER = '0x00000000000000000000000000000000000c0de5';
+  await chain.putCode(READER, `0x73${TOKEN.slice(2)}3b6000526020600060207${'3'}${TOKEN.slice(2)}3c60406000f3`);
+  const read = (await base.simulate({ chainId: 8453, from: USER, to: READER, data: '0x', value: 0n, at: { block: 'latest', header } }))!;
+  assert.deepEqual([read.status, BigInt(read.returnData!.slice(0, 66)), read.returnData!.slice(66, 68)], ['success', 1n, 'ef']);
+  // An account delegated (EIP-7702) to a token runs that marker as code, as the node does: an undefined opcode, all
+  // its gas. (The node finds a token's precompile by the address called, not by a delegate's.)
+  const DELEGATED = '0x00000000000000000000000000000000000de1e8';
+  await chain.putCode(DELEGATED, `0xef0100${TOKEN.slice(2)}`);
+  const halted = (await base.simulate({ chainId: 8453, from: USER, to: DELEGATED, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, gas: 100_000n, at: { block: 'latest', header } }))!;
+  assert.deepEqual([halted.status, halted.gasUsed], ['reverted', 100_000n]);
   // Not at a block from before that upgrade, when Base ran its tokens by other rules: refused, as before.
   await assert.rejects(base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header: { ...header, timestamp: 1_793_901_599n } } }),
     (e: unknown) => e instanceof ForkUnsupported && /from Base's upgrade of 2026-11-05 on/.test(e.message));

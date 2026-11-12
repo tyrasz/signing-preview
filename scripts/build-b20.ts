@@ -32,10 +32,10 @@
 //   - a call to no function of the token's: the chain reverts with the call's first four bytes (0x00000000 when it
 //     has fewer), or with NonPayable() when value is sent, where the reference reverted empty;
 //   - the activation registry's admin: the chain's (its configuration's), not the reference's placeholder.
-// Left as it is: calldata a function can't decode (the chain echoes the selector, the reference reverts empty), which
-// changes nothing a call that succeeds does. Two things the chain does to any call, before the token's code runs,
-// are done by the local EVM instead (src/fork-simulator.ts): value sent to a token or registry is refused with
-// NonPayable(), and a token or registry run as another contract's code (DELEGATECALL) with DelegateCallNotAllowed().
+// Three things the chain does to any call are done by the local EVM instead (src/fork-simulator.ts): value sent to a
+// token or registry is refused with NonPayable(); a token or registry run as another contract's code (DELEGATECALL)
+// with DelegateCallNotAllowed(); and calldata a function can't decode reverts with the call's selector, where the
+// reference reverts empty (its only empty revert).
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
