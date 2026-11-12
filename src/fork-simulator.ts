@@ -1065,11 +1065,13 @@ const MULTIPLIER_CANCELLED = 0x883856335ba5f60c18b9817c4505d3c7d3f6223dcf39516b3
  * with nothing pending; updateMultiplier cancelling a live update (100 more) or clearing one that took effect (200
  * more); setRoleAdmin on a token without admins, where the node reads the role's admin before it refuses.
  */
-type TokenFrame = { ok: boolean; returned: Uint8Array; sloads: number; stored: Set<bigint>; topics: Set<bigint> };
+type TokenFrame = { ok: boolean; returned: Uint8Array; sloads: number; stored: Set<bigint>; topics: Set<bigint>; data: Uint8Array; warm: (slot: bigint) => boolean };
+/** roleAdmins[role] (the mapping at B20_LAYOUT + 7) for a call whose first argument is the role. */
+const roleAdminSlot = (data: Uint8Array) => BigInt(keccak256(new Uint8Array([...setLengthLeft(data.subarray(4, 36), 32), ...setLengthLeft(hexToBytes(`0x${(B20_LAYOUT + 7n).toString(16)}`), 32)])));
 const B20_ENDED_GAS: Record<string, (f: TokenFrame) => bigint> = {
   '0x2c97a0f0': f => !f.ok && bytesToHex(f.returned.subarray(0, 4)) === '0xa7d6a5ca' ? 100n : 0n,
   '0x5ffe6146': f => !f.ok ? 0n : f.topics.has(MULTIPLIER_CANCELLED) ? 100n : f.stored.has(ASSET_PENDING) ? 200n : 0n,
-  '0x1e4e0091': f => !f.ok && f.sloads === 1 ? 2_100n : 0n,
+  '0x1e4e0091': f => !f.ok && f.sloads === 1 ? (f.warm(roleAdminSlot(f.data)) ? 100n : 2_100n) : 0n,
   // batchMint refusing a recipient (InvalidReceiver): its 100, charged as each recipient is reached (chargeStep).
   '0x68573107': f => !f.ok && bytesToHex(f.returned.subarray(0, 4)) === '0x9cfea583' ? 100n : 0n,
 };
@@ -1552,6 +1554,7 @@ export class ForkSimulator implements Simulator {
     const tokenCalls: TokenCall[] = [];
     // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
     const reached = new Set<string>();
+    const warmIn = (token: string) => (slot: bigint) => evm.journal.isWarmedStorage(hexToBytes(token as Hex), hexToBytes(`0x${slot.toString(16).padStart(64, '0')}`));
     const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint }; stack?: bigint[]; memory?: Uint8Array; address?: Address; depth?: number }, next?: () => void) => {
       // (Less 375 an event: the node charges its topics and data, not LOG's own base.)
       if (charging && NATIVE_CHARGED.has(e.opcode.name)) charging.node += BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n);
@@ -1604,7 +1607,7 @@ export class ForkSimulator implements Simulator {
       if (charging && own && !t.ended && (e.opcode.name === 'RETURN' || e.opcode.name === 'STOP')) {
         t.ended = true;
         const ended = B20_ENDED_GAS[t.selector];
-        if (ended) charging.node += ended({ ok: true, returned: new Uint8Array(0), sloads: t.sloads, stored: t.stored, topics: t.topics });
+        if (ended) charging.node += ended({ ok: true, returned: new Uint8Array(0), sloads: t.sloads, stored: t.stored, topics: t.topics, data: t.data, warm: warmIn(t.code) });
       }
       // A mapping's slot being found: kept, to read it after a block's earlier transactions (StateSource.preimages).
       if (e.opcode.name === 'KECCAK256' && e.stack && e.memory) {
@@ -1620,7 +1623,8 @@ export class ForkSimulator implements Simulator {
       if (o?.token) {
         tokenCalls.pop();
         const ended = B20_ENDED_GAS[o.token.selector];
-        if (ended && charging && !o.token.ended) charging.node += ended({ ok: !r.execResult.exceptionError, returned: r.execResult.returnValue, sloads: o.token.sloads, stored: o.token.stored, topics: o.token.topics });
+        // (Warmth seen as the call ends: a failed frame's own reads are undone by then, so it is what the node met.)
+        if (ended && charging && !o.token.ended) charging.node += ended({ ok: !r.execResult.exceptionError, returned: r.execResult.returnValue, sloads: o.token.sloads, stored: o.token.stored, topics: o.token.topics, data: o.token.data, warm: warmIn(o.token.code) });
       }
       const c = o?.charge;
       if (c) {
