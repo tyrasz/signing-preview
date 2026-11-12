@@ -1384,6 +1384,7 @@ export class ForkSimulator implements Simulator {
 
   private async rounds(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
     profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string): Promise<SimulationResult[]> {
+    let watched = 0;
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
       let run: Awaited<ReturnType<ForkSimulator['run']>>;
@@ -1395,6 +1396,17 @@ export class ForkSimulator implements Simulator {
       }
       const grew = !!run && run.rerun;
       if (misses) this.opts.onRound?.(round, { accounts: [...misses.accounts], storage: [...misses.storage], calls: [...misses.calls] }, grew);
+      // Past the speculative rounds a run fetches what it lacks as it goes, and is the answer, unless a later call
+      // showed a token or approval it wasn't watching: its amount would be its logs' (a lending pool's debt token,
+      // whose mint event adds the interest accrued before; Arbitrum One, 2026-11-12, after 24 rounds). Run again
+      // with them watched, twice at most.
+      if (run && !misses && grew && watched < 2) {
+        watched++;
+        for (const t of run.tokens) { tokens.add(t); this.seen.get(key)?.add(t); }
+        for (const a of run.approvals) approvals.set(approvalKey(a), a);
+        if (Date.now() > deadline) throw new ForkTimeout(`the simulation needed more than ${this.opts.timeoutMs} ms`);
+        continue;
+      }
       if (run && (!misses || (!missCount(misses) && !grew))) {
         this.last = { rounds: round, requests: source.requests, ms: Date.now() - started, ...(run.trace && { trace: run.trace }) };
         return run.results;

@@ -123,6 +123,14 @@ test('Speculative rounds converge, guesses from earlier simulations cut them, an
   // With no speculative rounds allowed, values are fetched one at a time: slower, same answer.
   const [slow] = (await fork({ maxRounds: 0 }).simulateBatch([{ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n }]))!;
   assert.deepEqual(slow.transfers.map(t => [t.asset, t.raw]), [[usdc, 1n]]);
+  // A token only a later call shows, past the speculative rounds, is read like the rest too: a contract that sends
+  // the user 101 stUSD (its event's figure; the balance moves by 100), named by neither call.
+  const giver = '0x91fe000000000000000000000000000000000091';
+  // CODECOPY the calldata after the code, CALL the token with it, STOP.
+  await chain.putCode(giver, `0x6044602a6000396000600060446000600073${shares.slice(2)}5af15000${call('transfer', [USER, 101n]).slice(2)}` as Hex);
+  await chain.exec(shares, call('mintShares', [giver, 300n]));
+  const [, given] = (await fork({ maxRounds: 0 }).simulateBatch([{ chainId: 999, from: USER, to: BOB, data: '0x', value: 0n }, { chainId: 999, from: USER, to: giver, data: '0x', value: 0n }]))!;
+  assert.deepEqual(given.transfers.map(t => [t.asset, t.to, t.raw]), [[shares, USER, 100n]]);
   await assert.rejects(fork({ timeoutMs: 1 }).simulate(req), ForkTimeout);
   // Past the budget, RpcSimulator asks the probe, and takes whichever of the two answers first: the probe when the
   // fork run is slow to fetch state, the fork's fuller answer when it finishes while the probe is still out.
