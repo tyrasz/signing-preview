@@ -891,6 +891,8 @@ const BASE = 8453;
 const BASE_DENIM = 1_793_901_600n;
 /** Base's registries a B20 token asks on its transfers: who may send and receive (policies), and what is switched on. */
 const BASE_REGISTRIES: Record<string, string> = { '0x8453000000000000000000000000000000000001': ACTIVATION_REGISTRY_CODE, '0x8453000000000000000000000000000000000002': POLICY_REGISTRY_CODE };
+/** Code that reverts with DelegateCallNotAllowed() (0x0d89438e): what a B20 token does when run as another's code. */
+const NO_DELEGATECALL = hexToBytes('0x630d89438e60e01b60005260046000fd');
 /** What a B20 token's call is charged for, as the node charges it (see rounds), and the gas it is given besides to run its reference. */
 const NATIVE_CHARGED = new Set(['SLOAD', 'SSTORE', 'LOG0', 'LOG1', 'LOG2', 'LOG3', 'LOG4']), NATIVE_SPARE_GAS = 300_000n;
 const STAND_IN_CODE = new Map<string, Uint8Array>();
@@ -1321,8 +1323,11 @@ export class ForkSimulator implements Simulator {
         next?.();
       });
     }
-    if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; gasLimit: bigint; isCompiled: boolean }, next?: () => void) => {
+    if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; gasLimit: bigint; isCompiled: boolean; code?: unknown }, next?: () => void) => {
       const code = (m._codeAddress ?? m.to)?.toString();
+      // The chain's B20 token refuses to run as another contract's code (DELEGATECALL, CALLCODE): DelegateCallNotAllowed().
+      // (Its own, announce's calls to itself, run.)
+      if (code && B20.test(code) && m.to && m.to.toString() !== code) m.code = NO_DELEGATECALL;
       if (!charging && code && B20.test(code)) {
         opened.push(charging = { code, limit: m.gasLimit, node: 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
         m.gasLimit += NATIVE_SPARE_GAS;

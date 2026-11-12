@@ -33,9 +33,9 @@
 //     has fewer), or with NonPayable() when value is sent, where the reference reverted empty;
 //   - the activation registry's admin: the chain's (its configuration's), not the reference's placeholder.
 // Left as they are: value sent to a function of the token's that exists (the chain says NonPayable(), the reference
-// reverts empty), calldata a function can't decode (the chain echoes the selector), and a token called by
-// DELEGATECALL (the chain refuses; the reference would run on the caller's storage). None changes what a call does
-// that succeeds.
+// reverts empty) and calldata a function can't decode (the chain echoes the selector). Neither changes what a call
+// does that succeeds. (A token run as another contract's code, by DELEGATECALL, is refused by the local EVM, as the
+// chain refuses it: src/fork-simulator.ts.)
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';

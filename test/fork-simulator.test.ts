@@ -490,6 +490,11 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
     const [stale] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: touching, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
     assert.deepEqual([stale.status, stale.standInsStale], ['success', [TOKEN]]);
   } finally { chain.simulateV1 = false; }
+  // Run as another contract's code (DELEGATECALL), the chain's token refuses: DelegateCallNotAllowed().
+  const DELEGATOR = '0x00000000000000000000000000000000000de1e9';
+  await chain.putCode(DELEGATOR, `0x365f5f375f5f365f73${TOKEN.slice(2)}5af43d5f5f3e6029573d5ffd5b3d5ff3`);
+  const delegated = (await base.simulate({ chainId: 8453, from: USER, to: DELEGATOR, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header } }))!;
+  assert.deepEqual([delegated.status, delegated.returnData], ['reverted', '0x0d89438e']);
   // Not at a block from before that upgrade, when Base ran its tokens by other rules: refused, as before.
   await assert.rejects(base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header: { ...header, timestamp: 1_793_901_599n } } }),
     (e: unknown) => e instanceof ForkUnsupported && /from Base's upgrade of 2026-11-05 on/.test(e.message));
