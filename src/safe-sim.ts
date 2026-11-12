@@ -185,7 +185,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE });
     if (!approvals) return null;
     const { stateDiff, signatures } = approvals;
-    const standIn = ecdsaStandIn(executor, hash);
+    const standIn = ecdsaStandIn(executor, hash, chainId);
     exec = { chainId, from: executor, account: safe, to: safe, value: 0n, accessList: standIn.accessList,
       stateOverrides: { ...standIn.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) },
       data: encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, signatures] }) };

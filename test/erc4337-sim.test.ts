@@ -276,6 +276,14 @@ test('The ecrecover stand-in: each stand-in signature recovers as its signer for
     }
   }
   assert.notEqual(STUB_COSIGNATURE.slice(2, 66), STUB_SIGNATURE.slice(2, 66));
+  // On a chain that charges its own price (HyperEVM's 15,000), the stand-in costs that.
+  const { ecrecoverPrice } = await import('../src/fork-simulator.ts');
+  assert.deepEqual([ecrecoverPrice(1), ecrecoverPrice(999)], [3000, 15_000]);
+  for (const [code, d] of [[ecrecoverAs(OWNER, undefined, [], 15_000), undefined], [ecrecoverAs(OWNER, digest, [{ signature: STUB_COSIGNATURE, signer: COSIGNER }], 15_000), digest]] as const) {
+    await chain.putCode(where, code);
+    const r = await chain.evm.runCall({ caller: at(OWNER), to: at(where), data: toBytes(input(STUB_SIGNATURE, d ?? `0x${'99'.repeat(32)}`)), gasLimit: 100_000n });
+    assert.deepEqual([`0x${toHex(r.execResult.returnValue).slice(-40)}`, r.execResult.executionGasUsed], [OWNER, 15_000n]);
+  }
 });
 
 test('A paymaster field naming address 0 is no paymaster, as the EntryPoint takes it: the account pays', async () => {

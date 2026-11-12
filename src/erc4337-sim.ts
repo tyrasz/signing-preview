@@ -16,6 +16,7 @@ import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResul
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
+import { ecrecoverPrice } from './fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 
@@ -660,18 +661,18 @@ function standIn(moved: string, r: Hex, s: Hex, rAt: number, answer: string): He
  * ecrecover (0x01) recovering STUB_SIGNATURE as `signer`: the account's validation runs as it will once signed.
  * With `digest`, only over that digest (what the signer's wallet will sign: an account that tries other forms of
  * the hash first, as Kernel's ECDSA validator does, fails on those as it will). The stand-in is checked first and
- * costs exactly the precompile's 3,000 gas: instead of calling the real precompile it burns a fixed amount (a
+ * costs exactly the precompile's price (`price`: 3,000, or the chain's own, HyperEVM's 15,000): instead of calling the real precompile it burns a fixed amount (a
  * counted loop of 26 gas a turn, then 1-gas JUMPDESTs), so validation uses the gas it will. Other signatures go to
  * the real precompile, for about 200 gas more than calling it directly.
  *   if (calldata[64:96] == r && calldata[96:128] == s [&& calldata[0:32] == digest]) { burn; return signer }
  *   calldatacopy(0, 0, calldatasize); staticcall(gas, MOVED, 0, calldatasize, 0, 32); return its output
  * With `cosigners`, each of their stand-in signatures is recovered as its signer the same way, also for 3,000 gas.
  */
-export function ecrecoverAs(signer: string, digest?: Hex, cosigners: { signature: Hex; signer: string }[] = []): Hex {
-  if (cosigners.length) return ecrecoverAsMany([{ signature: STUB_SIGNATURE, signer }, ...cosigners], digest);
+export function ecrecoverAs(signer: string, digest?: Hex, cosigners: { signature: Hex; signer: string }[] = [], price = 3000): Hex {
+  if (cosigners.length) return ecrecoverAsMany([{ signature: STUB_SIGNATURE, signer }, ...cosigners], digest, price);
   const r = STUB_SIGNATURE.slice(2, 66), s = STUB_SIGNATURE.slice(66, 130);
   // The stand-in's path: 59 gas of its own (the checks, the jump, and returning a word; 74 with the digest's check), and the burn.
-  const burn = 3000 - (digest ? 74 : 59), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
+  const burn = price - (digest ? 74 : 59), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
   const check = `7f${r}60403514` + `7f${s}6060351416` + (digest ? `7f${digest.slice(2)}60003514${'16'}` : ''); // 37 + 38 (+ 38) bytes
   const forward = `366000600037` + `6020600036600073${ECRECOVER_MOVED.slice(2)}5afa50` + `3d6000f3`; // 41 bytes
   const dest = (check.length + forward.length) / 2 + 3; // after `PUSH1 dest JUMPI`
@@ -686,7 +687,7 @@ export function ecrecoverAs(signer: string, digest?: Hex, cosigners: { signature
  * its signature's burn and answer), then the real precompile for anything else. The k-th signature's path runs k + 1
  * checks before its jump, and burns what makes it exactly 3,000 gas too.
  */
-function ecrecoverAsMany(pairs: { signature: Hex; signer: string }[], digest?: Hex): Hex {
+function ecrecoverAsMany(pairs: { signature: Hex; signer: string }[], digest?: Hex, price = 3000): Hex {
   const hex2 = (n: number) => n.toString(16).padStart(4, '0');
   // Each check: r, s (and the digest), then PUSH2 dest JUMPI: 40 gas (55 with the digest); the answer, 19.
   const checkGas = digest ? 55 : 40;
@@ -697,7 +698,7 @@ function ecrecoverAsMany(pairs: { signature: Hex; signer: string }[], digest?: H
   const dests: number[] = [];
   let at = head;
   pairs.forEach((p, k) => {
-    const burn = 3000 - ((k + 1) * checkGas + 19), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
+    const burn = price - ((k + 1) * checkGas + 19), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
     const loop = at + 1 + 3;
     const section = `5b61${hex2(turns)}5b600190038061${hex2(loop)}5750${'5b'.repeat(sled)}` + `73${p.signer.toLowerCase().slice(2)}60005260206000f3`;
     dests.push(at);
@@ -710,9 +711,9 @@ function ecrecoverAsMany(pairs: { signature: Hex; signer: string }[], digest?: H
  * What a simulation request needs for ecrecover to recover STUB_SIGNATURE as `signer` (over `digest`, if given): the
  * precompile's stand-in (see ecrecoverAs), with both addresses warm as the precompile is. For Safe transactions too.
  */
-export function ecdsaStandIn(signer: string, digest?: Hex): Pick<SimulationRequest, 'stateOverrides' | 'accessList'> {
+export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number): Pick<SimulationRequest, 'stateOverrides' | 'accessList'> {
   return {
-    stateOverrides: { '0x0000000000000000000000000000000000000001': { code: ecrecoverAs(signer, digest), movePrecompileToAddress: ECRECOVER_MOVED } },
+    stateOverrides: { '0x0000000000000000000000000000000000000001': { code: ecrecoverAs(signer, digest, [], chainId === undefined ? 3000 : ecrecoverPrice(chainId)), movePrecompileToAddress: ECRECOVER_MOVED } },
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] }],
   };
 }
@@ -921,8 +922,9 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     return ran;
   };
   // Over the digest the wallet will sign first; if the account checks another form of the hash, over any.
-  let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest, stub.cosigners)) : null;
-  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(ecrecoverAs(signer, undefined, stub.cosigners));
+  const recoverGas = ecrecoverPrice(op.chainId);
+  let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest, stub.cosigners, recoverGas)) : null;
+  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(ecrecoverAs(signer, undefined, stub.cosigners, recoverGas));
   return result && { ...result, standIn };
   }
 }

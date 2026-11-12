@@ -919,6 +919,9 @@ const codeOf = (hex: string) => { let c = STAND_IN_CODE.get(hex); if (!c) STAND_
  * are base-std's `main`, what Base runs from its upgrade of 2026-11-05 (Denim): a block before it ran B20 tokens by
  * other rules (v1.1.0's from 2026-09-30, v1.0.0's before), and isn't given them.
  */
+/** What ecrecover costs on the chain: Ethereum's 3,000, or the multiple its profile charges (HyperEVM: 15,000). */
+export const ecrecoverPrice = (chainId: number) => 3_000 * Number(CHAIN_PROFILES[chainId]?.precompileScale?.[1] ?? 1n);
+
 /** Whether a precompile the chain's node lists is one the local EVM runs from its Solidity reference (Base's registries). */
 export const hasReference = (chainId: number, address: string) => chainId === BASE && address.toLowerCase() in BASE_REGISTRIES;
 
