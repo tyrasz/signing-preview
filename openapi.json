@@ -1062,6 +1062,10 @@
             "type": "string",
             "pattern": "^[0-9]+$",
             "description": "The block whose state the simulation ran on, when one was named (`context.block`) or the transaction is a replay."
+          },
+          "stateReadError": {
+            "type": "string",
+            "description": "Why balances and allowances couldn't be read after the simulation (the node's answer); its amounts are then from events."
           }
         }
       },

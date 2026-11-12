@@ -95,6 +95,8 @@ export interface SimulationSummary {
   error?: string;
   /** The block whose state it ran on, when one was named (PreviewContext.block) or the transaction is a replay: a decimal number. */
   block?: string;
+  /** Why balances and allowances couldn't be read after it (the node's answer): its amounts are then from events. */
+  stateReadError?: string;
 }
 
 /** A mined transaction run again where it ran (replayTransaction), and how the run compares with its receipt. */
@@ -540,6 +542,8 @@ export interface SimulationResult {
   standInsStale?: string[];
   /** The amounts were read from balances before and after the call (not taken from the logs). */
   balancesRead?: boolean;
+  /** Why the balances and allowances couldn't be read after the call (the node's answer), when they couldn't: its amounts are then its events'. */
+  stateReadError?: string;
   /** The call's trace and the state it changed, when the request asked for them and the simulator can (see SimulationRequest.trace). */
   trace?: TraceCall;
   stateChanges?: StateChange[];

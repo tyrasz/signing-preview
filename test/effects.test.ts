@@ -164,6 +164,18 @@ test('RpcSimulator reads the real allowance after each call, so a silently spent
   assert.deepEqual(p.approvals?.map(a => [a.allowance, a.revoked, a.basis]), [['none', true, 'simulated_state']], 'state after the batch');
 });
 
+test('When the node won’t answer the reads after a call, its result says why, and its amounts stay the events’', async () => {
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    if (body.params[0].blockStateCalls[0].calls.length === 1) return new Response(JSON.stringify({ result: [{ calls: [
+      { status: '0x1', gasUsed: '0x1', returnData: '0x', logs: [{ address: USDC, topics: [T.transfer, w(ALICE), w(ROUTER)], data: data(10_000_000n) }] },
+    ] }] }));
+    return new Response(JSON.stringify({ error: { code: -32000, message: 'execution aborted (timeout = 5s)' } }));
+  }) as typeof fetch;
+  const r = await new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 42161, from: ALICE, to: ROUTER, data: '0xdeadbeef', value: 0n });
+  assert.deepEqual([r?.status, r?.balancesRead, r?.stateReadError, r?.transfers.map(t => t.raw)], ['success', undefined, 'execution aborted (timeout = 5s)', [10_000_000n]]);
+});
+
 test('On a node that splits a block’s gas among the calls that set none, a heavy balanceOf is read again on its own', async () => {
   // reth's eth_simulateV1 (BNB Chain's public node) gives each call without a gas field an equal share of what the
   // block has left. A token like Open Genesis works out a holder's balance for 1.37 million gas and emits events

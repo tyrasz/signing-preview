@@ -209,6 +209,9 @@ function unavailableState(error: unknown, block: string): Error {
     : error instanceof Error ? error : new Error(message);
 }
 
+/** A node's answer when it is turning requests away. */
+const RATE_LIMITED = /rate limit|too many requests|adjustable limit/i;
+
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
   private fetchImpl: typeof fetch;
@@ -512,7 +515,12 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]) as { result?: { calls: RawCallResult[] }[] };
+    const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]);
+    // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
+    // asked once more after a pause, since without these reads the amounts are only the events'.)
+    let reply = await ask();
+    if (reply.error && RATE_LIMITED.test(reply.error.message ?? '')) { await new Promise(r => setTimeout(r, 3000)); reply = await ask(); }
+    const body = reply as { result?: { calls: RawCallResult[] }[] };
     const out = body.result?.[0]?.calls?.slice(before.length);
     // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the
     // tokens the logs name are asked again in a lean pass (leanReads). On a node that splits the block's gas among
@@ -527,7 +535,10 @@ export class RpcSimulator implements Simulator {
     if (starved !== undefined) {
       const pairs = owners.flatMap(owner => [...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)).map(token => ({ owner, token })));
       const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs, tag).catch(() => undefined) : undefined;
-      if (!again) return;
+      if (!again) {
+        if (!out) { const why = (body as { error?: { message?: string } }).error?.message ?? 'no answer'; for (const p of parsed) p.stateReadError = why; }
+        return;
+      }
       parsed.forEach((p, i) => {
         if (p.status !== 'success') return;
         for (const { owner, token } of pairs) {

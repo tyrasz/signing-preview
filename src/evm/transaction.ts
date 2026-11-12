@@ -311,7 +311,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     }
     if (context.stateOverrides && !replay && !preset) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
     const stateBlock = replay ? BigInt(replay.at.block) : named?.number;
-    simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }), ...(stateBlock !== undefined && { block: stateBlock.toString() }) };
+    simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }), ...(stateBlock !== undefined && { block: stateBlock.toString() }), ...(sim.stateReadError && { stateReadError: sim.stateReadError }) };
     if (sim.status === 'reverted') {
       b.warn('danger', 'simulation_reverted', replay ? `The transaction failed${sim.revertReason ? `: ${sim.revertReason}` : ''}. Its sender still paid the network fee.` : `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
     } else if (sim.limited) {

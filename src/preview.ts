@@ -179,7 +179,8 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
     const failed = results.findIndex(r => r.status === 'reverted');
     const gasUsed = results.reduce((sum, r) => sum + (r.gasUsed ?? 0n), 0n);
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
-      ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }), ...(named && { block: named.number.toString() }) };
+      ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }), ...(named && { block: named.number.toString() }),
+      ...(results[0].stateReadError && { stateReadError: results[0].stateReadError }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
     if (named) b.note(`Simulated on the state after ${blockText(named.number, named.time)}, in the block that followed: what the calls would have done then, not now.`);
     if (context.stateOverrides) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
