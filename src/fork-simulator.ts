@@ -447,7 +447,10 @@ class StateSource {
     if (accounts.length) blocks.push({ stateOverrides: { [BALANCE_READER]: { code: BALANCE_READER_CODE } }, calls: [balanceCall] });
     if (codeCalls.length) blocks.push({ stateOverrides: { [CODE_READER]: { code: CODE_READER_CODE } }, calls: codeCalls });
     // (Before the slot readers, whose code overrides last into later blocks.)
-    if (views.length) blocks.push({ calls: views.map(v => ({ to: v.a, data: v.data, gas: '0x30d40' })) });
+    // 150 a block, 200,000 gas each: within a block's limit however a node adds them up (Base's is 40,000,000; a
+    // block of 1,700 such views was refused).
+    const VIEWS_PER_BLOCK = 150, viewBlocks = Math.ceil(views.length / VIEWS_PER_BLOCK);
+    for (let i = 0; i < views.length; i += VIEWS_PER_BLOCK) blocks.push({ calls: views.slice(i, i + VIEWS_PER_BLOCK).map(v => ({ to: v.a, data: v.data, gas: '0x30d40' })) });
     // Each slot reader with gas of its own for its slots (a cold read is 2,100 on most chains), not a share of the block's: unless
     // their limits would add up to more than 30,000,000 (a node that adds them up refuses past its block's).
     // (A cold read costs what the chain charges: Polygon 5,460, not 2,100; a reader of 65 slots on 3,000 each ran out.)
@@ -500,7 +503,8 @@ class StateSource {
       accounts.forEach((a, i) => this.accounts.set(a, { balance: BigInt(balances[i]), nonce: nonces.get(a) ?? 0n, code: this.codeOverrides.get(a) ?? code.get(a) ?? new Uint8Array(0) }));
     }
     const viewed = new Set<string>();
-    if (views.length) out[at++].calls.forEach((c, i) => {
+    const viewResults = out.slice(at, at += viewBlocks).flatMap(b => b.calls);
+    viewResults.forEach((c, i) => {
       if (c.status !== '0x1' || c.returnData.length !== 66) return;
       const k = `${views[i].a}_${views[i].slot}`;
       this.storage.set(k, unpadBytes(hexToBytes(c.returnData)));
@@ -525,13 +529,18 @@ class StateSource {
       // The rest of its storage as of the block the earlier transactions ran on (the only way the node gives it):
       // what they left, unless one of them changed it, which its events tell (a B20 token's every change has one).
       // Transfers and approvals change only balances, allowances, nonces (a permit's) and the total supply (a mint's
-      // or a burn's), read above after the calls; any other event of the contract's, or any of a registry's, may have
-      // changed what was read here. Such a contract is noted (StateSource.staleNative): what it reads may not be what
-      // it held.
+      // or a burn's), read above after the calls where their views answered; any other event of the contract's, any
+      // of a registry's, the factory's naming the token (one created among them), or any event at all where a view
+      // of a slot didn't answer, may have changed what was read here. Such a contract is noted
+      // (StateSource.staleNative): what it reads may not be what it held.
       if (native.length) {
-        const changed = new Set(out[0].calls.flatMap(c => (c.logs ?? []).filter(l => !B20.test(l.address) || ![TRANSFER, APPROVAL].includes((l.topics?.[0] ?? '').toLowerCase())).map(l => l.address.toLowerCase())));
+        const logs = out[0].calls.flatMap(c => c.logs ?? []), word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
+        const touched = new Set(logs.map(l => l.address.toLowerCase()));
+        const changed = new Set(logs.filter(l => !B20.test(l.address) || ![TRANSFER, APPROVAL].includes((l.topics?.[0] ?? '').toLowerCase())).map(l => l.address.toLowerCase()));
+        const created = new Set(logs.filter(l => l.address.toLowerCase() === B20_FACTORY).map(l => (l.topics?.[1] ?? '').toLowerCase()));
+        const meant = new Set(views.map(v => `${v.a}_${v.slot}`));
         const rest = native.flatMap(a => slots.get(a)!.filter(slot => !viewed.has(`${a}_${slot}`)).map(slot => [a, slot] as const));
-        for (const [a] of rest) if (changed.has(a)) this.staleNative.add(a);
+        for (const [a, slot] of rest) if (changed.has(a) || created.has(word(a)) || (meant.has(`${a}_${slot}`) && touched.has(a))) this.staleNative.add(a);
         await this.sendAll(rest.map(([a, slot]) => ({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: (v: unknown) => { this.storage.set(`${a}_${slot}`, unpadBytes(hexToBytes(v as Hex))); } })));
       }
     }
@@ -942,6 +951,8 @@ const isDelegation = (code: Uint8Array) => code.length === 23 && code[0] === 0xe
 const B20 = /^0xb2000000000000000000/i;
 /** Where a B20 token keeps its state (ERC-7201 \`base.b20\`): name, symbol, URI, total supply, balances, allowances, … from here (MockB20Storage). */
 const B20_LAYOUT = 0xc78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434000n;
+/** Base's B20 factory (its events name the tokens it creates); and the addresses the node has a token precompile at: variants 00 and 01. */
+const B20_FACTORY = '0xb20f000000000000000000000000000000000000', B20_PRECOMPILE = /^0xb20000000000000000000[01]/i;
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
 const BASE = 8453;
 /** When Base's upgrade of 2026-11-05 (Denim) took effect: the B20 rules base-std's `main` has (its eth_config activationTime). */
@@ -1339,7 +1350,7 @@ export class ForkSimulator implements Simulator {
     // registry's reference under it included) and its precompiles' gas, on top of that 100 and 6 a word. Without
     // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries, called
     // themselves, are charged so too. A call whose charge passes the gas it was given runs out there, as the node's.
-    type Charge = { code: string; limit: bigint; node: bigint };
+    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean };
     let charging: Charge | undefined;
     const opened: (Charge | 'precompile' | undefined)[] = [];
     // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
@@ -1361,7 +1372,7 @@ export class ForkSimulator implements Simulator {
       else if (c && typeof c === 'object') {
         evm.events!.removeListener('step', chargeStep);
         charging = undefined;
-        if (source.standIns.has(c.code)) r.execResult.executionGasUsed = c.node < c.limit ? c.node : c.limit;
+        if (c.refused || source.standIns.has(c.code)) r.execResult.executionGasUsed = c.node < c.limit ? c.node : c.limit;
       }
       next?.();
     });
@@ -1412,17 +1423,17 @@ export class ForkSimulator implements Simulator {
     if (chainId === BASE) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; value: bigint; gasLimit: bigint; isCompiled: boolean; code?: unknown }, next?: () => void) => {
       const code = (m._codeAddress ?? m.to)?.toString();
       // The chain's B20 tokens and registries refuse to run as another contract's code (DELEGATECALL, CALLCODE):
-      // DelegateCallNotAllowed(). (A token's own calls to itself, announce's, run.) Sent value, they refuse it
+      // DelegateCallNotAllowed(), charging that frame nothing. (A token's own calls to itself, announce's, run.) Sent value, they refuse it
       // before anything else, whatever the function, with NonPayable(), and the node charges the call nothing
       // (measured on Base: a value call's frame used no gas, the token's or a registry's, the calldata's size
       // whatever it was); the references' own functions would revert empty.
-      const native = !!code && (B20.test(code) || code in BASE_REGISTRIES);
+      const native = !!code && (B20_PRECOMPILE.test(code) || code in BASE_REGISTRIES);
       const delegated = native && !!m.to && m.to.toString() !== code, refused = native && !delegated && m.value > 0n;
       if (delegated) m.code = NO_DELEGATECALL;
       else if (refused) m.code = NON_PAYABLE;
       if (native) reached.add(code!);
       if (!charging && native) {
-        opened.push(charging = { code, limit: m.gasLimit, node: refused ? 0n : 100n + 6n * BigInt(Math.ceil(m.data.length / 32)) });
+        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : 100n + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
       } else opened.push(charging && code && (m.isCompiled || evm.precompiles.has(code.slice(2))) ? 'precompile' : undefined);

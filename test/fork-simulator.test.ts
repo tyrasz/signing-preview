@@ -513,9 +513,12 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
       const out = await res.json() as { result?: { calls: { status: string; returnData: string; logs: unknown[] }[] }[] }[];
       out[0].result?.[0]?.calls[0]?.logs.push({ address: TOKEN, topics: ['0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925'], data: '0x' });
       (body[0].params[0].blockStateCalls as { calls: { to: string; data: string }[] }[]).forEach((b, i) => b.calls.forEach((c, j) => {
-        if (c.to !== TOKEN || !c.data.startsWith('0xdd62ed3e')) return;
-        assert.equal(c.data, `0xdd62ed3e${USER.slice(2).padStart(64, '0')}${BOB.slice(2).padStart(64, '0')}`);
-        out[0].result![i].calls[j] = { status: '0x1', returnData: `0x${(500).toString(16).padStart(64, '0')}`, logs: [] };
+        if (c.to !== TOKEN) return;
+        // (The token's views, as Base's node answers them: the allowance the approval set, and the balances, which it left.)
+        const answer = c.data.startsWith('0x70a08231') ? (c.data.endsWith(USER.slice(2)) ? 1_000_000 : 0) : c.data.startsWith('0xdd62ed3e') ? 500 : undefined;
+        if (answer === undefined) return;
+        if (c.data.startsWith('0xdd62ed3e')) assert.equal(c.data, `0xdd62ed3e${USER.slice(2).padStart(64, '0')}${BOB.slice(2).padStart(64, '0')}`);
+        out[0].result![i].calls[j] = { status: '0x1', returnData: `0x${answer.toString(16).padStart(64, '0')}`, logs: [] };
       }));
       return new Response(JSON.stringify(out));
     }) as typeof fetch;
@@ -523,6 +526,16 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
     const spend: SimulationRequest = { chainId: 8453, from: BOB, to: TOKEN, data: transferFrom, value: 0n };
     const [spent] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: approving, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...spend, at: { block: '0x10', header, before: [earlier] } }]))!;
     assert.deepEqual([spent.status, spent.standInsStale], ['success', undefined]);
+    // A view that didn't answer leaves its slot read as of the block before: stale, whatever the token's events.
+    const silent = (async (u: string, init: RequestInit) => {
+      const res = await chain.fetchImpl(u, init), body = JSON.parse(String(init.body));
+      if (!Array.isArray(body) || body[0]?.method !== 'eth_simulateV1') return res;
+      const out = await res.json() as { result?: { calls: { logs: unknown[] }[] }[] }[];
+      out[0].result?.[0]?.calls[0]?.logs.push({ address: TOKEN, topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'], data: '0x' });
+      return new Response(JSON.stringify(out));
+    }) as typeof fetch;
+    const [unviewed] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: silent, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...target, at: { block: '0x10', header, before: [earlier] } }]))!;
+    assert.deepEqual(unviewed.standInsStale, [TOKEN]);
     // (Without it, the parent block's allowance: none, InsufficientAllowance.)
     const [refused] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: touching, profiles: { 8453: CHAIN_PROFILES[8453] } }).trace([{ ...spend, at: { block: '0x10', header, before: [earlier] } }]))!;
     assert.deepEqual([refused.status, refused.returnData?.slice(0, 10)], ['reverted', '0x192b9e4e']);
