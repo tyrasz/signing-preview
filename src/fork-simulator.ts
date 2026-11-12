@@ -21,7 +21,7 @@ import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2, PRECOMPILE_SCALE } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
-import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
+import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_FACTORY_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
 import { formatUnits } from './format.ts';
 import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
@@ -770,6 +770,7 @@ class LazyState extends SimpleStateManager {
     // (Its code stays the chain's, the marker: what EXTCODESIZE, EXTCODECOPY and an EIP-7702 delegation to it see.
     // The reference is given to a call that runs at its address: runStandIns.)
     const standIn = nativeStandIn(this.source.chainId, key, a.code, this.source.time);
+    if (this.source.chainId === BASE && key === B20_FACTORY && this.source.time !== undefined && this.source.time < BASE_DENIM) throw new ForkUnsupported(`${key} is Base's B20 factory, which the local EVM runs as it is from Base's upgrade of 2026-11-05 on, not as it was at this block`);
     if (!standIn && isNative(a.code)) throw new ForkUnsupported(!B20.test(key) ? `${key} is a contract this chain's node runs itself (its code is a marker, not EVM code), which the local EVM can't run`
       : this.source.time !== undefined && this.source.time < BASE_DENIM ? `${key} is a B20 token (Base's native token standard, which its node runs itself), and the local EVM runs B20 tokens as they are from Base's upgrade of 2026-11-05 on, not as they were at this block`
       : `${key} is a B20 token of a kind the local EVM has no reference for (Base's native token standard: its node runs the token itself, behind the marker code 0xef)`);
@@ -978,6 +979,40 @@ const B20 = /^0xb2000000000000000000/i;
 const B20_LAYOUT = 0xc78b71fee795ddd74aff64ea9b2474194c938c3196430e10bb5f01ed48434000n;
 /** Base's B20 factory (its events name the tokens it creates); and the addresses the node has a token precompile at: variants 00 and 01. */
 const B20_FACTORY = '0xb20f000000000000000000000000000000000000', B20_PRECOMPILE = /^0xb20000000000000000000[01]/i;
+/**
+ * Foundry's cheatcode address, which the factory's reference calls to write a new token's state (vm.etch, vm.store):
+ * answered for the factory alone (see the run's hooks), an empty account to anyone else, as on the chain.
+ */
+const HEVM = '0x7109709ecfa91a80626ff3989d68f67f5b1dd12d';
+/**
+ * What Base's node charges a creation beyond the storage it writes and the events it emits (which are charged as
+ * a token's are), measured on its node by creations of each kind beside the local EVM's, each call's own gas timed
+ * by a contract calling the factory (a transaction's gas hides a cheap one under the calldata floor). A call to the
+ * factory is charged 6 a word of its input, not a token's 100 besides, and the factory is warm from the start. It
+ * works out the token's address (a hash, 42) before it checks the parameters' version and decimals, which fail with
+ * that much more; finding whether the token exists is a cold account read (2,600): a creation that would overwrite
+ * one fails with both more (TokenAlreadyExists). Writing the token costs 34,436 more for an asset, 32,236 for a
+ * stablecoin, 100 less with an admin. A stablecoin's currency is checked after all that: an invalid one (lowercase)
+ * and an empty one fail with it charged. With these, 141 calls of 20 kinds of creation came out alike on the node
+ * and here (asset and stablecoin; 6 or 18 decimals; names of 0 to 50 bytes; an admin or none; init calls that
+ * succeed, revert, or can't be dispatched; each way it can fail), and so did eight early failures timed from a
+ * contract.
+ */
+const B20_ADDRESS_GAS = 42n, B20_EXISTS_GAS = B20_ADDRESS_GAS + 2_600n, B20_CREATED_GAS: Record<string, bigint> = { '00': 34_436n, '01': 32_236n }, B20_ADMIN_GAS = -100n;
+const B20_PARAM_ERRORS: Record<string, bigint> = {
+  '0xc0d8b4e0': B20_ADDRESS_GAS, '0xca950391': B20_ADDRESS_GAS, // UnsupportedVersion, InvalidDecimals
+  '0x997c1de8': B20_EXISTS_GAS + B20_CREATED_GAS['01'], '0x4a43ae87': B20_EXISTS_GAS + B20_CREATED_GAS['01'], // InvalidCurrency, MissingRequiredField
+};
+/** The factory's createB20 call names an initial admin (its params' fourth word, not zero). */
+function namesAdmin(data: Uint8Array): boolean {
+  if (data.length < 4 + 128 || bytesToHex(data.subarray(0, 4)) !== '0x62975e6a') return false;
+  const at = 4 + Number(BigInt(bytesToHex(data.subarray(68, 100)))) + 32, admin = data.subarray(at + 32 + 96, at + 32 + 128);
+  return admin.length === 32 && admin.some(b => b !== 0);
+}
+/** Code that returns the word 1 (the cheatcodes' answer: see VM_SOURCE in scripts/build-b20.ts). */
+const RETURN_ONE = hexToBytes('0x600160005260206000f3');
+/** Code that reverts with no data: a call to a token's address before there is a token there (measured on Base). */
+const NO_TOKEN = hexToBytes('0x60006000fd');
 const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !isDelegation(code);
 const BASE = 8453;
 /** When Base's upgrade of 2026-11-05 (Denim) took effect: the B20 rules base-std's `main` has (its eth_config activationTime). */
@@ -1003,11 +1038,15 @@ const codeOf = (hex: string) => { let c = STAND_IN_CODE.get(hex); if (!c) STAND_
  * other rules (v1.1.0's from 2026-09-30, v1.0.0's before), and isn't given them.
  */
 /** Whether a precompile the chain's node lists is one the local EVM runs from its Solidity reference (Base's registries). */
-export const hasReference = (chainId: number, address: string) => chainId === BASE && address.toLowerCase() in BASE_REGISTRIES;
+export const hasReference = (chainId: number, address: string) => chainId === BASE && (address.toLowerCase() in BASE_REGISTRIES || address.toLowerCase() === B20_FACTORY);
 
 export function nativeStandIn(chainId: number, address: string, code: Uint8Array, time?: bigint): Uint8Array | undefined {
-  if (chainId !== BASE || code.length !== 1 || code[0] !== 0xef || (time !== undefined && time < BASE_DENIM)) return undefined;
-  const key = address.toLowerCase(), registry = BASE_REGISTRIES[key];
+  if (chainId !== BASE || (time !== undefined && time < BASE_DENIM)) return undefined;
+  const key = address.toLowerCase();
+  // The factory has no code on the chain (it is listed as a precompile).
+  if (key === B20_FACTORY) return code.length === 0 ? codeOf(B20_FACTORY_CODE) : undefined;
+  if (code.length !== 1 || code[0] !== 0xef) return undefined;
+  const registry = BASE_REGISTRIES[key];
   if (registry) return codeOf(registry);
   if (!B20.test(key)) return undefined;
   const variant = key.slice(22, 24);
@@ -1392,14 +1431,17 @@ export class ForkSimulator implements Simulator {
     // registry's reference under it included) and its precompiles' gas, on top of that 100 and 6 a word. Without
     // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries, called
     // themselves, are charged so too. A call whose charge passes the gas it was given runs out there, as the node's.
-    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array };
+    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; admin?: boolean; looked?: boolean };
     let charging: Charge | undefined;
     const opened: (Charge | 'precompile' | undefined)[] = [];
     // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
     const reached = new Set<string>();
-    const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint }; stack?: bigint[]; memory?: Uint8Array }, next?: () => void) => {
+    const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint }; stack?: bigint[]; memory?: Uint8Array; address?: Address }, next?: () => void) => {
       // (Less 375 an event: the node charges its topics and data, not LOG's own base.)
       if (charging && NATIVE_CHARGED.has(e.opcode.name)) charging.node += BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n);
+      // The factory finding whether the token it is to create exists (B20_EXISTS_GAS).
+      // (Once: the reference looks again before it calls the token, for its admin.)
+      if (charging?.code === B20_FACTORY && !charging.looked && e.opcode.name === 'EXTCODESIZE' && e.address?.toString() === B20_FACTORY && e.stack?.length && B20_PRECOMPILE.test(`0x${e.stack[e.stack.length - 1].toString(16).padStart(40, '0')}`)) { charging.node += B20_EXISTS_GAS; charging.looked = true; }
       // A mapping's slot being found: kept, to read it after a block's earlier transactions (StateSource.preimages).
       if (e.opcode.name === 'KECCAK256' && e.stack && e.memory) {
         const n = e.stack.length, offset = Number(e.stack[n - 1]);
@@ -1414,6 +1456,8 @@ export class ForkSimulator implements Simulator {
       else if (c && typeof c === 'object') {
         evm.events!.removeListener('step', chargeStep);
         charging = undefined;
+        // (Parameters the factory's reference checks before what the node charges first: B20_PARAM_ERRORS.)
+        if (c.code === B20_FACTORY && r.execResult.exceptionError?.error === EVMError.errorMessages.REVERT) c.node += B20_PARAM_ERRORS[bytesToHex(r.execResult.returnValue.subarray(0, 4))] ?? 0n;
         if (c.refused || source.standIns.has(c.code)) r.execResult.executionGasUsed = c.node < c.limit ? c.node : c.limit;
         // Calldata a function of the token's can't decode: the chain reverts with the call's selector, the reference
         // empty (its only empty revert: base-std's references revert with an error everywhere else). Measured on
@@ -1456,36 +1500,71 @@ export class ForkSimulator implements Simulator {
           } else {
             if (f.call.type !== 'create' && f.call.type !== 'create2' && ex.returnValue.length) f.call.output = bytesToHex(ex.returnValue);
             owned.set(f.call, (ex.logs ?? []).filter(l => !f.under.has(l)));
-            if (parent) for (const l of ex.logs ?? []) parent.under.add(l);
+            // (What the factory's reference calls is left out of the tree, below: its events are the factory's.)
+            if (parent && !(chainId === BASE && parent.call.to === B20_FACTORY)) for (const l of ex.logs ?? []) parent.under.add(l);
           }
           // A B20 token asking a registry (its reference calls it; the node's token reads the registry's storage
           // itself, with no call) is left out of the tree: the chain's own trace has no such call.
           const inToken = !!parent && chainId === BASE && !!parent.call.to && B20.test(parent.call.to) && !!f.call.to && f.call.to in BASE_REGISTRIES;
-          if (parent && !inToken) (parent.call.calls ??= []).push(f.call);
+          // The same for what Base's factory calls (the registry, the token it creates, the cheatcodes it writes
+          // the token with): the chain's factory writes the token itself, its trace one call whose events are all
+          // there.
+          const inFactory = !!parent && chainId === BASE && parent.call.to === B20_FACTORY;
+          if (parent && !inToken && !inFactory) (parent.call.calls ??= []).push(f.call);
           else if (!parent) root = f;
         }
         next?.();
       });
     }
-    if (chainId === BASE) evm.events!.on('beforeMessage', async (m: { to?: Address; _codeAddress?: Address; data: Uint8Array; value: bigint; gasLimit: bigint; isCompiled: boolean; code?: unknown }, next?: () => void) => {
+    type BaseMessage = { to?: Address; _codeAddress?: Address; caller: Address; data: Uint8Array; value: bigint; gasLimit: bigint; isCompiled: boolean; code?: unknown };
+    const onBaseMessage = async (m: BaseMessage) => {
+      // The factory's reference writing a new token (vm.etch, vm.store; vm.load reads): answered as the chain's
+      // factory writes it, in the token's own account. Its code becomes the chain's marker, and a store is an
+      // SSTORE run in the token's storage, so it is priced as one, cold or warm, as chargeStep counts it.
+      if (m.to?.toString() === HEVM && m.caller.toString() === B20_FACTORY && m.data.length >= 68) {
+        const word = (i: number) => m.data.subarray(4 + 32 * i, 36 + 32 * i), at = createAddressFromString(bytesToHex(word(0).subarray(12)));
+        const selector = bytesToHex(m.data.subarray(0, 4));
+        if (selector === '0xb4d6c782') { // etch(address,bytes)
+          const offset = 4 + Number(BigInt(bytesToHex(word(1)))), length = Number(BigInt(bytesToHex(m.data.subarray(offset, offset + 32))));
+          await state.putCode(at, m.data.slice(offset + 32, offset + 32 + length));
+          // (Writing the token: B20_CREATED_GAS, charged here so that a creation short of it runs out, as the node's.)
+          if (charging?.code === B20_FACTORY) charging.node += (B20_CREATED_GAS[at.toString().slice(22, 24)] ?? 0n) + (charging.admin ? B20_ADMIN_GAS : 0n);
+          m.code = RETURN_ONE;
+        } else if (selector === '0x70ca10bb') { // store(address,bytes32,bytes32)
+          m.to = at; m._codeAddress = at;
+          m.code = new Uint8Array([0x7f, ...word(2), 0x7f, ...word(1), 0x55, ...RETURN_ONE]);
+        } else if (selector === '0x667f9d70') { // load(address,bytes32)
+          m.code = new Uint8Array([0x7f, ...setLengthLeft(await state.getStorage(at, word(1)), 32), 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        }
+        opened.push(undefined);
+        return;
+      }
       const code = (m._codeAddress ?? m.to)?.toString();
       // The chain's B20 tokens and registries refuse to run as another contract's code (DELEGATECALL, CALLCODE):
       // DelegateCallNotAllowed(), charging that frame nothing. (A token's own calls to itself, announce's, run.) Sent value, they refuse it
       // before anything else, whatever the function, with NonPayable(), and the node charges the call nothing
       // (measured on Base: a value call's frame used no gas, the token's or a registry's, the calldata's size
       // whatever it was); the references' own functions would revert empty.
-      const native = !!code && (B20_PRECOMPILE.test(code) || code in BASE_REGISTRIES);
+      const native = !!code && (B20_PRECOMPILE.test(code) || code in BASE_REGISTRIES || code === B20_FACTORY);
       const delegated = native && !!m.to && m.to.toString() !== code, refused = native && !delegated && m.value > 0n;
       if (delegated) m.code = NO_DELEGATECALL;
       else if (refused) m.code = NON_PAYABLE;
-      else if (native) { const ref = await standInFor(state, chainId, code!, source.time); if (ref) { m.code = ref; source.standIns.add(code!); } }
+      // A token's address with no token yet (variant 00 or 01): the node reverts with no data and charges what it
+      // charges any call (measured: decimals() there 21,170 gas in all).
+      let empty = false;
+      if (!delegated && !refused && native) { const ref = await standInFor(state, chainId, code!, source.time); if (ref) { m.code = ref; source.standIns.add(code!); } else if (B20_PRECOMPILE.test(code!) && (await state.getCode(createAddressFromString(code!))).length === 0) { m.code = NO_TOKEN; empty = true; } }
       if (native) reached.add(code!);
       if (!charging && native) {
-        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : 100n + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated, ...(m.data.length >= 4 && { selector: m.data.slice(0, 4) }) });
+        opened.push(charging = { code, limit: m.gasLimit, node: refused || delegated ? 0n : (code === B20_FACTORY ? 0n : 100n) + 6n * BigInt(Math.ceil(m.data.length / 32)), refused: refused || delegated || empty, ...(m.data.length >= 4 && !empty && { selector: m.data.slice(0, 4) }), ...(code === B20_FACTORY && { admin: namesAdmin(m.data) }) });
         m.gasLimit += NATIVE_SPARE_GAS;
         evm.events!.on('step', chargeStep);
       } else opened.push(charging && code && (m.isCompiled || evm.precompiles.has(code.slice(2))) ? 'precompile' : undefined);
-      next?.();
+    };
+    // (The message always goes on, with what was found pushed once: a read that fails here, a block before Base's
+    // upgrade, fails again as the EVM loads the code, and says why there.)
+    if (chainId === BASE) evm.events!.on('beforeMessage', async (m: BaseMessage, next?: () => void) => {
+      const before = opened.length;
+      try { await onBaseMessage(m); } catch { /* see above */ } finally { if (opened.length === before) opened.push(undefined); next?.(); }
     });
     /** The finished trace of the call just run: each frame's events numbered by their place among the call's. */
     const traceOf = (logs: unknown[]): TraceCall | undefined => {
@@ -1541,7 +1620,7 @@ export class ForkSimulator implements Simulator {
         // (Base's tokens run their references here too: see standInFor.)
         if (chainId === BASE) pre.events!.on('beforeMessage', async (m: { to?: Address; _codeAddress?: Address; code?: unknown }, next?: () => void) => {
           const code = (m._codeAddress ?? m.to)?.toString();
-          if (code && m.to?.toString() === code && (B20_PRECOMPILE.test(code) || code in BASE_REGISTRIES)) { const ref = await standInFor(preState, chainId, code, source.time); if (ref) m.code = ref; }
+          if (code && m.to?.toString() === code && (B20_PRECOMPILE.test(code) || code in BASE_REGISTRIES || code === B20_FACTORY)) { const ref = await standInFor(preState, chainId, code, source.time); if (ref) m.code = ref; }
           next?.();
         });
       }
@@ -1578,7 +1657,7 @@ export class ForkSimulator implements Simulator {
       await evm.journal.cleanup();
       state.originalStorageCache.clear();
       // (An address that isn't a precompile on this chain is an account like any other: cold until touched.)
-      for (const a of [caller, target, block.header.coinbase.toString(), ...(chainId === BASE ? Object.keys(BASE_REGISTRIES).map(r => r.slice(2)) : []), ...[...evm.precompiles.keys()].filter(k => !absent.some(x => x.address.slice(2) === k))]) evm.journal.addAlwaysWarmAddress(a);
+      for (const a of [caller, target, block.header.coinbase.toString(), ...(chainId === BASE ? [...Object.keys(BASE_REGISTRIES), B20_FACTORY].map(r => r.slice(2)) : []), ...[...evm.precompiles.keys()].filter(k => !absent.some(x => x.address.slice(2) === k))]) evm.journal.addAlwaysWarmAddress(a);
       for (const e of req.accessList ?? []) { evm.journal.addAlwaysWarmAddress(e.address); for (const k of e.storageKeys) evm.journal.addAlwaysWarmSlot(e.address, k); }
       // The sender's nonce goes up first, then the EIP-7702 authorizations apply (and stay, whatever the call does).
       const sender = createAddressFromString(caller);

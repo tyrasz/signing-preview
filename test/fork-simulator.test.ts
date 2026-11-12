@@ -2,7 +2,7 @@
 // without eth_simulateV1), run against real contracts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, serializeSignature, toHex, type Hex } from 'viem';
+import { decodeFunctionResult, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, parseAbi, serializeSignature, toHex, type Hex } from 'viem';
 import { privateKeyToAccount, sign } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { PERMIT2, StaticTokenRegistry } from '../src/chains.ts';
@@ -599,6 +599,32 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   await chain.putCode(DELEGATED, `0xef0100${TOKEN.slice(2)}`);
   const halted = (await base.simulate({ chainId: 8453, from: USER, to: DELEGATED, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, gas: 100_000n, at: { block: 'latest', header } }))!;
   assert.deepEqual([halted.status, halted.gasUsed], ['reverted', 100_000n]);
+  // Base's factory (no code on the chain, listed as a precompile) runs its reference too: a token it creates is
+  // written where the chain's factory writes it, with the marker for code, and answers as the chain's would.
+  const FACTORY = '0xb20f000000000000000000000000000000000000', ACTIVATION = '0x8453000000000000000000000000000000000001';
+  const assetFeature = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }], ['0xcdcc772fe4cbdb1029f822861176d09e646db96723d4c1e82ddfdeb8163ef54c', 0x43ee1bbe25e988521cccd8b2c8fbd38c8287ebff8e074e825a70dfd3885cce00n]));
+  await chain.evm.stateManager.putStorage(createAddressFromString(ACTIVATION), hexToBytes(assetFeature), word(1n));
+  const factory = parseAbi(['function createB20(uint8 variant, bytes32 salt, bytes params, bytes[] initCalls) payable returns (address)']);
+  const params = encodeAbiParameters([{ type: 'tuple', components: [{ type: 'uint8' }, { type: 'string' }, { type: 'string' }, { type: 'address' }, { type: 'uint8' }] }], [[1, 'New Token', 'NEW', '0x0000000000000000000000000000000000000000', 18]]);
+  const salt = `0x${'11'.repeat(32)}` as Hex;
+  const mint = encodeFunctionData({ abi: parseAbi(['function mint(address,uint256)']), functionName: 'mint', args: [USER as Hex, 1_000n] });
+  const create: SimulationRequest = { chainId: 8453, from: USER, to: FACTORY, data: encodeFunctionData({ abi: factory, functionName: 'createB20', args: [0, salt, params, [mint]] }), value: 0n, at: { block: 'latest', header } };
+  const NEW = `0xb2${'00'.repeat(10)}${keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes32' }], [USER as Hex, salt])).slice(2, 20)}`;
+  const [made] = (await base.trace([create]))!;
+  assert.deepEqual([made.status, made.returnData?.slice(26)], ['success', NEW.slice(2)]);
+  // B20Created from the factory, then the mint's Transfer from the token: one call in the trace, both its events.
+  assert.deepEqual(made.logs!.map(l => [l.address, l.topics[0].slice(0, 10)]), [[FACTORY, '0xfd9bf273'], [NEW, '0xddf252ad']]);
+  assert.deepEqual([made.trace!.calls ?? [], made.trace!.logs?.length], [[], 2]);
+  // (The factory, the activation registry it asks, the token, and the policy registry the mint asks.)
+  assert.deepEqual(made.standIns, [FACTORY, '0x8453000000000000000000000000000000000001', NEW, '0x8453000000000000000000000000000000000002']);
+  // Read back after it in the same batch: its symbol and the minted balance; and made again, refused (TokenAlreadyExists).
+  const readNew = parseAbi(['function symbol() view returns (string)', 'function balanceOf(address) view returns (uint256)']);
+  const [, symbol, held, again] = (await base.simulateBatch([create, { ...create, to: NEW, data: encodeFunctionData({ abi: readNew, functionName: 'symbol' }) }, { ...create, to: NEW, data: encodeFunctionData({ abi: readNew, functionName: 'balanceOf', args: [USER as Hex] }) }, create]))!;
+  assert.deepEqual([decodeFunctionResult({ abi: readNew, functionName: 'symbol', data: symbol.returnData! as Hex }), BigInt(held.returnData!)], ['NEW', 1_000n]);
+  assert.deepEqual([again.status, again.returnData?.slice(0, 10)], ['reverted', '0x15ef3a57']);
+  // An address of the token kind with no token yet reverts with nothing, as on the chain.
+  const unborn = (await base.simulate({ chainId: 8453, from: USER, to: '0xb200000000000000000000fedcba9876543210ff', data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header } }))!;
+  assert.deepEqual([unborn.status, unborn.returnData ?? '0x'], ['reverted', '0x']);
   // Not at a block from before that upgrade, when Base ran its tokens by other rules: refused, as before.
   await assert.rejects(base.simulate({ chainId: 8453, from: USER, to: TOKEN, data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header: { ...header, timestamp: 1_793_901_599n } } }),
     (e: unknown) => e instanceof ForkUnsupported && /from Base's upgrade of 2026-11-05 on/.test(e.message));

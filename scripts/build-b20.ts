@@ -9,9 +9,12 @@
 // run. The Base Standard Library (github.com/base/base-std) ships a Solidity reference for each of them, which Base
 // keeps behaving like the Rust precompiles and storing state in the same slots (its suite runs against both): the
 // token variants (MockB20Asset, MockB20Stablecoin) and the registries a token asks on every transfer
-// (MockPolicyRegistry, MockActivationRegistry). Compiled here, they run in the local EVM in place of the markers, on
-// the chain's own storage (src/fork-simulator.ts: nativeStandIn). The factory's reference isn't among them: it
-// creates tokens with test-only cheatcodes, so a creation is still refused.
+// (MockPolicyRegistry, MockActivationRegistry), and the factory that creates tokens (MockB20Factory). Compiled here,
+// they run in the local EVM in place of the markers, on the chain's own storage (src/fork-simulator.ts:
+// nativeStandIn). The factory writes a new token's state with two of Foundry's cheatcodes, vm.etch and vm.store,
+// which the local EVM answers for it: the token's code becomes the chain's marker, and each store is a write to the
+// token's own storage, priced as one (src/fork-simulator.ts). Its Vm interface is the two functions it calls, here
+// (VM_SOURCE), not forge-std's.
 //
 // The sources are base/base-std's `main` as fetched on 2026-11-12 (raw.githubusercontent.com), kept in
 // vendor/base-std with its licence (MIT) and checked against a sha256 over them (each path and content, in path
@@ -21,11 +24,15 @@
 // shows there first) and prints the new hash, to be checked against the chain before it replaces SOURCES_SHA256.
 // The compiler is this repository's solc (package.json), so the output depends on nothing else.
 //
-// Checked against the live precompiles call by call (188 calls to a token, 372 to the registries), the references
-// differ in a few ways, patched here (PATCHES) so that they do what the chain does:
+// Checked against the live precompiles call by call (188 calls to a token, 372 to the registries, 141 creations and
+// what the tokens answered after), the references differ in a few ways, patched here (PATCHES) so that they do what
+// the chain does:
 //   - the token's bootstrap window: the reference lets the factory skip every role and policy check until a flag it
-//     alone stores is set; the chain never stores that flag, so read from the chain's storage the window was open
-//     for any call from the factory's address. Every token the local EVM meets is past it: closed.
+//     alone stores is set; the chain never stores that flag (a created token's slot for it is 0), so read from the
+//     chain's storage the window would be open for good. It is open to the factory's calls alone, which it makes
+//     only to the token it is creating, as it creates it: on the chain, the same. The factory writes no flag, and
+//     answers isB20Initialized by whether the token exists, as the chain does (measured: true for a created token,
+//     false for an address with none). It etches the chain's marker, not the reference's code.
 //   - permit to spender 0 (after the signature checks): the chain refuses it (InvalidSpender), the reference didn't;
 //   - MAX_SUPPLY_CAP() and the policy registry's ALWAYS_ALLOW_ID() and ALWAYS_BLOCK_ID() are the references' own:
 //     the chain has no such functions;
@@ -51,23 +58,37 @@ const FILES = [
   'src/interfaces/IB20Stablecoin.sol', 'src/interfaces/IERC165.sol', 'src/interfaces/IERC8056.sol', 'src/interfaces/IPolicyRegistry.sol',
   'src/lib/B20Constants.sol', 'src/lib/B20FactoryLib.sol',
   'test/lib/mocks/ActivationRegistryFeatureList.sol', 'test/lib/mocks/MockActivationRegistry.sol', 'test/lib/mocks/MockActivationRegistryStorage.sol',
-  'test/lib/mocks/MockB20.sol', 'test/lib/mocks/MockB20Asset.sol', 'test/lib/mocks/MockB20Stablecoin.sol', 'test/lib/mocks/MockB20Storage.sol',
+  'test/lib/mocks/MockB20.sol', 'test/lib/mocks/MockB20Asset.sol', 'test/lib/mocks/MockB20Factory.sol', 'test/lib/mocks/MockB20Stablecoin.sol', 'test/lib/mocks/MockB20Storage.sol',
   'test/lib/mocks/MockPolicyRegistry.sol', 'test/lib/mocks/MockPolicyRegistryStorage.sol',
 ] as const;
-const SOURCES_SHA256 = '5dca0a63ed0227de56168e0d92b5a8fe180bc488f1e98e903400179534bf1589';
+const SOURCES_SHA256 = '7b5172add3d241aac80c4be0b0183cb0ef316b7981dd083f03e52a59d32635f9';
 /** The contracts written out, by the name the generated file gives each one's runtime code. */
 const OUTPUTS = {
   B20_ASSET_CODE: ['test/lib/mocks/MockB20Asset.sol', 'MockB20Asset'],
   B20_STABLECOIN_CODE: ['test/lib/mocks/MockB20Stablecoin.sol', 'MockB20Stablecoin'],
   POLICY_REGISTRY_CODE: ['test/lib/mocks/MockPolicyRegistry.sol', 'MockPolicyRegistry'],
   ACTIVATION_REGISTRY_CODE: ['test/lib/mocks/MockActivationRegistry.sol', 'MockActivationRegistry'],
+  B20_FACTORY_CODE: ['test/lib/mocks/MockB20Factory.sol', 'MockB20Factory'],
 } as const;
+/**
+ * The cheatcodes the factory calls (forge-std's Vm, cut to them): the local EVM answers them for the factory alone.
+ * etch and store return a word here (forge-std's return nothing), so that the compiled call doesn't first check the
+ * address has code, which the cheatcodes' hasn't; the local EVM's answer is that word.
+ */
+const VM_SOURCE = `// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+interface Vm {
+    function etch(address target, bytes calldata newRuntimeBytecode) external returns (bool);
+    function store(address target, bytes32 slot, bytes32 value) external returns (bool);
+    function load(address target, bytes32 slot) external view returns (bytes32 data);
+}
+`;
 /** Base's activation registry admin (its admin() on the chain: the chain configuration's, the registry storing none). */
 const ACTIVATION_ADMIN = getAddress('0xce3a3bee7e72e2a24079f3c0cb3b97740ed425a9');
 /** The changes made to the sources before compiling (see the top of the file): each must occur exactly once. */
 const PATCHES: Record<string, [string, string][]> = {
   'test/lib/mocks/MockB20.sol': [
-    ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return false;\n'],
+    ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return msg.sender == FACTORY;\n'],
     ['            revert InvalidSigner(recovered, owner);\n        }\n', '            revert InvalidSigner(recovered, owner);\n        }\n        if (spender == address(0)) revert InvalidSpender(spender);\n'],
     ['    uint256 public constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;', '    uint256 internal constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;'],
     ['    function _isPrivileged() internal view returns (bool) {', `    fallback() external payable {
@@ -84,6 +105,21 @@ const PATCHES: Record<string, [string, string][]> = {
   'test/lib/mocks/MockPolicyRegistry.sol': [
     ['    uint64 public constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;', '    uint64 internal constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;'],
     ['    uint64 public constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;', '    uint64 internal constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;'],
+  ],
+  'test/lib/mocks/MockB20Factory.sol': [
+    // The token's code is the chain's marker, not the reference's (which the local EVM gives a call to it).
+    ['            vm.etch(token, type(MockB20Asset).runtimeCode);', '            vm.etch(token, hex"ef");'],
+    ['            vm.etch(token, type(MockB20Stablecoin).runtimeCode);', '            vm.etch(token, hex"ef");'],
+    // No initialized flag: the chain stores none (a created token's slot for it is 0), and has a token initialized
+    // once it exists.
+    ['        _writeUint(token, MockB20Storage.initializedSlot(), 1);', '        // (The chain stores no initialized flag: the window closes as the factory never calls the token again.)'],
+    ['        return uint256(vm.load(token, MockB20Storage.initializedSlot())) != 0;', '        return token.code.length != 0;'],
+    // An init call the token can't dispatch (a function it hasn't, or calldata too short for a selector) fails the
+    // creation with InitCallFailed(i) on the chain, where the reference passed on the token's answer, the selector
+    // (measured: 0xdeadbeef, 0x12; an error the token raises, SupplyCapExceeded, is passed on by both).
+    ['                if (reason.length > 0) {', '                if (reason.length > 0 && !(reason.length == 4 && (initCalls[i].length < 4 || bytes4(reason) == bytes4(initCalls[i])))) {'],
+    // (The token's patched fallback is payable: the cast says so.)
+    ['            MockB20(token).grantRole(DEFAULT_ADMIN_ROLE, admin);', '            MockB20(payable(token)).grantRole(DEFAULT_ADMIN_ROLE, admin);'],
   ],
   'test/lib/mocks/MockActivationRegistry.sol': [
     ['    address internal constant ADMIN = 0xCB00000000000000000000000000000000000000;', `    address internal constant ADMIN = ${ACTIVATION_ADMIN};`],
@@ -125,7 +161,7 @@ if (args.includes('--update')) {
 const files = read();
 if (hashOf(files) !== SOURCES_SHA256) throw new Error(`vendor/base-std doesn't match its pinned hash (${hashOf(files)}): pin it as SOURCES_SHA256 only once it is checked against the chain`);
 const solc = createRequire(import.meta.url)('solc') as { compile(input: string): string; version(): string };
-const input = { language: 'Solidity', sources: Object.fromEntries(Object.entries(files).map(([k, content]) => [k, { content: patched(k, content) }])), settings: { ...SETTINGS, outputSelection: { '*': { '*': ['evm.deployedBytecode.object', 'evm.deployedBytecode.immutableReferences'] } } } };
+const input = { language: 'Solidity', sources: { ...Object.fromEntries(Object.entries(files).map(([k, content]) => [k, { content: patched(k, content) }])), 'forge-std/Vm.sol': { content: VM_SOURCE } }, settings: { ...SETTINGS, outputSelection: { '*': { '*': ['evm.deployedBytecode.object', 'evm.deployedBytecode.immutableReferences'] } } } };
 const out = JSON.parse(solc.compile(JSON.stringify(input))) as { errors?: { severity: string; formattedMessage: string }[]; contracts: Record<string, Record<string, { evm: { deployedBytecode: { object: string; immutableReferences?: Record<string, unknown> } } }>> };
 const errors = (out.errors ?? []).filter(e => e.severity === 'error');
 if (errors.length) throw new Error(errors.map(e => e.formattedMessage).join('\n'));
