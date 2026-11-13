@@ -29,10 +29,16 @@
 // the chain does:
 //   - the token's bootstrap window: the reference lets the factory skip every role and policy check until a flag it
 //     alone stores is set; the chain never stores that flag (a created token's slot for it is 0), so read from the
-//     chain's storage the window would be open for good. It is open to the factory's calls alone, which it makes
-//     only to the token it is creating, as it creates it: on the chain, the same. The factory writes no flag, and
-//     answers isB20Initialized by whether the token exists, as the chain does (measured: true for a created token,
-//     false for an address with none). It etches the chain's marker, not the reference's code.
+//     chain's storage the window would be open for good. The chain's factory is native code that calls a token only
+//     as it creates it, so the window is open only then: to calls from the factory's address while the local EVM
+//     runs the factory's creation of that token, which it marks in the token's transient storage
+//     (B20_BOOTSTRAP_SLOT, from the factory's vm.etch of the token to the end of its createB20). A transaction sent
+//     from the factory's own address, which only a simulation can send, is an ordinary caller, as on the chain
+//     (measured: mint, burn, seize, grantRole, pause, setters and transfers from 0xb20f… refused or checked as
+//     anyone's), and so is grantInitialAdmin, this patch's own (below), refused with its selector as a function the
+//     token hasn't. The factory writes no flag, and answers isB20Initialized by whether the token exists, as the
+//     chain does (measured: true for a created token, false for an address with none). It etches the chain's
+//     marker, not the reference's code.
 //   - permit to spender 0 (after the nonce is written, as the chain writes it once the signature verifies): the
 //     chain refuses it (InvalidSpender), the reference didn't;
 //   - MAX_SUPPLY_CAP() and the policy registry's ALWAYS_ALLOW_ID() and ALWAYS_BLOCK_ID() are the references' own:
@@ -81,7 +87,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { getAddress } from 'viem';
+import { getAddress, keccak256, toHex } from 'viem';
 
 const root = new URL('..', import.meta.url).pathname;
 const BASE = 'https://raw.githubusercontent.com/base/base-std/main/';
@@ -117,6 +123,12 @@ interface Vm {
     function load(address target, bytes32 slot) external view returns (bytes32 data);
 }
 `;
+/**
+ * Where the local EVM marks a token's bootstrap window, in the token's transient storage (EIP-1153): set as the factory's
+ * reference etches the token, cleared as its createB20 ends (src/fork-simulator.ts). Nothing else can write a token's
+ * transient storage: its code is the marker, and the local EVM runs its reference at its own address alone.
+ */
+const B20_BOOTSTRAP_SLOT = keccak256(toHex('signing-preview.b20.bootstrap'));
 /** Base's activation registry admin (its admin() on the chain: the chain configuration's, the registry storing none). */
 const ACTIVATION_ADMIN = getAddress('0xce3a3bee7e72e2a24079f3c0cb3b97740ed425a9');
 /** The changes made to the sources before compiling (see the top of the file): each must occur exactly once. */
@@ -124,7 +136,9 @@ const ACTIVATION_ADMIN = getAddress('0xce3a3bee7e72e2a24079f3c0cb3b97740ed425a9'
 const ARRAY_ARGUMENT = /(?:address|uint64)\[\] calldata (\w+)/;
 const PATCHES: Record<string, [string, string][]> = {
   'test/lib/mocks/MockB20.sol': [
-    ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return msg.sender == FACTORY;\n'],
+    // The bootstrap window: open to the factory's calls only while the local EVM runs its creation of this token (the
+    // mark in the token's transient storage, B20_BOOTSTRAP_SLOT), not to a transaction sent from its address.
+    ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return msg.sender == FACTORY && _bootstrapping();\n'],
     // (After the nonce is written: the node writes it, and charges it, once the signature verifies.)
     ['            $.nonces[owner] = nonce + 1;\n        }\n', '            $.nonces[owner] = nonce + 1;\n        }\n        if (spender == address(0)) revert InvalidSpender(spender);\n'],
     // The default admin role granted under the factory's bootstrap (an init call): the chain reads the admin count
@@ -142,7 +156,7 @@ const PATCHES: Record<string, [string, string][]> = {
     function grantInitialAdmin(address account) external {
         bool done;
         assembly { done := tload(0x5f0b4a63c4f34c1c1b0e3f6b9b9d0b6b2f2f8f6f0e3c1a7a2b6d5e4c3b2a1900) }
-        if (msg.sender != FACTORY || done) {
+        if (!_isPrivileged() || done) {
             assembly { mstore(0, shl(224, 0x62a80d42)) revert(0, 4) }
         }
         assembly { tstore(0x5f0b4a63c4f34c1c1b0e3f6b9b9d0b6b2f2f8f6f0e3c1a7a2b6d5e4c3b2a1900, 1) }
@@ -230,6 +244,11 @@ const PATCHES: Record<string, [string, string][]> = {
             if gt(calldatasize(), 3) { mstore(0, calldataload(0)) }
             revert(0, 4)
         }
+    }
+
+    /// Whether the factory is creating this token: marked by the local EVM in its transient storage.
+    function _bootstrapping() internal view returns (bool open) {
+        assembly { open := iszero(iszero(tload(${B20_BOOTSTRAP_SLOT}))) }
     }
 
     function _isPrivileged() internal view returns (bool) {`],
@@ -402,7 +421,7 @@ const PATCHES: Record<string, [string, string][]> = {
     ['            vm.etch(token, type(MockB20Stablecoin).runtimeCode);', '            vm.etch(token, hex"ef");'],
     // No initialized flag: the chain stores none (a created token's slot for it is 0), and has a token initialized
     // once it exists.
-    ['        _writeUint(token, MockB20Storage.initializedSlot(), 1);', '        // (The chain stores no initialized flag: the window closes as the factory never calls the token again.)'],
+    ['        _writeUint(token, MockB20Storage.initializedSlot(), 1);', '        // (The chain stores no initialized flag: the window closes as this creation ends, src/fork-simulator.ts.)'],
     ['        return uint256(vm.load(token, MockB20Storage.initializedSlot())) != 0;', '        return token.code.length != 0;'],
     // A stablecoin's currency is checked after the factory finds whether the token exists (measured: re-creating one
     // with a bad currency fails TokenAlreadyExists on the chain), not before it works out the address.
@@ -477,6 +496,9 @@ const text = `// Generated by scripts/build-b20.ts (npm run build:b20): do not e
 
 /** Where the code came from. */
 export const B20_REFERENCE = { source: 'base/base-std main', sourcesSha256: '${SOURCES_SHA256}', solc: '${solc.version()}' } as const;
+
+/** Where a token's bootstrap window is marked, in its transient storage, while the factory's reference creates it. */
+export const B20_BOOTSTRAP_SLOT = '${B20_BOOTSTRAP_SLOT}';
 ${codes.map(([name, code]) => `\nexport const ${name} = '${code}';`).join('')}
 `;
 const target = join(root, 'src', 'b20-reference.ts');

@@ -655,6 +655,27 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   const [, symbol, held, again] = (await base.simulateBatch([create, { ...create, to: NEW, data: encodeFunctionData({ abi: readNew, functionName: 'symbol' }) }, { ...create, to: NEW, data: encodeFunctionData({ abi: readNew, functionName: 'balanceOf', args: [USER as Hex] }) }, create]))!;
   assert.deepEqual([decodeFunctionResult({ abi: readNew, functionName: 'symbol', data: symbol.returnData! as Hex }), BigInt(held.returnData!)], ['NEW', 1_000n]);
   assert.deepEqual([again.status, again.returnData?.slice(0, 10)], ['reverted', '0x15ef3a57']);
+  // A transaction sent from the factory's own address, which only a simulation can send, is any caller's, as on
+  // Base's node, whose factory is native code: the token's bootstrap window is open to the factory only as it
+  // creates the token (above, its init call's mint). A mint is refused for the role (AccessControlUnauthorizedAccount
+  // of the factory's address and MINT_ROLE), the reference's own grantInitialAdmin with its selector, as a function
+  // the token hasn't, and a store at the cheatcodes' address, an empty account, does nothing.
+  const asFactory = (to: string, data: Hex): SimulationRequest => ({ chainId: 8453, from: FACTORY, to, data, value: 0n, at: { block: 'latest', header } });
+  const mintRole = keccak256(toHex('MINT_ROLE'));
+  const minted = (await base.simulate(asFactory(TOKEN, encodeFunctionData({ abi: parseAbi(['function mint(address,uint256)']), functionName: 'mint', args: [BOB, 1n] }))))!;
+  assert.deepEqual([minted.status, minted.returnData, minted.logs ?? []], ['reverted', `0xe2517d3f${FACTORY.slice(2).padStart(64, '0')}${mintRole.slice(2)}`, []]);
+  const granted = (await base.simulate(asFactory(TOKEN, encodeFunctionData({ abi: parseAbi(['function grantInitialAdmin(address)']), functionName: 'grantInitialAdmin', args: [BOB] }))))!;
+  assert.deepEqual([granted.status, granted.returnData], ['reverted', '0x62a80d42']);
+  const store = encodeFunctionData({ abi: parseAbi(['function store(address,bytes32,bytes32)']), functionName: 'store', args: [TOKEN, balanceSlot(BOB) as Hex, toHex(10n ** 30n, { size: 32 })] });
+  const [stored, bobs] = (await base.simulateBatch([asFactory('0x7109709ecfa91a80626ff3989d68f67f5b1dd12d', store), { ...asFactory(TOKEN, encodeFunctionData({ abi: readNew, functionName: 'balanceOf', args: [BOB] })), from: USER }]))!;
+  assert.deepEqual([stored.status, stored.returnData ?? '0x', BigInt(bobs.returnData!)], ['success', '0x', 0n]);
+  // And a precompile moved onto a registry's address runs there for it as for anyone (it is a registry only to a
+  // token's or the factory's reference that asks it, whose read of the registry's storage the node makes itself).
+  const recover = `0x${'11'.repeat(32)}${'00'.repeat(31)}1b${'22'.repeat(32)}${'33'.repeat(32)}` as Hex;
+  const moved = { '0x0000000000000000000000000000000000000001': { movePrecompileToAddress: '0x8453000000000000000000000000000000000002' } };
+  const [fromFactory, fromUser] = await Promise.all([FACTORY, USER].map(async from => (await base.simulate({ ...asFactory('0x8453000000000000000000000000000000000002', recover), from, stateOverrides: moved }))!));
+  assert.deepEqual([fromFactory.status, fromFactory.returnData, fromFactory.gasUsed], ['success', fromUser.returnData, fromUser.gasUsed]);
+  assert.equal(fromFactory.returnData?.length, 66);
   // An address of the token kind with no token yet reverts with nothing, as on the chain.
   const unborn = (await base.simulate({ chainId: 8453, from: USER, to: '0xb200000000000000000000fedcba9876543210ff', data: encodeFunctionData({ abi: erc20, functionName: 'decimals' }), value: 0n, at: { block: 'latest', header } }))!;
   assert.deepEqual([unborn.status, unborn.returnData ?? '0x'], ['reverted', '0x']);

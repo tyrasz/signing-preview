@@ -21,7 +21,7 @@ import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2, PRECOMPILE_SCALE } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
-import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_FACTORY_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
+import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_BOOTSTRAP_SLOT, B20_FACTORY_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
 import { formatUnits } from './format.ts';
 import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
@@ -1006,9 +1006,18 @@ const B20_FACTORY = '0xb20f000000000000000000000000000000000000', B20_PRECOMPILE
 const baseNative = (a: string) => B20_PRECOMPILE.test(a) || a in BASE_REGISTRIES || a === B20_FACTORY;
 /**
  * Foundry's cheatcode address, which the factory's reference calls to write a new token's state (vm.etch, vm.store):
- * answered for the factory alone (see the run's hooks), an empty account to anyone else, as on the chain.
+ * answered for the factory's reference alone (see the run's hooks), an empty account to anyone else, as on the chain
+ * (a transaction sent from the factory's address included: measured on Base, a store or etch there does nothing).
  */
 const HEVM = '0x7109709ecfa91a80626ff3989d68f67f5b1dd12d';
+/**
+ * A token's bootstrap window (B20_BOOTSTRAP_SLOT, in its transient storage), which its reference opens to the factory's
+ * calls: marked as the factory's reference etches the token and cleared as its createB20 ends, so it is open while
+ * the factory creates the token and never to a transaction sent from the factory's address, which Base's node takes
+ * as any caller's (measured: mint, burn, seize, grantRole, pause and setters refused for the role, transfers checked
+ * against the policies). The chain's factory is native code that calls a token only as it creates it.
+ */
+const BOOTSTRAP_KEY = hexToBytes(B20_BOOTSTRAP_SLOT as Hex), BOOTSTRAP_OPEN = setLengthLeft(new Uint8Array([1]), 32);
 /**
  * What Base's node charges a creation beyond the storage it writes and the events it emits (which are charged as
  * a token's are), measured on its node by creations of each kind beside the local EVM's, each call's own gas timed
@@ -1065,8 +1074,8 @@ const SSTORE_SENTRY = 2_300n;
  * was given, as the node's: a call given its charge less a little runs out on the node, and one given a little more
  * than the charge succeeds; and whatever fails after it, an announce whose calls fail after its id is written).
  */
-const B20_WRITE_GAS: Record<string, (data: Uint8Array, call: { caller: string }) => bigint> = {
-  '0x1e4e0091': (_, call) => call.caller === B20_FACTORY ? 0n : -100n, // setRoleAdmin (as an init call, the reference reads as the node does)
+const B20_WRITE_GAS: Record<string, (data: Uint8Array, call: { bootstrap?: boolean }) => bigint> = {
+  '0x1e4e0091': (_, call) => call.bootstrap ? 0n : -100n, // setRoleAdmin (as an init call, in the bootstrap window, the reference reads as the node does)
   '0x595135dd': () => -100n, // announce
   '0x5ffe6146': () => 100n, // updateMultiplier (more when it clears a pending update: B20_ENDED_GAS)
   '0x2c97a0f0': () => 200n, // cancelUIMultiplierUpdate
@@ -1600,9 +1609,11 @@ export class ForkSimulator implements Simulator {
     // this, a transaction given just the gas it needed on the chain ran out locally (2 of 66). The registries and the
     // factory, called themselves, are charged so too, without the 100 (B20_EXISTS_GAS). A call whose charge passes
     // the gas it was given runs out there, as the node's.
-    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; looked?: boolean; hashed?: boolean; static?: boolean; hevmCold?: boolean };
+    type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; looked?: boolean; hashed?: boolean; static?: boolean; hevmCold?: boolean;
+      /** The token the factory's reference etched in this creation, whose bootstrap window it opened (BOOTSTRAP_KEY). */ created?: Address };
     /** A token's own call (not run as another's code, not refused): what is charged by its function (B20_WRITE_GAS, EIP-712). */
     type TokenCall = { code: string; caller: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean; written?: boolean; ended?: boolean; sloads: number; stored: Set<bigint>; topics: Set<bigint>;
+      /** The factory's call in its creation of the token (the bootstrap window: BOOTSTRAP_KEY), as its init calls are. */ bootstrap?: boolean;
       /** A multiplier view's first read of the pending slot (MULTIPLIER_VIEWS): its value on the stack at the next step, then seen. */ pending?: 'reading' | 'seen' };
     let charging: Charge | undefined;
     /** Each message's bookkeeping, popped as it ends: the charge it opened, a precompile, a token's own call. */
@@ -1730,6 +1741,8 @@ export class ForkSimulator implements Simulator {
         if (c.node > c.limit && ex.exceptionError?.error !== EVMError.errorMessages.OUT_OF_GAS) { ex.exceptionError = new EVMError(EVMError.errorMessages.OUT_OF_GAS); ex.returnValue = new Uint8Array(0); }
         // (The cheatcode address, which only the factory's reference calls, cold again, as it is on the chain.)
         if (c.hevmCold) (evm.journal as unknown as { journal: Map<string, unknown> }).journal.delete(HEVM.slice(2));
+        // (The created token's bootstrap window closed as the creation ends: undone with it where it failed.)
+        if (c.created) evm.transientStorage.put(c.created, BOOTSTRAP_KEY, new Uint8Array(32));
         if (c.refused || source.standIns.has(c.code)) ex.executionGasUsed = c.node < c.limit ? c.node : c.limit;
         // Calldata a function can't decode: the chain reverts with the call's selector (4 zero bytes for calldata
         // shorter than one), the reference empty (its only empty revert: base-std's references revert with an
@@ -1793,8 +1806,9 @@ export class ForkSimulator implements Simulator {
     const onBaseMessage = async (m: BaseMessage) => {
       // The factory's reference writing a new token (vm.etch, vm.store; vm.load reads): answered as the chain's
       // factory writes it, in the token's own account. Its code becomes the chain's marker, and a store is an
-      // SSTORE run in the token's storage, so it is priced as one, cold or warm, as chargeStep counts it.
-      if (m.to?.toString() === HEVM && m.caller.toString() === B20_FACTORY && m.data.length >= 68) {
+      // SSTORE run in the token's storage, so it is priced as one, cold or warm, as chargeStep counts it. (The
+      // reference alone: a transaction sent from the factory's address to the cheatcodes' finds an empty account.)
+      if (m.to?.toString() === HEVM && m.caller.toString() === B20_FACTORY && charging?.code === B20_FACTORY && m.data.length >= 68) {
         const word = (i: number) => m.data.subarray(4 + 32 * i, 36 + 32 * i), at = createAddressFromString(bytesToHex(word(0).subarray(12)));
         const selector = bytesToHex(m.data.subarray(0, 4));
         if (selector === '0xb4d6c782' && m.isStatic) {
@@ -1806,6 +1820,9 @@ export class ForkSimulator implements Simulator {
           await state.putCode(at, m.data.slice(offset + 32, offset + 32 + length));
           // (Writing the token: B20_CREATED_GAS, charged here so that a creation short of it runs out, as the node's.)
           if (charging?.code === B20_FACTORY) charging.node += B20_CREATED_GAS[at.toString().slice(22, 24)] ?? 0n;
+          // (Its bootstrap window opened to the factory's calls, for the rest of this creation: BOOTSTRAP_KEY.)
+          evm.transientStorage.put(at, BOOTSTRAP_KEY, BOOTSTRAP_OPEN);
+          if (charging) charging.created = at;
           // (An asset's multiplier, which the node writes as it creates one, is warm for the rest of the transaction:
           // an init call that reads it pays 100, not 2,100.)
           if (at.toString().slice(22, 24) === '00') evm.journal.addWarmedStorage(at.bytes, hexToBytes(`0x${ASSET_MULTIPLIER.toString(16).padStart(64, '0')}`));
@@ -1828,8 +1845,9 @@ export class ForkSimulator implements Simulator {
       // (Not where a precompile was moved for the simulation: that runs there, as on the node.)
       // (A registry a token's or the factory's reference calls, or the activation registry the policy registry's
       // writes ask, stays the registry, whatever was moved onto its address: on the node those are its own storage
-      // reads.)
-      const fromReference = baseNative(m.caller.toString());
+      // reads. Not for a transaction sent from one of these addresses, which only a simulation can send: for it, as
+      // for anyone's, the node runs what was moved there.)
+      const fromReference = m.depth > 0 && baseNative(m.caller.toString());
       const native = !!code && baseNative(code) && (!evm.precompiles.has(code.slice(2)) || (code in BASE_REGISTRIES && fromReference));
       const delegated = native && !!m.to && m.to.toString() !== code, refused = native && !delegated && m.value > 0n;
       if (delegated) m.code = NO_DELEGATECALL;
@@ -1852,7 +1870,8 @@ export class ForkSimulator implements Simulator {
         m.data = data;
       }
       const token: TokenCall | undefined = native && !delegated && !refused && !empty && B20_PRECOMPILE.test(code!)
-        ? { code: code!, caller: m.caller.toString(), depth: m.depth, selector, data: m.data, sloads: 0, stored: new Set(), topics: new Set(), ...(EIP712_FUNCTIONS.has(selector) && { eip712: true }) } : undefined;
+        ? { code: code!, caller: m.caller.toString(), depth: m.depth, selector, data: m.data, sloads: 0, stored: new Set(), topics: new Set(), ...(EIP712_FUNCTIONS.has(selector) && { eip712: true }),
+          ...(m.caller.toString() === B20_FACTORY && evm.transientStorage.get(createAddressFromString(code!), BOOTSTRAP_KEY)[31] === 1 && { bootstrap: true }) } : undefined;
       if (token) tokenCalls.push(token);
       if (!charging && native) {
         // (Short of a selector, the calldata's echo is four zero bytes.)
