@@ -1045,18 +1045,18 @@ const PANIC_ALLOCATION = `0x4e487b71${'41'.padStart(64, '0')}`;
 /** RoleGranted, RoleRevoked: renounceLastAdmin's 100 more after its write, at its RoleRevoked. */
 const ROLE_EVENTS = new Set([0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0dn, 0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171bn]);
 /**
- * A token's roles (roles[role][account]) and allowances (allowances[owner][spender]): mappings of mappings at
- * B20_LAYOUT + these. The reference reads a role's flag again to write it, the node once (100 less, at the write).
+ * A token's roles (roles[role][account]): a mapping of mappings at B20_LAYOUT + this. The reference reads a role's
+ * flag again to write it, the node once (100 less, at the write).
  */
-const ROLES_AT = 6n, ALLOWANCES_AT = 5n;
+const ROLES_AT = 6n;
 /**
  * roles[DEFAULT_ADMIN_ROLE], the mapping of its holders' flags, and its slot's preimage: the reference's compiler
  * works that slot out ahead where the role is a constant (the factory's grant of the initial admin), so a run never
  * hashes it.
  */
 const ADMIN_FLAGS = (() => { const p = setLengthLeft(hexToBytes(`0x${(B20_LAYOUT + ROLES_AT).toString(16)}`), 64); return { slot: keccak256(p), preimage: p }; })();
-/** renounceLastAdmin, and transferFrom and transferFromWithMemo, which spend an allowance (see chargeStep). */
-const RENOUNCE_LAST_ADMIN = '0x6f79e3d7', SPENDS_ALLOWANCE = new Set(['0x23b872dd', '0x929c2539']), TRANSFER_TOPIC = BigInt(TRANSFER);
+/** renounceLastAdmin (see chargeStep). */
+const RENOUNCE_LAST_ADMIN = '0x6f79e3d7';
 /** EIP-2200's sentry: an SSTORE fails with this much gas left or less. */
 const SSTORE_SENTRY = 2_300n;
 /**
@@ -1583,8 +1583,7 @@ export class ForkSimulator implements Simulator {
     type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; looked?: boolean; hashed?: boolean; static?: boolean; hevmCold?: boolean };
     /** A token's own call (not run as another's code, not refused): what is charged by its function (B20_WRITE_GAS, EIP-712). */
     type TokenCall = { code: string; caller: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean; written?: boolean; ended?: boolean; sloads: number; stored: Set<bigint>; topics: Set<bigint>;
-      /** A multiplier view's first read of the pending slot (MULTIPLIER_VIEWS): its value on the stack at the next step, then seen. */ pending?: 'reading' | 'seen';
-      /** The price of an allowance's write a transferFrom spends, charged after its Transfer (SPENDS_ALLOWANCE). */ spent?: bigint };
+      /** A multiplier view's first read of the pending slot (MULTIPLIER_VIEWS): its value on the stack at the next step, then seen. */ pending?: 'reading' | 'seen' };
     let charging: Charge | undefined;
     /** Each message's bookkeeping, popped as it ends: the charge it opened, a precompile, a token's own call. */
     const opened: { charge?: Charge; precompile?: boolean; token?: TokenCall; static?: boolean }[] = [];
@@ -1635,28 +1634,18 @@ export class ForkSimulator implements Simulator {
       // The function's own correction at its first write (B20_WRITE_GAS), and what its frame reads, writes and logs
       // (B20_ENDED_GAS); updateUIMultiplier writing the multiplier itself (a pending update that took effect) reads
       // it once more on the node.
-      if (charging && own && e.opcode.name === 'SSTORE') {
-        if (!t.written) { t.written = true; const fix = B20_WRITE_GAS[t.selector]; if (fix) charging.node += fix(t.data, t); }
-        // pause and unpause: the reference reads and writes the paused features again for each past the first, the
-        // node once (200 less each, as each is reached).
-        else if (t.selector === '0xa290249c' || t.selector === '0x8b93dd63') charging.node -= 200n;
-      }
+      if (charging && own && e.opcode.name === 'SSTORE' && !t.written) { t.written = true; const fix = B20_WRITE_GAS[t.selector]; if (fix) charging.node += fix(t.data, t); }
       if (charging && e.opcode.name === 'SSTORE' && e.stack?.length) {
         const mapping = nestedIn(e.stack[e.stack.length - 1]);
         // A role's flag written (ROLES_AT; in a static call too, where the write fails): renounceLastAdmin reads once
         // more than the reference before it (a static one is charged the reference's reads), and again after.
         if (own && mapping === ROLES_AT && t.selector !== RENOUNCE_LAST_ADMIN) charging.node -= 100n;
         // The sentry (above), as of the charge before this write, with what this step stands for before it: a
-        // function's first-write correction, pause's, a verified permit's read of its nonce, a role's flag read once.
-        // An allowance transferFrom spends the node writes after the transfer and its Transfer event (measured: a
-        // second transferFrom runs out until 2,201 over its charge, transferFromWithMemo 701, before its Memo): its
-        // write is checked and charged there, and one whose transfer fails is charged none of it (100 or 2,900 less).
-        if (!opened.at(-1)?.static) {
-          if (own && mapping === ALLOWANCES_AT && SPENDS_ALLOWANCE.has(t.selector)) { charging.node -= fee; t.spent = fee; }
-          else sentry(charging.node - fee);
-        }
+        // function's first-write correction, a verified permit's read of its nonce, a role's flag read once. (The
+        // allowance transferFrom spends, the reference, patched, writes where the node does: after the transfer and
+        // its Transfer event, before transferFromWithMemo's Memo; see scripts/build-b20.ts.)
+        if (!opened.at(-1)?.static) sentry(charging.node - fee);
       }
-      if (charging && own && t.spent !== undefined && e.opcode.name === 'LOG3' && e.stack && e.stack[e.stack.length - 3] === TRANSFER_TOPIC) { sentry(charging.node); charging.node += t.spent; t.spent = undefined; }
       // batchMint: 100 more a recipient, as each is reached (its mint asks the policy registry), the refused one too.
       if (charging && own && t.selector === '0x68573107' && e.opcode.name === 'STATICCALL' && e.stack && `0x${e.stack[e.stack.length - 2].toString(16).padStart(40, '0')}` === '0x8453000000000000000000000000000000000002') charging.node += 100n;
       // renounceLastAdmin: 100 over the reference, the rest of it (with its flag's write, ROLES_AT) at its RoleRevoked: a

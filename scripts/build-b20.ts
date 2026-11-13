@@ -42,7 +42,18 @@
 //   - the activation registry's admin: the chain's (its configuration's), not the reference's placeholder;
 //   - an asset's fromUIAmount and toRawBalance read the multiplier before they multiply the amount by 1e18, as the
 //     chain's do: an amount that overflows is charged those reads before it fails Panic(0x11) (measured: 4,200 more
-//     with nothing pending, 2,200 with an update that took effect), where the reference failed before reading.
+//     with nothing pending, 2,200 with an update that took effect), where the reference failed before reading;
+//   - transferFrom and transferFromWithMemo check the allowance first and write it after the transfer and its
+//     Transfer event (before the Memo), as the chain does, where the reference wrote it before the transfer: in a
+//     static call the chain's write fails at the balance, after the policies and the balance are read (measured:
+//     4,200 more than the reference's with no policies, 10,500 with the live token's, and InsufficientBalance where
+//     the balance is short);
+//   - pause and unpause decode the whole list before anything, as the chain does: a feature out of range (4 or
+//     more) fails as calldata the token can't decode, the selector, with nothing read (the reference read the role
+//     and wrote the features before it: 20,200 more, 24,200 on a cold token, or AccessControlUnauthorizedAccount
+//     without the role); and the paused features are read and written once, whatever the list (the reference read
+//     and wrote them for each feature: a two-feature list given its least gas ran out here, at a write the chain
+//     doesn't make).
 // Three things the chain does to any call are done by the local EVM instead (src/fork-simulator.ts): value sent to a
 // token or registry is refused with NonPayable(); a token or registry run as another contract's code (DELEGATECALL)
 // with DelegateCallNotAllowed(); and calldata a function can't decode reverts with the call's selector, where the
@@ -118,6 +129,79 @@ const PATCHES: Record<string, [string, string][]> = {
     }
 `],
     ['    uint256 public constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;', '    uint256 internal constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;'],
+    // transferFrom and transferFromWithMemo: the chain checks the allowance first, and writes it after the transfer
+    // and its Transfer event (before transferFromWithMemo's Memo), where the reference wrote it before the transfer
+    // (measured: a static call's write fails at the balance, after the policies and the balance are read; a second
+    // transferFrom in a transaction runs out until 2,201 over its charge, transferFromWithMemo 701).
+    ['        _consumeAllowance(from, msg.sender, amount);\n        _transfer(from, to, amount);\n        return true;\n',
+      '        uint256 allowance_ = _checkAllowance(from, msg.sender, amount);\n        _transfer(from, to, amount);\n        _spendAllowance(from, msg.sender, allowance_, amount);\n        return true;\n'],
+    ['        _consumeAllowance(from, msg.sender, amount);\n        _transfer(from, to, amount);\n        emit Memo(msg.sender, memo);\n',
+      '        uint256 allowance_ = _checkAllowance(from, msg.sender, amount);\n        _transfer(from, to, amount);\n        _spendAllowance(from, msg.sender, allowance_, amount);\n        emit Memo(msg.sender, memo);\n'],
+    [`    function _consumeAllowance(address owner, address spender, uint256 amount) internal {
+        uint256 current = MockB20Storage.layout().allowances[owner][spender];
+        if (current != type(uint256).max) {
+            if (current < amount) revert InsufficientAllowance(spender, current, amount);
+            unchecked {
+                MockB20Storage.layout().allowances[owner][spender] = current - amount;
+            }
+        }
+    }
+`, `    function _checkAllowance(address owner, address spender, uint256 amount) internal view returns (uint256 current) {
+        current = MockB20Storage.layout().allowances[owner][spender];
+        if (current != type(uint256).max && current < amount) revert InsufficientAllowance(spender, current, amount);
+    }
+
+    function _spendAllowance(address owner, address spender, uint256 current, uint256 amount) internal {
+        if (current != type(uint256).max) {
+            unchecked {
+                MockB20Storage.layout().allowances[owner][spender] = current - amount;
+            }
+        }
+    }
+`],
+    // pause and unpause: the chain decodes the whole list before anything, so a feature out of range fails as
+    // calldata it can't decode (the selector, with nothing read: the reference checked its role and wrote the
+    // features before it), and then reads and writes the paused features once, whatever the list (the reference
+    // read and wrote them for each feature, a duplicate too).
+    [`    function pause(PausableFeature[] calldata features) external onlyRole(PAUSE_ROLE) {
+        if (features.length == 0) revert EmptyFeatureSet();
+        MockB20Storage.Layout storage $ = MockB20Storage.layout();
+        for (uint256 i = 0; i < features.length; i++) {
+            $.pausedVectors |= uint256(1) << uint8(features[i]);
+        }
+        emit Paused(msg.sender, features);
+    }
+`, `    function pause(PausableFeature[] calldata features) external {
+        uint256 bits = _featureBits(features);
+        _requireRole(PAUSE_ROLE);
+        if (features.length == 0) revert EmptyFeatureSet();
+        MockB20Storage.layout().pausedVectors |= bits;
+        emit Paused(msg.sender, features);
+    }
+`],
+    [`    function unpause(PausableFeature[] calldata features) external onlyRole(UNPAUSE_ROLE) {
+        if (features.length == 0) revert EmptyFeatureSet();
+        MockB20Storage.Layout storage $ = MockB20Storage.layout();
+        for (uint256 i = 0; i < features.length; i++) {
+            $.pausedVectors &= ~(uint256(1) << uint8(features[i]));
+        }
+        emit Unpaused(msg.sender, features);
+    }
+`, `    function unpause(PausableFeature[] calldata features) external {
+        uint256 bits = _featureBits(features);
+        _requireRole(UNPAUSE_ROLE);
+        if (features.length == 0) revert EmptyFeatureSet();
+        MockB20Storage.layout().pausedVectors &= ~bits;
+        emit Unpaused(msg.sender, features);
+    }
+
+    /// (Each feature read is checked: one out of range reverts empty, as calldata the token can't decode.)
+    function _featureBits(PausableFeature[] calldata features) internal pure returns (uint256 bits) {
+        for (uint256 i = 0; i < features.length; i++) {
+            bits |= uint256(1) << uint8(features[i]);
+        }
+    }
+`],
     ['    function _isPrivileged() internal view returns (bool) {', `    fallback() external payable {
         assembly {
             if callvalue() { mstore(0, shl(224, 0x6fb1b0e9)) revert(0, 4) }
