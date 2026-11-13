@@ -311,6 +311,21 @@ test('A whole operation whose balances the node didn’t read after it: its note
   assert.deepEqual(usdcChange(p), ['out 50']);
 });
 
+test('A Kernel validator that keeps signers by id: a deploying account’s stand-in names the id of the signer asked, else the first', async () => {
+  const { signerIdOf } = await import('../src/erc4337-sim.ts');
+  const { encodeAbiParameters: enc } = await import('viem');
+  const ROOT = '0x01933401632d92bc7005d7415242171a55e20004ba', MODULE = '0x9895a7b30a9dfcfbb1cd8f41595d2ad15fdcc9c3';
+  const id = (b: string) => `0x${b.repeat(32)}` as Hex;
+  const configs = enc([{ type: 'tuple[]', components: [{ name: 'id', type: 'bytes32' }, { name: 'signer', type: 'address' }, { name: 'data', type: 'bytes' }] }],
+    [[{ id: id('11'), signer: MODULE, data: BOB }, { id: id('22'), signer: MODULE, data: OWNER as Hex }]]);
+  const setup = { root: ROOT as Hex, installs: new Map<string, Hex>([[ROOT, configs]]) };
+  const context = (signer: string) => ({ deps, chainId: 999, sender: BOB, signer, nonce: 0n, hash: async () => undefined }) as never;
+  assert.equal(await signerIdOf(context(OWNER), ROOT, setup), id('22'));
+  assert.equal(await signerIdOf(context('0x000000000000000000000000000000000000beef'), ROOT, setup), id('11'));
+  // Install data it can't read: no id, so the plain ECDSA stand-in.
+  assert.equal(await signerIdOf(context(OWNER), ROOT, { root: ROOT as Hex, installs: new Map([[ROOT, '0x1234' as Hex]]) }), undefined);
+});
+
 test('The ecrecover stand-in: each stand-in signature recovers as its signer for exactly the precompile’s 3,000 gas', async () => {
   const { ecrecoverAs, STUB_SIGNATURE, STUB_COSIGNATURE } = await import('../src/erc4337-sim.ts');
   const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');

@@ -420,21 +420,20 @@ const ZERODEV_PRECOMPILED = new Set([137, 8453, 42161, 11155111]);
 const HANDLE_OPS = parseAbi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
 const ZERODEV_WEBAUTHN_SIGNATURE = [{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }] as const;
 /** What each account's latest earlier operation showed (see zeroDevPrecompiled), for ten minutes. */
-const ZERODEV_SIGNED = new Map<string, { at: number; precompiled: boolean | undefined }>();
+/** Each account's latest earlier operation's signature (see lastSignature), for ten minutes. */
+const LAST_SIGNED = new Map<string, { at: number; signature: Hex | undefined }>();
 /**
- * Whether a ZeroDev passkey account's wallet signs with the P256 precompile: as its latest earlier operation did (its
- * signature's usePrecompiled, after the 0xff of a permission's; the same wallet signs the same way), its last
- * UserOperationEvent up to the block before the latest, within 10,000 blocks, then 100,000; else as most do on its
- * chain (ZERODEV_PRECOMPILED). Blofin's wallet signs without the precompile on Arbitrum One, where 141 of 147
- * operations had it: by the chain's default its operations came out 27-47% low.
+ * The signature of the account's latest earlier operation through this EntryPoint (v0.7's packed form): its last
+ * UserOperationEvent up to the block before the latest, within 10,000 blocks, then 100,000. A wallet signs the same
+ * way each time, so what it chose then (a flag, a key's id) it chooses now. Undefined with none, or unreadable.
  */
-async function zeroDevPrecompiled(c: StubContext): Promise<boolean> {
+async function lastSignature(c: StubContext): Promise<Hex | undefined> {
   const rpc = c.deps.rpc;
-  if (!rpc?.has(c.chainId) || !c.entryPoint) return ZERODEV_PRECOMPILED.has(c.chainId);
+  if (!rpc?.has(c.chainId) || !c.entryPoint) return undefined;
   const key = `${c.chainId}:${c.entryPoint}:${c.sender}`;
-  let known = ZERODEV_SIGNED.get(key);
+  let known = LAST_SIGNED.get(key);
   if (!known || Date.now() - known.at >= 600_000) {
-    let precompiled: boolean | undefined;
+    let signature: Hex | undefined;
     try {
       const latest = await rpc.call(c.chainId, 'eth_getBlockByNumber', ['latest', false]) as { number?: string } | null;
       const head = BigInt(latest?.number ?? '0x0') - 1n;
@@ -445,16 +444,49 @@ async function zeroDevPrecompiled(c: StubContext): Promise<boolean> {
         const last = logs?.at(-1);
         if (!last) continue;
         const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [last.transactionHash]) as { input?: Hex } | null;
-        const mine = (tx?.input ? decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0] : []).find(o => o.sender.toLowerCase() === c.sender.toLowerCase());
-        const read = (sig: Hex) => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
-        if (mine) precompiled = read(mine.signature) ?? (mine.signature.startsWith('0xff') ? read(`0x${mine.signature.slice(4)}`) : undefined);
+        signature = (tx?.input ? decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0] : []).find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature;
         break;
       }
-    } catch { /* not readable: the chain's default */ }
-    known = { at: Date.now(), precompiled };
-    ZERODEV_SIGNED.set(key, known);
+    } catch { /* not readable */ }
+    known = { at: Date.now(), signature };
+    LAST_SIGNED.set(key, known);
   }
-  return known.precompiled ?? ZERODEV_PRECOMPILED.has(c.chainId);
+  return known.signature;
+}
+/**
+ * Whether a ZeroDev passkey account's wallet signs with the P256 precompile: as its latest earlier operation did (its
+ * signature's usePrecompiled, after the 0xff of a permission's; see lastSignature); else as most do on its chain
+ * (ZERODEV_PRECOMPILED). Blofin's wallet signs without the precompile on Arbitrum One, where 141 of 147 operations
+ * had it: by the chain's default its operations came out 27-47% low.
+ */
+async function zeroDevPrecompiled(c: StubContext): Promise<boolean> {
+  const signature = await lastSignature(c);
+  const read = (sig: Hex) => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
+  const precompiled = signature && (read(signature) ?? (signature.startsWith('0xff') ? read(`0x${signature.slice(4)}`) : undefined));
+  return precompiled ?? ZERODEV_PRECOMPILED.has(c.chainId);
+}
+/**
+ * A Kernel v3 validator that keeps signers by id (0x9334…04ba, unpublished; its layout read from its set-up and
+ * operations, Sepolia and Polygon, 2026-11-13): its data is abi.encode((bytes32 id, address signer, bytes data)[]),
+ * each signer a module with its data (an ECDSA signer module, 0x9895…c9c3, the owner's address); a signature is the
+ * signer's id, then that module's (the owner's ECDSA signature over the operation's hash, EIP-191).
+ */
+const SIGNER_ID_VALIDATORS = new Set(['0x933401632d92bc7005d7415242171a55e20004ba']);
+const SIGNER_CONFIGS = [{ type: 'tuple[]', components: [{ name: 'id', type: 'bytes32' }, { name: 'signer', type: 'address' }, { name: 'data', type: 'bytes' }] }] as const;
+/**
+ * The id a signer-id validator's operation names: a deploying account's from its set-up (the signer whose data is
+ * the address asked to sign, else the first), an existing one's as its latest earlier operation named it.
+ */
+export async function signerIdOf(c: StubContext, vId: string, deploying?: KernelSetup): Promise<Hex | undefined> {
+  const data = deploying?.installs.get(vId.toLowerCase());
+  if (data) {
+    try {
+      const [configs] = decodeAbiParameters(SIGNER_CONFIGS, data);
+      return (configs.find(x => x.data.toLowerCase() === c.signer.toLowerCase()) ?? configs[0])?.id;
+    } catch { return undefined; }
+  }
+  const last = await lastSignature(c);
+  return last && last.length === 2 + 97 * 2 ? `0x${last.slice(2, 66)}` as Hex : undefined;
 }
 /**
  * A passkey's assertion as ZeroDev's WebAuthn validator decodes it: abi.encode(authenticatorData, clientDataJSON,
@@ -479,7 +511,7 @@ const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
 const ZERODEV_WEBAUTHN_SIGNERS = new Set(['0x65deec8fee717dc044d0cfd63ccf55f02ccac2b3']);
 const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
 /** What a Kernel v3 account being deployed is set up with: its root validator, and each validation its initialize() installs, with its install data. */
-type KernelSetup = { root: Hex; installs: Map<string, Hex> };
+export type KernelSetup = { root: Hex; installs: Map<string, Hex> };
 /**
  * The signer of permission `pId` (4 bytes, no 0x) a deploying Kernel installs: its install data is abi.encode(bytes[]),
  * the policies, then the signer (each a 2-byte flag, the module's address, its own data).
@@ -541,6 +573,10 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
     if (!hash) return ecdsa;
     const precompiled = await zeroDevPrecompiled(c);
     return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
+  }
+  if (type === '01' && SIGNER_ID_VALIDATORS.has(`0x${id}`.toLowerCase())) {
+    const signerId = await signerIdOf(c, `0x01${id}`, deploying);
+    if (signerId) return [{ signature: concatHex([signerId, STUB_SIGNATURE]) }];
   }
   if (type === '01' && KERNEL_WEBAUTHN_SOL_VALIDATORS.has(`0x${id}`.toLowerCase())) {
     const hash = await c.hash();
