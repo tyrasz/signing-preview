@@ -279,6 +279,10 @@ test('A passkey owner’s verifiers stood in for: the precompile where named, th
   assert.ok(!onlyFallback?.stateOverrides?.[P256] && onlyFallback?.stateOverrides?.[FALLBACK]);
   // A fallback with no code and no precompile: nothing that would verify, so no stand-in (the ECDSA one is used).
   assert.equal(await passkeyVerifiersStandIn(deps('0x'), 137, { precompile: NONE, fallback: FALLBACK }), null);
+  // HyperEVM has no P256VERIFY: the precompile a passkey names there answers nothing, so only its fallback is stood in for.
+  assert.equal(await passkeyVerifiersStandIn(deps('0x'), 999, { precompile: P256, fallback: NONE }), null);
+  const hyper = await passkeyVerifiersStandIn(deps('0x6001'), 999, { precompile: P256, fallback: FALLBACK });
+  assert.ok(!hyper?.stateOverrides?.[P256] && hyper?.stateOverrides?.[FALLBACK]);
 });
 
 test('A passkey owner through Safe’s WebAuthn shared signer: a contract signature in Safe’s layout, decoded as its WebAuthn library requires', async () => {

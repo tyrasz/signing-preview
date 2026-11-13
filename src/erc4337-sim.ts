@@ -17,6 +17,7 @@ import type { Dependencies, SimulationRequest, SimulationResult } from './types.
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { ecrecoverPrice } from './chains.ts';
+import { CHAIN_PROFILES } from './fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 
@@ -123,6 +124,10 @@ async function kernelExecutionHook(deps: Dependencies, chainId: number, sender: 
     const config = await view(encodeFunctionData({ abi: KERNEL_VALIDATION, functionName: 'validationConfig', args: [vId] }));
     if (!/^0x[0-9a-f]{128}$/i.test(config)) return none;
     const hook = BigInt(`0x${config.slice(66 + 24)}`);
+    // A validator or permission the nonce names that isn't installed (no hook at all), outside enable mode (byte 0
+    // 0x01, which installs it in validation): Kernel refuses the operation in validation (InvalidValidator), so the
+    // calls are given no hook either, and fail, rather than run as if it were installed.
+    if (hook === 0n && type !== '00' && n.slice(0, 2) !== '01') return `0x${'00'.repeat(32)}` as Hex;
     return hook > 1n ? `0x${hook.toString(16).padStart(64, '0')}` as Hex : none;
   } catch { return none; }
 }
@@ -420,38 +425,65 @@ const ZERODEV_PRECOMPILED = new Set([137, 8453, 42161, 11155111]);
 const HANDLE_OPS = parseAbi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
 const ZERODEV_WEBAUTHN_SIGNATURE = [{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }] as const;
 /** What each account's latest earlier operation showed (see zeroDevPrecompiled), for ten minutes. */
-/** Each account's latest earlier operation's signature (see lastSignature), for ten minutes. */
-const LAST_SIGNED = new Map<string, { at: number; signature: Hex | undefined }>();
+/** Each account's latest earlier operation's signature (see lastSignature), as of the block `head`. */
+const LAST_SIGNED = new Map<string, { at: number; head: bigint; signature: Hex | undefined }>();
+/** How far back an account's earlier operation is looked for, and in windows of at most how many blocks. */
+const LAST_SIGNED_REACH = 100_000n, LAST_SIGNED_WINDOW = 10_000n;
+/** A node's answer that the blocks asked for are older than it serves (Ethereum's public node): the reach ends there. */
+const BEYOND_REACH = /archive|pruned|missing trie node|not available|header not found/i;
 /**
  * The signature of the account's latest earlier operation through this EntryPoint (v0.7's packed form): its last
- * UserOperationEvent up to the block before the latest, within 10,000 blocks, then 100,000. A wallet signs the same
- * way each time, so what it chose then (a flag, a key's id) it chooses now. Undefined with none, or unreadable.
+ * UserOperationEvent up to the block before the latest, looked for back from there in windows of 10,000 blocks (or
+ * the node's cap, from its refusal: Polygon's public node takes 10,000, BNB Chain's fewer) to 100,000 back, or as far
+ * as the node serves. A wallet signs the same way each time, so what it chose then (a flag, a key's id) it chooses
+ * now. Undefined with none, or unreadable. Remembered ten minutes (a minute when none was found), for previews at that
+ * block or later; a lookup any of whose reads failed is not remembered, and one at an earlier block (a replay) reads
+ * again, so an operation never sees one after it.
  */
 async function lastSignature(c: StubContext): Promise<Hex | undefined> {
   const rpc = c.deps.rpc;
   if (!rpc?.has(c.chainId) || !c.entryPoint) return undefined;
+  let head: bigint;
+  try {
+    const latest = await rpc.call(c.chainId, 'eth_getBlockByNumber', ['latest', false]) as { number?: string } | null;
+    head = BigInt(latest?.number ?? '0x0') - 1n;
+  } catch { return undefined; }
+  if (head <= 0n) return undefined;
   const key = `${c.chainId}:${c.entryPoint}:${c.sender}`;
-  let known = LAST_SIGNED.get(key);
-  if (!known || Date.now() - known.at >= 600_000) {
-    let signature: Hex | undefined;
-    try {
-      const latest = await rpc.call(c.chainId, 'eth_getBlockByNumber', ['latest', false]) as { number?: string } | null;
-      const head = BigInt(latest?.number ?? '0x0') - 1n;
-      for (const span of [10_000n, 100_000n]) {
-        if (head <= 0n) break;
-        const logs = await rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
-          fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]).catch(() => null) as { transactionHash: string }[] | null;
-        const last = logs?.at(-1);
-        if (!last) continue;
-        const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [last.transactionHash]) as { input?: Hex } | null;
-        signature = (tx?.input ? decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0] : []).find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature;
+  const known = LAST_SIGNED.get(key);
+  if (known && head >= known.head && Date.now() - known.at < (known.signature ? FOUND_FOR : EMPTY_FOR)) return known.signature;
+  let signature: Hex | undefined, failed = false, window = LAST_SIGNED_WINDOW, reached = 0n;
+  try {
+    for (let reads = 0; reached < LAST_SIGNED_REACH && head - reached > 0n && reads < 16; reads++) {
+      const to = head - reached, from = to >= window ? to - window + 1n : 0n;
+      let logs: { transactionHash: string }[];
+      try {
+        logs = await rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
+          fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }]) as { transactionHash: string }[];
+      } catch (e) {
+        const why = capMessage(e) || String((e as Error)?.message ?? e);
+        if (RANGE_CAPPED.test(why)) {
+          // The node's cap, where it names one (else half): asked again within it.
+          const m = why.match(/(\d[\d,]{2,})/); const named = m ? BigInt(m[1].replace(/,/g, '')) : window / 2n;
+          if (named <= 0n || named >= window) { failed = true; break; }
+          window = named;
+          continue;
+        }
+        if (!BEYOND_REACH.test(why)) failed = true;
         break;
       }
-    } catch { /* not readable */ }
-    known = { at: Date.now(), signature };
-    LAST_SIGNED.set(key, known);
-  }
-  return known.signature;
+      const last = logs.at(-1);
+      if (last) {
+        const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [last.transactionHash]) as { input?: Hex } | null;
+        if (!tx?.input) { failed = true; break; }
+        try { signature = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* not v0.7's handleOps */ }
+        break;
+      }
+      reached += to - from + 1n;
+    }
+  } catch { failed = true; }
+  if (!failed) LAST_SIGNED.set(key, { at: Date.now(), head, signature });
+  return signature;
 }
 /**
  * Whether a ZeroDev passkey account's wallet signs with the P256 precompile: as its latest earlier operation did (its
@@ -1116,7 +1148,9 @@ export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number): Pi
  */
 export async function passkeyVerifiersStandIn(deps: Dependencies, chainId: number, verifiers: { precompile: string; fallback: string }): Promise<Pick<SimulationRequest, 'stateOverrides' | 'accessList'> | null> {
   const P256 = '0x0000000000000000000000000000000000000100';
-  const precompile = BigInt(verifiers.precompile) === 0x100n;
+  // (On a chain that has P256VERIFY: Osaka's rules, as each chain's node was measured to run them. HyperEVM's Cancun
+  // has none, so the precompile named there answers nothing and the fallback verifier is what checks it.)
+  const precompile = BigInt(verifiers.precompile) === 0x100n && CHAIN_PROFILES[chainId]?.hardfork !== 'cancun';
   const fallback = BigInt(verifiers.fallback) ? verifiers.fallback.toLowerCase() : undefined;
   let code: Hex | undefined;
   if (fallback && deps.rpc?.has(chainId)) {

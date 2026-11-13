@@ -277,6 +277,9 @@ test('Calls run alone on Kernel v3 (executeUserOp) run inside the execution hook
   assert.match(String(refused?.result.revertReason), /ModuleCallNotAllowed/);
   assert.equal((await run(permission, BOB))?.result.status, 'success', 'and lets other calls through');
   assert.equal((await run(0n, MODULE))?.result.status, 'success', 'the root has no hook');
+  // A permission the nonce names that isn't installed (outside enable mode): Kernel refuses the operation, so its
+  // calls fail too, rather than run as if it were.
+  assert.equal((await run(BigInt(`0x0002deadbeef${'00'.repeat(26)}`), BOB))?.result.status, 'reverted');
 });
 
 test('A Kernel v3 account asked by a signer that isn’t its owner: the run that went through stands, not the 0xff form’s rejection', async () => {
@@ -324,6 +327,37 @@ test('A Kernel validator that keeps signers by id: a deploying account’s stand
   assert.equal(await signerIdOf(context('0x000000000000000000000000000000000000beef'), ROOT, setup), id('11'));
   // Install data it can't read: no id, so the plain ECDSA stand-in.
   assert.equal(await signerIdOf(context(OWNER), ROOT, { root: ROOT as Hex, installs: new Map([[ROOT, '0x1234' as Hex]]) }), undefined);
+});
+
+test('An account’s last operation is looked for back in windows the node takes, from its own refusal, and a failed lookup isn’t remembered', async () => {
+  const { signerIdOf } = await import('../src/erc4337-sim.ts');
+  const { encodeFunctionData: enc, parseAbi: abi, concatHex: cat } = await import('viem');
+  const HANDLE = abi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
+  const sender = '0x00000000000000000000000000000000005e1d01', id = `0x${'5f'.repeat(32)}` as Hex, zero = `0x${'00'.repeat(32)}` as Hex;
+  const input = enc({ abi: HANDLE, functionName: 'handleOps', args: [[{ sender, nonce: 0n, initCode: '0x', callData: '0x', accountGasLimits: zero, preVerificationGas: 0n, gasFees: zero, paymasterAndData: '0x', signature: cat([id, `0x${'ab'.repeat(65)}`]) }], BOB] });
+  const ranges: number[] = [];
+  let failNext = false;
+  // A node that refuses more than 5,000 blocks a query, naming its cap, and holds the operation 40,000 blocks back.
+  const rpc = { has: () => true, call: async (_: number, method: string, params: any[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x30d41' };
+    if (method === 'eth_getTransactionByHash') { if (failNext) throw new Error('HTTP 429'); return { input }; }
+    const from = Number(BigInt(params[0].fromBlock)), to = Number(BigInt(params[0].toBlock));
+    ranges.push(to - from + 1);
+    if (to - from + 1 > 5000) throw Object.assign(new Error('capped'), { rpcError: { message: 'exceed maximum block range: 5000' } });
+    return from <= 160_000 && 160_000 <= to ? [{ transactionHash: `0x${'77'.repeat(32)}` }] : [];
+  } };
+  const context = (who: string) => ({ deps: { rpc }, chainId: 137, sender: who, signer: who, nonce: 0n, entryPoint: EP, hash: async () => undefined }) as never;
+  assert.equal(await signerIdOf(context(sender), '0x01933401632d92bc7005d7415242171a55e20004ba'), id);
+  assert.equal(ranges[0], 10_000, 'a 10,000-block window first');
+  assert.ok(ranges.slice(1).every(r => r <= 5000), 'then within the cap the node named');
+  // A read that fails: no id, and nothing remembered, so the next preview finds it.
+  const other = '0x00000000000000000000000000000000005e1d02';
+  failNext = true;
+  assert.equal(await signerIdOf(context(other), '0x01933401632d92bc7005d7415242171a55e20004ba'), undefined);
+  failNext = false;
+  // (The operation is the first account's; the lookup reads it again, and finds the operation isn't the second's.)
+  assert.equal(await signerIdOf(context(other), '0x01933401632d92bc7005d7415242171a55e20004ba'), undefined);
+  assert.equal(ranges.filter(r => r === 10_000).length, 3, 'looked up again, not remembered from the failure');
 });
 
 test('The ecrecover stand-in: each stand-in signature recovers as its signer for exactly the precompile’s 3,000 gas', async () => {
