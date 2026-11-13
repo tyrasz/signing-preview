@@ -232,6 +232,13 @@ const PATCHES: Record<string, [string, string][]> = {
     ['        return (uiAmount * WAD_PRECISION) / _multiplier();\n', '        uint256 multiplier_ = _multiplier();\n        return (uiAmount * WAD_PRECISION) / multiplier_;\n'],
   ],
   'test/lib/mocks/MockPolicyRegistry.sol': [
+    // A composite's children, read once: the node reads the list's length and each of its slots (four ids a slot)
+    // once, where the reference's index access read the length again for each child's bounds check and the shared
+    // slot again for each id in it (a two-child UNION or INTERSECT 300 high). Copied to memory first, as the node
+    // reads them.
+    ...(['_isAuthorizedUnion', '_isAuthorizedIntersect'].map((name): [string, string] => [
+      `    function ${name}(uint64 policyId, address account) internal view returns (bool) {\n        uint64[] storage childPolicyIds = MockPolicyRegistryStorage.layout().children[policyId];\n`,
+      `    function ${name}(uint64 policyId, address account) internal view returns (bool) {\n        uint64[] memory childPolicyIds = MockPolicyRegistryStorage.layout().children[policyId];\n`])),
     ['    uint64 public constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;', '    uint64 internal constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;'],
     ['    uint64 public constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;', '    uint64 internal constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;'],
     // Every write asks the activation registry whether the policy registry is switched on, once its calldata
