@@ -792,7 +792,7 @@ What the contracts imply, and what the preview reports:
 
 ### Live verification (2026-11-03)
 
-`npm run verify:live` checks the previewer against the deployed contracts. It is read-only: it uses a fresh throwaway key and never broadcasts. It needs network access to `arb1.arbitrum.io`, `ethereum-rpc.publicnode.com` (or set `ETHEREUM_RPC_URL`), `rpc.hyperliquid.xyz` and `api.hyperliquid.xyz`, plus `sourcify.dev`, `api.openchain.xyz` and `www.4byte.directory`. It exits non-zero on any disagreement.
+`npm run verify:live` checks the previewer against the deployed contracts. It is read-only: it uses a fresh throwaway key and never broadcasts. It needs network access to `arb1.arbitrum.io`, `ethereum-rpc.publicnode.com` (or set `ETHEREUM_RPC_URL`), `rpc.hyperliquid.xyz` and `api.hyperliquid.xyz`, plus `sourcify.dev`, `api.openchain.xyz` and `www.4byte.directory`. It exits non-zero on any disagreement. (Where Arbitrum One's node rate-limits the batch check's state reads, as it does GitHub's runners some days, those two checks are skipped with its answer, and the amount from the events is checked; any other failure to read fails.)
 
 - **Circle docs.** All seven pages used here were re-fetched and are identical to the 2026-10-29 snapshot.
 - **Arbitrum One.** `eth_simulateV1` runs the guide's transactions and 9 variants: perps, spot, standard finality, batch split, header-only hook, empty hook, `maxFee ≥ amount`, indivisible batch, expired authorization, low `maxFee`, and the `TokenMessengerV2` route with and without a hook. **12/12 match the preview.**
