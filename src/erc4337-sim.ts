@@ -1073,6 +1073,27 @@ export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number): Pi
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] }],
   };
 }
+/**
+ * Stand-ins for a passkey's P-256 check through the verifiers it names (a Safe passkey owner's P256.Verifiers): the
+ * precompile accepting P256_STUB where it is named (0x100), and the fallback verifier contract accepting it after
+ * running its real code (its code moved, as verifierAccepting has it). Null where neither can be stood in for.
+ */
+export async function passkeyVerifiersStandIn(deps: Dependencies, chainId: number, verifiers: { precompile: string; fallback: string }): Promise<Pick<SimulationRequest, 'stateOverrides' | 'accessList'> | null> {
+  const P256 = '0x0000000000000000000000000000000000000100';
+  const precompile = BigInt(verifiers.precompile) === 0x100n;
+  const fallback = BigInt(verifiers.fallback) ? verifiers.fallback.toLowerCase() : undefined;
+  let code: Hex | undefined;
+  if (fallback && deps.rpc?.has(chainId)) {
+    try { code = String(await deps.rpc.call(chainId, 'eth_getCode', [fallback, 'latest'])) as Hex; } catch { code = undefined; }
+    if (code === '0x') code = undefined;
+  }
+  if (!precompile && !code) return null;
+  return {
+    stateOverrides: { ...(precompile && { [P256]: { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }), ...(code && { [fallback!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code } }) },
+    // The moved precompile is warm, as precompiles are; the verifier itself stays cold, as on-chain.
+    accessList: [...(precompile ? [{ address: P256, storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []), ...(code ? [{ address: VERIFIER_MOVED, storageKeys: [] }] : [])],
+  };
+}
 /** P256VERIFY (0x100, RIP-7212 / EIP-7951) accepting P256_STUB: a passkey's assertion (see webAuthnStub) verifies. */
 export const p256Accepting = (): Hex => standIn(P256_MOVED, P256_STUB.r, P256_STUB.s, 0x20, '6001');
 /**

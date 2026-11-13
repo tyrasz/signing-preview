@@ -10,7 +10,7 @@ import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
 import type { BlockAt } from './block.ts';
-import { ecdsaStandIn, P256_STUB, STUB_SIGNATURE } from './erc4337-sim.ts';
+import { ecdsaStandIn, P256_STUB, passkeyVerifiersStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
 import { effectOf, roomFor } from './evm/effects.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 
@@ -52,6 +52,8 @@ export interface SafeRun {
   priced?: { gasPrice: bigint; tip: bigint };
   /** What was simulated for `result` (execTransaction, then the configuration reads): for tracing it. */
   requests?: SimulationRequest[];
+  /** The signing owner is a passkey, which signed with a stand-in for its WebAuthn assertion. */
+  passkey?: boolean;
 }
 
 const word = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');
@@ -190,7 +192,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, 'latest'])) as Hex;
   const before = config(await Promise.all(reads(safe).map(r => call(r.data).catch(() => undefined))));
   if (!before || before.partial) return null; // not a readable Safe
-  let exec: SimulationRequest;
+  let exec: SimulationRequest, signedByPasskey = false;
   if (opts.request) exec = { ...opts.request, account: safe };
   else {
     // The transaction's hash at the Safe's current nonce, as execTransaction computes it.
@@ -198,14 +200,20 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     const hash = await call(encodeFunctionData({ abi: ABI, functionName: 'getTransactionHash', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, nonce] }));
     // The signing owner (the executor, or else the first owner) signs with the ECDSA stand-in, which the replaced
     // ecrecover attributes to them over this hash, so the Safe's check costs what it will; any other owners the
-    // threshold needs approve on-chain.
+    // threshold needs approve on-chain. A passkey owner (through Safe's WebAuthn shared signer, or its own
+    // SafeWebAuthnSignerProxy) signs as a contract, with a WebAuthn assertion its P-256 verifier accepts after
+    // running its real check, as for a SafeOp (src/typed-data/safe.ts): the ECDSA stand-in recovered to its address,
+    // so Safe took it as an EOA's and the check (about 225,000 gas, in Solidity) never ran.
     const executor = (opts.executor && before.owners.includes(opts.executor.toLowerCase()) ? opts.executor : before.owners[0]).toLowerCase();
-    const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE });
+    const verifiers = executor === SAFE_WEBAUTHN_SHARED_SIGNER ? await sharedSignerVerifiers(deps, chainId, safe) : await webAuthnSignerVerifiers(deps, chainId, executor);
+    const passkey = verifiers ? await passkeyVerifiersStandIn(deps, chainId, verifiers) : null;
+    const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE, ...(passkey && { contract: safeWebAuthnStub() }) });
     if (!approvals) return null;
     const { stateDiff, signatures } = approvals;
     const standIn = ecdsaStandIn(executor, hash, chainId);
-    exec = { chainId, from: executor, account: safe, to: safe, value: 0n, accessList: standIn.accessList,
-      stateOverrides: { ...standIn.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) },
+    if (passkey) signedByPasskey = true;
+    exec = { chainId, from: executor, account: safe, to: safe, value: 0n, accessList: [...standIn.accessList!, ...(passkey?.accessList ?? [])],
+      stateOverrides: { ...standIn.stateOverrides, ...passkey?.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) },
       data: encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, signatures] }) };
   }
   if (opts.at) exec = { ...exec, at: opts.at };
@@ -232,7 +240,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   const result = results[0];
   // execTransaction returns false (and emits ExecutionFailure) when the call fails with safeTxGas or gasPrice set.
   const executed = result.status === 'success' && (!result.returnData || result.returnData === '0x' || BigInt(result.returnData.slice(0, 66)) === 1n);
-  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), requests };
+  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), requests, ...(signedByPasskey && { passkey: true }) };
 }
 
 const SAFE_FACTORY = parseAbi([

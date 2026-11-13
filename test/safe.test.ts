@@ -267,6 +267,20 @@ test('A multi-chain Safe root, with the operations the wallet built it from: sho
   assert.ok(codes(await sign(leaves[0], [ops.find(o => hashTypedData({ domain: { chainId: o.chainId, verifyingContract: MC }, types, primaryType: 'SafeOp', message: o.operation as never }) === leaves[0])!])).includes('safe_multichain_root_verified'));
 });
 
+test('A passkey owner’s verifiers stood in for: the precompile where named, the fallback verifier after its real code, or nothing to stand in for', async () => {
+  const { passkeyVerifiersStandIn, p256Accepting, verifierAccepting } = await import('../src/erc4337-sim.ts');
+  const FALLBACK = '0xa86e0054c51e4894d88762a017ecc5e5235f5dba', P256 = '0x0000000000000000000000000000000000000100', NONE = `0x${'00'.repeat(20)}`;
+  const deps = (code: string) => ({ rpc: { has: () => true, call: async () => code } }) as unknown as Dependencies;
+  const both = await passkeyVerifiersStandIn(deps('0x6001'), 137, { precompile: P256, fallback: FALLBACK });
+  assert.equal(both?.stateOverrides?.[P256]?.code, p256Accepting());
+  assert.equal(both?.stateOverrides?.[FALLBACK]?.code, verifierAccepting());
+  assert.ok(Object.values(both?.stateOverrides ?? {}).some(o => o.code === '0x6001'), 'the fallback’s own code, moved');
+  const onlyFallback = await passkeyVerifiersStandIn(deps('0x6001'), 137, { precompile: NONE, fallback: FALLBACK });
+  assert.ok(!onlyFallback?.stateOverrides?.[P256] && onlyFallback?.stateOverrides?.[FALLBACK]);
+  // A fallback with no code and no precompile: nothing that would verify, so no stand-in (the ECDSA one is used).
+  assert.equal(await passkeyVerifiersStandIn(deps('0x'), 137, { precompile: NONE, fallback: FALLBACK }), null);
+});
+
 test('A passkey owner through Safe’s WebAuthn shared signer: a contract signature in Safe’s layout, decoded as its WebAuthn library requires', async () => {
   const { safeSignatures, safeWebAuthnStub, sharedSignerVerifiers, SAFE_WEBAUTHN_SHARED_SIGNER } = await import('../src/safe-sim.ts');
   const { P256_STUB, STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');

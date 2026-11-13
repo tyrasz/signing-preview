@@ -249,6 +249,6 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     }
     return safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, opts.request
       ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'
-      : "Simulated as the Safe runs it: execTransaction itself, with the transaction approved by enough owners (the Safe's approvedHashes standing in for their signatures), so guards, the gas refund and delegatecalls run as they will.");
+      : `Simulated as the Safe runs it: execTransaction itself, with the transaction approved by enough owners (the Safe's approvedHashes standing in for their signatures${run.passkey ? ", and for the signing owner's passkey a stand-in WebAuthn assertion, which the P-256 verifier it is checked with accepts after running its real check" : ''}), so guards, the gas refund and delegatecalls run as they will.`);
   };
 }
