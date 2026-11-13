@@ -613,19 +613,23 @@ async function replay(item: string): Promise<void> {
     // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas
     // (a post-quantum SPHINCS+ wallet on Base, 40%); a shape to add, not a wrong preview, as for calls simulated alone.
     judged && !timeBumped && !relayed && row.standIn !== 'rejected' && !row.passkeyExtraKey && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
-    judged && row.tokens === 'other' && !row.unread && 'tokens',
+    // (Whether or not the node answered the balance reads after the run: both sides here are events, the receipt's
+    // and, without the reads, the run's.)
+    judged && row.tokens === 'other' && 'tokens',
   ].filter((x): x is string => !!x);
   // Run a second after its block (BNB Chain's node won't simulate a block in its parent's second), an amount can
   // move by more than a second's accrual: a price or fee that changes with the time (0.06% on a vault deposit after a
-  // swap). The bundle is replayed then as the previewer replays a mined transaction, in the local EVM at its own
-  // time after the transactions of that second (src/replay.ts): if that matches its receipt, the difference is the
-  // second, reported and not failed; if it doesn't, it fails.
+  // swap). The bundle is replayed then as the previewer replays a mined transaction (src/replay.ts): where its run a
+  // second late, as the preview's was, missed its receipt and its run at its own time (on the node with the second's
+  // earlier blocks, or in the local EVM) matched it, the second is what moved it, and the difference is reported, not
+  // failed. A bundle that matches a second late too says the second didn't: that fails, as does one that misses at
+  // its own time.
   if (timeBumped && differs.includes('tokens')) {
     const again = await replayTransaction({ chainId: CHAIN, hash }, { trace: false }, replayDeps()).catch(() => null);
-    if (again?.replay?.matches) {
+    if (again?.replay?.matches && again.decoding.notes.some(x => /run a second later there, the transaction didn't come out as its receipt says/.test(x))) {
       differs.splice(differs.indexOf('tokens'), 1);
       row.tokensAtOwnTime = true;
-      row.warned = [row.warned, 'tokens (run a second after its block; at its own time, in the local EVM, the bundle matches its receipt)'].filter(Boolean).join('; ');
+      row.warned = [row.warned, "tokens (run a second after its block; the bundle a second late missed its receipt, at its own time it matches)"].filter(Boolean).join('; ');
     }
   }
   if (differs.length) row.differs = differs;
@@ -701,7 +705,7 @@ if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's 
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; at its own time the bundle matches its receipt: not judged)' : ''}`].filter(Boolean);
+    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 
