@@ -255,6 +255,48 @@ test('A Kernel v3.1 passkey account: the stand-in passes ZeroDev’s own WebAuth
   assert.deepEqual(usdcChange(p), ['out 50']);
 });
 
+test('Calls run alone on Kernel v3 (executeUserOp) run inside the execution hook their validation was installed with, which can refuse them', async () => {
+  const { simulateExecution } = await import('../src/erc4337-sim.ts');
+  const { compiled } = await import('./evm-chain.ts');
+  const KERNEL_V33 = '0xd6cedde84be40893d153be9d467cd6ad37875b28';
+  await chain.putCode(KERNEL_V33, `0x${compiled('KernelHooked').evm.deployedBytecode.object}`);
+  const kernel = await chain.deploy('Proxy1967', 'address', [KERNEL_V33]);
+  const MODULE = '0x00000000000000000000000000000000000d0d01';
+  await chain.putCode(MODULE, '0x00' as Hex);
+  const hook = await chain.deploy('RefusingHook', 'address', [MODULE]);
+  const K = parseAbi(['function init(address,address,bytes21)', 'function install(bytes21,address)', 'function execute(address,uint256,bytes)']);
+  await chain.exec(kernel, encodeFunctionData({ abi: K, functionName: 'init', args: [OWNER as Hex, EP, `0x01${'ec'.repeat(20)}`] }));
+  // A permission (validation type 0x02, its id 0x4e48b87d) installed with the hook; the root with none.
+  await chain.exec(kernel, encodeFunctionData({ abi: K, functionName: 'install', args: [`0x024e48b87d${'00'.repeat(16)}`, hook as Hex] }));
+  const run = (nonce: bigint, to: string) => simulateExecution({ chainId: 999, entryPoint: EP, sender: kernel,
+    callData: concatHex(['0x8dd7712f', encodeFunctionData({ abi: K, functionName: 'execute', args: [to as Hex, 0n, '0x'] })]),
+    packed: { nonce, initCode: '0x', accountGasLimits: `0x${'00'.repeat(32)}`, preVerificationGas: 0n, gasFees: `0x${'00'.repeat(32)}`, paymasterAndData: '0x' }, userOpHash: `0x${'5a'.repeat(32)}` }, deps);
+  const permission = BigInt(`0x00024e48b87d${'00'.repeat(16)}${'00'.repeat(10)}`);
+  const refused = await run(permission, MODULE);
+  assert.equal(refused?.result.status, 'reverted', 'the hook refuses the module call, as on-chain');
+  assert.match(String(refused?.result.revertReason), /ModuleCallNotAllowed/);
+  assert.equal((await run(permission, BOB))?.result.status, 'success', 'and lets other calls through');
+  assert.equal((await run(0n, MODULE))?.result.status, 'success', 'the root has no hook');
+});
+
+test('A Kernel v3 account asked by a signer that isn’t its owner: the run that went through stands, not the 0xff form’s rejection', async () => {
+  const { compiled } = await import('./evm-chain.ts');
+  // Kernel v3.2's implementation address, whose stand-ins are the ECDSA one as it is and after 0xff; this account's
+  // validator reverts on the 66-byte one, as Kernel's ECDSA validator does.
+  const KERNEL_V32 = '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1';
+  await chain.putCode(KERNEL_V32, `0x${compiled('KernelHooked').evm.deployedBytecode.object}`);
+  const kernel = await chain.deploy('Proxy1967', 'address', [KERNEL_V32]);
+  await chain.exec(kernel, encodeFunctionData({ abi: parseAbi(['function init(address,address,bytes21)']), functionName: 'init', args: [OWNER as Hex, EP, `0x01${'ec'.repeat(20)}`] }));
+  await chain.exec(usdc, call('mint', [kernel, 100_000_000n]));
+  await chain.setBalance(kernel, E);
+  const p = await preview(operation({ sender: kernel }), BOB);
+  const whole = p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? p.decoding.notes.join(' | ');
+  assert.match(whole, /doesn't accept it as theirs/);
+  assert.ok(!p.decoding.notes.some(n => /validation reverts on a stand-in/.test(n)), p.decoding.notes.join(' | '));
+  assert.ok(detail(p, 'Gas cost (simulated)'), 'the whole operation’s gas is shown');
+  assert.deepEqual(usdcChange(p), ['out 50']);
+});
+
 test('The ecrecover stand-in: each stand-in signature recovers as its signer for exactly the precompile’s 3,000 gas', async () => {
   const { ecrecoverAs, STUB_SIGNATURE, STUB_COSIGNATURE } = await import('../src/erc4337-sim.ts');
   const { hexToBytes: toBytes, bytesToHex: toHex, createAddressFromString: at } = await import('@ethereumjs/util');

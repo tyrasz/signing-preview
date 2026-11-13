@@ -306,3 +306,56 @@ contract Noisy {
     event Step(uint256 n);
     function fail() external { emit Step(99); revert("after an event"); }
 }
+/// The parts of a Kernel v3 account the simulation relies on: executeUserOp runs the calls between the preCheck and
+/// postCheck of the hook validation stored for the operation's hash (executionHook, slot 0; address(1) is none), and
+/// validationConfig and rootValidator say which hook each validation was installed with. Validation is an ECDSA
+/// owner's (the root's, storing its hook), and a signature of another length reverts, as Kernel's ECDSA validator does.
+interface IKernelHook { function preCheck(address sender, uint256 value, bytes calldata data) external returns (bytes memory); function postCheck(bytes calldata context) external; }
+contract KernelHooked {
+    struct ValidationConfig { uint32 nonce; address hook; }
+    mapping(bytes32 => address) public executionHook;
+    address public owner;
+    address public entryPoint;
+    bytes21 public rootValidator;
+    mapping(bytes21 => ValidationConfig) internal configs;
+    error ExecutionReverted();
+    function init(address o, address ep, bytes21 root) external { owner = o; entryPoint = ep; rootValidator = root; configs[root] = ValidationConfig(0, address(1)); }
+    function install(bytes21 vId, address hook) external { configs[vId] = ValidationConfig(0, hook); }
+    function validationConfig(bytes21 vId) external view returns (ValidationConfig memory) { return configs[vId]; }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        bytes calldata sig = op.signature;
+        require(sig.length == 65, "InvalidSignature");
+        executionHook[hash] = configs[rootValidator].hook;
+        bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        return ecrecover(h, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64])) == owner ? 0 : 1;
+    }
+    function executeUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash) external payable {
+        require(msg.sender == entryPoint, "entrypoint");
+        address hook = executionHook[userOpHash];
+        bytes memory context;
+        if (hook != address(1)) context = IKernelHook(hook).preCheck(msg.sender, msg.value, userOp.callData[4:]);
+        (bool ok, ) = address(this).delegatecall(userOp.callData[4:]);
+        if (!ok) revert ExecutionReverted();
+        if (hook != address(1)) IKernelHook(hook).postCheck(context);
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
+/// An execution hook that refuses calls to one module (as a Kernel permission's hook on Base refuses module calls).
+contract RefusingHook {
+    error ModuleCallNotAllowed(address target);
+    address public immutable module;
+    constructor(address m) { module = m; }
+    function preCheck(address, uint256, bytes calldata data) external view returns (bytes memory) {
+        (address to, , ) = abi.decode(data[4:], (address, uint256, bytes));
+        if (to == module) revert ModuleCallNotAllowed(to);
+        return "";
+    }
+    function postCheck(bytes calldata) external pure {}
+}

@@ -3,13 +3,14 @@
 // aave-v3-origin's Errors library as deployed by HyperLend (all verified on Sourcify, HyperEVM); and smart accounts'
 // and paymasters' errors met replaying ERC-4337 operations: ZeroDev Kernel, Alchemy's LightAccount and Modular
 // Account v2, Bleap's cosigning module (verified on Sourcify), Pimlico's paymaster, a bridge's relaying paymaster
-// (UnrecycledBundle), Solady's SafeTransferLib (TransferFromFailed), Ostium's price upkeep (NotInitiated) and
-// NonAdminSelfCall (OpenChain's signature database, from verified contracts).
+// (UnrecycledBundle), Solady's SafeTransferLib (TransferFromFailed), Ostium's price upkeep (NotInitiated), and
+// NonAdminSelfCall and a Kernel execution hook's ModuleCallNotAllowed (OpenChain's signature database, from
+// verified contracts).
 import { decodeErrorResult, parseAbiItem, toFunctionSelector, type Abi, type Hex } from 'viem';
 
 export const KNOWN_ERRORS = [
   'InvalidSignatureType()', 'BundlerNotAllowed(address)', 'UnrecycledBundle()', 'TransferFromFailed()', 'NotInitiated(uint256)', 'NonAdminSelfCall()', 'UserOpValidationFunctionReverted(bytes24,bytes)', 'ValidationFunctionMissing(bytes4)',
-  'InvalidValidator()', 'InvalidNonce()', 'OnlyExecuteUserOp()', 'InvalidValidationType()', 'PermissionNotAlllowedForUserOp()', 'NotRootPermission()',
+  'InvalidValidator()', 'InvalidNonce()', 'ModuleCallNotAllowed(address)', 'OnlyExecuteUserOp()', 'InvalidValidationType()', 'PermissionNotAlllowedForUserOp()', 'NotRootPermission()',
   'ERC20InsufficientAllowance(address,uint256,uint256)', 'ERC20InsufficientBalance(address,uint256,uint256)', 'ERC20InvalidReceiver(address)', 'ERC20InvalidSpender(address)',
   'ReentrancyGuardReentrantCall()', 'AccessControlUnauthorizedAccount(address,bytes32)', 'EnforcedPause()', 'AboveMaximum()',
   'BelowMinimum()', 'ContractPaused()', 'InsufficientTokenBalance()', 'InvalidAddress()',
@@ -51,6 +52,7 @@ const MEANING: Record<string, string> = {
   NonAdminSelfCall: 'the account only lets an admin key make calls to itself',
   ValidationFunctionMissing: 'the account has no validation installed for this call',
   InvalidValidator: "the validator the operation names isn't installed for this call",
+  ModuleCallNotAllowed: "the hook the account's key was installed with doesn't let it call that module",
   ERC20InsufficientAllowance: 'the contract is not allowed to move that much of your token (approve it first)',
   ERC20InsufficientBalance: 'you do not hold enough of the token',
   BelowMinimum: 'the amount is below the minimum',

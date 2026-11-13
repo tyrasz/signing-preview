@@ -99,6 +99,34 @@ async function hasCode(deps: Dependencies, chainId: number, address: string): Pr
   try { return String(await deps.rpc.call(chainId, 'eth_getCode', [address, 'latest'])) !== '0x'; } catch { return undefined; }
 }
 
+const KERNEL_VALIDATION = parseAbi(['function rootValidator() view returns (bytes21)', 'function validationConfig(bytes21 vId) view returns (uint32 nonce, address hook)']);
+/**
+ * The execution hook Kernel v3's validateUserOp stores for an operation, as a storage word: its validation's
+ * (validationConfig(vId).hook, vId from the nonce as Kernel decodes it: the type byte and the validator's 20 bytes, or
+ * a permission's 4; the root's, rootValidator(), for type 0x00). address(1), none, where it can't be read or none is
+ * installed yet (enable mode installs it in validation itself).
+ */
+async function kernelExecutionHook(deps: Dependencies, chainId: number, sender: string, nonce: bigint): Promise<Hex> {
+  const none = `0x${'1'.padStart(64, '0')}` as Hex;
+  const rpc = deps.rpc?.has(chainId) ? deps.rpc : undefined;
+  if (!rpc) return none;
+  const view = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: sender, data }, 'latest']));
+  try {
+    const n = nonce.toString(16).padStart(64, '0');
+    const type = n.slice(2, 4);
+    let vId = `0x${type}${type === '02' ? n.slice(4, 12).padEnd(40, '0') : n.slice(4, 44)}` as Hex;
+    if (type === '00') {
+      const root = await view(encodeFunctionData({ abi: KERNEL_VALIDATION, functionName: 'rootValidator' }));
+      if (!/^0x[0-9a-f]{64}$/i.test(root)) return none;
+      vId = root.slice(0, 44) as Hex;
+    }
+    const config = await view(encodeFunctionData({ abi: KERNEL_VALIDATION, functionName: 'validationConfig', args: [vId] }));
+    if (!/^0x[0-9a-f]{128}$/i.test(config)) return none;
+    const hook = BigInt(`0x${config.slice(66 + 24)}`);
+    return hook > 1n ? `0x${hook.toString(16).padStart(64, '0')}` as Hex : none;
+  } catch { return none; }
+}
+
 /**
  * The operation's execution phase, simulated. Null when there's no simulator, the simulator doesn't cover the chain,
  * or (deploying) it can't run calls from two senders in order.
@@ -111,14 +139,17 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
   if (data.toLowerCase().startsWith(EXECUTE_USER_OP) && op.packed) {
     data = encodeFunctionData({ abi: PACKED, functionName: 'executeUserOp', args: [{ sender: sender as Hex, ...op.packed, callData: op.callData, signature: '0x' }, op.userOpHash ?? `0x${'00'.repeat(32)}`] });
   }
-  // Kernel v3 runs executeUserOp's calls after the execution hook validateUserOp stored for the operation's hash
-  // (executionHook[userOpHash], the mapping in its slot 0): with none stored, it calls address(0) as the hook and
-  // reverts, as calls of an operation that succeeded did on Polygon and Base. Stored here as address(1), no hook,
-  // which is what validation stores for a validator or permission installed without one.
+  // Kernel v3 runs executeUserOp's calls between the preCheck and postCheck of the execution hook validateUserOp
+  // stored for the operation's hash (executionHook[userOpHash], the mapping in its slot 0): with none stored, it
+  // calls address(0) as the hook and reverts, as calls of an operation that succeeded did on Polygon and Base. Stored
+  // here as validation stores it (kernelExecutionHook): the hook its validator or permission was installed with, which
+  // can refuse the calls (on Base, a permission's hook refusing calls to modules: ModuleCallNotAllowed).
   let hook: Record<string, Hex> | undefined;
-  if (data !== op.callData && !op.initCode) {
+  if (data !== op.callData && !op.initCode && op.packed) {
     const runs = op.delegate?.toLowerCase() ?? await implementationOf(deps, op.chainId, sender);
-    if (runs && KERNEL_V3_EXECUTION_HOOK.has(runs)) hook = { [keccak256(concatHex([op.userOpHash ?? `0x${'00'.repeat(32)}`, `0x${'00'.repeat(32)}`]))]: `0x${'1'.padStart(64, '0')}` };
+    if (runs && KERNEL_V3_EXECUTION_HOOK.has(runs)) {
+      hook = { [keccak256(concatHex([op.userOpHash ?? `0x${'00'.repeat(32)}`, `0x${'00'.repeat(32)}`]))]: await kernelExecutionHook(deps, op.chainId, sender, op.packed.nonce) };
+    }
   }
   const exec: SimulationRequest = { chainId: op.chainId, from: entryPoint, account: sender, to: sender, data, value: 0n, ...(op.watch?.length && { watch: op.watch }),
     // With headroom: on-chain, validation (and a token paymaster's checks) has already warmed the contracts and
@@ -1201,10 +1232,15 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const price = fee === undefined ? undefined : op.maxFeePerGas >= fee ? (op.maxFeePerGas < fee + tip ? op.maxFeePerGas : fee + tip)
     : fee + (NO_TIPS.has(op.chainId) ? 0n : await suggestedTip(deps, op.chainId));
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
+  // Failing that, the best of them: a run that went through with the signature refused (the signer isn't the
+  // account's: the whole operation's gas, and why) over a later shape's rejection (Kernel's ECDSA validator reverts on
+  // the 0xff form, InvalidSignature); and a candidate that couldn't run doesn't replace one that did.
   let result: OperationRun | null = null;
+  const rank = (r: OperationRun) => (r.rejected?.startsWith('AA23') ? 0 : 1);
   for (const stub of stubs) {
-    result = await withStub(stub);
-    if (result && !result.account?.signatureFailed && !result.rejected?.startsWith('AA23')) break;
+    const ran = await withStub(stub);
+    if (ran && !ran.account?.signatureFailed && !ran.rejected?.startsWith('AA23')) return ran;
+    if (ran && (!result || rank(ran) >= rank(result))) result = ran;
   }
   return result;
 
