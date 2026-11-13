@@ -444,13 +444,14 @@ console.log('\n8. Recent real Uniswap Universal Router transactions on Ethereum'
   const routers = Object.entries(UNIVERSAL_ROUTERS).filter(([, v]) => v.chains.includes(1)).map(([a]) => a);
   const sym = async (a: string) => a === 'native' ? 'ETH' : (await tokens.get(1, a))?.symbol ?? a;
   let n = BigInt(String(await live.call(1, 'eth_blockNumber', []))) - 2n;
-  const txs: { hash: string; from: string; to: string; input: Hex; value: string; ts: number }[] = [];
+  const txs: { hash: string; from: string; to: string; input: Hex; value: string; ts: number; senders: Set<string> }[] = [];
   for (let i = 0; i < 40 && txs.length < 10; i++, n--) {
     const blk = await live.call(1, 'eth_getBlockByNumber', ['0x' + n.toString(16), true]) as { timestamp: string; transactions: { hash: string; from: string; to: string | null; input: Hex; value: string }[] };
-    for (const t of blk.transactions) if (t.to && routers.includes(t.to.toLowerCase()) && txs.length < 10) txs.push({ ...t, to: t.to, ts: Number(blk.timestamp) });
+    const senders = new Set(blk.transactions.map(x => x.from.toLowerCase()));
+    for (const t of blk.transactions) if (t.to && routers.includes(t.to.toLowerCase()) && txs.length < 10) txs.push({ ...t, to: t.to, ts: Number(blk.timestamp), senders });
   }
   const bad: string[] = [];
-  let matched = 0, unheadlined = 0;
+  let matched = 0, unheadlined = 0, unchecked = 0;
   for (const t of txs) {
     const r = await live.call(1, 'eth_getTransactionReceipt', [t.hash]) as { status: string; blockNumber: string; gasUsed: string; effectiveGasPrice: string; logs: { address: string; topics: string[]; data: string }[] };
     if (r.status !== '0x1') continue; // reverted: nothing moved to compare with
@@ -469,15 +470,21 @@ console.log('\n8. Recent real Uniswap Universal Router transactions on Ethereum'
     net.set('native', (net.get('native') ?? 0n) + ethIn); // value paid shows as a negative balance change
     const paid = await Promise.all([...net].filter(([, v]) => v < 0n).map(([k]) => sym(k)));
     const got = await Promise.all([...net].filter(([, v]) => v > 0n).map(([k]) => sym(k)));
+    // ETH the preview says goes to another address: seen as that address's balance rising across the block, which an
+    // address that also sends a transaction of its own in the block (a trading bot's wallet) can hide: its inflow
+    // then can't be told from the balances, and the swap is left unchecked rather than failed.
+    let hidden = false;
     for (const a of new Set([...(p.warnings.find(w => w.code === 'output_to_other')?.message ?? '').matchAll(/0x[0-9a-fA-F]{40}/g)].map(x => x[0].toLowerCase()))) {
       if ((await bal(a, bn)) > (await bal(a, bn - 1n))) got.push('ETH');
+      else if (m[2] === 'ETH' && t.senders.has(a)) hidden = true;
       for (const x of logs.transfers) if (x.to === a) got.push(await sym(x.asset));
     }
     if (paid.includes(m[1]) && got.includes(m[2])) matched++;
+    else if (paid.includes(m[1]) && hidden) unchecked++;
     else bad.push(`${t.hash}: "${p.title}" but the chain shows paid ${paid.join('+') || 'nothing'}, received ${got.join('+') || 'nothing'}`);
   }
   check(txs.length > 0, 'recent router transactions found'.padEnd(34), `${txs.length} in the last 40 blocks`);
-  check(bad.length === 0, 'real swaps decode and match'.padEnd(34), `${matched} matched${unheadlined ? `, ${unheadlined} multi-step without a single headline` : ''}${bad.length ? ' | ' + bad.join(' | ') : ''}`);
+  check(bad.length === 0, 'real swaps decode and match'.padEnd(34), `${matched} matched${unheadlined ? `, ${unheadlined} multi-step without a single headline` : ''}${unchecked ? `, ${unchecked} whose ETH went to an address that spent in the same block (not checkable from balances)` : ''}${bad.length ? ' | ' + bad.join(' | ') : ''}`);
 }
 
 console.log('\n9. Kinetiq and HyperLend on HyperEVM');
