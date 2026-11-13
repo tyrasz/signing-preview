@@ -144,9 +144,27 @@ export async function sharedSignerVerifiers(deps: Dependencies, chainId: number,
       if (/^0x[0-9a-f]{192}$/i.test(out)) verifiers = BigInt(`0x${out.slice(130)}`);
     } catch { /* unreadable */ }
   }
+  return verifiersOf(verifiers);
+}
+/** P256.Verifiers (a uint176): the precompile's address (16 bits) above the fallback verifier contract's. Null if unset. */
+function verifiersOf(verifiers: bigint): { precompile: string; fallback: string } | null {
   if (!verifiers) return null;
   const address = (v: bigint) => `0x${v.toString(16).padStart(40, '0')}`;
   return { precompile: address((verifiers >> 160n) & 0xffffn), fallback: address(verifiers & ((1n << 160n) - 1n)) };
+}
+const SIGNER_CONFIGURATION = toFunctionSelector('getConfiguration()');
+/**
+ * A Safe owner that is a passkey's own signer (safe-modules' SafeWebAuthnSignerProxy, one per passkey, made by its
+ * SafeWebAuthnSignerFactory): the passkey and the verifiers it is checked with are the proxy's immutables, which its
+ * getConfiguration() returns (x, y, verifiers). The verifiers, or null when the owner isn't one (an EOA answers nothing).
+ */
+export async function webAuthnSignerVerifiers(deps: Dependencies, chainId: number, owner: string): Promise<{ precompile: string; fallback: string } | null> {
+  if (!deps.rpc?.has(chainId)) return null;
+  try {
+    const out = String(await deps.rpc.call(chainId, 'eth_call', [{ to: owner, data: SIGNER_CONFIGURATION }, 'latest']));
+    if (!/^0x[0-9a-f]{192}$/i.test(out) || /^0x0{128}/.test(out)) return null;
+    return verifiersOf(BigInt(`0x${out.slice(130)}`));
+  } catch { return null; }
 }
 /**
  * A passkey's assertion as Safe's WebAuthn library decodes it: abi.encode(authenticatorData, clientDataFields, r, s)

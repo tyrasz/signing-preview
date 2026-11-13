@@ -39,7 +39,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { okxDigest } from '../src/erc4337-sim.ts';
+import { BULLBIT_IMPLEMENTATION, implementationOf, okxDigest } from '../src/erc4337-sim.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
@@ -582,8 +582,10 @@ async function replay(item: string): Promise<void> {
   // A passkey's assertion whose clientDataJSON carries the key Chrome adds to some at random
   // ("other_keys_can_be_added_here", 109 bytes; 35 of 163 of the bullbit.ai wallet's operations on Base): which
   // will get it isn't known before signing, and the stand-in has none. An account that reads clientDataJSON byte by
-  // byte pays for it (the bullbit.ai wallet 30,296 gas, 4-7% of its operations' gas). Its gas is reported, not judged.
-  if (op.signature.toLowerCase().includes(CHROME_EXTRA_KEY)) row.passkeyExtraKey = true;
+  // byte pays for it (the bullbit.ai wallet 30,296 gas, 4-7% of its operations' gas). Its gas is reported, not judged:
+  // for that wallet only. For the others measured (ZeroDev's and Safe's passkeys) the key costs nothing measurable, and
+  // not judging it hid real errors (190% and -23%, of stand-ins on another verification path).
+  if (op.signature.toLowerCase().includes(CHROME_EXTRA_KEY) && await implementationOf(deps, CHAIN, sender) === BULLBIT_IMPLEMENTATION) row.passkeyExtraKey = true;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
     // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas

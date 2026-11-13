@@ -329,6 +329,8 @@ interface Stub {
 }
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
+  /** The EntryPoint the operation goes to (where the account's earlier operations are logged). */
+  entryPoint?: string;
   /** The operation's paymasterAndData (a multi-signer account's cosigners sign gas limits that name its paymaster). */
   paymasterAndData?: Hex;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
@@ -374,8 +376,55 @@ const ZERODEV_WEBAUTHN_VALIDATORS = new Set(['0x7ab16ff354acb328452f1d445b3ddee9
  * challenge the operation's hash; checked live: the stand-in validates).
  */
 const KERNEL_WEBAUTHN_SOL_VALIDATORS = new Set(['0xbbbe97d3d0e926231975e0b69acb54d534d35b1e']);
-/** Chains here on which ZeroDev's SDK signs with the P256 precompile (its isRIP7212SupportedNetwork). */
-const ZERODEV_PRECOMPILED = new Set([1, 42161, 8453, 137]);
+/**
+ * Chains here on which ZeroDev's passkey accounts sign with the P256 precompile (usePrecompiled), else with Daimo's
+ * verifier contract (P-256 in Solidity, about 335,000 gas more): for an account with no earlier operation to tell
+ * (see zeroDevPrecompiled). The wallet's SDK decides: @zerodev/webauthn-key's isRIP7212SupportedNetwork named only
+ * Polygon up to 5.4.4, and from 5.5.0 (December 2025) every chain here but HyperEVM, and wallets still ship both. So
+ * by what accounts sign on each chain (November 2026): with the precompile on Base 34 of 34 operations, Polygon 8 of
+ * 8, Arbitrum One 141 of 147, Sepolia 19 of 24; without it on Ethereum 17 of 17 and BNB Chain 5 of 5 (none seen on OP
+ * Mainnet). Taken the other way, Base's came out 190-219% high, Polygon's 25-113%, BNB Chain's 60% low.
+ */
+const ZERODEV_PRECOMPILED = new Set([137, 8453, 42161, 11155111]);
+const HANDLE_OPS = parseAbi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
+const ZERODEV_WEBAUTHN_SIGNATURE = [{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }] as const;
+/** What each account's latest earlier operation showed (see zeroDevPrecompiled), for ten minutes. */
+const ZERODEV_SIGNED = new Map<string, { at: number; precompiled: boolean | undefined }>();
+/**
+ * Whether a ZeroDev passkey account's wallet signs with the P256 precompile: as its latest earlier operation did (its
+ * signature's usePrecompiled, after the 0xff of a permission's; the same wallet signs the same way), its last
+ * UserOperationEvent up to the block before the latest, within 10,000 blocks, then 100,000; else as most do on its
+ * chain (ZERODEV_PRECOMPILED). Blofin's wallet signs without the precompile on Arbitrum One, where 141 of 147
+ * operations had it: by the chain's default its operations came out 27-47% low.
+ */
+async function zeroDevPrecompiled(c: StubContext): Promise<boolean> {
+  const rpc = c.deps.rpc;
+  if (!rpc?.has(c.chainId) || !c.entryPoint) return ZERODEV_PRECOMPILED.has(c.chainId);
+  const key = `${c.chainId}:${c.entryPoint}:${c.sender}`;
+  let known = ZERODEV_SIGNED.get(key);
+  if (!known || Date.now() - known.at >= 600_000) {
+    let precompiled: boolean | undefined;
+    try {
+      const latest = await rpc.call(c.chainId, 'eth_getBlockByNumber', ['latest', false]) as { number?: string } | null;
+      const head = BigInt(latest?.number ?? '0x0') - 1n;
+      for (const span of [10_000n, 100_000n]) {
+        if (head <= 0n) break;
+        const logs = await rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
+          fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]).catch(() => null) as { transactionHash: string }[] | null;
+        const last = logs?.at(-1);
+        if (!last) continue;
+        const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [last.transactionHash]) as { input?: Hex } | null;
+        const mine = (tx?.input ? decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0] : []).find(o => o.sender.toLowerCase() === c.sender.toLowerCase());
+        const read = (sig: Hex) => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
+        if (mine) precompiled = read(mine.signature) ?? (mine.signature.startsWith('0xff') ? read(`0x${mine.signature.slice(4)}`) : undefined);
+        break;
+      }
+    } catch { /* not readable: the chain's default */ }
+    known = { at: Date.now(), precompiled };
+    ZERODEV_SIGNED.set(key, known);
+  }
+  return known.precompiled ?? ZERODEV_PRECOMPILED.has(c.chainId);
+}
 /**
  * A passkey's assertion as ZeroDev's WebAuthn validator decodes it: abi.encode(authenticatorData, clientDataJSON,
  * responseTypeLocation, r, s, usePrecompiled), with `"type":"webauthn.get"` at clientDataJSON[1] and the hash as
@@ -459,7 +508,7 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
   if (type === '01' && ZERODEV_WEBAUTHN_VALIDATORS.has(`0x${id}`.toLowerCase())) {
     const hash = await c.hash();
     if (!hash) return ecdsa;
-    const precompiled = ZERODEV_PRECOMPILED.has(c.chainId);
+    const precompiled = await zeroDevPrecompiled(c);
     return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
   }
   if (type === '01' && KERNEL_WEBAUTHN_SOL_VALIDATORS.has(`0x${id}`.toLowerCase())) {
@@ -479,7 +528,7 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
       // validator takes it (zeroDevWebAuthnStub).
       if (config && ZERODEV_WEBAUTHN_SIGNERS.has(config.signer.toLowerCase())) {
         const hash = await c.hash();
-        if (hash) { const precompiled = ZERODEV_PRECOMPILED.has(c.chainId); return [{ signature: `0xff${zeroDevWebAuthnStub(hash, precompiled).slice(2)}` as Hex, p256: precompiled || 'daimo' }]; }
+        if (hash) { const precompiled = await zeroDevPrecompiled(c); return [{ signature: `0xff${zeroDevWebAuthnStub(hash, precompiled).slice(2)}` as Hex, p256: precompiled || 'daimo' }]; }
       }
       if (config && COSIGNING_SIGNERS.has(config.signer.toLowerCase())) {
         const cosigner = String(await rpc.call(c.chainId, 'eth_call', [{ to: config.signer, data: encodeFunctionData({ abi: COSIGNER, functionName: 'cosigner' }) }, 'latest']));
@@ -893,7 +942,7 @@ const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e1560
  * The code an account runs: the ERC-1967 implementation its proxy (or Biconomy Smart Account v2's proxy's) (or its EIP-7702 delegate, such as Coinbase's
  * EIP7702Proxy) runs, else its EIP-7702 delegate. Undefined if neither, or unreadable.
  */
-async function implementationOf(deps: Dependencies, chainId: number, account: string): Promise<string | undefined> {
+export async function implementationOf(deps: Dependencies, chainId: number, account: string): Promise<string | undefined> {
   if (!deps.rpc?.has(chainId)) return undefined;
   try {
     const code = String(await deps.rpc.call(chainId, 'eth_getCode', [account, 'latest']));
@@ -1135,7 +1184,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
   const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData }, op.delegate, op.initCode);
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;

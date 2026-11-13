@@ -5,7 +5,7 @@ import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../f
 import { chainName } from '../chains.ts';
 import { describeSafeTx, reportConfigChanges, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
 import { simulateExecution, simulateOperation, STUB_SIGNATURE, stubSignature } from '../erc4337-sim.ts';
-import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf, safeSignatures, safeWebAuthnStub, SAFE_WEBAUTHN_SHARED_SIGNER, sharedSignerVerifiers } from '../safe-sim.ts';
+import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf, safeSignatures, safeWebAuthnStub, SAFE_WEBAUTHN_SHARED_SIGNER, sharedSignerVerifiers, webAuthnSignerVerifiers } from '../safe-sim.ts';
 import { decodeTransaction } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
@@ -143,9 +143,14 @@ const safeOp: TypedAdapter = async (data, env) => {
         const setup = deploys ? safeSetupOf(initCode) : null;
         const asc = (a: string, z: string) => (BigInt(a) < BigInt(z) ? -1 : 1);
         const primary = setup && (env.signer && setup.owners.includes(env.signer.toLowerCase()) ? env.signer.toLowerCase() : [...setup.owners].sort(asc)[0]);
-        // A passkey owner through Safe's WebAuthn shared signer signs as a contract: a WebAuthn assertion, which the
-        // P-256 verifier its passkey names accepts after running its real check (so the check costs what it will).
-        const verifiers = (owner ?? primary) === SAFE_WEBAUTHN_SHARED_SIGNER ? await sharedSignerVerifiers(env.deps, chainId, safe, deploys ? initCode : undefined) : null;
+        // A passkey owner signs as a contract: a WebAuthn assertion, which the P-256 verifier its passkey names accepts
+        // after running its real check (so the check costs what it will). Through Safe's WebAuthn shared signer (the
+        // passkey in the Safe's storage), or through the passkey's own signer contract (SafeWebAuthnSignerProxy): an
+        // ECDSA stand-in for that owner left out the check, a P-256 verification in Solidity, and SafeOps came out
+        // 44-51% low (Ethereum, Base, Polygon; about 225,000 gas).
+        const signingOwner = owner ?? primary;
+        const verifiers = signingOwner === SAFE_WEBAUTHN_SHARED_SIGNER ? await sharedSignerVerifiers(env.deps, chainId, safe, deploys ? initCode : undefined)
+          : signingOwner ? await webAuthnSignerVerifiers(env.deps, chainId, signingOwner) : null;
         const passkey = verifiers ? safeWebAuthnStub() : undefined;
         const approvals = before && digest ? approvalsFor(before, digest as Hex, owner ? { owner, signature: STUB_SIGNATURE, ...(passkey && { contract: passkey }) } : undefined) : null;
         const signing = setup && primary && setup.threshold <= 16n ? [primary, ...[...setup.owners].sort(asc).filter(o => o !== primary)].slice(0, Number(setup.threshold)).sort(asc) : null;
