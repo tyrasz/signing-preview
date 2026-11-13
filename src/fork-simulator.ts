@@ -1019,7 +1019,7 @@ const HEVM = '0x7109709ecfa91a80626ff3989d68f67f5b1dd12d';
  * registry), before it checks the parameters' version and decimals; getB20Address is charged it too. Finding
  * whether the token exists is an account read, warm or cold as EIP-2929 prices it (100 or 2,600), isB20Initialized's
  * the same: a creation that would overwrite one fails with both (TokenAlreadyExists). Writing the token costs 34,436
- * more for an asset, 32,236 for a stablecoin; a role granted is charged one read of its flag (ROLE_EVENTS). A
+ * more for an asset, 32,236 for a stablecoin; a role granted is charged one read of its flag (ROLES_AT). A
  * stablecoin's currency is checked after all that: an invalid one (lowercase) and an empty one fail with it charged
  * (the reference, patched, checks it after the existence check too, as the chain does). With these, 141 calls of 20 kinds of creation came out alike on the node
  * and here (asset and stablecoin; 6 or 18 decimals; names of 0 to 50 bytes; an admin or none; init calls that
@@ -1042,8 +1042,23 @@ const EIP712_FUNCTIONS = new Set(['0xd505accf', '0x3644e515']), PERMIT = '0xd505
 const B20_PARAM_ERRORS: Record<string, bigint> = { '0x997c1de8': B20_CREATED_GAS['01'], '0x4a43ae87': B20_CREATED_GAS['01'] }; // InvalidCurrency, MissingRequiredField
 /** Panic(0x41): the reference's ABI decoder given a string too long to allocate, where the node echoes the selector. */
 const PANIC_ALLOCATION = `0x4e487b71${'41'.padStart(64, '0')}`;
-/** RoleGranted, RoleRevoked: the reference reads a role's flag again to write it, the node once (100 less each). */
+/** RoleGranted, RoleRevoked: renounceLastAdmin's 100 more after its write, at its RoleRevoked. */
 const ROLE_EVENTS = new Set([0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0dn, 0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171bn]);
+/**
+ * A token's roles (roles[role][account]) and allowances (allowances[owner][spender]): mappings of mappings at
+ * B20_LAYOUT + these. The reference reads a role's flag again to write it, the node once (100 less, at the write).
+ */
+const ROLES_AT = 6n, ALLOWANCES_AT = 5n;
+/**
+ * roles[DEFAULT_ADMIN_ROLE], the mapping of its holders' flags, and its slot's preimage: the reference's compiler
+ * works that slot out ahead where the role is a constant (the factory's grant of the initial admin), so a run never
+ * hashes it.
+ */
+const ADMIN_FLAGS = (() => { const p = setLengthLeft(hexToBytes(`0x${(B20_LAYOUT + ROLES_AT).toString(16)}`), 64); return { slot: keccak256(p), preimage: p }; })();
+/** renounceLastAdmin, and transferFrom and transferFromWithMemo, which spend an allowance (see chargeStep). */
+const RENOUNCE_LAST_ADMIN = '0x6f79e3d7', SPENDS_ALLOWANCE = new Set(['0x23b872dd', '0x929c2539']), TRANSFER_TOPIC = BigInt(TRANSFER);
+/** EIP-2200's sentry: an SSTORE fails with this much gas left or less. */
+const SSTORE_SENTRY = 2_300n;
 /**
  * Where the reference's own storage reads differ from the node's for a token's function, measured on Base with each
  * call timed from a contract: what to add to its charge, at its first write in its own frame (so within the gas it
@@ -1568,19 +1583,33 @@ export class ForkSimulator implements Simulator {
     type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; looked?: boolean; hashed?: boolean; static?: boolean; hevmCold?: boolean };
     /** A token's own call (not run as another's code, not refused): what is charged by its function (B20_WRITE_GAS, EIP-712). */
     type TokenCall = { code: string; caller: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean; written?: boolean; ended?: boolean; sloads: number; stored: Set<bigint>; topics: Set<bigint>;
-      /** A multiplier view's first read of the pending slot (MULTIPLIER_VIEWS): its value on the stack at the next step, then seen. */ pending?: 'reading' | 'seen' };
+      /** A multiplier view's first read of the pending slot (MULTIPLIER_VIEWS): its value on the stack at the next step, then seen. */ pending?: 'reading' | 'seen';
+      /** The price of an allowance's write a transferFrom spends, charged after its Transfer (SPENDS_ALLOWANCE). */ spent?: bigint };
     let charging: Charge | undefined;
     /** Each message's bookkeeping, popped as it ends: the charge it opened, a precompile, a token's own call. */
-    const opened: { charge?: Charge; precompile?: boolean; token?: TokenCall }[] = [];
+    const opened: { charge?: Charge; precompile?: boolean; token?: TokenCall; static?: boolean }[] = [];
     const tokenCalls: TokenCall[] = [];
     // The contracts the node runs itself that the request being run reached (SimulationResult.standIns).
     const reached = new Set<string>();
     const warmIn = (token: string) => (slot: bigint) => evm.journal.isWarmedStorage(hexToBytes(token as Hex), hexToBytes(`0x${slot.toString(16).padStart(64, '0')}`));
+    source.preimages.set(ADMIN_FLAGS.slot, ADMIN_FLAGS.preimage);
+    /** The token's mapping of mappings (B20_LAYOUT + n) a slot is an entry of, by its preimages (StateSource.preimages). */
+    const nestedIn = (slot: bigint) => {
+      const p = source.preimages.get(`0x${slot.toString(16).padStart(64, '0')}`), outer = p && source.preimages.get(bytesToHex(p.subarray(32)));
+      return outer ? BigInt(bytesToHex(outer.subarray(32))) - B20_LAYOUT : undefined;
+    };
+    // EIP-2200's sentry: the node's write fails, out of gas, with 2,300 gas or less left, what the call was given less
+    // what it has charged before the write (measured on Base, with a stipend each side of it: a write that costs 100
+    // and is followed by less than 2,201 of events or writes, as a second transfer, approve, mint, burn, permit, pause,
+    // grant or revoke in a transaction is, runs out where the reference, on spare gas, didn't), in a token's own
+    // writes, its init calls, announce's and the registries' alike; in a static call the write fails first.
+    const sentry = (charged: bigint) => {
+      if (charging && charging.limit - charged <= SSTORE_SENTRY) { charging.node = charging.limit + 1n; throw new EVMError(EVMError.errorMessages.OUT_OF_GAS); }
+    };
     const chargeStep = (e: { opcode: { name: string; fee: number; dynamicFee?: bigint }; stack?: bigint[]; memory?: Uint8Array; address?: Address; depth?: number }, next?: () => void) => {
-      // (Less 375 an event: the node charges its topics and data, not LOG's own base.)
-      if (charging && NATIVE_CHARGED.has(e.opcode.name)) charging.node += BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n);
-      // A role granted or revoked: the reference reads its flag again to write it, the node once (ROLE_EVENTS).
-      if (charging && e.opcode.name === 'LOG4' && e.stack && e.address && B20.test(e.address.toString()) && ROLE_EVENTS.has(e.stack[e.stack.length - 3])) charging.node -= 100n;
+      // (Less 375 an event: the step's dynamic fee counts LOG's base again. The node charges an event as an EVM's LOG.)
+      const fee = charging && NATIVE_CHARGED.has(e.opcode.name) ? BigInt(e.opcode.fee) + (e.opcode.dynamicFee ?? 0n) - (e.opcode.name.startsWith('LOG') ? 375n : 0n) : 0n;
+      if (charging) charging.node += fee;
       const at = e.address?.toString(), top = e.stack?.length ? `0x${e.stack[e.stack.length - 1].toString(16).padStart(40, '0')}` : '';
       if (charging?.code === B20_FACTORY && at === B20_FACTORY) {
         const selector = charging.selector ? bytesToHex(charging.selector) : '';
@@ -1612,11 +1641,27 @@ export class ForkSimulator implements Simulator {
         // node once (200 less each, as each is reached).
         else if (t.selector === '0xa290249c' || t.selector === '0x8b93dd63') charging.node -= 200n;
       }
+      if (charging && e.opcode.name === 'SSTORE' && e.stack?.length) {
+        const mapping = nestedIn(e.stack[e.stack.length - 1]);
+        // A role's flag written (ROLES_AT; in a static call too, where the write fails): renounceLastAdmin reads once
+        // more than the reference before it (a static one is charged the reference's reads), and again after.
+        if (own && mapping === ROLES_AT && t.selector !== RENOUNCE_LAST_ADMIN) charging.node -= 100n;
+        // The sentry (above), as of the charge before this write, with what this step stands for before it: a
+        // function's first-write correction, pause's, a verified permit's read of its nonce, a role's flag read once.
+        // An allowance transferFrom spends the node writes after the transfer and its Transfer event (measured: a
+        // second transferFrom runs out until 2,201 over its charge, transferFromWithMemo 701, before its Memo): its
+        // write is checked and charged there, and one whose transfer fails is charged none of it (100 or 2,900 less).
+        if (!opened.at(-1)?.static) {
+          if (own && mapping === ALLOWANCES_AT && SPENDS_ALLOWANCE.has(t.selector)) { charging.node -= fee; t.spent = fee; }
+          else sentry(charging.node - fee);
+        }
+      }
+      if (charging && own && t.spent !== undefined && e.opcode.name === 'LOG3' && e.stack && e.stack[e.stack.length - 3] === TRANSFER_TOPIC) { sentry(charging.node); charging.node += t.spent; t.spent = undefined; }
       // batchMint: 100 more a recipient, as each is reached (its mint asks the policy registry), the refused one too.
       if (charging && own && t.selector === '0x68573107' && e.opcode.name === 'STATICCALL' && e.stack && `0x${e.stack[e.stack.length - 2].toString(16).padStart(40, '0')}` === '0x8453000000000000000000000000000000000002') charging.node += 100n;
-      // renounceLastAdmin: 100 over the reference, with its RoleRevoked's 100 less (ROLE_EVENTS), there: a static call,
-      // whose write fails, is charged none of it.
-      if (charging && own && t.selector === '0x6f79e3d7' && e.opcode.name === 'LOG4' && e.stack && ROLE_EVENTS.has(e.stack[e.stack.length - 3])) charging.node += 200n;
+      // renounceLastAdmin: 100 over the reference, the rest of it (with its flag's write, ROLES_AT) at its RoleRevoked: a
+      // static call, whose write fails, is charged none of it.
+      if (charging && own && t.selector === RENOUNCE_LAST_ADMIN && e.opcode.name === 'LOG4' && e.stack && ROLE_EVENTS.has(e.stack[e.stack.length - 3])) charging.node += 100n;
       // A multiplier view taking the pending update's multiplier (MULTIPLIER_VIEWS): the node's read of the pending
       // slot again, as the reference has read it (the value it read on the stack now).
       if (charging && own && t.pending === 'reading' && e.stack?.length) { t.pending = 'seen'; if (takesPending(t.selector, e.stack[e.stack.length - 1], block.header.timestamp)) charging.node += 100n; }
@@ -1798,7 +1843,7 @@ export class ForkSimulator implements Simulator {
     // upgrade, fails again as the EVM loads the code, and says why there.)
     if (chainId === BASE) evm.events!.on('beforeMessage', async (m: BaseMessage, next?: () => void) => {
       const before = opened.length;
-      try { await onBaseMessage(m); } catch { /* see above */ } finally { if (opened.length === before) opened.push({}); next?.(); }
+      try { await onBaseMessage(m); } catch { /* see above */ } finally { if (opened.length === before) opened.push({}); opened.at(-1)!.static = m.isStatic; next?.(); }
     });
     /** The finished trace of the call just run: each frame's events numbered by their place among the call's. */
     const traceOf = (logs: unknown[]): TraceCall | undefined => {
