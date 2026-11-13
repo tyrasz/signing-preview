@@ -100,6 +100,18 @@ const BEFORE_EXECUTION = '0xbb47ee3e183a558b1a2ff0874b079f3fc5478b7454eacf2bfc5a
 const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 /** WETH-style wrappers' Deposit(dst, wad) and Withdrawal(src, wad): their balance changes without a Transfer. */
 const DEPOSIT = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c', WITHDRAWAL = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65';
+/** Whether a contract answers decimals(), as a token does (remembered for the run). */
+const TOKEN_LIKE = new Map<string, Promise<boolean>>();
+const tokenLike = (address: string): Promise<boolean> => {
+  let known = TOKEN_LIKE.get(address);
+  if (!known) {
+    known = rpc.call(CHAIN, 'eth_call', [{ to: address, data: '0x313ce567' }, 'latest']).then(r => /^0x[0-9a-f]{64}$/i.test(String(r)))
+      // A node's answer (it reverted: no decimals) is no; a read that failed keeps it counted, as before.
+      .catch((e: { rpcError?: unknown }) => !e?.rpcError);
+    TOKEN_LIKE.set(address, known);
+  }
+  return known;
+};
 const FALLBACK_SLOT = '0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5';
 const SAFE_EXECUTE = ['0x7bb37428', '0x541d63c8'];
 const hi = (w: Hex) => BigInt(`0x${w.slice(2, 34)}`), lo = (w: Hex) => BigInt(`0x${w.slice(34)}`);
@@ -483,7 +495,9 @@ async function replay(item: string): Promise<void> {
   const validated = r.logs.findIndex(l => isEp(l) && l.topics[0] === BEFORE_EXECUTION);
   const previous = r.logs.slice(0, ownEvent).map((l, i) => (isEp(l) && l.topics[0] === UOE ? i : -1)).filter(i => i >= 0).at(-1) ?? validated;
   const own = r.logs.filter((_, i) => i <= validated || (i > previous && i <= ownEvent));
-  for (const l of own) if ((l.topics[0] === DEPOSIT || l.topics[0] === WITHDRAWAL) && l.topics.length === 2 && `0x${l.topics[1].slice(26)}` === sender) {
+  // (Only a token's: a staking contract's or vault's Deposit(address,uint256) has WETH9's signature too, and moves no
+  // token of the account's. One that answers decimals() is taken as a token.)
+  for (const l of own) if ((l.topics[0] === DEPOSIT || l.topics[0] === WITHDRAWAL) && l.topics.length === 2 && `0x${l.topics[1].slice(26)}` === sender && await tokenLike(l.address.toLowerCase())) {
     const token = l.address.toLowerCase(), v = BigInt(l.data.slice(0, 66));
     moved.set(token, (moved.get(token) ?? 0n) + (l.topics[0] === DEPOSIT ? v : -v));
   }
