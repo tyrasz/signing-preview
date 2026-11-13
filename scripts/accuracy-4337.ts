@@ -136,6 +136,17 @@ function safeOpTyped(op: Op, module: string, prefixBytes: number) {
 function innerSignatures(sig: Hex): Hex[] {
   try { const [w] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], sig); if (w.signatureData.length === 132) return [w.signatureData]; } catch { /* not a wrapper */ }
   try { const [inner] = decodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], sig); if (inner.length === 132 && sig.length === 2 + 192 * 2) return [inner]; } catch { /* not Biconomy's */ }
+  // Splits' Smart Vault: a type byte, then its signatures (signerIndex, signatureData) after the gas limits (type 0),
+  // or after the gas limits and two Merkle roots and proofs (type 1: one signature for several operations).
+  if (/^0x0[01]/.test(sig)) {
+    const wrappers = { name: 'signatures', type: 'tuple[]', components: [{ name: 'signerIndex', type: 'uint8' }, { name: 'signatureData', type: 'bytes' }] } as const;
+    const merkle = [{ name: 'lightRoot', type: 'bytes32' }, { name: 'lightProof', type: 'bytes32[]' }, { name: 'root', type: 'bytes32' }, { name: 'proof', type: 'bytes32[]' }] as const;
+    try {
+      const [s] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'gasLimits', type: 'uint256[7]' }, ...(sig.startsWith('0x01') ? merkle : []), wrappers] }], `0x${sig.slice(4)}`) as unknown as [{ signatures: readonly { signatureData: Hex }[] }];
+      const ecdsa = s.signatures.map(w => w.signatureData).filter(d => d.length === 132);
+      if (ecdsa.length) return ecdsa.reverse();
+    } catch { /* not a vault's */ }
+  }
   return [...(sig.length === 2 + 131 * 2 ? [`0x${sig.slice(4, 4 + 130)}` as Hex] : []), ...(sig.length >= 132 ? [`0x${sig.slice(-130)}` as Hex] : [])];
 }
 
@@ -314,6 +325,8 @@ async function replay(item: string): Promise<void> {
   // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
   // validator or permission it installs, which signs the operation (a dApp's session key, mostly). No wallet signs
   // the operation's hash.
+  // An account the operation deploys through ZeroDev's FactoryStaker is a Kernel v3 too.
+  if (BigInt(op.nonce) >> 248n === 1n && code === '0x' && op.initCode.slice(0, 42).toLowerCase() === '0xd703aae79538628d27099b8c4f621be4ccd142d5') return skip("a Kernel operation in enable mode (signed by the key it installs, which its owner approves as typed data)");
   if (BigInt(op.nonce) >> 248n === 1n && code.length > 2) {
     const root = await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']).catch(() => '0x');
     if (/^0x[0-9a-f]{64}$/i.test(String(root))) return skip("a Kernel operation in enable mode (signed by the key it installs, which its owner approves as typed data)");

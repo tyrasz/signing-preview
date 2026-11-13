@@ -28,6 +28,10 @@ export const SENDER_CREATORS: Record<string, string> = {
   '0x433709009b8330fda32311df1c2afa402ed8d009': '0x0a630a99df908a81115a3022927be82f9299987e',
 };
 const EXECUTE_USER_OP = '0x8dd7712f';
+/** ZeroDev's FactoryStaker, which deploys Kernel v3 accounts (deployWithFactory). */
+const KERNEL_FACTORY_STAKER = '0xd703aae79538628d27099b8c4f621be4ccd142d5';
+/** Kernel v3.1, v3.2 and v3.3 (accountId()), which keep each operation's execution hook in executionHook[userOpHash] (slot 0). */
+const KERNEL_V3_EXECUTION_HOOK = new Set(['0xbac849bb641841b44e965fb01a4bf5f074f84b4d', '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1', '0xd6cedde84be40893d153be9d467cd6ad37875b28']);
 const PACKED = parseAbi(['function executeUserOp((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) userOp, bytes32 userOpHash)']);
 
 export interface ExecutionInput {
@@ -107,11 +111,20 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
   if (data.toLowerCase().startsWith(EXECUTE_USER_OP) && op.packed) {
     data = encodeFunctionData({ abi: PACKED, functionName: 'executeUserOp', args: [{ sender: sender as Hex, ...op.packed, callData: op.callData, signature: '0x' }, op.userOpHash ?? `0x${'00'.repeat(32)}`] });
   }
+  // Kernel v3 runs executeUserOp's calls after the execution hook validateUserOp stored for the operation's hash
+  // (executionHook[userOpHash], the mapping in its slot 0): with none stored, it calls address(0) as the hook and
+  // reverts, as calls of an operation that succeeded did on Polygon and Base. Stored here as address(1), no hook,
+  // which is what validation stores for a validator or permission installed without one.
+  let hook: Record<string, Hex> | undefined;
+  if (data !== op.callData && !op.initCode) {
+    const runs = op.delegate?.toLowerCase() ?? await implementationOf(deps, op.chainId, sender);
+    if (runs && KERNEL_V3_EXECUTION_HOOK.has(runs)) hook = { [keccak256(concatHex([op.userOpHash ?? `0x${'00'.repeat(32)}`, `0x${'00'.repeat(32)}`]))]: `0x${'1'.padStart(64, '0')}` };
+  }
   const exec: SimulationRequest = { chainId: op.chainId, from: entryPoint, account: sender, to: sender, data, value: 0n, ...(op.watch?.length && { watch: op.watch }),
     // With headroom: on-chain, validation (and a token paymaster's checks) has already warmed the contracts and
     // slots the call reads, so a standalone run pays cold-access costs the operation doesn't (EIP-2929).
     ...(op.callGasLimit !== undefined && op.callGasLimit > 0n && { gas: op.callGasLimit + op.callGasLimit / 10n + COLD_HEADROOM + intrinsic(data) }),
-    ...(op.delegate && { stateOverrides: { [sender]: { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` } } }) };
+    ...((op.delegate || hook) && { stateOverrides: { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` as Hex }), ...(hook && { stateDiff: hook }) } } }) };
   // A new account: the SenderCreator calls the factory first, as the EntryPoint has it do.
   const factory = op.initCode && op.initCode.length >= 42 && !op.delegate ? `0x${op.initCode.slice(2, 42)}`.toLowerCase() : null;
   const creator = SENDER_CREATORS[entryPoint];
@@ -121,6 +134,13 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     const results = await sim.simulateBatch([deploy, exec]);
     if (!results) return null;
     if (results[0].status === 'reverted') return { result: { ...results[0], revertReason: `deploying the account failed${results[0].revertReason ? `: ${results[0].revertReason}` : ''}` }, deployed: true };
+    // A Kernel v3 that ZeroDev's FactoryStaker deploys has no execution hook stored for executeUserOp either (above),
+    // and storage can't be set at an address before it's created: its calls as executeUserOp runs them, callData
+    // after the selector, from the EntryPoint (which Kernel's execute accepts), without the hook.
+    if (results[1].status === 'reverted' && data !== op.callData && factory === KERNEL_FACTORY_STAKER) {
+      const direct = await sim.simulateBatch([deploy, { ...exec, data: `0x${op.callData.slice(10)}` as Hex }]);
+      if (direct && direct[0].status !== 'reverted') return { result: direct[1], deployed: true };
+    }
     return { result: results[1], deployed: true };
   }
   if (!factory && !op.delegate && (await hasCode(deps, op.chainId, sender)) === false) return { result: { status: 'success', source: 'no code at the account', transfers: [], limited: true }, deployed: false, noCode: true };
@@ -309,6 +329,8 @@ interface Stub {
 }
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
+  /** The operation's paymasterAndData (a multi-signer account's cosigners sign gas limits that name its paymaster). */
+  paymasterAndData?: Hex;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
   hash: () => Promise<Hex | undefined>;
 };
@@ -353,7 +375,7 @@ const ZERODEV_WEBAUTHN_VALIDATORS = new Set(['0x7ab16ff354acb328452f1d445b3ddee9
  */
 const KERNEL_WEBAUTHN_SOL_VALIDATORS = new Set(['0xbbbe97d3d0e926231975e0b69acb54d534d35b1e']);
 /** Chains here on which ZeroDev's SDK signs with the P256 precompile (its isRIP7212SupportedNetwork). */
-const ZERODEV_PRECOMPILED = new Set([1, 42161]);
+const ZERODEV_PRECOMPILED = new Set([1, 42161, 8453, 137]);
 /**
  * A passkey's assertion as ZeroDev's WebAuthn validator decodes it: abi.encode(authenticatorData, clientDataJSON,
  * responseTypeLocation, r, s, usePrecompiled), with `"type":"webauthn.get"` at clientDataJSON[1] and the hash as
@@ -373,6 +395,43 @@ const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)', 'str
  */
 const COSIGNING_SIGNERS = new Set(['0x5b424d5133fae2ce64ce739cec0796343e957131']);
 const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
+/** ZeroDev's WebAuthnSigner, a Kernel permission's signer (source verified on Sourcify, Ethereum): its signature is zeroDevWebAuthnStub's form. */
+const ZERODEV_WEBAUTHN_SIGNERS = new Set(['0x65deec8fee717dc044d0cfd63ccf55f02ccac2b3']);
+const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
+/** What a Kernel v3 account being deployed is set up with: its root validator, and each validation its initialize() installs, with its install data. */
+type KernelSetup = { root: Hex; installs: Map<string, Hex> };
+/**
+ * The signer of permission `pId` (4 bytes, no 0x) a deploying Kernel installs: its install data is abi.encode(bytes[]),
+ * the policies, then the signer (each a 2-byte flag, the module's address, its own data).
+ */
+function setupPermissionSigner(setup: KernelSetup, pId: string): string | undefined {
+  const data = setup.installs.get(`0x02${pId}${'00'.repeat(16)}`.toLowerCase());
+  if (!data) return undefined;
+  try { const [items] = decodeAbiParameters([{ type: 'bytes[]' }], data); const last = items.at(-1); return last && last.length >= 2 + 44 ? `0x${last.slice(6, 46)}`.toLowerCase() : undefined; } catch { return undefined; }
+}
+/**
+ * A Kernel v3 account ZeroDev's FactoryStaker is deploying: kernelV3Stub, with the root validator its initialize()
+ * sets and the validations it installs (the root's own install data, and installValidations among its initConfig
+ * calls): a permission the operation validates through can be installed there (on Base: a passkey's, ZeroDev's
+ * WebAuthn signer, with an execution hook).
+ */
+async function kernelDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> {
+  try {
+    // deployWithFactory hands createData to the KernelFactory's createAccount, which calls the new account with it.
+    const { args: [, createData] } = decodeFunctionData({ abi: KERNEL_DEPLOY, data: factoryData });
+    const init = decodeFunctionData({ abi: KERNEL_DEPLOY, data: createData as Hex });
+    if (init.functionName !== 'initialize') return [{ signature: STUB_SIGNATURE }];
+    const [root, , validatorData, , initConfig] = init.args as unknown as [Hex, Hex, Hex, Hex, readonly Hex[]];
+    const installs = new Map<string, Hex>([[root.toLowerCase(), validatorData]]);
+    for (const call of initConfig) {
+      try {
+        const d = decodeFunctionData({ abi: KERNEL_DEPLOY, data: call });
+        if (d.functionName === 'installValidations') (d.args[0] as readonly Hex[]).forEach((vId, i) => installs.set(vId.toLowerCase(), (d.args[2] as readonly Hex[])[i]));
+      } catch { /* another call */ }
+    }
+    return kernelV3Stub(c, { root, installs });
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
 /**
  * ZeroDev Kernel v3.1, by how it validates: what its nonce names (byte 1 the validation type: 0x00 its root
  * validation, 0x01 the validator in bytes 2-21, 0x02 the permission in bytes 2-5), the root read from
@@ -382,14 +441,15 @@ const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
  * seen on-chain for the same implementation, by how each account is set up; checked: 0xff + signature validates as
  * signed by its owner).
  */
-async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
+async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<Stub[]> {
   const ecdsa: Stub[] = [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }];
   const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
   const view = async (data: Hex) => rpc ? String(await rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data }, 'latest'])) as Hex : undefined;
   // What validates: [type, id] from the nonce, or from rootValidator() for the root (a bytes21, left-aligned).
   const nonce = c.nonce.toString(16).padStart(64, '0');
   let type = nonce.slice(2, 4), id = nonce.slice(4, 44);
-  if (type === '00') {
+  if (type === '00' && deploying) { type = deploying.root.slice(2, 4); id = deploying.root.slice(4, 44); }
+  else if (type === '00') {
     try {
       const root = await view(encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }));
       if (!root || !/^0x[0-9a-f]{64}$/i.test(root)) return ecdsa;
@@ -409,10 +469,18 @@ async function kernelV3Stub(c: StubContext): Promise<Stub[]> {
   }
   if (type === '02' && rpc) {
     try {
-      const out = await view(encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [`0x${id.slice(0, 8)}`] }));
-      const config = out && decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out });
+      // A deploying account's permission: its signer from the install data (nothing to read on-chain yet).
+      const installed = deploying && setupPermissionSigner(deploying, id.slice(0, 8));
+      const out = installed ? undefined : await view(encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [`0x${id.slice(0, 8)}`] }));
+      const config = installed ? { signer: installed } : out && decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out });
       // Policies before the signer each read their own part of the signature, tagged with their index; one that
       // starts with 0xff (the signer's) gives every policy an empty part, as these wallets' signatures do.
+      // ZeroDev's WebAuthn signer: 0xff, then a passkey's assertion over the operation's hash, as its WebAuthn
+      // validator takes it (zeroDevWebAuthnStub).
+      if (config && ZERODEV_WEBAUTHN_SIGNERS.has(config.signer.toLowerCase())) {
+        const hash = await c.hash();
+        if (hash) { const precompiled = ZERODEV_PRECOMPILED.has(c.chainId); return [{ signature: `0xff${zeroDevWebAuthnStub(hash, precompiled).slice(2)}` as Hex, p256: precompiled || 'daimo' }]; }
+      }
       if (config && COSIGNING_SIGNERS.has(config.signer.toLowerCase())) {
         const cosigner = String(await rpc.call(c.chainId, 'eth_call', [{ to: config.signer, data: encodeFunctionData({ abi: COSIGNER, functionName: 'cosigner' }) }, 'latest']));
         if (/^0x0{24}[0-9a-f]{40}$/i.test(cosigner) && !/^0x0+$/.test(cosigner)) {
@@ -474,6 +542,17 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
     try {
       const [module] = decodeFunctionData({ abi: BICONOMY_FACTORY, data: factoryData }).args;
       if (module.toLowerCase() === BICONOMY_ECDSA_MODULE) return biconomyStub();
+    } catch { /* another call */ }
+    return { signature: STUB_SIGNATURE };
+  },
+  // ZeroDev's FactoryStaker (deployWithFactory), deploying Kernel v3 accounts (see kernelDeployStub).
+  [KERNEL_FACTORY_STAKER]: kernelDeployStub,
+  // Splits' Smart Vault factory (its implementation's FACTORY()): the signers and threshold its createAccount sets
+  // (see splitsVaultStub).
+  '0x8e6af8ed94e87b4402d0272c5d6b0d47f0483e7c': async (c, factoryData) => {
+    try {
+      const d = decodeFunctionData({ abi: SPLITS, data: factoryData });
+      if (d.functionName === 'createAccount') return splitsVaultStub(c, { signers: d.args[1], threshold: d.args[2] });
     } catch { /* another call */ }
     return { signature: STUB_SIGNATURE };
   },
@@ -610,6 +689,8 @@ async function okxDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> 
 // Validation then runs every check and hash the real signature's does (the verifier's chain walks, the tree path,
 // the leaf's bitmap word), for the gas it will use, and the ECDSA half is the usual stand-in for owner().
 export const SHRINCS_IMPLEMENTATION = '0xc4e4652898bb12c4f0ba9083829689b1963135e7';
+/** Another build of it (verified on Sourcify, Base; the same storage and pinned verifier), seen 2026-11-13. */
+const SHRINCS_IMPLEMENTATION_2 = '0x680840c831c6d147404a0e00eda08a5360564fbc';
 /** Its storage (ShrincsWalletStorage): the key's commitment at +1, keyVersion +3, the action nonce +4, then statefulLeavesUsed and maxSignatures (uint32s, packed, the first the lowest) at +5. */
 const SHRINCS_SLOT = 0x156c3acdcccbf9925f3430f598565ae5b05788e8a68a7bf182e71c432eafdc00n;
 const SHRINCS_OP_VERIFY_STATEFUL = keccak256(stringToHex('shrincs-verify-stateful'));
@@ -704,6 +785,63 @@ async function bullbitStub(c: StubContext): Promise<Stub[]> {
   } catch { return [eoa]; }
 }
 
+// --- Splits' Smart Vault (verified source on Sourcify, Base) ---
+// A multi-signer account (EOAs and passkeys, by index, with a threshold). validateUserOp reads the signature's first
+// byte as its SignatureTypes enum: 0 for one operation, 1 for a Merkle tree of them, 2 (ERC-1271's) reverts, and
+// anything else is no member of it, so STUB_SIGNATURE's 0xff reverted with Panic(0x21). After it,
+// abi.encode(SingleUserOpSignature(gasLimits, SignatureWrapper(signerIndex, signatureData)[])): with a threshold of
+// t, the first t - 1 sign the operation's "light" hash (without its gas values, which the gas limits cap and name
+// its paymaster), the last the operation's hash; an EOA's signature is over the personal_sign form, a passkey's a
+// WebAuthn assertion (webauthn-sol's struct, the hash as its challenge) checked by P256VERIFY, FreshCryptoLib after.
+// With one signer (all seen on Base) the gas limits aren't read, and its SDK leaves them zero.
+export const SPLITS_VAULT_IMPLEMENTATION = '0x15ec0fa66a0d96a64d67c58368641fbe9325f3fa';
+const SPLITS = parseAbi(['function createAccount(address owner, (bytes32 slot1, bytes32 slot2)[] signers, uint8 threshold, uint256 salt)', 'function getSignerCount() view returns (uint8)', 'function getThreshold() view returns (uint8)', 'function getSigner(uint8 index) view returns ((bytes32 slot1, bytes32 slot2))']);
+const SPLITS_SIGNATURE = [{ type: 'tuple', components: [
+  { name: 'gasLimits', type: 'tuple', components: [{ name: 'maxPriorityFeePerGas', type: 'uint256' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'callGasLimit', type: 'uint256' }, { name: 'verificationGasLimit', type: 'uint256' }, { name: 'paymaster', type: 'address' }, { name: 'paymasterVerificationGasLimit', type: 'uint256' }, { name: 'paymasterPostOpGasLimit', type: 'uint256' }] },
+  { name: 'signatures', type: 'tuple[]', components: [{ name: 'signerIndex', type: 'uint8' }, { name: 'signatureData', type: 'bytes' }] }] }] as const;
+/**
+ * The vault's signers read from it (indices with holes once one is removed). The last to sign: the signer's own index
+ * when it is an EOA signer; a passkey's when the account itself is asked to sign (as coinbaseFor); else the first
+ * EOA's (the vault then reports the signature as not its own). Others to reach the threshold: EOAs as cosigners
+ * (stubSignature(k)), then passkeys.
+ */
+async function splitsVaultStub(c: StubContext, deploying?: { signers: readonly { slot1: Hex; slot2: Hex }[]; threshold: number }): Promise<Stub[]> {
+  if (!c.deps.rpc?.has(c.chainId) && !deploying) return [{ signature: STUB_SIGNATURE }];
+  const read = async (data: Hex) => String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: c.sender, data }, 'latest'])) as Hex;
+  try {
+    const signers: { index: number; address?: string; passkey: boolean }[] = [];
+    const add = (s: { slot1: Hex; slot2: Hex }, index: number) => { if (BigInt(s.slot2)) signers.push({ index, passkey: true }); else if (BigInt(s.slot1)) signers.push({ index, address: `0x${s.slot1.slice(26)}`.toLowerCase(), passkey: false }); };
+    let threshold: number;
+    if (deploying) { deploying.signers.forEach(add); threshold = deploying.threshold; }
+    else {
+      let count: number;
+      [count, threshold] = await Promise.all([read(encodeFunctionData({ abi: SPLITS, functionName: 'getSignerCount' })), read(encodeFunctionData({ abi: SPLITS, functionName: 'getThreshold' }))]).then(o => o.map(x => Number(BigInt(x))));
+      for (let from = 0; from < 256 && signers.length < count; from += 8) {
+        const got = await Promise.all(Array.from({ length: 8 }, (_, k) => read(encodeFunctionData({ abi: SPLITS, functionName: 'getSigner', args: [from + k] })).then(data => decodeFunctionResult({ abi: SPLITS, functionName: 'getSigner', data }))));
+        got.forEach((s, k) => add(s, from + k));
+      }
+    }
+    const hash = signers.some(s => s.passkey) ? await c.hash() : undefined;
+    const last = signers.find(s => s.address === c.signer) ?? (c.signer === c.sender && hash ? signers.find(s => s.passkey) : undefined) ?? signers.find(s => !s.passkey) ?? signers[0];
+    if (!last || (last.passkey && !hash)) return [{ signature: STUB_SIGNATURE }];
+    const others = signers.filter(s => s !== last && (!s.passkey || hash)).sort((a, b) => Number(a.passkey) - Number(b.passkey)).slice(0, Math.max(threshold - 1, 0));
+    // In signing order, EOAs first: the ecrecover stand-in recovers theirs over the light hash as over any other,
+    // where a passkey's assertion names its challenge, which here is the operation's hash (so one passkey, signing
+    // last, validates; a second, over the light hash, would not).
+    const order = [last, ...others].sort((a, b) => Number(a.passkey) - Number(b.passkey));
+    const cosigners: { signature: Hex; signer: string }[] = [];
+    const passkey = () => encodeAbiParameters([WEBAUTHN_AUTH], [webAuthnAuth(hash!, 'app.splits.org', ',"crossOrigin":false')]);
+    const part = (s: typeof last) => { if (s.passkey) return passkey(); if (s === last) return STUB_SIGNATURE; const signature = stubSignature(cosigners.length + 1); cosigners.push({ signature, signer: s.address! }); return signature; };
+    const wrappers = order.map(s => ({ signerIndex: s.index, signatureData: part(s) }));
+    const pm = c.paymasterAndData && c.paymasterAndData.length >= 42 ? `0x${c.paymasterAndData.slice(2, 42)}` as Hex : `0x${'00'.repeat(20)}` as Hex;
+    const max = (1n << 256n) - 1n;
+    const gasLimits = wrappers.length > 1 ? { maxPriorityFeePerGas: max, preVerificationGas: max, callGasLimit: max, verificationGasLimit: max, paymaster: pm, paymasterVerificationGasLimit: max, paymasterPostOpGasLimit: max }
+      : { maxPriorityFeePerGas: 0n, preVerificationGas: 0n, callGasLimit: 0n, verificationGasLimit: 0n, paymaster: `0x${'00'.repeat(20)}` as Hex, paymasterVerificationGasLimit: 0n, paymasterPostOpGasLimit: 0n };
+    const signature = concatHex(['0x00', encodeAbiParameters(SPLITS_SIGNATURE, [{ gasLimits, signatures: wrappers }])]);
+    return [{ signature, ...(cosigners.length && { cosigners }), ...(signers.some(s => s.passkey && (s === last || others.includes(s))) && { p256: true }) }];
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
+
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
 /**
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
@@ -736,8 +874,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // module, which recovers the owner over the personal_sign form of the hash (or the hash itself); seen so on
   // Ethereum (EntryPoint v0.6). Accounts it has upgraded to Nexus keep the proxy and run Nexus's code instead.
   '0x0000002512019dafb59528b82cb92d3c5d2423ac': biconomyStub,
-  // ZeroDev Kernel v3.1: by its validator (see kernelV3Stub).
-  '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub,
+  // ZeroDev Kernel v3.1 and v3.2: by its validator (see kernelV3Stub).
+  '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub, '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1': kernelV3Stub,
   // ZeroDev's Kernel for EIP-7702 (an EIP-7702 delegate; its verified source): the nonce names what validates as in
   // v3.1, and its root is the account's own key, the bare signature over the personal_sign form of the hash; a
   // permission's signer takes the 0xff form. kernelV3Stub gives both, in that order.
@@ -745,7 +883,9 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // OKX Wallet's smart account (see okxStubs).
   [OKX_IMPLEMENTATION]: okxStub,
   // Quip's ShrincsWallet and the bullbit.ai wallet (see shrincsStub, bullbitStub).
-  [SHRINCS_IMPLEMENTATION]: shrincsStub, [BULLBIT_IMPLEMENTATION]: bullbitStub,
+  [SHRINCS_IMPLEMENTATION]: shrincsStub, [SHRINCS_IMPLEMENTATION_2]: shrincsStub, [BULLBIT_IMPLEMENTATION]: bullbitStub,
+  // Splits' Smart Vault (see splitsVaultStub).
+  [SPLITS_VAULT_IMPLEMENTATION]: splitsVaultStub,
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
@@ -995,7 +1135,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
   const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash }, op.delegate, op.initCode);
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;
