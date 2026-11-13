@@ -17,10 +17,11 @@ import { seaportAdapter } from './typed-data/seaport.ts';
 import { safeTxAdapter } from './typed-data/safe.ts';
 import { cowOrderAdapter, oneInchOrderAdapter } from './typed-data/orders.ts';
 import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts';
+import { kernelEnableAdapter } from './typed-data/kernel-enable.ts';
 import { previewMessage } from './message.ts';
 import { previewSignedOperation } from './userop-hash.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'] as const;
