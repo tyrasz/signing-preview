@@ -1120,6 +1120,18 @@ const BASE = 8453;
 const BASE_DENIM = 1_793_901_600n;
 /** Base's registries a B20 token asks on its transfers: who may send and receive (policies), and what is switched on. */
 const BASE_REGISTRIES: Record<string, string> = { '0x8453000000000000000000000000000000000001': ACTIVATION_REGISTRY_CODE, '0x8453000000000000000000000000000000000002': POLICY_REGISTRY_CODE };
+/**
+ * The policy registry's built-in policies (always allow, always block) are written by its first creation, while its
+ * counter is under 2 (on Base long since: only a state override puts it back). Before writing them the node marks
+ * the registry initialized, writing its code, the one-byte marker, at 200 a byte as a contract's code is charged:
+ * charged here as the reference writes the first of them, policies[0] (measured on Base, the counter overridden to
+ * 0 and to 1: a creation 200 more there than its reads, writes and events, which are charged as the node charges
+ * them; nothing more in a static call, whose first write fails before it).
+ */
+const POLICY_REGISTRY = '0x8453000000000000000000000000000000000002', REGISTRY_INITIALIZED_GAS = 200n;
+/** The policy registry's creations (createPolicy, createPolicyWithAccounts, createCompositePolicy): what writes its built-in policies. */
+const POLICY_CREATIONS = new Set(['0xca5d55f6', '0xa2d3044f', '0x6fdd1491']);
+const ALWAYS_ALLOW_POLICY = BigInt(keccak256(new Uint8Array([...new Uint8Array(32), ...setLengthLeft(hexToBytes('0x00503aeb06982fa1fe3151dc68f90b3946c55c449dfd447e49dcaece71ba4a00'), 32)])));
 /** Code that reverts with DelegateCallNotAllowed() (0x0d89438e): what a B20 token does when run as another's code. */
 const NO_DELEGATECALL = hexToBytes('0x630d89438e60e01b60005260046000fd');
 /** Code that reverts with NonPayable() (0x6fb1b0e9): what a B20 token or registry does when sent value, whatever the function. */
@@ -1640,8 +1652,14 @@ export class ForkSimulator implements Simulator {
         // A role's flag written (ROLES_AT; in a static call too, where the write fails): renounceLastAdmin reads once
         // more than the reference before it (a static one is charged the reference's reads), and again after.
         if (own && mapping === ROLES_AT && t.selector !== RENOUNCE_LAST_ADMIN) charging.node -= 100n;
+        // The policy registry's first creation marking it initialized as it writes its built-in policies
+        // (REGISTRY_INITIALIZED_GAS): in a creation only, since renounceAdmin or finalizeUpdateAdmin of policy 0
+        // (from address 0, or with a state override) writes the same slot, and the node charges them nothing more.
+        if (at === POLICY_REGISTRY && charging.code === POLICY_REGISTRY && charging.selector && POLICY_CREATIONS.has(bytesToHex(charging.selector))
+          && e.stack[e.stack.length - 1] === ALWAYS_ALLOW_POLICY && !opened.at(-1)?.static) charging.node += REGISTRY_INITIALIZED_GAS;
         // The sentry (above), as of the charge before this write, with what this step stands for before it: a
-        // function's first-write correction, a verified permit's read of its nonce, a role's flag read once. (The
+        // function's first-write correction, a verified permit's read of its nonce, a role's flag read once, the
+        // policy registry marked initialized. (The
         // allowance transferFrom spends, the reference, patched, writes where the node does: after the transfer and
         // its Transfer event, before transferFromWithMemo's Memo; see scripts/build-b20.ts.)
         if (!opened.at(-1)?.static) sentry(charging.node - fee);
@@ -1749,13 +1767,14 @@ export class ForkSimulator implements Simulator {
             if (f.call.type !== 'create' && f.call.type !== 'create2' && ex.returnValue.length) f.call.output = bytesToHex(ex.returnValue);
             owned.set(f.call, (ex.logs ?? []).filter(l => !f.under.has(l)));
             // (What a reference calls is left out of the tree, below: its events are the token's or the factory's.)
-            if (parent && !(chainId === BASE && !!parent.call.to && (parent.call.to === B20_FACTORY || B20_PRECOMPILE.test(parent.call.to)))) for (const l of ex.logs ?? []) parent.under.add(l);
+            if (parent && !(chainId === BASE && !!parent.call.to && baseNative(parent.call.to))) for (const l of ex.logs ?? []) parent.under.add(l);
           }
           // What a B20 token's reference calls (the registries, whose storage the node's token reads itself; ecrecover
-          // for a permit, which it recovers natively; announce's calls to itself) and what Base's factory calls (the
-          // registry, the token it creates, the cheatcodes it writes the token with) are left out of the tree: the
-          // chain's trace is one call whose events are all there, its gas the node's.
-          const underNative = !!parent && chainId === BASE && !!parent.call.to && (parent.call.to === B20_FACTORY || B20_PRECOMPILE.test(parent.call.to));
+          // for a permit, which it recovers natively; announce's calls to itself), what Base's factory calls (the
+          // registry, the token it creates, the cheatcodes it writes the token with) and what the policy registry's
+          // writes ask (the activation registry, whose flag the node's registry reads itself) are left out of the
+          // tree: the chain's trace is one call whose events are all there, its gas the node's.
+          const underNative = !!parent && chainId === BASE && !!parent.call.to && baseNative(parent.call.to);
           if (parent && !underNative) (parent.call.calls ??= []).push(f.call);
           else if (!parent) root = f;
         }
@@ -1799,9 +1818,10 @@ export class ForkSimulator implements Simulator {
       // (measured on Base: a value call's frame used no gas, the token's or a registry's, the calldata's size
       // whatever it was); the references' own functions would revert empty.
       // (Not where a precompile was moved for the simulation: that runs there, as on the node.)
-      // (A registry a token's or the factory's reference calls stays the registry, whatever was moved onto its
-      // address: on the node those are its own storage reads.)
-      const fromReference = B20_PRECOMPILE.test(m.caller.toString()) || m.caller.toString() === B20_FACTORY;
+      // (A registry a token's or the factory's reference calls, or the activation registry the policy registry's
+      // writes ask, stays the registry, whatever was moved onto its address: on the node those are its own storage
+      // reads.)
+      const fromReference = baseNative(m.caller.toString());
       const native = !!code && baseNative(code) && (!evm.precompiles.has(code.slice(2)) || (code in BASE_REGISTRIES && fromReference));
       const delegated = native && !!m.to && m.to.toString() !== code, refused = native && !delegated && m.value > 0n;
       if (delegated) m.code = NO_DELEGATECALL;

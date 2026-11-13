@@ -54,6 +54,17 @@
 //     without the role); and the paused features are read and written once, whatever the list (the reference read
 //     and wrote them for each feature: a two-feature list given its least gas ran out here, at a write the chain
 //     doesn't make).
+//   - the policy registry's writes ask the activation registry whether it is switched on (checkActivated: the flag
+//     in that registry's storage, cold or warm as the chain's read of it), once their calldata decodes and before
+//     any check of their arguments, as the chain's do, and are refused with FeatureNotActivated(feature) while it
+//     is off; its views don't ask. The reference has no such gate (measured: each write 2,100 more on the chain,
+//     100 with the flag warm; with the flag off, the chain's revert charged that read alone);
+//   - and they write a member's flag, a pending admin and the policy counter as whole slots, without reading them
+//     first, and read the counter once, as the chain does, where the compiled reference read each slot before
+//     writing it, and the counter three times (measured: a creation 200 less on the chain than the reads it lacks
+//     besides, a repeated account and finalizeUpdateAdmin 100 less, renounceAdmin's least gas 11,187 there and
+//     9,413 here, its read of the pending admin before EIP-2200's sentry, a static updateAllowlist charged a cold
+//     read the chain's write fails before).
 // Three things the chain does to any call are done by the local EVM instead (src/fork-simulator.ts): value sent to a
 // token or registry is refused with NonPayable(); a token or registry run as another contract's code (DELEGATECALL)
 // with DelegateCallNotAllowed(); and calldata a function can't decode reverts with the call's selector, where the
@@ -101,6 +112,8 @@ interface Vm {
 /** Base's activation registry admin (its admin() on the chain: the chain configuration's, the registry storing none). */
 const ACTIVATION_ADMIN = getAddress('0xce3a3bee7e72e2a24079f3c0cb3b97740ed425a9');
 /** The changes made to the sources before compiling (see the top of the file): each must occur exactly once. */
+/** A write's array argument, by name (the policy registry's accounts or child policy ids), from its declaration. */
+const ARRAY_ARGUMENT = /(?:address|uint64)\[\] calldata (\w+)/;
 const PATCHES: Record<string, [string, string][]> = {
   'test/lib/mocks/MockB20.sol': [
     ['        return msg.sender == FACTORY && !MockB20Storage.layout().initialized;\n', '        return msg.sender == FACTORY;\n'],
@@ -221,6 +234,102 @@ const PATCHES: Record<string, [string, string][]> = {
   'test/lib/mocks/MockPolicyRegistry.sol': [
     ['    uint64 public constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;', '    uint64 internal constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;'],
     ['    uint64 public constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;', '    uint64 internal constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;'],
+    // Every write asks the activation registry whether the policy registry is switched on, once its calldata
+    // decodes and before any check of its arguments, as the chain's does (it reads the flag in the activation
+    // registry's storage: 2,100 cold, 100 warm; FeatureNotActivated(feature) while it is off). Views don't.
+    ['import {MockPolicyRegistryStorage} from "base-std-test/lib/mocks/MockPolicyRegistryStorage.sol";\n',
+      'import {MockPolicyRegistryStorage} from "base-std-test/lib/mocks/MockPolicyRegistryStorage.sol";\nimport {IActivationRegistry} from "base-std/interfaces/IActivationRegistry.sol";\nimport {StdPrecompiles} from "base-std/StdPrecompiles.sol";\nimport {ActivationRegistryFeatureList} from "base-std-test/lib/mocks/ActivationRegistryFeatureList.sol";\n'],
+    ...[
+      '    function createPolicy(address admin, PolicyType policyType) external returns (uint64 newPolicyId) {\n',
+      '    function createPolicyWithAccounts(address admin, PolicyType policyType, address[] calldata accounts)\n        external\n        returns (uint64 newPolicyId)\n    {\n',
+      '    function createCompositePolicy(address admin, PolicyType policyType, uint64[] calldata childPolicyIds)\n        external\n        returns (uint64 newPolicyId)\n    {\n',
+      '    function stageUpdateAdmin(uint64 policyId, address newAdmin) external {\n',
+      '    function finalizeUpdateAdmin(uint64 policyId) external {\n',
+      '    function renounceAdmin(uint64 policyId) external {\n',
+      '    function updateAllowlist(uint64 policyId, bool allowed, address[] calldata accounts) external {\n',
+      '    function updateBlocklist(uint64 policyId, bool blocked, address[] calldata accounts) external {\n',
+      '    function updateComposite(uint64 policyId, uint64[] calldata childPolicyIds) external {\n',
+    ].map((head): [string, string] => [head, `${head}${ARRAY_ARGUMENT.exec(head) ? `        _decoded(${ARRAY_ARGUMENT.exec(head)![1]});\n` : ''}        _requireActivated();\n`]),
+    // A member's flag, a pending admin and the counter are written whole, without reading the slot first, as the
+    // chain writes them (the compiler reads a slot before writing a field narrower than it: 100 more for a flag
+    // written twice in a call, finalizeUpdateAdmin's delete, and the counter, which the reference also read twice
+    // more; and in a static call the chain's write fails before the cold read the compiler's would have made).
+    // The counter is read once, as the chain reads it.
+    [`        _writeBuiltins();
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        uint56 counter = $.nextCounter;
+        // Solidity checked arithmetic panics with Panic(0x11) on uint56 overflow,
+        // matching the Rust precompile which reverts with Panic(UnderOverflow) at COUNTER_MASK.
+        $.nextCounter = counter + 1;
+        newPolicyId = _makeId({policyType: policyType, counter: counter});
+        $.policies[newPolicyId] = _encode(admin);
+`, `        uint56 counter = _writeBuiltins();
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        // Solidity checked arithmetic panics with Panic(0x11) on uint56 overflow,
+        // matching the Rust precompile which reverts with Panic(UnderOverflow) at COUNTER_MASK.
+        uint56 next = counter + 1;
+        _storeWord(MockPolicyRegistryStorage.nextCounterSlot(), next);
+        newPolicyId = _makeId({policyType: policyType, counter: counter});
+        $.policies[newPolicyId] = _encode(admin);
+`],
+    [`    function _writeBuiltins() internal {
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        if ($.nextCounter >= PolicyRegistryConstants.BUILTIN_POLICY_COUNT) return;
+        uint256 packed = _encode(address(0));
+        $.policies[PolicyRegistryConstants.ALWAYS_ALLOW_ID] = packed;
+        $.policies[PolicyRegistryConstants.ALWAYS_BLOCK_ID] = packed;
+        $.nextCounter = PolicyRegistryConstants.BUILTIN_POLICY_COUNT;
+    }
+`, `    function _writeBuiltins() internal returns (uint56 counter) {
+        MockPolicyRegistryStorage.Layout storage $ = MockPolicyRegistryStorage.layout();
+        counter = $.nextCounter;
+        if (counter >= PolicyRegistryConstants.BUILTIN_POLICY_COUNT) return counter;
+        uint256 packed = _encode(address(0));
+        $.policies[PolicyRegistryConstants.ALWAYS_ALLOW_ID] = packed;
+        $.policies[PolicyRegistryConstants.ALWAYS_BLOCK_ID] = packed;
+        counter = PolicyRegistryConstants.BUILTIN_POLICY_COUNT;
+        _storeWord(MockPolicyRegistryStorage.nextCounterSlot(), counter);
+    }
+
+    /// Base's dispatch decodes the whole calldata before anything else, so an array element out of its type's range
+    /// (an address or uint64 with its upper bytes set) is refused there, before the flag is read: read here, each
+    /// element is checked as the decoder checks it (an empty revert, which the local EVM answers with the selector).
+    function _decoded(address[] calldata accounts) internal pure {
+        uint256 all;
+        for (uint256 i; i < accounts.length; ++i) all |= uint160(accounts[i]);
+        if (all >> 160 != 0) revert();
+    }
+
+    function _decoded(uint64[] calldata ids) internal pure {
+        uint256 all;
+        for (uint256 i; i < ids.length; ++i) all |= ids[i];
+        if (all >> 64 != 0) revert();
+    }
+
+    function _requireActivated() internal view {
+        address registry = StdPrecompiles.ACTIVATION_REGISTRY_ADDRESS;
+        bytes4 selector = IActivationRegistry.checkActivated.selector;
+        bytes32 feature = ActivationRegistryFeatureList.POLICY_REGISTRY;
+        assembly ("memory-safe") {
+            mstore(0, selector)
+            mstore(4, feature)
+            if iszero(staticcall(gas(), registry, 0, 36, 0, 0)) {
+                let p := mload(0x40)
+                returndatacopy(p, 0, returndatasize())
+                revert(p, returndatasize())
+            }
+        }
+    }
+
+    function _storeWord(bytes32 slot, uint256 value) internal {
+        assembly ("memory-safe") { sstore(slot, value) }
+    }
+`],
+    ['        mapping(address => bool) storage members = MockPolicyRegistryStorage.layout().members[policyId];\n        for (uint256 i = 0; i < accounts.length; ++i) {\n            members[accounts[i]] = value;\n        }\n',
+      '        for (uint256 i = 0; i < accounts.length; ++i) {\n            _storeWord(MockPolicyRegistryStorage.policyMemberSlot(policyId, accounts[i]), value ? 1 : 0);\n        }\n'],
+    ['        MockPolicyRegistryStorage.layout().pendingAdmins[policyId] = newAdmin;\n', '        _storeWord(MockPolicyRegistryStorage.pendingAdminSlot(policyId), uint160(newAdmin));\n'],
+    ['        $.policies[policyId] = _encode(msg.sender);\n        delete $.pendingAdmins[policyId];\n', '        $.policies[policyId] = _encode(msg.sender);\n        _storeWord(MockPolicyRegistryStorage.pendingAdminSlot(policyId), 0);\n'],
+    ['        $.policies[policyId] = _encode(address(0));\n        delete $.pendingAdmins[policyId];\n', '        $.policies[policyId] = _encode(address(0));\n        _storeWord(MockPolicyRegistryStorage.pendingAdminSlot(policyId), 0);\n'],
   ],
   'test/lib/mocks/MockB20Factory.sol': [
     // The token's code is the chain's marker, not the reference's (which the local EVM gives a call to it).

@@ -674,6 +674,54 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   assert.ok(nativeStandIn(8453, '0x8453000000000000000000000000000000000002', new Uint8Array([0x60, 0x00])));
 });
 
+test('Base’s policy registry: a write reads the activation registry’s flag first and writes its slots whole, as the node does', async () => {
+  const POLICY = '0x8453000000000000000000000000000000000002', ACTIVATION = '0x8453000000000000000000000000000000000001';
+  const POLICY_AT = 0x00503aeb06982fa1fe3151dc68f90b3946c55c449dfd447e49dcaece71ba4a00n, ACTIVATION_AT = 0x43ee1bbe25e988521cccd8b2c8fbd38c8287ebff8e074e825a70dfd3885cce00n;
+  const feature = keccak256(toHex('base.policy_registry'));
+  const flag = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }], [feature, ACTIVATION_AT]));
+  const policySlot = (id: bigint) => keccak256(encodeAbiParameters([{ type: 'uint64' }, { type: 'uint256' }], [id, POLICY_AT]));
+  const put = (a: string, slot: Hex, value: bigint) => chain.evm.stateManager.putStorage(createAddressFromString(a), hexToBytes(slot), setLengthLeft(hexToBytes(toHex(value)), 32));
+  for (const r of [ACTIVATION, POLICY]) await chain.putCode(r, '0xef');
+  // A caller that forwards the rest of its calldata to the registry on the gas its first word says, and returns
+  // whether the call succeeded (a transaction's gas hides a cheap call's under the calldata floor).
+  const CALLER = '0x00000000000000000000000000000000ca11e700';
+  await chain.putCode(CALLER, `0x6020360380602060003760006000826000600073${POLICY.slice(2)}600035f160005260206000f3`);
+  // The registry past its built-in policies (Base's counter is past 100), switched on; a policy the caller administers.
+  const ALLOWLIST = (1n << 56n) | 0x1000001n;
+  await put(POLICY, toHex(POLICY_AT + 3n, { size: 32 }), 139n);
+  await put(POLICY, policySlot(ALLOWLIST), (1n << 255n) | BigInt(CALLER));
+  await put(ACTIVATION, flag, 1n);
+  const base = new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl, profiles: { 8453: CHAIN_PROFILES[8453] } });
+  const header = { number: 17n, timestamp: 1_800_000_000n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const registry = parseAbi(['function createPolicy(address,uint8) returns (uint64)', 'function renounceAdmin(uint64)', 'function isAuthorized(uint64,address) view returns (bool)']);
+  const createPolicy = encodeFunctionData({ abi: registry, functionName: 'createPolicy', args: [USER as Hex, 1] });
+  const at = { block: 'latest', header };
+  // createPolicy, timed in its trace: 6 a word of input (3), the flag's cold read (2,100), the counter's read and
+  // write (2,100 and 2,900: once each, where the reference read it three times), the policy's write (22,100) and
+  // its two events (1,756 and 1,875): what Base's node charged it, measured from a contract.
+  const [made] = (await base.trace([{ chainId: 8453, from: USER, to: POLICY, data: createPolicy, value: 0n, at }]))!;
+  assert.deepEqual([made.status, made.trace!.gasUsed, BigInt(made.returnData!)], ['success', 18n + 2_100n + 2_100n + 2_900n + 22_100n + 1_756n + 1_875n, (1n << 56n) | 139n]);
+  // One call in the trace, as the node's (its read of the flag is its own), and both registries read.
+  assert.deepEqual([made.trace!.calls ?? [], made.standIns], [[], [POLICY, ACTIVATION]]);
+  // A view doesn't read the flag.
+  const [viewed] = (await base.trace([{ chainId: 8453, from: USER, to: POLICY, data: encodeFunctionData({ abi: registry, functionName: 'isAuthorized', args: [0n, BOB as Hex] }), value: 0n, at }]))!;
+  assert.deepEqual([viewed.trace!.gasUsed, viewed.standIns], [18n, [POLICY]]);
+  // renounceAdmin at its least gas, and 1 under it, from the caller: 12 for its input, the flag (2,100), the policy's
+  // read and write (2,100, 2,900), the pending admin deleted as one write (2,200: the reference read it first, which
+  // put its read before EIP-2200's sentry and made it succeed on as little as 9,413 here) and its event (1,875).
+  const renounce = encodeFunctionData({ abi: registry, functionName: 'renounceAdmin', args: [ALLOWLIST] });
+  const given = (gas: bigint) => ({ chainId: 8453, from: USER, to: CALLER, data: `0x${gas.toString(16).padStart(64, '0')}${renounce.slice(2)}` as Hex, value: 0n, at });
+  const [enough, under] = await Promise.all([base.simulate(given(11_187n)), base.simulate(given(11_186n))]);
+  assert.deepEqual([BigInt(enough!.returnData!), BigInt(under!.returnData!)], [1n, 0n]);
+  // Switched off, a write is refused (FeatureNotActivated(feature)) once it has read the flag; its calldata decoded
+  // first, so calldata it can't decode still reverts with the selector, reading nothing (6 for its one word).
+  await put(ACTIVATION, flag, 0n);
+  const [off, undecodable] = (await base.trace([{ chainId: 8453, from: USER, to: POLICY, data: createPolicy, value: 0n, at }, { chainId: 8453, from: USER, to: POLICY, data: createPolicy.slice(0, 10) as Hex, value: 0n, at }]))!;
+  assert.deepEqual([off.status, off.returnData, off.trace!.gasUsed], ['reverted', `0xb9b2a425${feature.slice(2)}`, 18n + 2_100n]);
+  assert.deepEqual([undecodable.returnData, undecodable.trace!.gasUsed], [createPolicy.slice(0, 10), 6n]);
+  await put(ACTIVATION, flag, 1n);
+});
+
 test('A rate limit on state reads: the node’s wait is kept to, and a trace it denies says why', async () => {
   // A public node refusing reads for a while (HTTP 429), asking for a short wait: kept to, not the usual backoff.
   let refused = 0;

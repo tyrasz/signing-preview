@@ -311,6 +311,9 @@ function b20Programs(): Program[] {
     { label: 'B20 an account delegated to a token (EIP-7702) called', code: `0xef0100${TOKEN}` as Hex, data: sel('decimals()') },
     { label: 'B20 policy registry isAuthorized(0, someone)', code: callOf(POLICY), data: `${sel('isAuthorized(uint64,address)')}${word(0)}${addressWord(someone)}` as Hex },
     { label: 'B20 activation registry isActivated(B20 asset)', code: callOf(ACTIVATION), data: `${sel('isActivated(bytes32)')}cdcc772fe4cbdb1029f822861176d09e646db96723d4c1e82ddfdeb8163ef54c` as Hex },
+    // (A write reads the activation registry's flag for the policy registry first: 2,100 more than base-std's reference.)
+    { label: 'B20 policy registry createPolicy(someone, ALLOWLIST)', code: callOf(POLICY), data: `${sel('createPolicy(address,uint8)')}${addressWord(someone)}${word(1)}` as Hex },
+    { label: 'B20 policy registry renounceAdmin of no policy (PolicyNotFound)', code: callOf(POLICY), data: `${sel('renounceAdmin(uint64)')}${word((1n << 56n) | 0xffffffn)}` as Hex },
     { label: 'B20 factory creating an asset, minted', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 18), [mint]) },
     { label: 'B20 factory creating a stablecoin', code: callOf(FACTORY), data: create(1, stablecoin('Rules Dollar', 'RUSD', 'USD'), []) },
     { label: 'B20 factory, decimals out of range', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 5), []) },
