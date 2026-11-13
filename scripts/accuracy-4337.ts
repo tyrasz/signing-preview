@@ -456,11 +456,21 @@ async function replay(item: string): Promise<void> {
     moved.set(token, (moved.get(token) ?? 0n) + (l.topics[0] === DEPOSIT ? v : -v));
   }
   // (Not the chain's own log of a native transfer, from Glamsterdam on: tokens are what is compared here.)
-  for (const l of own) if (l.topics[0] === TRANSFER && l.topics.length === 3 && l.address.toLowerCase() !== NATIVE_LOG_ADDRESS) {
+  // The fee in a token: what the paymaster took, sent to it or (followed by the paymaster's own event, its postOp's)
+  // to where it keeps its fees, a treasury (Pimlico's singleton paymaster: its charge to the treasury in its data,
+  // then UserOperationSponsored); else the smallest transfer out. An operation on Ethereum sent 0.1 USDC into a swap
+  // and paid 0.39 USDC to the treasury: the swap, taken as the fee, left a quarter of the rounding allowed.
+  const charged = new Set<string>();
+  own.forEach((l, i) => {
+    if (l.topics[0] !== TRANSFER || l.topics.length !== 3 || l.address.toLowerCase() === NATIVE_LOG_ADDRESS) return;
     const from = `0x${l.topics[1].slice(26)}`, to = `0x${l.topics[2].slice(26)}`, token = l.address.toLowerCase(), v = BigInt(l.data);
-    if (from === sender) { moved.set(token, (moved.get(token) ?? 0n) - v); if (to === paymaster || !fees.has(token) || v < fees.get(token)!) fees.set(token, v); }
+    if (from === sender) {
+      moved.set(token, (moved.get(token) ?? 0n) - v);
+      if (paymaster && (to === paymaster || own[i + 1]?.address.toLowerCase() === paymaster)) { fees.set(token, charged.has(token) ? fees.get(token)! + v : v); charged.add(token); }
+      else if (!charged.has(token) && (!fees.has(token) || v < fees.get(token)!)) fees.set(token, v);
+    }
     if (to === sender) moved.set(token, (moved.get(token) ?? 0n) + v);
-  }
+  });
   for (const [k, v] of moved) if (v === 0n) moved.delete(k);
   // Simulated movements only: a preview whose calls revert shows what they ask for (basis 'requested'), with a warning.
   const simulated = new Map((p.assetChanges ?? []).filter(c => c.asset && c.asset !== 'native' && c.raw && c.basis !== 'requested').map(c => [c.asset!.toLowerCase(), (c.direction === 'out' ? -1n : 1n) * BigInt(c.raw!)]));
@@ -475,7 +485,13 @@ async function replay(item: string): Promise<void> {
   const gasCompared = actualGasCost > 0n ? (simCost !== undefined ? { simulated: simCost, actual: actualGasCost } : undefined) : simUsed !== undefined && actualGasUsed > 0n ? { simulated: simUsed, actual: actualGasUsed, gasless: true } : undefined;
   const gasPercent = gasCompared ? Number((BigInt(gasCompared.simulated) - gasCompared.actual) * 100_000n / gasCompared.actual) / 1000 : undefined;
   // (and for one run a second after its block, BNB Chain, whose gas isn't judged either, see below)
-  const feeSlack = BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? Math.abs(gasPercent) : 0)));
+  // A paymaster's fee is priced on its own count of the gas, which can move further than the EntryPoint's: Pimlico's
+  // singleton paymaster charges for the gas before its postOp, a fixed postOp gas and its own estimate of the
+  // EntryPoint's penalty on unused execution gas: up to 14% more or less than the EntryPoint counts (over 6,040
+  // of its operations on Ethereum); and the EntryPoint's penalty takes back a tenth of an execution gas difference
+  // that the fee keeps. So the fee moves by up to 1.3 times the gas's percentage (the second of two operations in a
+  // bundle, its paymaster's and token's state cold in the replay: USDC fee 17.1% high, its gas about 15%).
+  const feeSlack = BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? 1.3 * Math.abs(gasPercent) : 0)));
   const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack;
   // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
   // ten-thousandth (as scripts/accuracy.ts allows).
