@@ -1131,6 +1131,14 @@ const BASE_REGISTRIES: Record<string, string> = { '0x845300000000000000000000000
 const POLICY_REGISTRY = '0x8453000000000000000000000000000000000002', REGISTRY_INITIALIZED_GAS = 200n;
 /** The policy registry's creations (createPolicy, createPolicyWithAccounts, createCompositePolicy): what writes its built-in policies. */
 const POLICY_CREATIONS = new Set(['0xca5d55f6', '0xa2d3044f', '0x6fdd1491']);
+/**
+ * The policy registry's functions that take a bool, its second argument (updateAllowlist, updateBlocklist: no other
+ * function of the tokens, registries or factory takes one). Base's node decodes a bool as any word whose upper 31
+ * bytes are zero, true where its last byte isn't (measured on Base: 2, 0x80 and 0xff are taken as true, the member
+ * written and logged as 1); a word with any upper byte set it refuses as calldata it can't decode, the selector,
+ * reading nothing, as the reference's decoder does. The reference's decoder takes 0 and 1 alone.
+ */
+const BOOL_ARGUMENTS = new Set(['0x3388fb5b', '0x5c4e51b8']);
 const ALWAYS_ALLOW_POLICY = BigInt(keccak256(new Uint8Array([...new Uint8Array(32), ...setLengthLeft(hexToBytes('0x00503aeb06982fa1fe3151dc68f90b3946c55c449dfd447e49dcaece71ba4a00'), 32)])));
 /** Code that reverts with DelegateCallNotAllowed() (0x0d89438e): what a B20 token does when run as another's code. */
 const NO_DELEGATECALL = hexToBytes('0x630d89438e60e01b60005260046000fd');
@@ -1836,6 +1844,13 @@ export class ForkSimulator implements Simulator {
       if (charging?.code === B20_FACTORY && !charging.hashed && code === ACTIVATION_REGISTRY && m.caller.toString() === B20_FACTORY) { charging.node += B20_ADDRESS_GAS; charging.hashed = true; }
       // A token's own call, for what its function is charged (B20_WRITE_GAS, EIP-712), wherever it runs.
       const selector = m.data.length >= 4 ? bytesToHex(m.data.subarray(0, 4)) : '';
+      // A bool argument (BOOL_ARGUMENTS) the node decodes as any word with its upper 31 bytes zero, true if its last
+      // isn't, where the reference's decoder takes 0 and 1 alone: run as 1 (the trace's input is the call's as sent).
+      if (native && !delegated && !refused && code === POLICY_REGISTRY && BOOL_ARGUMENTS.has(selector) && m.data.length >= 68 && m.data[67] > 1 && m.data.subarray(36, 67).every(b => b === 0)) {
+        const data = m.data.slice();
+        data[67] = 1;
+        m.data = data;
+      }
       const token: TokenCall | undefined = native && !delegated && !refused && !empty && B20_PRECOMPILE.test(code!)
         ? { code: code!, caller: m.caller.toString(), depth: m.depth, selector, data: m.data, sloads: 0, stored: new Set(), topics: new Set(), ...(EIP712_FUNCTIONS.has(selector) && { eip712: true }) } : undefined;
       if (token) tokenCalls.push(token);

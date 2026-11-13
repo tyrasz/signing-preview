@@ -65,10 +65,18 @@
 //     besides, a repeated account and finalizeUpdateAdmin 100 less, renounceAdmin's least gas 11,187 there and
 //     9,413 here, its read of the pending admin before EIP-2200's sentry, a static updateAllowlist charged a cold
 //     read the chain's write fails before).
-// Three things the chain does to any call are done by the local EVM instead (src/fork-simulator.ts): value sent to a
+//   - a composite's children are read as the chain reads them, the length once and each slot of four ids once, all
+//     before the first child is asked, and written so, each slot whole, the length, and the old list's slots past
+//     the new one zeroed, where the reference read the length and the shared slot again for each child (a two-child
+//     UNION 300 high), its copy to memory read a slot past the last of four children or none (a token's transfer
+//     under a four-child UNION 2,200 high, compositePolicyChildIds 2,100), and shrinking a list cleared its tail
+//     and wrote the slot again (100 high).
+// Four things the chain does to any call are done by the local EVM instead (src/fork-simulator.ts): value sent to a
 // token or registry is refused with NonPayable(); a token or registry run as another contract's code (DELEGATECALL)
-// with DelegateCallNotAllowed(); and calldata a function can't decode reverts with the call's selector, where the
-// reference reverts empty (its only empty revert).
+// with DelegateCallNotAllowed(); calldata a function can't decode reverts with the call's selector, where the
+// reference reverts empty (its only empty revert); and a bool argument (updateAllowlist's, updateBlocklist's) is
+// decoded as the chain decodes it, any word with its upper 31 bytes zero, true unless it is 0 (the reference's
+// decoder takes 0 and 1 alone): such a word runs as 1.
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -232,13 +240,22 @@ const PATCHES: Record<string, [string, string][]> = {
     ['        return (uiAmount * WAD_PRECISION) / _multiplier();\n', '        uint256 multiplier_ = _multiplier();\n        return (uiAmount * WAD_PRECISION) / multiplier_;\n'],
   ],
   'test/lib/mocks/MockPolicyRegistry.sol': [
-    // A composite's children, read once: the node reads the list's length and each of its slots (four ids a slot)
-    // once, where the reference's index access read the length again for each child's bounds check and the shared
-    // slot again for each id in it (a two-child UNION or INTERSECT 300 high). Copied to memory first, as the node
-    // reads them.
+    // A composite's children, read as the node reads them (_childIds): the list's length once, then each of its slots
+    // (four ids a slot) once, all before the first child is asked, where the reference's index access read the length
+    // again for each child's bounds check and the shared slot again for each id in it (a two-child UNION or
+    // INTERSECT 300 high), and a copy to memory (compositePolicyChildIds's return, and this patch's first form) read
+    // one slot past the last when the count is a multiple of four or none (2,100 high cold, 100 warm: four children
+    // are the most a write allows).
     ...(['_isAuthorizedUnion', '_isAuthorizedIntersect'].map((name): [string, string] => [
       `    function ${name}(uint64 policyId, address account) internal view returns (bool) {\n        uint64[] storage childPolicyIds = MockPolicyRegistryStorage.layout().children[policyId];\n`,
-      `    function ${name}(uint64 policyId, address account) internal view returns (bool) {\n        uint64[] memory childPolicyIds = MockPolicyRegistryStorage.layout().children[policyId];\n`])),
+      `    function ${name}(uint64 policyId, address account) internal view returns (bool) {\n        uint64[] memory childPolicyIds = _childIds(policyId);\n`])),
+    ['        return MockPolicyRegistryStorage.layout().children[policyId];\n', '        return _childIds(policyId);\n'],
+    // And written as the node writes them (_storeChildIds): each packed slot whole, the length (whose old value the
+    // node's write returns: read here after the first slot's write, so that a static call fails before it, as the
+    // node's does), and the slots past the new length zeroed, where the reference cleared the old tail of a shrunk
+    // list and then wrote its slot again (4 children to 2 or 3, 100 high).
+    ['        MockPolicyRegistryStorage.layout().children[newPolicyId] = childPolicyIds;\n', '        _storeChildIds(newPolicyId, childPolicyIds);\n'],
+    ['        MockPolicyRegistryStorage.layout().children[policyId] = childPolicyIds;\n', '        _storeChildIds(policyId, childPolicyIds);\n'],
     ['    uint64 public constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;', '    uint64 internal constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;'],
     ['    uint64 public constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;', '    uint64 internal constant ALWAYS_BLOCK_ID = PolicyRegistryConstants.ALWAYS_BLOCK_ID;'],
     // Every write asks the activation registry whether the policy registry is switched on, once its calldata
@@ -330,6 +347,47 @@ const PATCHES: Record<string, [string, string][]> = {
 
     function _storeWord(bytes32 slot, uint256 value) internal {
         assembly ("memory-safe") { sstore(slot, value) }
+    }
+
+    /// A composite's children: the length read once, then each slot of four ids once (none past the last).
+    function _childIds(uint64 policyId) internal view returns (uint64[] memory ids) {
+        bytes32 slot = MockPolicyRegistryStorage.childrenSlot(policyId);
+        uint256 count;
+        uint256 first;
+        assembly ("memory-safe") {
+            count := sload(slot)
+            mstore(0, slot)
+            first := keccak256(0, 32)
+        }
+        ids = new uint64[](count);
+        uint256 word;
+        for (uint256 i; i < count; ++i) {
+            if (i % 4 == 0) assembly ("memory-safe") { word := sload(add(first, div(i, 4))) }
+            ids[i] = uint64(word >> (64 * (i % 4)));
+        }
+    }
+
+    /// A composite's children written: each slot of four ids whole, the length, and the old list's slots past the new
+    /// one's zeroed. (Its first write is a slot's, before the length is read: the node's write of the length returns
+    /// its old value, read by nothing before it.)
+    function _storeChildIds(uint64 policyId, uint64[] calldata ids) internal {
+        bytes32 slot = MockPolicyRegistryStorage.childrenSlot(policyId);
+        uint256 first;
+        assembly ("memory-safe") {
+            mstore(0, slot)
+            first := keccak256(0, 32)
+        }
+        uint256 slots = (ids.length + 3) / 4;
+        for (uint256 j; j < slots; ++j) {
+            uint256 word;
+            for (uint256 i = 4 * j; i < ids.length && i < 4 * j + 4; ++i) word |= uint256(ids[i]) << (64 * (i % 4));
+            _storeWord(bytes32(first + j), word);
+        }
+        uint256 old;
+        assembly ("memory-safe") { old := sload(slot) }
+        _storeWord(slot, ids.length);
+        uint256 oldSlots = old / 4 + (old % 4 == 0 ? 0 : 1);
+        for (uint256 j = slots; j < oldSlots; ++j) _storeWord(bytes32(first + j), 0);
     }
 `],
     ['        mapping(address => bool) storage members = MockPolicyRegistryStorage.layout().members[policyId];\n        for (uint256 i = 0; i < accounts.length; ++i) {\n            members[accounts[i]] = value;\n        }\n',

@@ -722,6 +722,55 @@ test('Base’s policy registry: a write reads the activation registry’s flag f
   await put(ACTIVATION, flag, 1n);
 });
 
+test('Base’s policy registry: a composite’s children and a bool word, read as the node reads them', async () => {
+  const POLICY = '0x8453000000000000000000000000000000000002', ACTIVATION = '0x8453000000000000000000000000000000000001';
+  const POLICY_AT = 0x00503aeb06982fa1fe3151dc68f90b3946c55c449dfd447e49dcaece71ba4a00n, ACTIVATION_AT = 0x43ee1bbe25e988521cccd8b2c8fbd38c8287ebff8e074e825a70dfd3885cce00n;
+  const flag = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }], [keccak256(toHex('base.policy_registry')), ACTIVATION_AT]));
+  const slotOf = (id: bigint, field: bigint) => keccak256(encodeAbiParameters([{ type: 'uint64' }, { type: 'uint256' }], [id, POLICY_AT + field]));
+  const put = (a: string, slot: Hex, value: bigint) => chain.evm.stateManager.putStorage(createAddressFromString(a), hexToBytes(slot), setLengthLeft(hexToBytes(toHex(value)), 32));
+  for (const r of [ACTIVATION, POLICY]) await chain.putCode(r, '0xef');
+  await put(ACTIVATION, flag, 1n);
+  // Three allowlists and a blocklist the user administers, and a UNION of the four: one slot of children, four ids.
+  const id = (type: bigint, n: bigint) => (type << 56n) | n;
+  const [AL, AL2, AL3, BL, UNION, ABSENT] = [id(1n, 0x2000001n), id(1n, 0x2000002n), id(1n, 0x2000003n), id(0n, 0x2000004n), id(2n, 0x2000005n), id(2n, 0x2000006n)];
+  for (const p of [AL, AL2, AL3, BL, UNION]) await put(POLICY, slotOf(p, 0n), (1n << 255n) | BigInt(USER));
+  const children = slotOf(UNION, 4n), first = BigInt(keccak256(children));
+  await put(POLICY, children, 4n);
+  await put(POLICY, toHex(first, { size: 32 }), AL | (AL2 << 64n) | (AL3 << 128n) | (BL << 192n));
+  const base = new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl, profiles: { 8453: CHAIN_PROFILES[8453] } });
+  const header = { number: 17n, timestamp: 1_800_000_000n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const registry = parseAbi(['function isAuthorized(uint64,address) view returns (bool)', 'function compositePolicyChildIds(uint64) view returns (uint64[])', 'function updateComposite(uint64,uint64[])', 'function updateAllowlist(uint64,bool,address[])']);
+  const at = { block: 'latest', header };
+  const run = (...data: Hex[]) => base.trace(data.map(d => ({ chainId: 8453, from: USER, to: POLICY, data: d, value: 0n, at })));
+  const childIds = (r: SimulationResult) => decodeFunctionResult({ abi: registry, functionName: 'compositePolicyChildIds', data: r.returnData as Hex });
+  // Bob is on none of the allowlists and not blocked: the UNION asks all four. Its length and its one slot read once
+  // each, before the first child, then each child's member (6 for its input, 6 reads at 2,100): what Base's node
+  // charges, measured from a contract, where a copy to memory read a second slot (2,100 more, or 100 warm).
+  const [authorized, listed, absent] = (await run(encodeFunctionData({ abi: registry, functionName: 'isAuthorized', args: [UNION, BOB as Hex] }),
+    encodeFunctionData({ abi: registry, functionName: 'compositePolicyChildIds', args: [UNION] }), encodeFunctionData({ abi: registry, functionName: 'compositePolicyChildIds', args: [ABSENT] })))!;
+  assert.deepEqual([BigInt(authorized.returnData!), authorized.trace!.gasUsed], [1n, 18n + 6n * 2_100n]);
+  assert.deepEqual([childIds(listed), listed.trace!.gasUsed], [[AL, AL2, AL3, BL], 12n + 2n * 2_100n]);
+  // A composite with no children (none was created) reads its length alone.
+  assert.deepEqual([childIds(absent), absent.trace!.gasUsed], [[], 12n + 2_100n]);
+  // Shrunk from four children to two: the flag, the composite and the two children read (8,400), the slot written
+  // whole once (5,000: the reference cleared the old tail, then wrote it again, 100 more), the length (5,000) and
+  // its event (2,524), 6 a word of its input.
+  const [shrunk, after] = (await run(encodeFunctionData({ abi: registry, functionName: 'updateComposite', args: [UNION, [AL, BL]] }), encodeFunctionData({ abi: registry, functionName: 'compositePolicyChildIds', args: [UNION] })))!;
+  assert.deepEqual([shrunk.status, shrunk.trace!.gasUsed], ['success', 36n + 4n * 2_100n + 5_000n + 5_000n + 2_524n]);
+  assert.deepEqual(childIds(after), [AL, BL]);
+  // A bool word of 2 the node takes as true (any word with its upper 31 bytes zero; nonzero is true): the member is
+  // written, and logged, as 1, where the reference's decoder refused it. The trace keeps the input as it was sent.
+  const allow = encodeFunctionData({ abi: registry, functionName: 'updateAllowlist', args: [AL, true, [BOB as Hex]] });
+  const word = (w: string) => `${allow.slice(0, 74)}${w.padStart(64, '0')}${allow.slice(138)}` as Hex;
+  const [two, asked] = (await run(word('02'), encodeFunctionData({ abi: registry, functionName: 'isAuthorized', args: [AL, BOB as Hex] })))!;
+  assert.deepEqual([two.status, two.trace!.gasUsed, two.trace!.input], ['success', 36n + 2_100n + 2_100n + 22_100n + 2_524n, word('02')]);
+  assert.equal(BigInt(`0x${two.logs![0].data.slice(2, 66)}`), 1n);
+  assert.equal(BigInt(asked.returnData!), 1n);
+  // An upper byte set, the node refuses it as calldata it can't decode: the selector, nothing read.
+  const [upper] = (await run(word('0100')))!;
+  assert.deepEqual([upper.status, upper.returnData, upper.trace!.gasUsed], ['reverted', allow.slice(0, 10), 36n]);
+});
+
 test('A rate limit on state reads: the node’s wait is kept to, and a trace it denies says why', async () => {
   // A public node refusing reads for a while (HTTP 429), asking for a short wait: kept to, not the usual backoff.
   let refused = 0;
