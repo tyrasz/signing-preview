@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { chainName } from '../src/chains.ts';
 
 type Row = {
-  hash: string; kind: string; outcome: boolean; whole: boolean; standIn?: string; notSimulated?: boolean; prefix?: string;
+  hash: string; kind: string; outcome: boolean; whole: boolean; standIn?: string; passkeyExtraKey?: boolean; notSimulated?: boolean; prefix?: string;
   bundle?: { size: number; index: number }; gas?: { percent: number }; timeBumped?: boolean; relayedBy?: string; tokens?: string; callsOnlyBecause?: string; tokenDiffs?: unknown;
   /** What the harness found the preview got wrong (see scripts/accuracy-4337.ts): 'outcome', 'gas', 'tokens'. */
   differs?: string[];
@@ -39,7 +39,8 @@ for (const name of readdirSync(dir).sort()) {
   // Not one run a second after its block (BNB Chain): what writes once a second costs more there.
   // Nor one whose account rejected the stand-in (its signature check didn't run).
   // Nor one relayed by a bundler's contract (it warms state before the EntryPoint runs).
-  const gas = rows.filter(r => r.gas && !r.bundle && !r.relayedBy && !r.timeBumped && r.standIn !== 'rejected' && judged(r));
+  // Nor one whose passkey's clientDataJSON has the key Chrome adds to some (see scripts/accuracy-4337.ts).
+  const gas = rows.filter(r => r.gas && !r.bundle && !r.relayedBy && !r.timeBumped && r.standIn !== 'rejected' && !r.passkeyExtraKey && judged(r));
   const tokens = rows.filter(r => r.tokens);
   const wrong = rows.filter(r => r.differs?.length);
   total += rows.length; wrongTotal += wrong.length;

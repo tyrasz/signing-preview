@@ -12,7 +12,7 @@
 // deployed through its SenderCreator if it's new, then called with the operation's callData from the EntryPoint
 // (or with executeUserOp(userOp, userOpHash) when callData starts with its selector). Validation, the gas prefund
 // and refund, and a paymaster's postOp charge aren't part of it.
-import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, keccak256, encodeFunctionData, hexToBytes, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, keccak256, encodeFunctionData, hexToBytes, parseAbi, parseAbiParameters, sha256, stringToHex, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
@@ -570,6 +570,112 @@ async function okxDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> 
   } catch { return [{ signature: STUB_SIGNATURE }]; }
 }
 
+// --- Quip's ShrincsWallet (post-quantum: SHRINCS hash-based signatures; verified source on Sourcify, Base) ---
+// validateUserOp takes abi.encode(PublicKey, Signature, bytes ecdsaSig): the owner()'s ECDSA co-signature (over the
+// wallet's EIP-712 hash of the operation's hash) and a one-time SHRINCS signature, which the wallet's pinned
+// verifier checks against the key bundle's commitment in the wallet's storage: a WOTS-C signature (64 base-16 chains,
+// their digits summing to 480, ground with a counter) on leaf q of an unbalanced tree, whose authentication path has
+// q nodes (so a signature grows 32 bytes with each one the key makes). On success the leaf and the wallet's action
+// nonce are consumed. Neither half exists before signing, and the hash-based one can't be stood in for at a
+// precompile: the stand-in is a real SHRINCS signature by a key made up for the run, on the leaf the wallet's own
+// key signs next (its lowest unused one), with that key's commitment set in the wallet's storage for the run.
+// Validation then runs every check and hash the real signature's does (the verifier's chain walks, the tree path,
+// the leaf's bitmap word), for the gas it will use, and the ECDSA half is the usual stand-in for owner().
+export const SHRINCS_IMPLEMENTATION = '0xc4e4652898bb12c4f0ba9083829689b1963135e7';
+/** Its storage (ShrincsWalletStorage): the key's commitment at +1, keyVersion +3, the action nonce +4, then statefulLeavesUsed and maxSignatures (uint32s, packed, the first the lowest) at +5. */
+const SHRINCS_SLOT = 0x156c3acdcccbf9925f3430f598565ae5b05788e8a68a7bf182e71c432eafdc00n;
+const SHRINCS_OP_VERIFY_STATEFUL = keccak256(stringToHex('shrincs-verify-stateful'));
+const SHRINCS_PUBLIC_KEY = parseAbiParameters('(bytes statefulPublicKey, bytes publicKeyCommitment, bytes pkSeed, bytes hypertreeRoot), (bytes32 randomizer, uint32 counter, bytes32[] chains, bytes32[] authPath), bytes');
+/**
+ * A valid SHRINCS signature for `userOpHash` by a key made up here (see above), on leaf `leaf`, as this wallet
+ * verifies it: what it signs is keccak(OP_VERIFY_STATEFUL, suite 1, commitment, the action hash), the action hash
+ * binding the wallet's domain (keccak of its tag, the chain and the wallet), its action nonce, its key version,
+ * the ERC-4337 action type and keccak(userOpHash). Returns the signature (with `ecdsa` as the co-signature) and the
+ * key's commitment. Each WOTS-C chain's secret walks 15 steps to its endpoint; the signature reveals it after its
+ * digit's steps, and the counter is ground until the digits sum to 480.
+ */
+export function shrincsStandIn(wallet: string, chainId: number, userOpHash: Hex, state: { keyVersion: bigint; nonce: bigint; maxSignatures: number }, leaf: number, ecdsa: Hex): { signature: Hex; commitment: Hex } {
+  const u32 = (n: number) => n.toString(16).padStart(8, '0'), w = (n: bigint) => n.toString(16).padStart(64, '0');
+  const seed = keccak256(stringToHex('signing-preview SHRINCS stand-in'));
+  const pkSeed = keccak256(concatHex([seed, '0x01'])), statelessSeed = keccak256(concatHex([seed, '0x02'])), hypertreeRoot = keccak256(concatHex([seed, '0x03']));
+  const step = (chain: number, at: number, v: Hex) => keccak256(`0x${stringToHex('uxmss-wots-chain').slice(2)}${pkSeed.slice(2)}${w((BigInt(leaf) << 64n) | (BigInt(chain) << 32n) | BigInt(at))}${v.slice(2)}` as Hex);
+  // Each chain: its secret, and the values after each step (walk[i][k]: after k steps; walk[i][15], the endpoint).
+  const walks = Array.from({ length: 64 }, (_, i) => { const out: Hex[] = [keccak256(concatHex([seed, `0x${u32(i)}`]))]; for (let k = 0; k < 15; k++) out.push(step(i, k, out[k])); return out; });
+  const pkHash = keccak256(concatHex([stringToHex('uxmss-wots-pk'), pkSeed, `0x${u32(leaf)}`, ...walks.map(x => x[15])]));
+  const parent = (left: number, a: Hex, b: Hex) => keccak256(concatHex([stringToHex('uxmss-node'), pkSeed, `0x${u32(left)}`, a, b]));
+  const authPath = Array.from({ length: leaf }, (_, k) => keccak256(concatHex([seed, '0x04', `0x${u32(k)}`])));
+  let root = parent(leaf, pkHash, authPath[0]);
+  for (let k = 0; k < leaf - 1; k++) root = parent(leaf - k - 1, authPath[k + 1], root);
+  const statefulPublicKey = concatHex([pkSeed, root, `0x${u32(state.maxSignatures)}`]);
+  const commitment = keccak256(concatHex([stringToHex('shrincs-public-key/shrincs-256s-keccak'), statefulPublicKey, statelessSeed, hypertreeRoot]));
+  const domain = keccak256(concatHex([keccak256(stringToHex('quip-shrincs-wallet-v1')), `0x${w(BigInt(chainId))}`, `0x${w(BigInt(wallet))}`]));
+  const action = keccak256(concatHex([SHRINCS_OP_VERIFY_STATEFUL, '0x00000001', commitment, domain, `0x${w(state.nonce)}`, `0x${w(state.keyVersion)}`, keccak256(stringToHex('quip.shrincs.action.erc4337Execute')), keccak256(userOpHash)]));
+  const message = keccak256(concatHex([SHRINCS_OP_VERIFY_STATEFUL, '0x00000001', commitment, action]));
+  const randomizer = keccak256(concatHex([seed, '0x05']));
+  for (let counter = 0; counter < 1_000_000; counter++) {
+    const digest = keccak256(concatHex([stringToHex('uxmss-wots-digits'), pkSeed, `0x${u32(leaf)}`, randomizer, `0x${u32(counter)}`, message]));
+    const digits = [...digest.slice(2)].map(d => parseInt(d, 16));
+    if (digits.reduce((a, b) => a + b, 0) !== 480) continue;
+    const signature = encodeAbiParameters(SHRINCS_PUBLIC_KEY, [{ statefulPublicKey, publicKeyCommitment: commitment, pkSeed: statelessSeed, hypertreeRoot },
+      { randomizer, counter, chains: digits.map((d, i) => walks[i][d]), authPath }, ecdsa]);
+    return { signature, commitment };
+  }
+  throw new Error('no counter found');
+}
+const SHRINCS = parseAbi(['function statefulLeafBitmapWord(uint256 wordIndex) view returns (uint256)']);
+/**
+ * An existing ShrincsWallet: its key's state read from its storage. The stand-in signs the leaf the wallet's key
+ * signs next: its lowest unused one (statefulLeafBitmapWord), as 45 of 45 operations on Base had (one of them leaf 3
+ * of a key whose leaves 1, 2 and 4 to 11 were used; the others statefulLeavesUsed + 1).
+ */
+async function shrincsStub(c: StubContext): Promise<Stub[]> {
+  const hash = await c.hash();
+  if (!hash || !c.deps.rpc?.has(c.chainId)) return [{ signature: STUB_SIGNATURE }];
+  try {
+    const slot = async (n: bigint) => BigInt(String(await c.deps.rpc!.call(c.chainId, 'eth_getStorageAt', [c.sender, `0x${(SHRINCS_SLOT + n).toString(16)}`, 'latest'])));
+    const [keyVersion, nonce, budget] = await Promise.all([slot(3n), slot(4n), slot(5n)]);
+    const maxSignatures = Number((budget >> 32n) & 0xffffffffn);
+    const word = async (i: number) => BigInt(String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: SHRINCS, functionName: 'statefulLeafBitmapWord', args: [BigInt(i)] }) }, 'latest'])));
+    const words = await Promise.all(Array.from({ length: Math.min(Math.floor(maxSignatures / 256) + 1, 16) }, (_, i) => word(i)));
+    let leaf = 1;
+    while (leaf <= maxSignatures && leaf < words.length * 256 && (words[leaf >> 8] >> BigInt(leaf & 255)) & 1n) leaf++;
+    // A key with no leaf left can't sign (the wallet rotates first): nothing to stand in for.
+    if (leaf > maxSignatures || leaf >= words.length * 256) return [{ signature: STUB_SIGNATURE }];
+    const { signature, commitment } = shrincsStandIn(c.sender, c.chainId, hash, { keyVersion, nonce, maxSignatures }, leaf, STUB_SIGNATURE);
+    return [{ signature, storage: { [`0x${(SHRINCS_SLOT + 1n).toString(16)}`]: commitment } }];
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
+
+// --- The bullbit.ai wallet's account ---
+// Unpublished; its function names from OpenChain, its signature's layout read from its operations on Base and
+// checked by running them with stand-ins. A passkey owner's signature is 0x00, the passkey's id (an entry of
+// getPasskeyOwners(), whose key passkeyOwners(id) holds), its WebAuthn assertion as authenticatorData and
+// clientDataJSON each after its length, and r and s, which it checks with P256VERIFY; the challenge is the
+// operation's hash. An EOA owner's (getEOAOwners()) is 0x01 and its signature. Its check walks clientDataJSON byte
+// by byte (about 280 gas a byte), and neither the origin nor the authenticator data's RP id hash is checked: the
+// stand-in's clientDataJSON is what its dApp's passkeys sign (origin https://staking.bullbit.ai), without the key
+// Chrome adds to some at random ("other_keys_can_be_added_here", 109 bytes, 30,296 gas more: in a fifth of them).
+export const BULLBIT_IMPLEMENTATION = '0x330e71c9cd056a2e91a459f8112e8f8922ba5c13';
+const BULLBIT = parseAbi(['function getPasskeyOwners() view returns (bytes32[])', 'function expectedOrigin() view returns (string)']);
+async function bullbitStub(c: StubContext): Promise<Stub[]> {
+  const eoa: Stub = { signature: `0x01${STUB_SIGNATURE.slice(2)}` as Hex };
+  if (!c.deps.rpc?.has(c.chainId)) return [eoa];
+  const read = async (data: Hex) => String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: c.sender, data }, 'latest'])) as Hex;
+  try {
+    // An EOA owner signs as itself; the account itself is asked to sign for a passkey (as Coinbase's, coinbaseFor).
+    if (c.signer !== c.sender) return [eoa];
+    const [ids, origin, hash] = await Promise.all([
+      read(encodeFunctionData({ abi: BULLBIT, functionName: 'getPasskeyOwners' })).then(data => decodeFunctionResult({ abi: BULLBIT, functionName: 'getPasskeyOwners', data })),
+      read(encodeFunctionData({ abi: BULLBIT, functionName: 'expectedOrigin' })).then(data => decodeFunctionResult({ abi: BULLBIT, functionName: 'expectedOrigin', data }), () => ''),
+      c.hash()]);
+    if (!ids.length || !hash) return [eoa];
+    const clientDataJSON = `{"type":"webauthn.get","challenge":"${base64url(hash)}","origin":"${origin || 'https://staking.bullbit.ai'}","crossOrigin":false}`;
+    const authenticatorData = concatHex([sha256(stringToHex('bullbit.ai')), '0x1d', '0x00000000']);
+    const length = (bytes: number) => `0x${bytes.toString(16).padStart(64, '0')}` as Hex;
+    return [{ signature: concatHex(['0x00', ids[0], length(37), authenticatorData, length(clientDataJSON.length), stringToHex(clientDataJSON), P256_STUB.r, P256_STUB.s]), p256: true }, eoa];
+  } catch { return [eoa]; }
+}
+
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
 /**
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
@@ -610,6 +716,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   '0xd6cedde84be40893d153be9d467cd6ad37875b28': kernelV3Stub,
   // OKX Wallet's smart account (see okxStubs).
   [OKX_IMPLEMENTATION]: okxStub,
+  // Quip's ShrincsWallet and the bullbit.ai wallet (see shrincsStub, bullbitStub).
+  [SHRINCS_IMPLEMENTATION]: shrincsStub, [BULLBIT_IMPLEMENTATION]: bullbitStub,
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';

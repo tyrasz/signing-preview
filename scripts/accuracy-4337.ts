@@ -172,6 +172,8 @@ const blocks = new Set<number>();
 const skipped: Record<string, number> = {};
 const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
 const STAND_IN_REJECTED = /doesn't accept it as theirs/;
+/** The key Chrome adds to some passkeys' clientDataJSON, as it appears in a signature (hex, no 0x). */
+const CHROME_EXTRA_KEY = Buffer.from('"other_keys_can_be_added_here"').toString('hex');
 
 /** How many operations of one bundle are replayed (each after the bundle's earlier ones). */
 const BUNDLE_MAX = 5;
@@ -548,11 +550,16 @@ async function replay(item: string): Promise<void> {
   // The preview's own warning first: on BNB Chain most such operations are also run a second late.
   if (warned) row.warned = handedSignature ? 'outcome' : callsAlone ? 'outcome (its calls simulated alone)' : row.prefix ? "outcome (replayed without its block's earlier transactions)" : 'outcome (run a second after its block)';
   const judged = row.whole === true && !row.prefix && !warned;
+  // A passkey's assertion whose clientDataJSON carries the key Chrome adds to some at random
+  // ("other_keys_can_be_added_here", 109 bytes; 35 of 163 of the bullbit.ai wallet's operations on Base): which
+  // will get it isn't known before signing, and the stand-in has none. An account that reads clientDataJSON byte by
+  // byte pays for it (the bullbit.ai wallet 30,296 gas, 4-7% of its operations' gas). Its gas is reported, not judged.
+  if (op.signature.toLowerCase().includes(CHROME_EXTRA_KEY)) row.passkeyExtraKey = true;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
     // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas
     // (a post-quantum SPHINCS+ wallet on Base, 40%); a shape to add, not a wrong preview, as for calls simulated alone.
-    judged && !timeBumped && !relayed && row.standIn !== 'rejected' && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
+    judged && !timeBumped && !relayed && row.standIn !== 'rejected' && !row.passkeyExtraKey && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
     judged && row.tokens === 'other' && !row.unread && 'tokens',
   ].filter((x): x is string => !!x);
   if (differs.length) row.differs = differs;
@@ -628,7 +635,7 @@ if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's 
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}`].filter(Boolean);
+    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 
