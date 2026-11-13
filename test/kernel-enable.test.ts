@@ -308,6 +308,11 @@ test('Re-review: a grant made unreadable on purpose, a module\'s onInstall/onUni
   // uninstallModule granted: a hook-type uninstall reaches the root validator's onUninstall.
   const uninstall = await sign(enable({ selectorData: '0xa71763a8' }));
   assert.equal(uninstall.attention, 'danger');
+  // A handler with selector hook 0xff..ff (only the EntryPoint, from v3.1): not open to anyone; its install fails.
+  const handlerData = `0x12345678${'bad0'.repeat(10)}${'f'.repeat(40)}${encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], ['0x00', '0x00']).slice(2)}` as Hex;
+  const epOnly = await sign(enable({ selectorData: handlerData }));
+  assert.ok(!epOnly.warnings.some(w => w.code === 'kernel_enable_open_handler'), epOnly.warnings.map(w => w.code).join(','));
+  assert.match(detail(epOnly, 'Installs a handler') ?? '', /only the EntryPoint may call it/);
   // A rule value no bool or address is (the policy compares the whole word): shown as such, not as true or an address.
   const BAYC = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
   const odd = await sign(callsOnly([{ target: BAYC, selector: '0xa22cb465', rules: [{ condition: 5, offset: 32n, params: [word(2n)] }] }]));

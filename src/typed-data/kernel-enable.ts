@@ -614,9 +614,13 @@ function readSelector(selectorData: Hex, reading: Reading, b: PreviewBuilder, ve
   // Kernel's fallback: a selector hook of 0 becomes "only the EntryPoint" in v3.1 and later, but "no hook" (anyone) in
   // v3.0; address(1) is no hook; any other hook is called with the caller and decides.
   const v30 = version === '0.3.0-beta' || !DOMAIN_VERSIONS[version];
-  const open = !ZERO.test(selectorHook) || v30;
+  // 0xff..ff is what hook 0 becomes from v3.1 (only the EntryPoint may call it); given as such, Kernel also asks it
+  // whether it is set up as it installs the hook, and an address with no code can't answer, so the install fails.
+  const onlyEntryPoint = /^0xf{40}$/i.test(selectorHook) && !v30;
+  const open = (!ZERO.test(selectorHook) && !onlyEntryPoint) || v30;
   const kernel30 = version === '0.3.0-beta' ? 'Kernel v3.0' : 'Kernel v3.0 (and maybe this version, which this previewer doesn\'t know)';
-  const hookText = ZERO.test(selectorHook) ? (v30 ? `, with no hook (${kernel30} installs none for hook 0)` : '') : /^0x0{39}1$/.test(selectorHook) ? ', with no hook (address 1)' : `, with hook ${selectorHook}`;
+  const hookText = ZERO.test(selectorHook) ? (v30 ? `, with no hook (${kernel30} installs none for hook 0)` : '') : /^0x0{39}1$/.test(selectorHook) ? ', with no hook (address 1)'
+    : onlyEntryPoint ? ', with hook 0xff…ff (only the EntryPoint may call it; but Kernel asks that address, which has no code, whether it is set up as it installs it, so the Enable fails)' : `, with hook ${selectorHook}`;
   const how = callType === '0xff' ? 'by delegatecall: as your account itself, so its code decides what it can do with the account' : callType === '0x00' ? 'by call' : `call type ${callType}`;
   b.detail('Installs a handler', `${NAMED_ONLY[module] ?? module} for ${own ? own.sig : selector}, run ${how}${hookText}${own ? ' (never reached: Kernel\'s own function answers that call)' : ''}`, module);
   if (!own) {
