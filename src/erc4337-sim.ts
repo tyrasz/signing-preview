@@ -17,7 +17,6 @@ import type { Dependencies, SimulationRequest, SimulationResult } from './types.
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { ecrecoverPrice } from './chains.ts';
-import { CHAIN_PROFILES } from './fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 
@@ -1141,6 +1140,8 @@ export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number): Pi
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] }],
   };
 }
+/** Chains here without P256VERIFY (0x100): HyperEVM and its testnet, on Cancun's rules (as measured on their nodes). */
+const NO_P256VERIFY = new Set([999, 998]);
 /**
  * Stand-ins for a passkey's P-256 check through the verifiers it names (a Safe passkey owner's P256.Verifiers): the
  * precompile accepting P256_STUB where it is named (0x100), and the fallback verifier contract accepting it after
@@ -1148,9 +1149,10 @@ export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number): Pi
  */
 export async function passkeyVerifiersStandIn(deps: Dependencies, chainId: number, verifiers: { precompile: string; fallback: string }): Promise<Pick<SimulationRequest, 'stateOverrides' | 'accessList'> | null> {
   const P256 = '0x0000000000000000000000000000000000000100';
-  // (On a chain that has P256VERIFY: Osaka's rules, as each chain's node was measured to run them. HyperEVM's Cancun
-  // has none, so the precompile named there answers nothing and the fallback verifier is what checks it.)
-  const precompile = BigInt(verifiers.precompile) === 0x100n && CHAIN_PROFILES[chainId]?.hardfork !== 'cancun';
+  // (On a chain that has P256VERIFY: HyperEVM's, which runs Cancun's rules (CHAIN_PROFILES in src/fork-simulator.ts,
+  // which this module, in the browser bundle too, doesn't import), has none, so the precompile named there answers
+  // nothing and the fallback verifier is what checks it.)
+  const precompile = BigInt(verifiers.precompile) === 0x100n && !NO_P256VERIFY.has(chainId);
   const fallback = BigInt(verifiers.fallback) ? verifiers.fallback.toLowerCase() : undefined;
   let code: Hex | undefined;
   if (fallback && deps.rpc?.has(chainId)) {
