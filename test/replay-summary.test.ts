@@ -27,7 +27,7 @@ test('The replay summary: a row per chain and EntryPoint version, then what diff
   assert.match(out, /\| Arbitrum One \| v0\.6 \| 1 \| 1\/1 \| 1\/1 \| 1\/1 \| 1\/1 \| 1\/1 \| 1\/1 \|  \|  \|/);
   assert.match(out, /Not replayed[\s\S]*- 2: its state is no longer served by the node/);
   assert.match(out, /Previews that differed[\s\S]*`0xa3`: outcome differs/);
-  assert.match(out, /reported not failed[\s\S]*`0xa4`/);
+  assert.match(out, /Reported, not failed[\s\S]*`0xa4`/);
   assert.match(out, /simulated alone[\s\S]*`0xa6`/);
   assert.doesNotMatch(out, /`0xa5`/);
 });

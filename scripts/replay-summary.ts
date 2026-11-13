@@ -52,6 +52,6 @@ for (const name of readdirSync(dir).sort()) {
 console.log(`## UserOperation replays: ${total} operations${wrongTotal ? `, ${wrongTotal} differing from their receipts` : ', none differing from their receipts'}\n`);
 console.log(lines.join('\n'));
 if (differing.length) console.log(`\n### Previews that differed from what happened\n\n${differing.join('\n')}`);
-if (warned.length) console.log(`\n### Outcomes that differed, reported not failed (an account reading its stand-in signature while running its calls, unless another reason is given)\n\n${warned.join('\n')}`);
+if (warned.length) console.log(`\n### Reported, not failed (an outcome that differed where an account reads its stand-in signature while running its calls, unless another reason is given)\n\n${warned.join('\n')}`);
 if (skips.size) console.log(`\n### Not replayed\n\n${[...skips].sort((a, b) => b[1] - a[1]).map(([why, n]) => `- ${n}: ${why}`).join('\n')}`);
 if (fallbacks.length) console.log(`\n### Operations whose calls were simulated alone (a signature shape the stand-in doesn't take, or a paymaster refusing)\n\n${fallbacks.slice(0, 40).join('\n')}${fallbacks.length > 40 ? `\n- … and ${fallbacks.length - 40} more` : ''}`);

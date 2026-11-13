@@ -35,11 +35,13 @@ import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeFu
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
+import type { Dependencies } from '../src/types.ts';
 import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
 import { BULLBIT_IMPLEMENTATION, implementationOf, okxDigest } from '../src/erc4337-sim.ts';
+import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
@@ -64,6 +66,9 @@ const EP = ENTRY_POINTS[VERSION];
 if (!EP) throw new Error(`--entrypoint is one of ${Object.keys(ENTRY_POINTS).join(', ')}`);
 const SYSTEM = CHAIN === 42161 ? new Set(['0x64', '0x65', '0x66', '0x68', '0x69', '0x6a']) : OP_STACK.has(CHAIN) ? new Set(['0x7e']) : new Set<string>();
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 30_000, retries: 6, retryDelayMs: 800 });
+/** For replaying a bundle as the previewer replays a mined transaction (below): its lookups on the chain's node only. */
+let replaying: Dependencies | undefined;
+const replayDeps = () => (replaying ??= liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off', SIGNING_PREVIEW_OFFLINE_LOOKUPS: '1', SIGNING_PREVIEW_PRICES: 'off' }, { warmUp: false }));
 /**
  * A read; a block or transaction the answering backend doesn't have yet (null) is asked for again, four times, a
  * second and more apart, and one still refused for the rate after the client's own retries (HTTP 429: the
@@ -610,6 +615,19 @@ async function replay(item: string): Promise<void> {
     judged && !timeBumped && !relayed && row.standIn !== 'rejected' && !row.passkeyExtraKey && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
     judged && row.tokens === 'other' && !row.unread && 'tokens',
   ].filter((x): x is string => !!x);
+  // Run a second after its block (BNB Chain's node won't simulate a block in its parent's second), an amount can
+  // move by more than a second's accrual: a price or fee that changes with the time (0.06% on a vault deposit after a
+  // swap). The bundle is replayed then as the previewer replays a mined transaction, in the local EVM at its own
+  // time after the transactions of that second (src/replay.ts): if that matches its receipt, the difference is the
+  // second, reported and not failed; if it doesn't, it fails.
+  if (timeBumped && differs.includes('tokens')) {
+    const again = await replayTransaction({ chainId: CHAIN, hash }, { trace: false }, replayDeps()).catch(() => null);
+    if (again?.replay?.matches) {
+      differs.splice(differs.indexOf('tokens'), 1);
+      row.tokensAtOwnTime = true;
+      row.warned = [row.warned, 'tokens (run a second after its block; at its own time, in the local EVM, the bundle matches its receipt)'].filter(Boolean).join('; ');
+    }
+  }
   if (differs.length) row.differs = differs;
   // --differing <dir>: each differing operation's row and preview, kept to look at once its state is gone.
   if (differs.length && arg('differing', '')) {
@@ -683,7 +701,7 @@ if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's 
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}`].filter(Boolean);
+    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; at its own time the bundle matches its receipt: not judged)' : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 
