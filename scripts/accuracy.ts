@@ -225,6 +225,9 @@ async function replay(b: B, seen?: Set<string>) {
           gas: String(res.gasUsed) === row.receiptGas || (!!r.gasUsedForL1 && res.gasUsed !== undefined && res.gasUsed >= BigInt(row.receiptGas as string) && res.gasUsed - BigInt(row.receiptGas as string) <= 2n * BigInt(r.gasUsedForL1)),
           l1Charge: r.gasUsedForL1 && BigInt(r.gasUsedForL1) > 0n && res.gasUsed !== undefined ? Number(res.gasUsed - BigInt(row.receiptGas as string)) / Number(BigInt(r.gasUsedForL1)) : undefined,
           gasUsed: String(res.gasUsed), ms: Date.now() - t0,
+          // The node's reads of balances and allowances after the call got no answer (a public node rate limiting):
+          // its amounts are the events', so they aren't judged.
+          ...(res.stateReadError && { unread: res.stateReadError }),
         };
         // A native change that differs: what the block's other transactions sent the sender through a contract (a
         // builder's rebate, a contract paying it out) moves its balance too, with no log to show it. The block's
@@ -326,8 +329,9 @@ for (const row of rows) for (const name of SIMULATORS) {
   // An outcome that differs for a transaction run a second after its block is reported, not failed: what it checks
   // can be that second (a deadline of the block's own timestamp).
   if (!r.outcome && row.timeBumped) r.warned = 'outcome (run a second after its block)';
-  const differs = [!r.outcome && !row.timeBumped && 'outcome', r.tokenDiffs.some((d: { actual: string; simulated: string }) => !close(d)) && 'tokens',
-    !r.native && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+  const differs = [!r.outcome && !row.timeBumped && 'outcome', !r.unread && r.tokenDiffs.some((d: { actual: string; simulated: string }) => !close(d)) && 'tokens',
+    !r.unread && !r.native && 'native', !r.unread && r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+  if (r.unread && (r.tokenDiffs.length || !r.native || r.approvals < r.approvalTotal)) r.warned = `amounts from events (the node's reads got no answer: ${r.unread})`;
   if (differs.length) r.differs = differs;
 }
 const out = arg('out', '');
@@ -354,6 +358,8 @@ for (const name of SIMULATORS) {
 }
 const differing = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.differs)).length;
 const notCharged = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.l1FeeNotCharged)).length;
+const unread = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.unread)).length;
+if (unread) say(`  ${unread} whose balances the node didn't answer the reads of (a public node rate limiting): their amounts are the events', reported and not judged`);
 if (notCharged) say(`  ${notCharged} whose receipt names an L1 data fee their sender's balance didn't pay`);
 const bumped = rows.filter(r => r.timeBumped).length;
 if (bumped) say(`  ${bumped} run a second after their block, which shared its parent's second (the node refuses that): gas not judged for them`);

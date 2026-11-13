@@ -523,6 +523,8 @@ async function replay(item: string): Promise<void> {
     // Without any simulation (the node refused it) there are no simulated movements to compare.
     ...(!ran(p) && { notSimulated: true }),
     ...(byBalance && { tokensByBalance: byBalance }), ...(createdElsewhere && { tokenCreated: true }),
+    // (The node's reads of balances after the run got no answer, a public node rate limiting: amounts from events.)
+    ...(p.simulation?.stateReadError && { unread: p.simulation.stateReadError }),
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
   const row = rows.at(-1)!;
@@ -551,7 +553,7 @@ async function replay(item: string): Promise<void> {
     // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas
     // (a post-quantum SPHINCS+ wallet on Base, 40%); a shape to add, not a wrong preview, as for calls simulated alone.
     judged && !timeBumped && !relayed && row.standIn !== 'rejected' && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
-    judged && row.tokens === 'other' && 'tokens',
+    judged && row.tokens === 'other' && !row.unread && 'tokens',
   ].filter((x): x is string => !!x);
   if (differs.length) row.differs = differs;
   // --differing <dir>: each differing operation's row and preview, kept to look at once its state is gone.
