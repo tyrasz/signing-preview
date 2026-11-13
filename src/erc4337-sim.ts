@@ -210,8 +210,13 @@ const NO_TIPS = new Set([42161, 421614]);
  * empty answer left the refusal standing.
  */
 const RECENT_BUNDLERS = new Map<string, { at: number; bundlers: string[] }>();
-/** A node's refusal of a log query's block range as such (not a refusal under load). */
+/** Lookups in flight, by key: concurrent operations of one paymaster share one (and so one node read), not one each. */
+const RECENT_BUNDLERS_INFLIGHT = new Map<string, Promise<string[]>>();
+/** What an empty answer is remembered for: a lull or a passing node failure stands only a minute, found bundlers ten. */
+const FOUND_FOR = 600_000, EMPTY_FOR = 60_000;
+/** A node's refusal of a log query's block range as such (not a refusal under load); its cap, where it names one. */
 const RANGE_CAPPED = /block range|range (is )?too (large|wide|big)|range limit|exceeds? .*range|max(imum)? .*range/i;
+const capMessage = (e: unknown) => String((e as { rpcError?: { message?: string } })?.rpcError?.message ?? '');
 async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: string, paymasterAndData: Hex): Promise<string[]> {
   const paymaster = paymasterAndData.slice(0, 42).toLowerCase();
   // The paymaster's own data starts after its address, and from v0.7 on its two gas limits.
@@ -219,38 +224,61 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
   const config = paymasterAndData.length > 2 + at * 2 ? paymasterAndData.slice(2 + at * 2, 4 + at * 2).toLowerCase() : undefined;
   const key = `${chainId}:${entryPoint}:${paymaster}:${config ?? ''}`;
   const known = RECENT_BUNDLERS.get(key);
-  if (known && Date.now() - known.at < 600_000) return known.bundlers;
+  if (known && Date.now() - known.at < (known.bundlers.length ? FOUND_FOR : EMPTY_FOR)) { return known.bundlers; }
+  const inflight = RECENT_BUNDLERS_INFLIGHT.get(key);
+  if (inflight) { return inflight; }
   const rpc = deps.rpc;
   if (!rpc?.has(chainId)) return [];
-  let refused = false;
-  try {
-    const head = BigInt(String(await rpc.call(chainId, 'eth_blockNumber', [])));
-    for (const span of [200n, 2000n, 20_000n]) {
-      let logs: { transactionHash: string }[];
-      // A refused read is tried once more before a wider (heavier) one.
-      const read = () => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > span ? head - span : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
-      // A node that caps the range (HyperEVM's at 1,000 blocks) refuses every wider span too: that is its answer.
-      const capped = (e: unknown) => RANGE_CAPPED.test(String((e as { rpcError?: { message?: string } })?.rpcError?.message ?? ''));
-      try { logs = await read().catch(async e => { if (capped(e)) throw e; await new Promise(r => setTimeout(r, 500)); return read(); }); } catch (e) { if (capped(e)) break; refused = true; continue; }
-      const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
-      if (!hashes.length) continue;
-      const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
-      const score = new Map<string, number>();
-      for (const t of txs) {
-        const from = t?.from?.toLowerCase();
-        if (!from) continue;
-        // The paymaster's data in the bundle's calldata: its address, then (at the same offset) its first byte.
-        const input = (t?.input ?? '').toLowerCase(), i = input.indexOf(paymaster.slice(2));
-        const same = config !== undefined && i >= 0 && input.slice(i + at * 2, i + at * 2 + 2) === config;
-        score.set(from, (score.get(from) ?? 0) + (same ? 100 : 1));
+  const lookup = (async (): Promise<string[]> => {
+    // `refused` marks a read the node couldn't answer (load, a block it lacks, all the transactions missing): the
+    // empty it leaves is transient, so it is not remembered and the next operation tries again.
+    let refused = false;
+    const capped = (e: unknown) => RANGE_CAPPED.test(capMessage(e));
+    try {
+      const head = BigInt(String(await rpc.call(chainId, 'eth_blockNumber', [])));
+      // The widest range the node will answer, learned from its own refusal (Polygon's 10,000, HyperEVM's 1,000): a
+      // quiet paymaster's bundlers are over a wide span, which a capping node refuses whole, so the span is narrowed
+      // to the cap and asked again rather than given up on (which used to be remembered as "no bundlers").
+      let capBlocks: bigint | undefined;
+      for (const want of [200n, 2000n, 20_000n]) {
+        const span = capBlocks !== undefined && want > capBlocks ? capBlocks : want;
+        const read = (s: bigint) => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > s ? head - s : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
+        let logs: { transactionHash: string }[];
+        try {
+          logs = await read(span).catch(async e => { if (capped(e)) throw e; await new Promise(r => setTimeout(r, 500)); return read(span); });
+        } catch (e) {
+          if (!capped(e)) { refused = true; continue; }
+          // The node named its cap: query within it. If that is no narrower than what we just asked, stop.
+          const m = capMessage(e).match(/(\d[\d,]{2,})/); const named = m ? BigInt(m[1].replace(/,/g, '')) : (span > 2n ? span / 2n : 0n);
+          if (named <= 0n || (capBlocks !== undefined && named >= capBlocks)) break;
+          capBlocks = named;
+          try { logs = await read(named); } catch { refused = true; continue; }
+        }
+        const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
+        if (!hashes.length) { if (capBlocks !== undefined && span >= capBlocks) break; continue; }
+        const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
+        const score = new Map<string, number>();
+        for (const t of txs) {
+          const from = t?.from?.toLowerCase();
+          if (!from) continue;
+          // The paymaster's data in the bundle's calldata: its address, then (at the same offset) its first byte.
+          const input = (t?.input ?? '').toLowerCase(), i = input.indexOf(paymaster.slice(2));
+          const same = config !== undefined && i >= 0 && input.slice(i + at * 2, i + at * 2 + 2) === config;
+          score.set(from, (score.get(from) ?? 0) + (same ? 100 : 1));
+        }
+        const bundlers = [...score].sort((a, b) => b[1] - a[1]).map(([f]) => f).slice(0, 5);
+        if (bundlers.length) { RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers }); return bundlers; }
+        // The logs named transactions, but the node gave none of their senders: a passing failure, not "no bundlers".
+        refused = true;
       }
-      const bundlers = [...score].sort((a, b) => b[1] - a[1]).map(([f]) => f).slice(0, 5);
-      if (bundlers.length) RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers });
-      return bundlers;
-    }
-    if (!refused) RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers: [] });
-  } catch { /* none */ }
-  return [];
+      // A genuine empty (every span answered, nothing found) is remembered briefly, so a busy paymaster's next
+      // operation isn't a fresh heavy read; a refused one is not remembered at all.
+      if (!refused) RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers: [] });
+    } catch { /* none */ }
+    return [];
+  })();
+  RECENT_BUNDLERS_INFLIGHT.set(key, lookup);
+  try { return await lookup; } finally { RECENT_BUNDLERS_INFLIGHT.delete(key); }
 }
 
 /**
@@ -1022,7 +1050,11 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     const ran = await run(first, recover);
     // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one.
     if (paymaster && ran?.rejected?.startsWith('AA33')) {
-      for (const bundler of (await bundlers).filter(b => b !== first)) {
+      // An empty list here can be a passing node failure (the lookup is not remembered when so), not "no bundlers":
+      // ask once more before falling back to the account's calls alone.
+      let found = (await bundlers).filter(b => b !== first);
+      if (!found.length) found = (await recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData)).filter(b => b !== first);
+      for (const bundler of found) {
         const again = await run(bundler, recover);
         if (again && !again.rejected?.startsWith('AA33')) return again;
       }
