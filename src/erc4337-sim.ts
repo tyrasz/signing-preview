@@ -510,6 +510,13 @@ async function zeroDevPrecompiled(c: StubContext): Promise<boolean> {
  * signer's id, then that module's (the owner's ECDSA signature over the operation's hash, EIP-191).
  */
 const SIGNER_ID_VALIDATORS = new Set(['0x933401632d92bc7005d7415242171a55e20004ba']);
+/**
+ * Its ECDSA signer module, and the id its wallets give an owner's key: keccak256(module ++ owner), the id of every
+ * SignerAdded event (account, id, module; data the owner's address) with that module up to 2026-11-13: Polygon 112
+ * (1,100,000 blocks), Base 162 (1,300,000), Sepolia 909 (250,000).
+ */
+const SIGNER_ID_ECDSA_MODULE = '0x9895a7b30a9dfcfbb1cd8f41595d2ad15fdcc9c3';
+export const ownerSignerId = (owner: string): Hex => keccak256(concatHex([SIGNER_ID_ECDSA_MODULE, owner as Hex]));
 const SIGNER_CONFIGS = [{ type: 'tuple[]', components: [{ name: 'id', type: 'bytes32' }, { name: 'signer', type: 'address' }, { name: 'data', type: 'bytes' }] }] as const;
 /**
  * The id a signer-id validator's operation names: a deploying account's from its set-up (the signer whose data is
@@ -525,6 +532,21 @@ export async function signerIdOf(c: StubContext, vId: string, deploying?: Kernel
   }
   const last = await lastSignature(c);
   return last && last.length === 2 + 97 * 2 ? `0x${last.slice(2, 66)}` as Hex : undefined;
+}
+/**
+ * The ids a signer-id validator's stand-in tries, in turn: a deploying account's from its set-up (signerIdOf); an
+ * existing account's, the signer's own (its ECDSA key's, ownerSignerId), then the one its latest earlier operation
+ * named. That operation alone missed most existing accounts: of 13 previewed on Polygon, 8 were refused, 7 whose
+ * operations were older than lastSignature reaches and one whose latest was a passkey permission's; on Base, 3 of 17
+ * owners' operations replayed, whose latest earlier one was an enable-mode one or a permission's.
+ */
+export async function signerIdsOf(c: StubContext, vId: string, deploying?: KernelSetup): Promise<Hex[]> {
+  const ids = new Set<Hex>();
+  // (Not when the account itself is asked, as when no signer is named: no owner's key has its id.)
+  if (!deploying && /^0x[0-9a-f]{40}$/i.test(c.signer) && c.signer.toLowerCase() !== c.sender.toLowerCase()) ids.add(ownerSignerId(c.signer.toLowerCase()));
+  const last = await signerIdOf(c, vId, deploying);
+  if (last) ids.add(last.toLowerCase() as Hex);
+  return [...ids];
 }
 /**
  * A passkey's assertion as ZeroDev's WebAuthn validator decodes it: abi.encode(authenticatorData, clientDataJSON,
@@ -613,8 +635,8 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
     return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo' }];
   }
   if (type === '01' && SIGNER_ID_VALIDATORS.has(`0x${id}`.toLowerCase())) {
-    const signerId = await signerIdOf(c, `0x01${id}`, deploying);
-    if (signerId) return [{ signature: concatHex([signerId, STUB_SIGNATURE]) }];
+    const ids = await signerIdsOf(c, `0x01${id}`, deploying);
+    if (ids.length) return ids.map(i => ({ signature: concatHex([i, STUB_SIGNATURE]) }));
   }
   if (type === '01' && KERNEL_WEBAUTHN_SOL_VALIDATORS.has(`0x${id}`.toLowerCase())) {
     const hash = await c.hash();

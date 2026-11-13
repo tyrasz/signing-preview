@@ -86,10 +86,13 @@ const NAMED_ONLY: Record<string, string> = {
 };
 const RECOVERY_DANGER = "ZeroDev's recovery action re-installs any of your account's validators with new data (its code calls the validator's onUninstall, then onInstall with the data it is given), so it can replace your account's owner";
 /**
- * Kernel v3's own functions an Enable can grant (its verified ABI); `control`: ones that hand over the account itself;
- * `entryPointOnly`: only the EntryPoint may call it (a call from the account itself fails); `since`: the first version that has it.
+ * Kernel v3's own functions an Enable can grant (its verified ABI); `control`: ones that hand over the account itself,
+ * or (`lockout`) delete its owner's key, locking the owner out; `entryPointOnly`: only the EntryPoint may call it (a call
+ * from the account itself fails); `since`: the first version that has it; `permissionOwner`: it reaches the owner only
+ * when the account's root is a permission (see ownerFunction).
  */
-const KERNEL_FUNCTIONS: Record<string, { sig: string; text: string; runs?: boolean; control?: boolean; entryPointOnly?: boolean; since?: string }> = {
+type KernelFunction = { sig: string; text: string; runs?: boolean; control?: boolean; lockout?: boolean; entryPointOnly?: boolean; since?: string; permissionOwner?: boolean };
+const KERNEL_FUNCTIONS: Record<string, KernelFunction> = {
   '0xe9ae5c53': { sig: 'execute(bytes32,bytes)', text: 'run calls from your account', runs: true },
   '0xd691c964': { sig: 'executeFromExecutor(bytes32,bytes)', text: 'run calls from your account', runs: true },
   // executeUserOp delegatecalls the account itself with the rest of the operation's callData, with the EntryPoint as
@@ -100,17 +103,38 @@ const KERNEL_FUNCTIONS: Record<string, { sig: string; text: string; runs?: boole
   '0x52141cd9': { sig: 'changeRootValidator(bytes21,address,bytes,bytes)', text: "replace your account's owner", control: true, since: '0.3.1' },
   '0x3659cfe6': { sig: 'upgradeTo(address)', text: "replace your account's code", control: true },
   '0xb9b82941': { sig: 'grantAccess(bytes21,bytes4,bool)', text: 'let keys use other functions of your account', control: true, since: '0.3.3' },
-  // (A hook-type uninstall reaches any module's onUninstall, the root validator's included: its owner deleted, you locked out.)
-  '0xa71763a8': { sig: 'uninstallModule(uint256,address,bytes)', text: "remove modules from your account, your owner's validator included (locking you out)", control: true },
-  '0xe6f3d50a': { sig: 'uninstallValidation(bytes21,bytes,bytes)', text: 'remove keys from your account' },
+  // Shown live on v3.1 to v3.3 (a session key granted it, on real accounts): a hook-type uninstall (4) calls any module's
+  // onUninstall as the account, the root validator's included, and a validator-type one (1) any module's but the root
+  // validator's, a permission root's signer included: the owner's key deleted, its operations refused (AA24) after.
+  '0xa71763a8': { sig: 'uninstallModule(uint256,address,bytes)', text: "remove modules from your account, your owner's key included", control: true, lockout: true },
+  // Kernel refuses to uninstall the root validation itself (RootValidatorCannotBeRemoved), but calls onUninstall on any
+  // other module named as a validator (0x01 and its address), installed or not, as the account: a root permission's
+  // signer, named so with the permission's id as its data, deletes the owner's key (shown live on v3.1 to v3.3, Bleap's
+  // cosigner and ZeroDev's ECDSA signer). A root validator can't be reached so.
+  '0xe6f3d50a': { sig: 'uninstallValidation(bytes21,bytes,bytes)', text: "remove keys from your account, and your owner's key too if it is a permission rather than a validator", control: true, lockout: true, permissionOwner: true },
+  // Shown live: it revokes every validation but the root (the key's own next operation refused, InvalidNonce); the owner's operations still run.
   '0x1f1b92e3': { sig: 'invalidateNonce(uint32)', text: "revoke your account's other keys" },
 };
+/**
+ * What a function reaching the owner only through a root permission does on this account, when its root is read: with
+ * a root validator, only other keys (Kernel won't uninstall it); with a root permission, the owner's key too.
+ */
+function ownerFunction(f: KernelFunction | undefined, state: AccountState | undefined): KernelFunction | undefined {
+  if (!f?.permissionOwner || !state?.root) return f;
+  if (state.root.startsWith('0x01')) return { ...f, control: false, lockout: false, text: "remove keys from your account other than its owner, a validator, which Kernel won't uninstall" };
+  // An EIP-7702 account's owner is its own key, which no module holds (root 0): nothing to uninstall (checked live).
+  if (/^0x0{42}/.test(state.root) && state.code === 'delegated') return { ...f, control: false, lockout: false, text: "remove keys from your account other than its owner, the account's own key, which no module holds" };
+  if (state.root.startsWith('0x02')) return { ...f, text: "remove keys from your account, your owner's included: it is a permission, whose signer's key it can delete" };
+  return f;
+}
+/** What a function that hands over the account, or locks its owner out, does: the end of its danger. */
+const controlEnd = (f: KernelFunction) => (f.lockout ? 'that locks you out of the account and all it holds' : 'that hands over the account');
 const EXECUTE = '0xe9ae5c53', EXECUTE_FROM_EXECUTOR = '0xd691c964';
 /** Kernel's own function with this selector in this version (any version, when the domain names none Kernel has). */
-function kernelFunction(selector: string, version: string) {
+function kernelFunction(selector: string, version: string, state?: AccountState) {
   const f = KERNEL_FUNCTIONS[selector];
   if (f?.since && VERSION_ORDER.includes(version) && VERSION_ORDER.indexOf(version) < VERSION_ORDER.indexOf(f.since)) return undefined;
-  return f;
+  return ownerFunction(f, state);
 }
 const SKIP_USEROP = 0x0001, SKIP_SIGNATURE = 0x0002;
 /** doRecovery(address,bytes), the one function of ZeroDev's recovery action. */
@@ -218,7 +242,7 @@ async function describe(m: Record<string, unknown>, types: Record<string, { name
     const pId = `0x${vId.slice(4, 12)}`;
     if (!/^0{32}$/.test(vId.slice(12))) b.warn('caution', 'kernel_enable_bad_id', `The permission's ID (${vId}) has bytes after its first four, which Kernel's own operations never carry: it may not be usable as signed.`);
     b.detail('Installs', `permission ${pId}`, vId);
-    reading = await readPermission(validatorData, b, env, chainId, account, native);
+    reading = await readPermission(validatorData, b, env, chainId, account, native, state);
   } else {
     b.detail('Installs', `validation ${vId} (type 0x${type}, which Kernel doesn't install)`);
     reading = { who: `validation ${vId.slice(0, 12)}…`, scope: 'unknown', headline: null, scopeText: 'act in a way that can\'t be read', signing: 'unknown', signingText: 'unknown', until: null, after: null, danger: [], cautions: [['kernel_enable_unknown_type', `The validation type 0x${type} isn't a validator (0x01) or a permission (0x02): Kernel refuses to install it, and what it would do can't be read.`]] };
@@ -336,7 +360,7 @@ function readValidator(validator: string, data: Hex, b: PreviewBuilder): Reading
 }
 
 /** A permission (type 0x02): abi.encode(bytes[]), each policy and then the signer (2-byte flag, address, data). */
-async function readPermission(data: Hex, b: PreviewBuilder, env: TypedEnv, chainId: number | null, account: string, native: string): Promise<Reading> {
+async function readPermission(data: Hex, b: PreviewBuilder, env: TypedEnv, chainId: number | null, account: string, native: string, state: AccountState | undefined): Promise<Reading> {
   const [items] = decodeAbiParameters([{ type: 'bytes[]' }], data);
   if (!items.length) throw new Error('a permission with no signer');
   const entries: Entry[] = items.map(it => {
@@ -453,7 +477,7 @@ async function readPermission(data: Hex, b: PreviewBuilder, env: TypedEnv, chain
   // only unknown modules.
   if (!forOps) { reading.scope = 'none'; reading.scopeText = 'sign for your account only (no operations)'; }
   else if (calls) {
-    const lines = await describeCalls(calls, b, env, chainId, account, native, reading);
+    const lines = await describeCalls(calls, b, env, chainId, account, native, reading, state);
     reading.headline = `${calls.length} allowed call${calls.length === 1 ? '' : 's'}`;
     reading.scope = 'limited';
     reading.scopeText = `make only these calls from your account: ${lines.slice(0, 3).join('; ')}${lines.length > 3 ? `; and ${lines.length - 3} more (listed)` : ''}`;
@@ -479,7 +503,7 @@ function decodeCallPolicy(data: Hex, version: number): CallPermission[] {
 }
 
 /** Each allowed call, as a detail ("Allowed call 1"), and short lines for the warning. */
-async function describeCalls(calls: CallPermission[], b: PreviewBuilder, env: TypedEnv, chainId: number | null, account: string, native: string, reading: Reading): Promise<string[]> {
+async function describeCalls(calls: CallPermission[], b: PreviewBuilder, env: TypedEnv, chainId: number | null, account: string, native: string, reading: Reading, state: AccountState | undefined): Promise<string[]> {
   const lines: string[] = [];
   const tokens = new Map<string, TokenInfo | undefined>();
   const abis = new Map<string, AbiFunction[] | undefined>();
@@ -495,7 +519,7 @@ async function describeCalls(calls: CallPermission[], b: PreviewBuilder, env: Ty
     }
     const self = sameAddress(c.target, account);
     // A call the account makes to itself (its own address, or any contract) reaches Kernel's own functions.
-    const kernelFn = (self || wildcard) && !plain ? KERNEL_FUNCTIONS[c.selector] : undefined;
+    const kernelFn = (self || wildcard) && !plain ? ownerFunction(KERNEL_FUNCTIONS[c.selector], state) : undefined;
     const fn = kernelFn ? undefined : abis.get(c.target)?.find(f => { try { return toFunctionSelector(f) === c.selector; } catch { return false; } }) ?? FUNCTIONS.get(c.selector);
     const name = plain ? (c.version >= 2 ? `plain ${native} transfers (no function)` : `calls whose data starts 0x00000000 (call policy 0.0.1 refuses plain ${native} transfers)`)
       : kernelFn ? `${self ? 'your account\'s own ' : ''}${kernelFn.sig} (${self ? '' : 'Kernel\'s: '}${kernelFn.entryPointOnly ? 'only the EntryPoint may call it, so a call from your account fails' : kernelFn.text})`
@@ -513,7 +537,7 @@ async function describeCalls(calls: CallPermission[], b: PreviewBuilder, env: Ty
     if (c.callType === '0xff') reading.danger.push(['kernel_enable_takeover', `It may delegatecall ${wildcard ? 'any contract' : c.target}: that code runs as your account itself, so it can do anything with the account and all it holds.`]);
     // The account's own functions, reached by a call to itself: the call policy checks only that outer call.
     const viaAny = wildcard ? ' (allowed on any contract, so on your account too)' : '';
-    if (kernelFn?.control && !kernelFn.entryPointOnly) reading.danger.push(['kernel_enable_takeover', `It may call your account's own ${kernelFn.sig}${viaAny}, which lets it ${kernelFn.text}: that hands over the account.`]);
+    if (kernelFn?.control && !kernelFn.entryPointOnly) reading.danger.push(['kernel_enable_takeover', `It may call your account's own ${kernelFn.sig}${viaAny}, which lets it ${kernelFn.text}: ${controlEnd(kernelFn)}.`]);
     else if (kernelFn && c.selector === EXECUTE) reading.danger.push(['kernel_enable_takeover', `It may have your account call its own ${kernelFn.sig}${viaAny}, which runs any calls packed inside it: the call policy checks only that outer call, so it can send any transaction from your account.`]);
     else if (kernelFn && c.selector === EXECUTE_FROM_EXECUTOR) reading.danger.push(['kernel_enable_takeover', `It may have your account call ${kernelFn.sig}${wildcard ? ' on any contract, its own included' : ' on itself'}, which runs the calls packed inside it for an executor of that account: the call policy checks only that outer call, not the calls inside.`]);
     // A module's onInstall or onUninstall, called by your account: modules keep each account's settings under the
@@ -585,7 +609,7 @@ const handlerName = (module: string) => (NAMED_ONLY[module] ? `${NAMED_ONLY[modu
 /** The function the validation may be used for (selectorData[0:4]), and the module this installs for it (44 bytes on). */
 function readSelector(selectorData: Hex, reading: Reading, b: PreviewBuilder, version: string, state: AccountState | undefined): { runs: boolean; text: string } {
   const selector = selectorData.slice(0, 10).toLowerCase();
-  const own = kernelFunction(selector, version);
+  const own = kernelFunction(selector, version, state);
   const fn = FUNCTIONS.get(selector);
   const named = own ? `${own.sig}: ${own.text}` : fn ? `${toFunctionSignature(fn)} (not one of Kernel's own)` : `${selector} (not one of Kernel's own)`;
   const label = fn && !own ? `${toFunctionSignature(fn)} (${selector})` : selector;
@@ -593,7 +617,7 @@ function readSelector(selectorData: Hex, reading: Reading, b: PreviewBuilder, ve
   // What the grant reads as when its function isn't one that runs calls: that function, and nothing else.
   const only = own ? `use only your account's own ${own.sig}, to ${own.text}` : `call only your account's function ${label}`;
   // A key that sends no operations (its flag) calls nothing: the function matters only for what is installed with it.
-  if (own?.control && reading.scope !== 'none') reading.danger.push(['kernel_enable_takeover', `It may call your account's own ${own.sig}, which lets it ${own.text}: that hands over the account.`]);
+  if (own?.control && reading.scope !== 'none') reading.danger.push(['kernel_enable_takeover', `It may call your account's own ${own.sig}, which lets it ${own.text}: ${controlEnd(own)}.`]);
   const ownScope = () => { if (own && !own.runs && (reading.scope === 'unlimited' || reading.unknownLimits)) reading.scopeText = only; };
   if (selectorData.length === 10) {
     if (own) ownScope();

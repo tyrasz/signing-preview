@@ -141,18 +141,24 @@ test('Real grants: who gets the key, what its policies allow, and how much atten
   assert.equal(detail(unknown, 'Signs as your account (ERC-1271)'), 'yes, unless an unknown policy stops it');
   assert.equal(unknown.decoding.status, 'partial');
 
-  // A passkey's account: a call to the account's own uninstallValidation, signatures for two contracts only.
+  // A passkey's account: a call to the account's own uninstallValidation, signatures for two contracts only. Without
+  // an RPC its owner can't be read: uninstallValidation deletes the owner's key when the owner is a permission, so danger.
   const passkey = await preview(fixture('0x386ba95e958c180313d05f3750dbc94676ab32bf'));
   assert.equal(passkey.title, 'Let session key 0x8c03…e20a act for your Kernel account: 3 allowed calls');
-  assert.equal(detail(passkey, 'Allowed call 3'), "your account's own uninstallValidation(bytes21,bytes,bytes) (remove keys from your account), any arguments; no ETH");
+  assert.equal(detail(passkey, 'Allowed call 3'), "your account's own uninstallValidation(bytes21,bytes,bytes) (remove keys from your account, and your owner's key too if it is a permission rather than a validator), any arguments; no ETH");
   assert.equal(detail(passkey, 'Signs as your account (ERC-1271)'), 'yes, only when 0x954768e41236cf2ea910f494a9e13dfc372c57b9, 0xd59245a0cbdbc84b21a4586e57352167a9e6c778 check it');
-  assert.equal(passkey.attention, 'caution');
+  assert.equal(passkey.attention, 'danger');
+  // With an RPC, its owner is a validator (as the account's is, ZeroDev's passkey validator), which Kernel won't
+  // uninstall: other keys only, a caution.
+  const read = await sign(fixture('0x386ba95e958c180313d05f3750dbc94676ab32bf').typedData, '0x386ba95e958c180313d05f3750dbc94676ab32bf', { ...deps, rpc: kernelRpc({ root: `0x01${PASSKEY_VALIDATOR.slice(2)}` }) });
+  assert.equal(detail(read, 'Allowed call 3'), "your account's own uninstallValidation(bytes21,bytes,bytes) (remove keys from your account other than its owner, a validator, which Kernel won't uninstall), any arguments; no ETH");
+  assert.equal(read.attention, 'caution');
 });
 
 // Synthetic messages, built as ZeroDev's SDK builds them.
 const ACCOUNT = '0xacc0000000000000000000000000000000000001';
 const KEY = '0x5e55100000000000000000000000000000000001';
-const ECDSA_SIGNER = '0x6a6f069e2a08c2468e7724ab3250cdbfba14d4ff', ECDSA_VALIDATOR = '0x845adb2c711129d4f3966735ed98a9f09fc4ce57';
+const ECDSA_SIGNER = '0x6a6f069e2a08c2468e7724ab3250cdbfba14d4ff', ECDSA_VALIDATOR = '0x845adb2c711129d4f3966735ed98a9f09fc4ce57', PASSKEY_VALIDATOR = '0x7ab16ff354acb328452f1d445b3ddee9a91e9e69';
 const SUDO = '0x67b436cad8a6d025df6c82c5bb43fbf11fc5b9b7', CALL_POLICY = '0x9a52283276a0ec8740df50bf01b28a80d880eaf2', TIMESTAMP = '0xb9f8f524be6ecd8c945b1b87f9ae5c192fdce20f';
 const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const entry = (flag: Hex, module: string, data: Hex = '0x') => concatHex([flag, module as Hex, data]);
@@ -319,8 +325,53 @@ test('Re-review: a grant made unreadable on purpose, a module\'s onInstall/onUni
   assert.match(detail(odd, 'Allowed call 1') ?? '', /approved must not be 0x0{63}2 \(not a bool: neither true nor false matches it\)/);
 });
 
+// What a key granted uninstallValidation, uninstallModule or invalidateNonce can do to the owner, as simulated with a
+// session key on real accounts (Kernel v3.1, v3.2 and v3.3, Base and BNB Chain, 2026-11-13; the owner's key a test key,
+// so that its operation could be signed): uninstallModule's hook type deletes a root validator's key, and its validator
+// type a root permission's signer's; uninstallValidation refuses the root validation itself, but with 0x01 and a root
+// permission's signer (Bleap's cosigner, ZeroDev's ECDSA signer) and that permission's id it deletes the owner's key: the
+// owner's next operation fails (AA24). invalidateNonce revokes the key itself; the owner's operations still run.
+test('uninstallValidation, uninstallModule and invalidateNonce: what each can do to the account\'s owner', async () => {
+  const live = (root?: string) => ({ ...deps, rpc: kernelRpc({ root }) });
+  const permissionRoot = `0x02d7e3c4e0${'00'.repeat(16)}`;
+  const lockout = (p: Awaited<ReturnType<typeof sign>>) => p.warnings.find(w => w.code === 'kernel_enable_takeover')?.message;
+  // uninstallValidation as the key's function: danger when the owner is a permission or can't be read, not with a root validator.
+  for (const [label, d, attention] of [['no RPC', deps, 'danger'], ['permission root', live(permissionRoot), 'danger'], ['validator root', live(), 'caution']] as const) {
+    const p = await sign(enable({ selectorData: '0xe6f3d50a' }), ALICE, d);
+    assert.equal(p.attention, attention, label);
+  }
+  const unread = await sign(enable({ selectorData: '0xe6f3d50a' }));
+  assert.equal(lockout(unread), "It may call your account's own uninstallValidation(bytes21,bytes,bytes), which lets it remove keys from your account, and your owner's key too if it is a permission rather than a validator: that locks you out of the account and all it holds.");
+  const permission = await sign(enable({ selectorData: '0xe6f3d50a' }), ALICE, live(permissionRoot));
+  assert.equal(detail(permission, 'Account function it may use'), "uninstallValidation(bytes21,bytes,bytes): remove keys from your account, your owner's included: it is a permission, whose signer's key it can delete");
+  const validator = await sign(enable({ selectorData: '0xe6f3d50a' }), ALICE, live());
+  assert.equal(detail(validator, 'Account function it may use'), "uninstallValidation(bytes21,bytes,bytes): remove keys from your account other than its owner, a validator, which Kernel won't uninstall");
+  assert.ok(!codes(validator).includes('kernel_enable_takeover'));
+  // An EIP-7702 account's owner is its own key (root 0), which no module holds: nothing for it to uninstall.
+  const delegated = await sign(enable({ selectorData: '0xe6f3d50a' }), ALICE, { ...deps, rpc: kernelRpc({ code: '0xef0100d6cedde84be40893d153be9d467cd6ad37875b28', root: `0x${'00'.repeat(21)}` }) });
+  assert.equal(delegated.attention, 'caution');
+  assert.equal(detail(delegated, 'Account function it may use'), "uninstallValidation(bytes21,bytes,bytes): remove keys from your account other than its owner, the account's own key, which no module holds");
+  // As a call to the account itself (a call policy), the same.
+  const call = callsOnly([{ target: ACCOUNT, selector: '0xe6f3d50a' }]);
+  assert.equal((await sign(call)).attention, 'danger');
+  assert.equal((await sign(call, ALICE, live(permissionRoot))).attention, 'danger');
+  assert.equal((await sign(call, ALICE, live())).attention, 'caution');
+  // uninstallModule reaches the owner whatever it is: a root validator through a hook-type uninstall.
+  for (const d of [deps, live(), live(permissionRoot)]) {
+    const p = await sign(enable({ selectorData: '0xa71763a8' }), ALICE, d);
+    assert.equal(p.attention, 'danger');
+    assert.equal(lockout(p), "It may call your account's own uninstallModule(uint256,address,bytes), which lets it remove modules from your account, your owner's key included: that locks you out of the account and all it holds.");
+  }
+  // invalidateNonce revokes the account's other keys, never its owner.
+  for (const d of [deps, live(), live(permissionRoot)]) {
+    const p = await sign(enable({ selectorData: '0x1f1b92e3' }), ALICE, d);
+    assert.equal(p.attention, 'caution');
+    assert.equal(detail(p, 'Account function it may use'), "invalidateNonce(uint32): revoke your account's other keys");
+  }
+});
+
 /** A Kernel v3.1 account (an ERC-1967 proxy) whose root is ZeroDev's ECDSA validator. */
-function kernelRpc(o: { code?: string; implementation?: string; owner?: string; currentNonce?: number; vIdNonce?: number; hook?: string; handler?: { hook: string; target: string; callType: Hex }; executorHook?: string } = {}): Dependencies['rpc'] {
+function kernelRpc(o: { code?: string; implementation?: string; root?: string; owner?: string; currentNonce?: number; vIdNonce?: number; hook?: string; handler?: { hook: string; target: string; callType: Hex }; executorHook?: string } = {}): Dependencies['rpc'] {
   return {
     has: () => true,
     call: async (_chainId: number, method: string, params: unknown[]) => {
@@ -328,7 +379,7 @@ function kernelRpc(o: { code?: string; implementation?: string; owner?: string; 
       if (method === 'eth_getStorageAt') return word(o.implementation ?? '0xbac849bb641841b44e965fb01a4bf5f074f84b4d');
       const { to, data } = params[0] as { to: string; data: string };
       const selector = data.slice(0, 10);
-      if (selector === '0xf1f7f0f9') return `0x01${ECDSA_VALIDATOR.slice(2)}${'00'.repeat(11)}`; // rootValidator()
+      if (selector === '0xf1f7f0f9') return `${o.root ?? `0x01${ECDSA_VALIDATOR.slice(2)}`}${'00'.repeat(11)}`; // rootValidator()
       if (selector === '0x20709efc' && to === ECDSA_VALIDATOR) return word(o.owner ?? ALICE); // ecdsaValidatorStorage(address)
       if (selector === '0xadb610a3') return word(BigInt(o.currentNonce ?? 1)); // currentNonce()
       if (selector === '0xb8afe17d') return `${word(BigInt(o.vIdNonce ?? 0))}${word(o.hook ?? zeroAddress).slice(2)}`; // validationConfig(bytes21)

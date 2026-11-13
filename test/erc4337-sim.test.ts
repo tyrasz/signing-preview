@@ -329,6 +329,34 @@ test('A Kernel validator that keeps signers by id: a deploying account’s stand
   assert.equal(await signerIdOf(context(OWNER), ROOT, { root: ROOT as Hex, installs: new Map([[ROOT, '0x1234' as Hex]]) }), undefined);
 });
 
+test('A Kernel validator that keeps signers by id: an existing account’s stand-in names the signer’s own id first, then its last operation’s', async () => {
+  const { ownerSignerId, signerIdsOf } = await import('../src/erc4337-sim.ts');
+  const { encodeFunctionData: enc, parseAbi: abi, concatHex: cat } = await import('viem');
+  // A real SignerAdded event (Polygon, block 97,195,631): account 0x129f…2ff1, id 0xe51a…fae8, the ECDSA signer module, its owner.
+  assert.equal(ownerSignerId('0x5832707543109d7a0ee8917ee13c86f80b0ae1b0'), '0xe51aa87b2bdc5cbd9485754bb0d5b3998c05b7f930376c49ed6efa95d848fae8');
+  const ROOT = '0x01933401632d92bc7005d7415242171a55e20004ba', OWNER_ID = ownerSignerId(OWNER);
+  const HANDLE = abi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
+  const zero = `0x${'00'.repeat(32)}` as Hex;
+  // A node with no earlier operation of the account (older than the lookup reaches), or with one that named another id.
+  const node = (sender: Hex, signature?: Hex) => ({ has: () => true, call: async (_: number, method: string) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x30d41' };
+    if (method === 'eth_getTransactionByHash') return { input: enc({ abi: HANDLE, functionName: 'handleOps', args: [[{ sender, nonce: 0n, initCode: '0x', callData: '0x', accountGasLimits: zero, preVerificationGas: 0n, gasFees: zero, paymasterAndData: '0x', signature: signature! }], BOB] }) };
+    return signature ? [{ transactionHash: `0x${'78'.repeat(32)}` }] : [];
+  } });
+  const context = (sender: Hex, signature?: Hex, signer: string = OWNER) => ({ deps: { rpc: node(sender, signature) }, chainId: 137, sender, signer, nonce: 0n, entryPoint: EP, hash: async () => undefined }) as never;
+  const none: Hex = '0x00000000000000000000000000000000005e1d11';
+  assert.deepEqual(await signerIdsOf(context(none), ROOT), [OWNER_ID]);
+  // Its last operation named the same id: once; another (a second owner's): after the signer's own.
+  const same: Hex = '0x00000000000000000000000000000000005e1d12', other: Hex = '0x00000000000000000000000000000000005e1d13';
+  assert.deepEqual(await signerIdsOf(context(same, cat([OWNER_ID, `0x${'ab'.repeat(65)}`])), ROOT), [OWNER_ID]);
+  const second = `0x${'5f'.repeat(32)}` as Hex;
+  assert.deepEqual(await signerIdsOf(context(other, cat([second, `0x${'ab'.repeat(65)}`])), ROOT), [OWNER_ID, second]);
+  // A deploying account's: from its set-up only.
+  const { encodeAbiParameters: abiEnc } = await import('viem');
+  const configs = abiEnc([{ type: 'tuple[]', components: [{ name: 'id', type: 'bytes32' }, { name: 'signer', type: 'address' }, { name: 'data', type: 'bytes' }] }], [[{ id: second, signer: '0x9895a7b30a9dfcfbb1cd8f41595d2ad15fdcc9c3', data: OWNER as Hex }]]);
+  assert.deepEqual(await signerIdsOf(context(none), ROOT, { root: ROOT as Hex, installs: new Map([[ROOT, configs]]) }), [second]);
+});
+
 test('An account’s last operation is looked for back in windows the node takes, from its own refusal, and a failed lookup isn’t remembered', async () => {
   const { signerIdOf } = await import('../src/erc4337-sim.ts');
   const { encodeFunctionData: enc, parseAbi: abi, concatHex: cat } = await import('viem');
