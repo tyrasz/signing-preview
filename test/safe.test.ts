@@ -1,7 +1,7 @@
 // Safe multisig: owner signatures (SafeTx) and execTransaction, with the delegatecall danger (the Bybit pattern).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { concatHex, encodeFunctionData, encodePacked, parseAbi, size, type Hex } from 'viem';
+import { concatHex, encodeAbiParameters, encodeFunctionData, encodePacked, parseAbi, size, stringToHex, type Hex } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
 import type { Dependencies } from '../src/types.ts';
@@ -316,4 +316,148 @@ test('A passkey owner through Safe’s WebAuthn shared signer: a contract signat
   const configure = encodeFunctionData({ abi: parseAbi(['function configure((uint256 x, uint256 y, uint176 verifiers) signer)']), functionName: 'configure', args: [{ x: 1n, y: 2n, verifiers: (0x100n << 160n) | 0xa86e0054c51e4894d88762a017ecc5e5235f5dban }] });
   assert.deepEqual(await sharedSignerVerifiers({} as Dependencies, 42161, ALICE, `0x${'ab'.repeat(40)}${configure.slice(2)}${'cd'.repeat(20)}`),
     { precompile: '0x0000000000000000000000000000000000000100', fallback: '0xa86e0054c51e4894d88762a017ecc5e5235f5dba' });
+});
+
+test('A Zeal passkey owner’s stand-in: a real P-256 assertion by a passkey made up for the run, in the form the wallet signs in', async () => {
+  const { createPublicKey, verify } = await import('node:crypto');
+  const { decodeAbiParameters, hexToString, sha256 } = await import('viem');
+  const { base64url, STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
+  const { safeSignatures, standInPasskey, zealAssertion, zealFormIn, ZEAL_EXTENSION_FORM } = await import('../src/safe-sim.ts');
+  const { x, y } = standInPasskey();
+  const key = createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: Buffer.from(x.slice(2), 'hex').toString('base64url'), y: Buffer.from(y.slice(2), 'hex').toString('base64url') }, format: 'jwk' });
+  // What Zeal's signer checks (FreshCryptoLib's WebAuthn_format): the challenge in clientDataJSON at challengeOffset,
+  // and a P-256 signature over sha256(authenticatorData || sha256(clientDataJSON)), which node's ECDSA (SHA-256 of
+  // authenticatorData || sha256(clientDataJSON)) verifies.
+  const check = (assertion: Hex, challenge: Hex) => {
+    const [authenticatorData, clientData, offset, [r, s]] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' }, { type: 'uint256[2]' }], assertion);
+    const json = hexToString(clientData);
+    assert.equal(json.slice(Number(offset), Number(offset) + 43), base64url(challenge));
+    const rs = Buffer.from(`${r.toString(16).padStart(64, '0')}${s.toString(16).padStart(64, '0')}`, 'hex');
+    assert.ok(verify('sha256', Buffer.from(concatHex([authenticatorData, sha256(clientData)]).slice(2), 'hex'), { key, dsaEncoding: 'ieee-p1363' }, rs), 'the stand-in passkey’s signature verifies');
+    return { authenticatorData, json, offset: Number(offset) };
+  };
+  const challenge = sha256('0x01');
+  // No earlier assertion to go by: Zeal's browser extension's form (its challenge at 0x24, where the origin check wants it).
+  const ext = check(zealAssertion(challenge), challenge);
+  assert.equal(ext.offset, 0x24);
+  assert.equal(ext.json, `{"type":"webauthn.get","challenge":"${base64url(challenge)}","origin":"chrome-extension://heamnjbnflcikcggoiplibfommfbkjpj","crossOrigin":false}`);
+  assert.equal(ext.authenticatorData, ZEAL_EXTENSION_FORM.authenticatorData);
+  // The form of an earlier assertion, from among a Safe's signatures (Zeal's Android app's, as on Ethereum, Nov 2026):
+  // its authenticator data and clientDataJSON kept, only the challenge replaced, so the origin check scans as it will.
+  const OWNER = '0x9cea6f7fb7cb7e4e8a9eff0c3a29813ce69f39f6', OTHER = '0x97c09d1d3f757bbdacdeea4e8c31e5b6ce10b319';
+  const android = `{"type":"webauthn.get","challenge":"APvRJ3b_o37trvMyO8Py1aksI5DmiOfDx-RwCymZg7o","origin":"android:apk-key-hash:agY2kcQcEUA_2HxGSV_nwMzgCrpgZ8tky1JaJwbOQSE","androidPackageName":"app.zeal.wallet"}`;
+  const earlier = encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' }, { type: 'uint256[2]' }], [`0x${'ac'.repeat(32)}1d00000000`, stringToHex(android), 36n, [5n, 7n]]);
+  const signatures = safeSignatures([{ owner: OTHER, signature: STUB_SIGNATURE }, { owner: OWNER, contract: earlier }]);
+  const form = zealFormIn(signatures, OWNER)!;
+  assert.deepEqual(form, { authenticatorData: `0x${'ac'.repeat(32)}1d00000000`, clientDataJSON: android, challengeOffset: 36 });
+  const again = check(zealAssertion(challenge, form), challenge);
+  assert.equal(again.json, android.replace('APvRJ3b_o37trvMyO8Py1aksI5DmiOfDx-RwCymZg7o', base64url(challenge)));
+  // Not the owner's, an ECDSA owner's part, or data that isn't a Zeal assertion: no form.
+  assert.equal(zealFormIn(signatures, OTHER), undefined);
+  assert.equal(zealFormIn(safeSignatures([{ owner: OWNER, contract: '0x1234' }]), OWNER), undefined);
+  assert.equal(zealFormIn(STUB_SIGNATURE, OWNER), undefined);
+});
+
+test('Zeal’s signer stood in for: checkSignature is given the stand-in passkey’s key, and every call runs the real code, moved', async () => {
+  const { createEVM } = await import('@ethereumjs/evm');
+  const { createAddressFromString, hexToBytes, bytesToHex } = await import('@ethereumjs/util');
+  const { standInPasskey, zealSignerStandIn } = await import('../src/safe-sim.ts');
+  const evm = await createEVM();
+  const at = createAddressFromString;
+  const SIGNER = '0xfeca1a69282273548587fe1538d4471644d5807a', MOVED = '0x0000000000000000000000000000000000ec2ea1';
+  await evm.stateManager.putCode(at(SIGNER), hexToBytes(zealSignerStandIn()));
+  // The moved code here returns its calldata, or reverts with it when the first word is 0xbad.
+  await evm.stateManager.putCode(at(MOVED), hexToBytes('0x366000600037600035610bad14601457366000f35b366000fd'));
+  const call = async (data: Hex) => {
+    const res = await evm.runCall({ caller: at(ALICE), to: at(SIGNER), data: hexToBytes(data), gasLimit: 1_000_000n });
+    return { out: bytesToHex(res.execResult.returnValue), reverted: !!res.execResult.exceptionError };
+  };
+  const { x, y } = standInPasskey();
+  const words = (n: number) => Array.from({ length: n }, (_, i) => (i + 1).toString(16).padStart(64, '0')).join('');
+  const checkSignature = `0x0d5efec9${words(9)}${'ee'.repeat(40)}` as Hex;
+  assert.equal((await call(checkSignature)).out, `0x0d5efec9${words(7)}${x.slice(2)}${y.slice(2)}${'ee'.repeat(40)}`, 'the stored key (Q, words 7 and 8) replaced');
+  const other = `0x1626ba7e${words(9)}` as Hex;
+  assert.deepEqual(await call(other), { out: other, reverted: false });
+  assert.deepEqual(await call(`0x${'0'.repeat(61)}bad${'00'.repeat(4)}`), { out: `0x${'0'.repeat(61)}bad${'00'.repeat(4)}`, reverted: true });
+});
+
+test('A Zeal passkey owner is recognized deployed (its proxy’s implementation) or deploying (the Safe’s setup has Zeal’s router create it)', async () => {
+  const { keccak256, decodeAbiParameters, hexToString } = await import('viem');
+  const { zealSignerStandIn, zealStandIn } = await import('../src/safe-sim.ts');
+  const SIGNER = '0xfeca1a69282273548587fe1538d4471644d5807a', MOVED = '0x0000000000000000000000000000000000ec2ea1', OWNER = '0x6276c539c54c36f31883d5f1e60083ecd422d837';
+  const SAFE_141 = '0x29fcb43b46531bca003ddc8fcb67ffe91900c762', SAFE_150 = '0xedd160febbd92e350d4d398fb636302fccd67c7e';
+  const hash = keccak256('0x01');
+  const seen: string[] = [];
+  const deps = (implementation: string) => ({ rpc: { has: () => true, call: async (_: number, method: string, params: string[]) => {
+    seen.push(method);
+    if (method === 'eth_getStorageAt') return params[0] === OWNER ? `0x${implementation.slice(2).padStart(64, '0')}` : `0x${'00'.repeat(32)}`;
+    if (method === 'eth_getCode') return params[0] === SIGNER ? '0x6001' : '0x';
+    // Zeal's factory's IMPLEMENTATION_SIGNER(), which a deploy reads.
+    if (method === 'eth_call') return `0x${SIGNER.slice(2).padStart(64, '0')}`;
+    if (method === 'eth_getBlockByNumber') return { number: '0x100' };
+    if (method === 'eth_getLogs') return [];
+    throw new Error(method);
+  } } }) as unknown as Dependencies;
+  const challengeOf = (contract: Hex) => {
+    const [, clientData] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' }, { type: 'uint256[2]' }], contract);
+    return `0x${Buffer.from(hexToString(clientData).slice(36, 79), 'base64url').toString('hex')}`;
+  };
+  const deployed = await zealStandIn(deps(SIGNER), 1, OWNER, { safe: SAFE, hash, singleton: SAFE_141, entryPoints: ['0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789'] });
+  assert.deepEqual(deployed?.stateOverrides, { [SIGNER]: { code: zealSignerStandIn() }, [MOVED]: { code: '0x6001' } });
+  assert.deepEqual(deployed?.warm, [MOVED]);
+  // Safe 1.4.1 asks isValidSignature(bytes data): the challenge is the hash of that data, the SafeOp's or SafeTx's
+  // hash. Safe 1.5.0 asks isValidSignature(bytes32 hash): its keccak256.
+  assert.equal(challengeOf(deployed!.contract), hash);
+  assert.equal(challengeOf((await zealStandIn(deps(SIGNER), 1, OWNER, { safe: SAFE, hash, singleton: SAFE_150 }))!.contract), keccak256(hash));
+  // Another implementation (or none: an EOA owner) is not Zeal's.
+  assert.equal(await zealStandIn(deps(`0x${'11'.repeat(20)}`), 1, OWNER, { safe: SAFE, hash }), null);
+  assert.equal(await zealStandIn(deps(SIGNER), 1, ALICE, { safe: SAFE, hash }), null);
+  // A Safe being deployed whose setup delegatecalls Zeal's DeploymentRouter (setupSafe(recoveryId, x, y)) to create
+  // its owner's signer: nothing to read from the owner, which doesn't exist yet.
+  const FACTORY = parseAbi(['function createProxyWithNonce(address singleton, bytes initializer, uint256 saltNonce)', 'function setup(address[] owners, uint256 threshold, address to, bytes data, address fallbackHandler, address paymentToken, uint256 payment, address paymentReceiver)', 'function setupSafe(bytes32, uint256, uint256)']);
+  const initCode = (to: string) => concatHex(['0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67', encodeFunctionData({ abi: FACTORY, functionName: 'createProxyWithNonce', args: [SAFE_141, encodeFunctionData({ abi: FACTORY, functionName: 'setup',
+    args: [[OWNER], 1n, to as Hex, encodeFunctionData({ abi: FACTORY, functionName: 'setupSafe', args: [`0x${'42'.repeat(32)}`, 1n, 2n] }), ZERO, ZERO, 0n, ZERO] }), BigInt(OWNER)] })]);
+  seen.length = 0;
+  const deploying = await zealStandIn(deps(ZERO), 1, OWNER, { safe: SAFE, hash, initCode: initCode('0xf2230dc5924b7cb5757c86dbd658515a8894b493'), entryPoints: ['0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789'] });
+  assert.deepEqual(deploying?.stateOverrides, deployed?.stateOverrides);
+  assert.ok(!seen.includes('eth_getStorageAt') && !seen.includes('eth_getLogs'), 'nothing read of the owner or the Safe’s past');
+  assert.equal(await zealStandIn(deps(ZERO), 1, OWNER, { safe: SAFE, hash, initCode: initCode(BOB) }), null);
+});
+
+test('A SafeTx signed by a Zeal passkey owner: its assertion as the owner’s contract signature, and its signer stood in for', async () => {
+  const { decodeAbiParameters, decodeFunctionData, encodeAbiParameters: enc, hexToString } = await import('viem');
+  const { simulateSafeExecution, zealSignerStandIn } = await import('../src/safe-sim.ts');
+  const { base64url } = await import('../src/erc4337-sim.ts');
+  const SIGNER = '0xfeca1a69282273548587fe1538d4471644d5807a', MOVED = '0x0000000000000000000000000000000000ec2ea1', OWNER = '0x6276c539c54c36f31883d5f1e60083ecd422d837';
+  const HASH = `0x${'ab'.repeat(32)}` as Hex;
+  const view = (data: string) => {
+    const sel = data.slice(0, 10);
+    if (sel === '0xa619486e') return enc([{ type: 'address' }], ['0x29fcb43b46531bca003ddc8fcb67ffe91900c762']); // Safe 1.4.1 (L2)
+    if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [[OWNER]]);
+    if (sel === '0xe75235b8' || sel === '0xaffed0e0') return enc([{ type: 'uint256' }], [1n]);
+    if (sel === '0xd8d11f78') return HASH;
+    if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[], '0x0000000000000000000000000000000000000001']);
+    if (sel === '0x5624b25b') return enc([{ type: 'bytes' }], [`0x${'00'.repeat(32)}`]);
+    return '0x';
+  };
+  const batches: SimulationRequest[][] = [];
+  const d: Dependencies = { ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? view((p[0] as { data: string }).data)
+      : m === 'eth_getStorageAt' && p[0] === OWNER ? `0x${SIGNER.slice(2).padStart(64, '0')}` : m === 'eth_getCode' && p[0] === SIGNER ? '0x6001' : '0x' },
+    simulator: { simulate: async () => null, simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => ({ status: 'success' as const, source: 'mock', transfers: [], returnData: i === 0 ? enc([{ type: 'uint256' }], [1n]) : view(r.data) })); } } };
+  const run = await simulateSafeExecution({ safe: SAFE, to: USDC, value: 0n, data: transfer, operation: 0, safeTxGas: 0n, baseGas: 0n, gasPrice: 0n, gasToken: ZERO, refundReceiver: ZERO }, 1, d, { executor: OWNER });
+  assert.equal(run?.passkey, 'inline');
+  const exec = batches[0][0];
+  assert.equal(exec.stateOverrides?.[SIGNER]?.code, zealSignerStandIn());
+  assert.equal(exec.stateOverrides?.[MOVED]?.code, '0x6001');
+  assert.ok(exec.accessList?.some(a => a.address === MOVED) && !exec.accessList?.some(a => a.address === SIGNER), 'the moved code warm, the signer itself cold');
+  // The owner's part: a contract signature (v 0), its data a Zeal assertion whose challenge is the transaction's hash
+  // (Safe 1.4.1 passes isValidSignature the data it hashed).
+  const signatures = decodeFunctionData({ abi: parseAbi(['function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool)']), data: exec.data as Hex }).args[9];
+  assert.equal(signatures.slice(0, 66), `0x${OWNER.slice(2).padStart(64, '0')}`);
+  assert.equal(signatures.slice(130, 132), '00');
+  const length = Number(BigInt(`0x${signatures.slice(132, 196)}`)), contract = `0x${signatures.slice(196, 196 + length * 2)}` as Hex;
+  assert.equal(signatures.length, 196 + length * 2);
+  const [, clientData, offset] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' }, { type: 'uint256[2]' }], contract);
+  assert.equal(hexToString(clientData).slice(Number(offset), Number(offset) + 43), base64url(HASH));
 });

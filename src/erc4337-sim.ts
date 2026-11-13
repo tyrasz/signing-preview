@@ -375,7 +375,7 @@ const OWNERS = parseAbi(['function nextOwnerIndex() view returns (uint256)', 'fu
 
 /** The stand-in r and s of a passkey's P256 signature (s in the lower half, as WebAuthn verifiers require). */
 export const P256_STUB = { r: `0x${'5a'.repeat(32)}` as Hex, s: `0x${'25'.repeat(32)}` as Hex };
-const base64url = (hex: Hex) => {
+export const base64url = (hex: Hex) => {
   const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
   const bytes = hexToBytes(hex);
   let out = '';
@@ -422,6 +422,7 @@ const KERNEL_WEBAUTHN_SOL_VALIDATORS = new Set(['0xbbbe97d3d0e926231975e0b69acb5
  */
 const ZERODEV_PRECOMPILED = new Set([137, 8453, 42161, 11155111]);
 const HANDLE_OPS = parseAbi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
+const HANDLE_OPS_V06 = parseAbi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
 const ZERODEV_WEBAUTHN_SIGNATURE = [{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }] as const;
 /** What each account's latest earlier operation showed (see zeroDevPrecompiled), for ten minutes. */
 /** Each account's latest earlier operation's signature (see lastSignature), as of the block `head`. */
@@ -431,15 +432,16 @@ const LAST_SIGNED_REACH = 100_000n, LAST_SIGNED_WINDOW = 10_000n;
 /** A node's answer that the blocks asked for are older than it serves (Ethereum's public node): the reach ends there. */
 const BEYOND_REACH = /archive|pruned|missing trie node|not available|header not found/i;
 /**
- * The signature of the account's latest earlier operation through this EntryPoint (v0.7's packed form): its last
- * UserOperationEvent up to the block before the latest, looked for back from there in windows of 10,000 blocks (or
- * the node's cap, from its refusal: Polygon's public node takes 10,000, BNB Chain's fewer) to 100,000 back, or as far
- * as the node serves. A wallet signs the same way each time, so what it chose then (a flag, a key's id) it chooses
- * now. Undefined with none, or unreadable. Remembered ten minutes (a minute when none was found), for previews at that
- * block or later; a lookup any of whose reads failed is not remembered, and one at an earlier block (a replay) reads
- * again, so an operation never sees one after it.
+ * The signature of the account's latest earlier operation through this EntryPoint (v0.7's packed form, or v0.6's
+ * handleOps): its last UserOperationEvent up to the block before the latest, looked for back from there in windows
+ * of 10,000 blocks (or the node's cap, from its refusal: Polygon's public node takes 10,000, BNB Chain's fewer) to
+ * 100,000 back, or as far as the node serves. A wallet signs the same way each time, so what it chose then (a flag,
+ * a key's id) it chooses now. With `match`, the latest that matches, of the account's last six operations (`key` names the match, for
+ * remembering). Undefined with none, or unreadable. Remembered ten minutes (a minute when none was found), for previews
+ * at that block or later; a lookup any of whose reads failed is not remembered, and one at an earlier block (a
+ * replay) reads again, so an operation never sees one after it.
  */
-async function lastSignature(c: StubContext): Promise<Hex | undefined> {
+export async function lastSignature(c: { deps: Dependencies; chainId: number; sender: string; entryPoint?: string; match?: (signature: Hex) => boolean; key?: string }): Promise<Hex | undefined> {
   const rpc = c.deps.rpc;
   if (!rpc?.has(c.chainId) || !c.entryPoint) return undefined;
   let head: bigint;
@@ -448,10 +450,10 @@ async function lastSignature(c: StubContext): Promise<Hex | undefined> {
     head = BigInt(latest?.number ?? '0x0') - 1n;
   } catch { return undefined; }
   if (head <= 0n) return undefined;
-  const key = `${c.chainId}:${c.entryPoint}:${c.sender}`;
+  const key = `${c.chainId}:${c.entryPoint}:${c.sender}${c.key ? `:${c.key}` : ''}`;
   const known = LAST_SIGNED.get(key);
   if (known && head >= known.head && Date.now() - known.at < (known.signature ? FOUND_FOR : EMPTY_FOR)) return known.signature;
-  let signature: Hex | undefined, failed = false, window = LAST_SIGNED_WINDOW, reached = 0n;
+  let signature: Hex | undefined, failed = false, window = LAST_SIGNED_WINDOW, reached = 0n, fetched = 0;
   try {
     for (let reads = 0; reached < LAST_SIGNED_REACH && head - reached > 0n && reads < 16; reads++) {
       const to = head - reached, from = to >= window ? to - window + 1n : 0n;
@@ -471,13 +473,18 @@ async function lastSignature(c: StubContext): Promise<Hex | undefined> {
         if (!BEYOND_REACH.test(why)) failed = true;
         break;
       }
-      const last = logs.at(-1);
-      if (last) {
-        const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [last.transactionHash]) as { input?: Hex } | null;
-        if (!tx?.input) { failed = true; break; }
-        try { signature = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* not v0.7's handleOps */ }
-        break;
+      // Newest first: the latest operation's, or with `match`, the latest that matches.
+      let done = false;
+      for (const log of [...logs].reverse()) {
+        if (fetched++ >= (c.match ? 6 : 1)) { done = true; break; }
+        const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [log.transactionHash]) as { input?: Hex } | null;
+        if (!tx?.input) { failed = done = true; break; }
+        let found: Hex | undefined;
+        try { found = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* not v0.7's handleOps */ }
+        if (!found) try { found = decodeFunctionData({ abi: HANDLE_OPS_V06, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* nor v0.6's */ }
+        if (!c.match || (found && c.match(found))) { signature = found; done = true; break; }
       }
+      if (done) break;
       reached += to - from + 1n;
     }
   } catch { failed = true; }
@@ -1212,6 +1219,8 @@ export interface OperationInput {
   after?: SimulationRequest[];
   /** More state for the simulation (e.g. a Safe's approvals standing in for its owners' signatures). */
   stateOverrides?: SimulationRequest['stateOverrides'];
+  /** Addresses to start warm: code moved there for a stand-in (not an account the chain would touch). */
+  warm?: string[];
 }
 
 /**
@@ -1308,7 +1317,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
   const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint }, op.delegate, op.initCode);
+  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }), ...(op.warm?.length && { warm: op.warm }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint }, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;
