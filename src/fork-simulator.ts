@@ -1061,6 +1061,26 @@ const ASSET_MULTIPLIER = 0xfdc6d4552d1286ade4d9facdbf0fb50d2ec9b89a90e104f26fd27
 /** UIMultiplierUpdateCancelled(uint256,uint256). */
 const MULTIPLIER_CANCELLED = 0x883856335ba5f60c18b9817c4505d3c7d3f6223dcf39516b30c508c46a5e1cadn;
 /**
+ * An asset's functions that compute with its multiplier (multiplier, uiMultiplier, toUIAmount, fromUIAmount,
+ * toScaledBalance, toRawBalance, scaledBalanceOf, balanceOfUI, totalSupplyUI), and newUIMultiplier. Where the
+ * multiplier one takes is the pending update's (one that has taken effect; for newUIMultiplier, a live one too), the
+ * node reads the pending slot again for it, where the reference uses the value it read: 100 more, the slot warm by
+ * then. Measured on Base with each call timed from a contract, on a live asset given a pending update by an override
+ * (live, taken effect, taking effect in that block's second; a multiplier set or none) and on new assets' init calls:
+ * each of these 100 more, and once a call (newUIMultiplier on an update that took effect reads the slot twice here,
+ * three times there), inside announce as anywhere. Charged as the reference first reads the slot, so within the
+ * call's gas (given 1 less than the node's charge, the call runs out there, as on the node). A pending update yet to
+ * take effect leaves the others the current multiplier, read alike; effectiveAt(), balances, the supply, transfers,
+ * mints and burns cost the same whatever is pending. (updateMultiplier's own reads are B20_ENDED_GAS's; fromUIAmount
+ * and toRawBalance read the multiplier before they multiply, as the node's do, patched in scripts/build-b20.ts.)
+ */
+const MULTIPLIER_VIEWS = new Set(['0x1b3ed722', '0xa60bf13d', '0x3248d4ff', '0x65cd9b3c', '0x04f04c99', '0x0ca06c44', '0x1da24f3e', '0x437a9958', '0x9bea6429']), NEW_UI_MULTIPLIER = '0xdc767007';
+/** Whether a call to `selector` takes the pending update's multiplier, the pending slot holding `pending` at time `now`. */
+const takesPending = (selector: string, pending: bigint, now: bigint) => {
+  const effectiveAt = (pending >> 128n) & 0xffff_ffff_ffff_ffffn;
+  return effectiveAt !== 0n && (selector === NEW_UI_MULTIPLIER || (MULTIPLIER_VIEWS.has(selector) && now >= effectiveAt));
+};
+/**
  * And what to add as the call ends, given what its own frame did (measured the same way): cancelUIMultiplierUpdate
  * with nothing pending; updateMultiplier cancelling a live update (100 more) or clearing one that took effect (200
  * more); setRoleAdmin on a token without admins, where the node reads the role's admin before it refuses.
@@ -1547,7 +1567,8 @@ export class ForkSimulator implements Simulator {
     // the gas it was given runs out there, as the node's.
     type Charge = { code: string; limit: bigint; node: bigint; refused?: boolean; selector?: Uint8Array; looked?: boolean; hashed?: boolean; static?: boolean; hevmCold?: boolean };
     /** A token's own call (not run as another's code, not refused): what is charged by its function (B20_WRITE_GAS, EIP-712). */
-    type TokenCall = { code: string; caller: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean; written?: boolean; ended?: boolean; sloads: number; stored: Set<bigint>; topics: Set<bigint> };
+    type TokenCall = { code: string; caller: string; depth: number; selector: string; data: Uint8Array; eip712?: boolean; verified?: boolean; written?: boolean; ended?: boolean; sloads: number; stored: Set<bigint>; topics: Set<bigint>;
+      /** A multiplier view's first read of the pending slot (MULTIPLIER_VIEWS): its value on the stack at the next step, then seen. */ pending?: 'reading' | 'seen' };
     let charging: Charge | undefined;
     /** Each message's bookkeeping, popped as it ends: the charge it opened, a precompile, a token's own call. */
     const opened: { charge?: Charge; precompile?: boolean; token?: TokenCall }[] = [];
@@ -1596,8 +1617,12 @@ export class ForkSimulator implements Simulator {
       // renounceLastAdmin: 100 over the reference, with its RoleRevoked's 100 less (ROLE_EVENTS), there: a static call,
       // whose write fails, is charged none of it.
       if (charging && own && t.selector === '0x6f79e3d7' && e.opcode.name === 'LOG4' && e.stack && ROLE_EVENTS.has(e.stack[e.stack.length - 3])) charging.node += 200n;
+      // A multiplier view taking the pending update's multiplier (MULTIPLIER_VIEWS): the node's read of the pending
+      // slot again, as the reference has read it (the value it read on the stack now).
+      if (charging && own && t.pending === 'reading' && e.stack?.length) { t.pending = 'seen'; if (takesPending(t.selector, e.stack[e.stack.length - 1], block.header.timestamp)) charging.node += 100n; }
       if (own && e.stack?.length) {
         const top = e.stack[e.stack.length - 1];
+        if (e.opcode.name === 'SLOAD' && top === ASSET_PENDING && !t.pending && (MULTIPLIER_VIEWS.has(t.selector) || t.selector === NEW_UI_MULTIPLIER)) t.pending = 'reading';
         if (e.opcode.name === 'SLOAD') t.sloads++;
         else if (e.opcode.name === 'SSTORE') { if (charging && t.selector === '0x628e600f' && top === ASSET_MULTIPLIER && !t.stored.has(top)) charging.node += 100n; t.stored.add(top); }
         else if (e.opcode.name.startsWith('LOG') && e.opcode.name !== 'LOG0' && e.stack.length >= 3) t.topics.add(e.stack[e.stack.length - 3]);

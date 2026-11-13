@@ -39,7 +39,10 @@
 //     the chain has no such functions;
 //   - a call to no function of the token's: the chain reverts with the call's first four bytes (0x00000000 when it
 //     has fewer), or with NonPayable() when value is sent, where the reference reverted empty;
-//   - the activation registry's admin: the chain's (its configuration's), not the reference's placeholder.
+//   - the activation registry's admin: the chain's (its configuration's), not the reference's placeholder;
+//   - an asset's fromUIAmount and toRawBalance read the multiplier before they multiply the amount by 1e18, as the
+//     chain's do: an amount that overflows is charged those reads before it fails Panic(0x11) (measured: 4,200 more
+//     with nothing pending, 2,200 with an update that took effect), where the reference failed before reading.
 // Three things the chain does to any call are done by the local EVM instead (src/fork-simulator.ts): value sent to a
 // token or registry is refused with NonPayable(); a token or registry run as another contract's code (DELEGATECALL)
 // with DelegateCallNotAllowed(); and calldata a function can't decode reverts with the call's selector, where the
@@ -125,6 +128,11 @@ const PATCHES: Record<string, [string, string][]> = {
     }
 
     function _isPrivileged() internal view returns (bool) {`],
+  ],
+  'test/lib/mocks/MockB20Asset.sol': [
+    // fromUIAmount and toRawBalance: the chain reads the multiplier before it multiplies the amount by 1e18, so an
+    // amount that overflows is charged those reads (the reference panicked before it read anything).
+    ['        return (uiAmount * WAD_PRECISION) / _multiplier();\n', '        uint256 multiplier_ = _multiplier();\n        return (uiAmount * WAD_PRECISION) / multiplier_;\n'],
   ],
   'test/lib/mocks/MockPolicyRegistry.sol': [
     ['    uint64 public constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;', '    uint64 internal constant ALWAYS_ALLOW_ID = PolicyRegistryConstants.ALWAYS_ALLOW_ID;'],
