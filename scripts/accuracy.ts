@@ -316,6 +316,8 @@ else {
 
 // What the harness finds the preview got wrong, per simulator (see --strict above).
 const GAS_FAIL_PERCENT = 10;
+/** Chains whose nodes log no transfer for a SELFDESTRUCT's payout (src/simulation.ts reads native balances for it). */
+const NATIVE_UNLOGGED = new Set([10, 8453, 56]);
 for (const row of rows) for (const name of SIMULATORS) {
   const r = row[name] as Record<string, any> | undefined;
   if (!r || r.error) continue;
@@ -329,9 +331,15 @@ for (const row of rows) for (const name of SIMULATORS) {
   // An outcome that differs for a transaction run a second after its block is reported, not failed: what it checks
   // can be that second (a deadline of the block's own timestamp).
   if (!r.outcome && row.timeBumped) r.warned = 'outcome (run a second after its block)';
-  const differs = [!r.outcome && !row.timeBumped && 'outcome', !r.unread && r.tokenDiffs.some((d: { actual: string; simulated: string }) => !close(d)) && 'tokens',
-    !r.unread && !r.native && 'native', !r.unread && r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
-  if (r.unread && (r.tokenDiffs.length || !r.native || r.approvals < r.approvalTotal)) r.warned = `amounts from events (the node's reads got no answer: ${r.unread})`;
+  // A run whose balance reads the node didn't answer (r.unread) has its events' amounts: its token movements are
+  // reported, not judged, and its native ones only where the node's own transfers leave some out (a SELFDESTRUCT's,
+  // NATIVE_UNLOGGED); elsewhere they are all there, read or not. Its approvals are judged: the reads only take away
+  // ones the state doesn't confirm, so without them none is missing that they would have found.
+  const tokensDiffer = r.tokenDiffs.some((d: { actual: string; simulated: string }) => !close(d));
+  const unreadTokens = !!r.unread && tokensDiffer, unreadNative = !!r.unread && !r.native && NATIVE_UNLOGGED.has(CHAIN);
+  const differs = [!r.outcome && !row.timeBumped && 'outcome', !r.unread && tokensDiffer && 'tokens',
+    !r.native && !unreadNative && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+  if (unreadTokens || unreadNative) r.warned = [r.warned, `amounts from events (the node's reads got no answer: ${r.unread})`].filter(Boolean).join('; ');
   if (differs.length) r.differs = differs;
 }
 const out = arg('out', '');
@@ -359,7 +367,7 @@ for (const name of SIMULATORS) {
 const differing = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.differs)).length;
 const notCharged = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.l1FeeNotCharged)).length;
 const unread = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any> | undefined)?.unread)).length;
-if (unread) say(`  ${unread} whose balances the node didn't answer the reads of (a public node rate limiting): their amounts are the events', reported and not judged`);
+if (unread) say(`  ${unread} whose balances the node didn't answer the reads of (a public node rate limiting): their token amounts${NATIVE_UNLOGGED.has(CHAIN) ? ' and native ones' : ''} are the events', reported and not judged`);
 if (notCharged) say(`  ${notCharged} whose receipt names an L1 data fee their sender's balance didn't pay`);
 const bumped = rows.filter(r => r.timeBumped).length;
 if (bumped) say(`  ${bumped} run a second after their block, which shared its parent's second (the node refuses that): gas not judged for them`);

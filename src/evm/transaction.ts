@@ -462,11 +462,12 @@ export function pendingRequests(tx: Tx, context: PreviewContext): SimulationRequ
 }
 
 /** How the simulated balance changes were found, for the preview's notes. */
-export function simulationNote(sim: Pick<SimulationResult, 'basis' | 'tokensRead' | 'balancesRead'>): string {
+export function simulationNote(sim: Pick<SimulationResult, 'basis' | 'tokensRead' | 'balancesRead' | 'stateReadError'>): string {
   if (sim.basis === 'state') return stateBasisNote(sim);
   if (sim.basis === 'fork') return "Simulated in a local EVM over this chain's latest state (its RPC has no eth_simulateV1), in the next block. Balance changes were read from the state before and after, for every token the transaction's events touch; the final result can differ if state changes before inclusion.";
   if (sim.balancesRead) return 'Simulated at the latest block. Balance changes were read from the state before and after, for every token the transaction\'s events or calldata mention; the final result can differ if state changes before inclusion.';
-  return 'Simulated balance changes are derived from transfer events at the latest block; the final result can differ if state changes before inclusion.';
+  // (Where the node didn't answer the reads of balances after the run, which would have given them, its answer.)
+  return `Simulated balance changes are derived from transfer events at the latest block${sim.stateReadError ? ` (the balances couldn't be read after it: ${sim.stateReadError})` : ''}; the final result can differ if state changes before inclusion.`;
 }
 
 /** For results measured from balances (SimulationProbe) rather than logs. */

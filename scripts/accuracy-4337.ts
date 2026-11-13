@@ -149,6 +149,19 @@ function innerSignatures(sig: Hex): Hex[] {
   }
   return [...(sig.length === 2 + 131 * 2 ? [`0x${sig.slice(4, 4 + 130)}` as Hex] : []), ...(sig.length >= 132 ? [`0x${sig.slice(-130)}` as Hex] : [])];
 }
+/**
+ * The Merkle roots a Splits Smart Vault's type-1 signature is signed over, in place of the operation's hash: its last
+ * signer signs the root of the operations' hashes, the others the root of their light forms (an EOA's over its EIP-191
+ * form, as for one operation). Empty for any other signature.
+ */
+function vaultRoots(sig: Hex): Hex[] {
+  if (!sig.startsWith('0x01')) return [];
+  try {
+    const [s] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'gasLimits', type: 'uint256[7]' }, { name: 'lightRoot', type: 'bytes32' }, { name: 'lightProof', type: 'bytes32[]' },
+      { name: 'root', type: 'bytes32' }, { name: 'proof', type: 'bytes32[]' }, { name: 'signatures', type: 'tuple[]', components: [{ name: 'signerIndex', type: 'uint8' }, { name: 'signatureData', type: 'bytes' }] }] }], `0x${sig.slice(4)}`) as unknown as [{ root: Hex; lightRoot: Hex }];
+    return [s.root, s.lightRoot];
+  } catch { return []; }
+}
 
 const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)', 'struct PermissionConfig { bytes1 permissionFlag; address signer; bytes22[] policyData; }', 'function permissionConfig(bytes4 pId) view returns (PermissionConfig)', 'function signers(address account, bytes32 id) view returns (address)']);
 /**
@@ -374,7 +387,7 @@ async function replay(item: string): Promise<void> {
   const signers: string[] = [], bare = new Set<string>();
   const add = (a: string | undefined) => { if (a && /^0x[0-9a-f]{40}$/.test(a) && !/^0x0+$/.test(a) && !signers.includes(a)) signers.push(a); };
   if (code.startsWith('0xef0100')) add(sender);
-  for (const inner of module ? [] : innerSignatures(op.signature)) for (const h of [hashMessage({ raw: digest }), digest]) {
+  for (const inner of module ? [] : innerSignatures(op.signature)) for (const h of [hashMessage({ raw: digest }), digest, ...vaultRoots(op.signature).flatMap(root => [hashMessage({ raw: root }), root])]) {
     try {
       const a = (await recoverAddress({ hash: h, signature: inner })).toLowerCase();
       if (h === digest && !signers.includes(a)) bare.add(a);
@@ -450,6 +463,7 @@ async function replay(item: string): Promise<void> {
   if (!event) return skip('no UserOperationEvent for it in its receipt');
   const succeeded = BigInt(`0x${event.data.slice(66, 130)}`) === 1n, actualGasCost = BigInt(`0x${event.data.slice(130, 194)}`), actualGasUsed = BigInt(`0x${event.data.slice(194, 258)}`);
   const whole = p.decoding.notes.some(x => /whole operation was simulated/.test(x));
+  const unread = p.decoding.notes.map(x => /the balances couldn't be read after it: (.*)\); the final result/.exec(x)?.[1]).find(Boolean);
   const reverts = p.warnings.some(w => ['userop_execution_reverts', 'userop_postop_reverts', 'safe_tx_reverts'].includes(w.code));
   const rejected = p.warnings.find(w => w.code === 'userop_rejected')?.message;
   const fallbackNote = p.decoding.notes.find(x => /validation reverts on a stand-in/.test(x));
@@ -503,9 +517,11 @@ async function replay(item: string): Promise<void> {
   // EntryPoint's penalty on unused execution gas: up to 14% more or less than the EntryPoint counts (over 6,040
   // of its operations on Ethereum); and the EntryPoint's penalty takes back a tenth of an execution gas difference
   // that the fee keeps. So the fee moves by up to 1.3 times the gas's percentage (the second of two operations in a
-  // bundle, its paymaster's and token's state cold in the replay: USDC fee 17.1% high, its gas about 15%).
-  const feeSlack = BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? 1.3 * Math.abs(gasPercent) : 0)));
-  const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack;
+  // bundle, its paymaster's and token's state cold in the replay: USDC fee 17.1% high, its gas about 15%). Only for
+  // the paymaster's fee (charged): the smallest transfer out, taken as the fee where no paymaster's is seen, moves by
+  // the gas's percentage at most, else an amount that is wrong passes as a fee.
+  const feeSlack = (token: string) => BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? (charged.has(token) ? 1.3 : 1) * Math.abs(gasPercent) : 0)));
+  const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack(t.token);
   // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
   // ten-thousandth (as scripts/accuracy.ts allows).
   const secondLate = (t: { actual: string; simulated: string }) => timeBumped && abs(BigInt(t.simulated) - BigInt(t.actual)) * 10_000n <= abs(BigInt(t.actual));
@@ -554,8 +570,9 @@ async function replay(item: string): Promise<void> {
     // Without any simulation (the node refused it) there are no simulated movements to compare.
     ...(!ran(p) && { notSimulated: true }),
     ...(byBalance && { tokensByBalance: byBalance }), ...(createdElsewhere && { tokenCreated: true }),
-    // (The node's reads of balances after the run got no answer, a public node rate limiting: amounts from events.)
-    ...(p.simulation?.stateReadError && { unread: p.simulation.stateReadError }),
+    // The node didn't answer the reads of balances after the run (a public node rate limiting): the amounts are the
+    // events', which the preview's note says, with the node's answer (src/evm/transaction.ts simulationNote).
+    ...(unread && { unread }),
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
   });
   const row = rows.at(-1)!;

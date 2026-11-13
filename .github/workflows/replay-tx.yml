@@ -13,7 +13,8 @@ name: Transaction replays
 # L1 fee a few).
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
-# differences are listed in the summary.
+# differences are listed in the summary. Where the node didn't answer the balance reads after a run (a rate limit),
+# its token movements, and on OP Mainnet, Base and BNB Chain its native ones, are the events': listed, not failed.
 
 on:
   schedule:

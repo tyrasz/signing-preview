@@ -11,7 +11,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V09 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import type { Dependencies, Preview } from '../src/types.ts';
+import type { Dependencies, Preview, SimulationResult } from '../src/types.ts';
 import { codes, detail, NOW } from './helpers.ts';
 import { testChain } from './evm-chain.ts';
 
@@ -294,6 +294,20 @@ test('A Kernel v3 account asked by a signer that isn’t its owner: the run that
   assert.match(whole, /doesn't accept it as theirs/);
   assert.ok(!p.decoding.notes.some(n => /validation reverts on a stand-in/.test(n)), p.decoding.notes.join(' | '));
   assert.ok(detail(p, 'Gas cost (simulated)'), 'the whole operation’s gas is shown');
+  assert.deepEqual(usdcChange(p), ['out 50']);
+});
+
+test('A whole operation whose balances the node didn’t read after it: its note says the amounts are the events’, with the node’s answer', async () => {
+  const inner = deps.simulator!;
+  // As RpcSimulator leaves a run whose reads a node rate-limited: amounts from its events, and why.
+  const limited = (r: SimulationResult): SimulationResult => ({ ...r, basis: undefined, balancesRead: undefined, stateReadError: 'RPC HTTP 429: Too Many Requests' });
+  const busy: Dependencies = { ...deps, simulator: { simulate: async q => { const r = await inner.simulate(q); return r && limited(r); }, simulateBatch: async qs => (await inner.simulateBatch!(qs))?.map(limited) ?? null } };
+  const op = operation();
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  const p = await previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, busy);
+  const whole = p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? p.decoding.notes.join(' | ');
+  // (scripts/accuracy-4337.ts reads it so: such a run's amounts are reported, not judged.)
+  assert.equal(/the balances couldn't be read after it: (.*)\); the final result/.exec(whole)?.[1], 'RPC HTTP 429: Too Many Requests');
   assert.deepEqual(usdcChange(p), ['out 50']);
 });
 
