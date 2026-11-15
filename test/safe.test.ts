@@ -461,3 +461,88 @@ test('A SafeTx signed by a Zeal passkey owner: its assertion as the owner’s co
   const [, clientData, offset] = decodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' }, { type: 'uint256[2]' }], contract);
   assert.equal(hexToString(clientData).slice(Number(offset), Number(offset) + 43), base64url(HASH));
 });
+
+test("A later call's Safe transaction that fails on its own but runs after the calls before it is a note, not a failure", async () => {
+  // Base, 2026-11-15: a SafeOp sent a token to a Safe it then deployed, and ran a transaction on that Safe sending
+  // the token on. Simulated on its own, without the transfer before it, that transaction fails; the batch ran.
+  const d = (outer: InOrder, alone: 'reverts' | 'false' = 'reverts') => laterSafeDeps(outer, alone);
+  const ran = await sign(laterSafeBatch(0n), d({ logs: [executionLog(EXECUTION_SUCCESS)] }));
+  assert.ok(!codes(ran).includes('safe_tx_reverts'), JSON.stringify(ran.warnings));
+  assert.match(ran.decoding.notes.join(' '), /Call 2's Safe transaction fails when simulated on its own, without the calls before it \(ERC20InsufficientBalance\); run after them, as the batch runs it, it succeeds \(its Safe logs ExecutionSuccess\)\./);
+  const fails = async (p: Promise<Awaited<ReturnType<typeof sign>>>, reason: RegExp) => {
+    const q = await p;
+    assert.match(q.warnings.find(w => w.code === 'safe_tx_reverts')?.message ?? '', reason, JSON.stringify(q.warnings));
+    assert.ok(!q.decoding.notes.some(n => /Call 2's Safe transaction/.test(n)));
+  };
+  // A batch that succeeds doesn't say the transaction ran: execTransaction can fail without reverting, logging
+  // ExecutionFailure (with a safeTxGas or a gas price; on Safe 1.1.1 and 1.2.0, whatever they are, as there it
+  // returns false when run on its own too). Its failure stands.
+  await fails(sign(laterSafeBatch(50_000n), d({ logs: [executionLog(EXECUTION_FAILURE)] })), /^Call 2: .*ERC20InsufficientBalance/);
+  await fails(sign(laterSafeBatch(0n), d({ logs: [executionLog(EXECUTION_FAILURE)] }, 'false')), /^Call 2: .*\(ExecutionFailure\)/);
+  // Nothing logged by that Safe (a simulator that doesn't report logs, or Safe 1.0.0, which logs neither), or only
+  // the outer Safe's own ExecutionSuccess: not shown to have run.
+  await fails(sign(laterSafeBatch(0n), d({ logs: [] }, 'false')), /^Call 2: /);
+  await fails(sign(laterSafeBatch(0n), d({ logs: [executionLog(EXECUTION_SUCCESS, SAFE)] })), /^Call 2: .*ERC20InsufficientBalance/);
+  // A Safe further down whose transaction fails without reverting (SAFE2's transaction runs one on a third Safe):
+  // SAFE2 logs ExecutionSuccess, as its call didn't revert, but the third Safe's ExecutionFailure (or 1.0.0's
+  // ExecutionFailed) is in the run. Its failure stands.
+  const SAFE3 = '0x5afe00000000000000000000000000000000f00d', EXECUTION_FAILED = '0xabfd711ecdd15ae3a6b3ad16ff2e9d81aec026a39d16725ee164be4fbf857a7c';
+  for (const failure of [EXECUTION_FAILURE, EXECUTION_FAILED]) await fails(sign(laterSafeBatch(0n), d({ logs: [executionLog(failure, SAFE3), executionLog(EXECUTION_SUCCESS)] })), /^Call 2: .*ERC20InsufficientBalance/);
+  // And when the batch fails too.
+  await fails(sign(laterSafeBatch(0n), d({ reverted: true })), /ERC20InsufficientBalance/);
+});
+
+// A batch's later call running execTransaction on a second Safe (SAFE2), which fails when simulated on its own: it
+// reverts (Safe 1.3.0 on, no safeTxGas or gas price: GS013) or returns false (ExecutionFailure). The outer Safe's run
+// of the whole batch reverts, or succeeds and logs what the second Safe logged in it.
+const SAFE2 = '0x5afe00000000000000000000000000000000beef';
+const EXECUTION_SUCCESS = '0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e', EXECUTION_FAILURE = '0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23';
+type Log = { address: string; topics: string[]; data: string };
+type InOrder = { reverted: true } | { logs: Log[] };
+const executionLog = (topic: string, by = SAFE2): Log => ({ address: by, topics: [topic], data: concat([`0x${'cd'.repeat(32)}`, `0x${'0'.repeat(64)}`]) });
+const laterSafeViews = (data: string) => {
+  const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const sel = data.slice(0, 10);
+  if (sel === '0xa619486e') return enc([{ type: 'address' }], [SINGLETON as Hex]);
+  if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [OWNERS as Hex[]]);
+  if (sel === '0xe75235b8') return word(2n);
+  if (sel === '0xaffed0e0') return word(7n);
+  if (sel === '0xd8d11f78') return `0x${'ab'.repeat(32)}`;
+  if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[], '0x0000000000000000000000000000000000000001']);
+  if (sel === '0x5624b25b') return enc([{ type: 'bytes' }], [`0x${SINGLETON.slice(2).padStart(64, '0')}` as Hex]);
+  if (sel === '0x2f54bf6e' || sel === '0x2d9ad53d') return word(1n);
+  return '0x';
+};
+/** `outer` answers the batch's own run: the outer Safe's execTransaction, or (`whole`) the EntryPoint's run of a SafeOp. */
+const laterSafeDeps = (outer: InOrder, alone: 'reverts' | 'false', whole?: (r: SimulationRequest) => object | null): Dependencies => ({ ...deps,
+  rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? laterSafeViews((p[0] as { data: string }).data) : '0x' },
+  simulator: { simulate: async () => null, simulateBatch: async rs => rs.map((r, i) => {
+    if (i > 0) return { status: 'success' as const, source: 'mock', transfers: [], returnData: laterSafeViews(r.data) };
+    const reverted = { status: 'reverted' as const, source: 'mock', transfers: [], revertReason: 'ERC20InsufficientBalance' };
+    if (rs[0].to?.toLowerCase() === SAFE2) return alone === 'reverts' ? reverted : { status: 'success' as const, source: 'mock', transfers: [], returnData: enc([{ type: 'uint256' }], [0n]), logs: [executionLog(EXECUTION_FAILURE)] };
+    return (whole?.(r) as never) ?? ('reverted' in outer ? reverted : { status: 'success' as const, source: 'mock', transfers: [], returnData: enc([{ type: 'uint256' }], [1n]), logs: outer.logs });
+  }) } });
+const laterSafeInner = (safeTxGas: bigint) => encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [USDC, 0n, transfer, 0, safeTxGas, 0n, 0n, ZERO, ZERO, `0x${'00'.repeat(65)}`] });
+const laterSafeCalls = (safeTxGas: bigint) => multiSend([[0, USDC, 0n, encodeFunctionData({ abi: ABI, functionName: 'transfer', args: [SAFE2, 1_000_000_000n] })], [0, SAFE2, 0n, laterSafeInner(safeTxGas)]]);
+const laterSafeBatch = (safeTxGas: bigint) => ({ to: MULTISEND_CALL_ONLY, operation: 1, data: laterSafeCalls(safeTxGas) });
+
+test("A SafeOp whose calls fail when the EntryPoint runs them doesn't make a later call's failing Safe transaction a note", async () => {
+  // The SafeOp runs whole (EntryPoint v0.7, through the module): the batch's run is the operation's. Its calls can
+  // fail without the run reverting (UserOperationEvent's success false): Base's operation with its first call
+  // sending 1 unit instead of 569.55 BRS showed the calls failing and the second Safe's transaction as succeeding.
+  const EP = '0x0000000071727de22e5e9d8baf0edac6f37da032', sender = SAFE_OP_V03.message.safe.toLowerCase();
+  const whole = (success: boolean, logs: Log[]) => (r: SimulationRequest) => r.to?.toLowerCase() !== EP ? null : {
+    status: 'success' as const, source: 'mock', transfers: [],
+    returnData: enc([{ type: 'tuple', components: [{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }, { type: 'bytes' }] }], [[100_000n, 10n ** 14n, 0n, 0n, success, '0x']]),
+    logs: [...logs, { address: EP, topics: ['0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f', `0x${'11'.repeat(32)}`, `0x${sender.slice(2).padStart(64, '0')}`, `0x${'0'.repeat(64)}`],
+      data: enc([{ type: 'uint256' }, { type: 'bool' }, { type: 'uint256' }, { type: 'uint256' }], [BigInt(SAFE_OP_V03.message.nonce), success, 10n ** 14n, 100_000n]) }] };
+  const op = (success: boolean, logs: Log[]) => signOp(SAFE_OP_V03, { callData: execute(MULTISEND_CALL_ONLY, laterSafeCalls(0n), 1) }, {}, laterSafeDeps({ reverted: true }, 'reverts', whole(success, logs)));
+  const ran = await op(true, [executionLog(EXECUTION_SUCCESS)]);
+  assert.match(ran.decoding.notes.join(' '), /The whole operation was simulated as EntryPoint v0\.7 runs it/);
+  assert.ok(!codes(ran).includes('safe_tx_reverts') && !codes(ran).includes('userop_execution_reverts'), JSON.stringify(ran.warnings));
+  assert.match(ran.decoding.notes.join(' '), /Call 2's Safe transaction fails when simulated on its own, without the calls before it \(ERC20InsufficientBalance\); run after them, as the batch runs it, it succeeds/);
+  const failed = await op(false, []);
+  assert.ok(codes(failed).includes('userop_execution_reverts'), JSON.stringify(failed.warnings));
+  assert.match(failed.warnings.find(w => w.code === 'safe_tx_reverts')?.message ?? '', /^Call 2: .*ERC20InsufficientBalance/, JSON.stringify(failed.warnings));
+  assert.ok(!failed.decoding.notes.some(n => /Call 2's Safe transaction/.test(n)), JSON.stringify(failed.decoding.notes));
+});

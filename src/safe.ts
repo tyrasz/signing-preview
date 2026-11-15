@@ -10,7 +10,7 @@ import { CHAINS } from './chains.ts';
 import { decodeTransaction, simulationNote } from './evm/transaction.ts';
 import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
-import type { AssetChange, SimulationRequest, SimulationResult } from './types.ts';
+import type { AssetChange, SimulationRequest, SimulationResult, Warning } from './types.ts';
 import { configChanges, simulateSafeExecution, type SafeConfig } from './safe-sim.ts';
 import { pinLatest } from './block.ts';
 import { tracePreviews, noTrace, type TraceEnv } from './evm/trace.ts';
@@ -85,6 +85,16 @@ function safeAdmin(data: Hex, b: PreviewBuilder, p: string): string | null {
   return null;
 }
 
+/** A call running a Safe transaction: execTransaction(to, value, data, operation, safeTxGas, …, signatures). */
+const isExecTransaction = (c: Call) => c.operation === 0 && c.data.toLowerCase().startsWith('0x6a761202');
+/**
+ * What a Safe logs when execTransaction has run its transaction: ExecutionSuccess(bytes32 txHash, uint256 payment),
+ * or ExecutionFailure when the call failed and execTransaction didn't revert (Safe 1.1.1 and 1.2.0 whenever it fails;
+ * from 1.3.0, with a safeTxGas or a gas price). Safe 1.0.0 logs neither.
+ */
+const EXECUTION_SUCCESS = '0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e', EXECUTION_FAILURE = '0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23', EXECUTION_FAILED = '0xabfd711ecdd15ae3a6b3ad16ff2e9d81aec026a39d16725ee164be4fbf857a7c';
+type Log = NonNullable<SimulationResult['logs']>[number];
+
 /** One call the Safe makes, decoded as its own transaction from the Safe (its settings when it calls itself). */
 async function describeCall(c: Call, safe: string, chainId: number, env: AdapterEnv, b: PreviewBuilder, p: string): Promise<Decoded | { title: string; status: 'full'; watch?: undefined }> {
   if (sameAddress(c.to, safe)) {
@@ -105,7 +115,12 @@ async function describeCall(c: Call, safe: string, chainId: number, env: Adapter
  * (through the EntryPoint and the 4337 module, or execTransaction itself). It resolves the Safe's balance changes, or
  * null when it couldn't be simulated (the calls are then simulated one by one, as before).
  */
-export type SafeExecution = (watch: string[]) => Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null>;
+export type SafeExecution = (watch: string[]) => Promise<SafeRan | { reverted: string } | null>;
+/**
+ * A run of the Safe's transaction: its balance changes, a note, whether its calls succeeded (an operation can run with
+ * its calls failing: its own warning says so), and what the run logged, when the simulator reports it.
+ */
+export type SafeRan = { assetChanges: AssetChange[]; note: string; succeeded: boolean; logs?: readonly Log[] };
 
 export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder, execution?: SafeExecution): Promise<{ title: string; summary: string; status: Decoded['status']; assetChanges: AssetChange[] }> {
   const safe = t.safe.toLowerCase();
@@ -151,10 +166,19 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
 
   const titles: string[] = [];
   const decoded: { status: Decoded['status']; watch?: string[] }[] = [];
+  // A Safe transaction among the batch's later calls (one Safe running another's execTransaction), simulated by its
+  // own decoding, runs without the calls before it: it can spend what they send it, on a Safe they deploy. Its
+  // failure there stands unless the batch, run in order, succeeds and that Safe logs it ran (below): a batch that
+  // succeeds doesn't say so by itself, since execTransaction can fail without reverting (ExecutionFailure: before Safe
+  // 1.3.0 always, from it with a safeTxGas or a gas price). On Base, a SafeOp sent a token to a Safe it then deployed
+  // and ran a transaction on: shown failing (ERC20InsufficientBalance), it ran.
+  const alone: { call: number; warning: Warning }[] = [];
   for (const [i, c] of calls.slice(0, MAX_CALLS).entries()) {
     const p = calls.length > 1 ? `Call ${i + 1}: ` : '';
     if (calls.length > 1 && c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()]) b.warn('danger', 'safe_delegatecall', `${p}a delegatecall to ${c.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
+    const from = b.warnings.length;
     const d = await describeCall(c, safe, chainId, env, b, p);
+    if (i > 0 && isExecTransaction(c)) for (const w of b.warnings.slice(from)) if (w.code === 'safe_tx_reverts') alone.push({ call: i, warning: w });
     decoded.push(d);
     const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}` : '';
     titles.push(d.title);
@@ -174,11 +198,13 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   const sim = env.deps.simulator;
   // The real execution path, when the caller has one: delegatecalls included.
   let ran = false;
+  // What the calls logged run in order, when they all succeeded.
+  let inOrder: readonly Log[] | undefined;
   if (sim && execution) {
     try {
       const r = await execution(decoded.flatMap(d => (d as Decoded).watch ?? []));
       if (r && 'reverted' in r) { ran = true; b.warn('caution', 'safe_tx_reverts', `The transaction is expected to fail when the Safe runs it${r.reverted ? `: ${r.reverted}` : ''}.`); }
-      else if (r) { ran = true; assetChanges = r.assetChanges; if (r.note) b.note(r.note); }
+      else if (r) { ran = true; assetChanges = r.assetChanges; if (r.note) b.note(r.note); if (r.succeeded) inOrder = r.logs ?? []; }
     } catch { ran = false; }
   }
   // Otherwise simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way).
@@ -187,6 +213,7 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     try {
       const results = reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
       if (results && results.every(r => r?.status === 'success')) {
+        inOrder = results.flatMap(r => r!.logs ?? []);
         const basis = results.every(r => r!.basis === 'state' || r!.basis === 'fork' || r!.balancesRead) ? 'simulated_state' as const : 'simulated_events' as const;
         assetChanges = await netChanges(results.flatMap(r => r!.transfers), { chainId, from: safe }, env.deps, b, basis);
         b.note(`Simulated as the Safe making the call${calls.length > 1 ? 's in order' : ''}. ${simulationNote(results[0]!)}`);
@@ -195,6 +222,18 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
         b.warn('caution', 'safe_tx_reverts', `${calls.length > 1 ? `Call ${k + 1} of the transaction` : 'The transaction'} is expected to fail when the Safe runs it${results[k]?.revertReason ? `: ${results[k]!.revertReason}` : ''}.`);
       }
     } catch { /* not simulated */ }
+  }
+  // The batch ran in order and succeeded, and a later call's Safe logged that its transaction ran (above): as many
+  // ExecutionSuccess as the batch has run transactions on it up to that call, and no Safe in the run logged a failure
+  // (ExecutionFailure, or 1.0.0's ExecutionFailed): a Safe further down whose transaction fails without reverting
+  // (before 1.3.0 always, from it with a safeTxGas or a gas price) leaves the Safes above it succeeding.
+  if (inOrder) for (const { call, warning } of alone) {
+    const target = calls[call].to.toLowerCase(), logged = (topic: string) => inOrder!.filter(l => l.address.toLowerCase() === target && l.topics[0] === topic).length;
+    const earlier = calls.slice(0, call).filter(c => isExecTransaction(c) && c.to.toLowerCase() === target).length;
+    if (inOrder.some(l => l.topics[0] === EXECUTION_FAILURE || l.topics[0] === EXECUTION_FAILED) || logged(EXECUTION_SUCCESS) <= earlier) continue;
+    b.warnings.splice(b.warnings.indexOf(warning), 1);
+    const why = /runs it: (.*?)\.?$/.exec(warning.message)?.[1];
+    b.note(`Call ${call + 1}'s Safe transaction fails when simulated on its own, without the calls before it${why ? ` (${why})` : ''}; run after them, as the batch runs it, it succeeds (its Safe logs ExecutionSuccess).`);
   }
   const statuses = decoded.map(d => d.status);
   const status = statuses.includes('opaque') ? 'partial' : statuses.includes('partial') ? 'partial' : 'full';
@@ -207,12 +246,12 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
 }
 
 /** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes (and a note, unless it added its own), or why it fails. */
-export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: Pick<AdapterEnv, 'deps'>, b: PreviewBuilder, how: string): Promise<{ assetChanges: AssetChange[]; note: string } | { reverted: string } | null> {
+export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: Pick<AdapterEnv, 'deps'>, b: PreviewBuilder, how: string): Promise<SafeRan | { reverted: string } | null> {
   if (sim.status === 'reverted') return { reverted: sim.revertReason ?? '' };
   // The probe measures the call's sender, which isn't the Safe here: its balance reads don't apply.
   if (sim.limited || sim.basis === 'state') return null;
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
-  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}` };
+  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}`, succeeded: true, ...(sim.logs && { logs: sim.logs }) };
 }
 
 /** Warns of what a simulated transaction changes in the Safe's configuration, unless a static warning already says it. */

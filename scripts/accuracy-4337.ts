@@ -14,7 +14,8 @@
 // How accurate whole-operation simulation is (src/erc4337-sim.ts), measured against what happened. Recent operations
 // of an EntryPoint are rebuilt as the request their owner signed:
 //   (an operation in a bundle of several, up to five of them, after the bundle's earlier operations as a handleOps of
-//   their own: gas reported apart, as warm state from the same transaction is cold in a replay);
+//   their own, what they touched warm for it as in the bundle: gas reported apart, as a slot they wrote is still
+//   dearer to write again in a transaction of its own);
 //   - a SafeOp, for a Safe whose fallback handler is one of the known 4337 modules (src/typed-data/safe.ts);
 //   - otherwise, for v0.6 and v0.7, personal_sign of the operation's hash with the operation as context.userOperation;
 //   - for v0.8 and v0.9, the PackedUserOperation typed data (an EIP-7702 account's delegate where its marker is).
@@ -23,7 +24,8 @@
 // paymaster or a token holds, and so the gas and amounts; on Ethereum this turned an operation 10% off into one within
 // 0.05%). It is compared with the receipt: the outcome, whether the
 // operation ran whole, whether the account accepted the stand-in signature, the gas it paid (UserOperationEvent's
-// actualGasCost) and the account's token movements.
+// actualGasCost) and the token movements of the account (and of any other account the preview shows: a Safe it runs a
+// transaction on; scripts/userop-tokens.ts).
 //
 // The signer isn't on the chain: it is the account itself for an EIP-7702 account, else whoever the operation's
 // real signature recovers to (its last 65 bytes, or a Coinbase Smart Wallet's wrapped one), over the personal_sign
@@ -46,6 +48,7 @@ import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
 import { chainName, EVM_RPCS, OP_STACK, rpcUrlFor } from '../src/chains.ts';
+import { compareTokens, movedAlike, TRANSFER, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
@@ -97,9 +100,6 @@ type Op = { sender: Hex; nonce: bigint; initCode: Hex; callData: Hex; callGasLim
 const UOE = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f';
 /** EntryPoint's BeforeExecution(): the end of a bundle's validation, from v0.6 on. */
 const BEFORE_EXECUTION = '0xbb47ee3e183a558b1a2ff0874b079f3fc5478b7454eacf2bfc5af2ff5878f972';
-const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-/** WETH-style wrappers' Deposit(dst, wad) and Withdrawal(src, wad): their balance changes without a Transfer. */
-const DEPOSIT = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c', WITHDRAWAL = '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65';
 /** Whether a contract answers decimals(), as a token does (remembered for the run). */
 const TOKEN_LIKE = new Map<string, Promise<boolean>>();
 const tokenLike = (address: string): Promise<boolean> => {
@@ -227,7 +227,7 @@ const blockReceipts = (number: Hex) => {
 async function replay(item: string): Promise<void> {
   // An item is a bundle transaction's hash, or `hash#i` for its i-th operation.
   const [hash, at] = item.split('#');
-  const tx = await call<{ from: string; to: string | null; input: Hex; transactionIndex: Hex; blockNumber: Hex; authorizationList?: NonNullable<SimulationRequest['authorizationList']> }>('eth_getTransactionByHash', [hash]);
+  const tx = await call<{ from: string; to: string | null; input: Hex; gas: Hex; transactionIndex: Hex; blockNumber: Hex; authorizationList?: NonNullable<SimulationRequest['authorizationList']> }>('eth_getTransactionByHash', [hash]);
   if (!tx) return skip("the node didn't return the transaction");
   // handleOps to the EntryPoint, or the same call to a bundler's own contract that relays it there (on Polygon, most
   // v0.7 bundles in a sample went through one): its operations are the EntryPoint's, and its receipt has their events.
@@ -290,7 +290,7 @@ async function replay(item: string): Promise<void> {
   // authorizations apply first, as they do on-chain, and the account's code reads as the delegation.
   // The authorities are warm in the bundle transaction from its start (EIP-7702), so they are in the replay too.
   let delegation: string | undefined;
-  const warm: string[] = [];
+  const warm: (string | { address: string; storageKeys: string[] })[] = [];
   // What must run first whatever else is dropped: the bundle's authorizations and its earlier operations.
   const essential: SimulationRequest[] = [];
   if (tx.authorizationList?.length) {
@@ -303,7 +303,20 @@ async function replay(item: string): Promise<void> {
       } catch { /* unreadable */ }
     }
   }
-  if (index > 0) essential.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [ops.slice(0, index) as never, beneficiary] }) });
+  if (index > 0) {
+    const earlierOps = encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [ops.slice(0, index) as never, beneficiary] });
+    essential.push({ chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, data: earlierOps });
+    // What the earlier operations touched is warm by this one's turn in the bundle (one transaction, EIP-2929) and
+    // cold where they ran as a transaction of their own: it is warm in the replay too (the access list a node gives
+    // their handleOps). On Base the second operation of a bundle, a swap through a router that checks the gas left
+    // before its call, failed in the replay (InsufficientGasForCall) where on-chain the first had warmed USDC and
+    // the EntryPoint's slots for it; warmed, it succeeds, its gas 0.29% over the receipt's (a slot the earlier
+    // operation wrote stays dearer to write again in a transaction of its own).
+    try {
+      const listed = await call<{ accessList?: { address: string; storageKeys: string[] }[] }>('eth_createAccessList', [{ from: tx.from, to: EP, data: earlierOps, gas: hex(BigInt(tx.gas)) }, parent]);
+      for (const e of listed?.accessList ?? []) warm.push({ address: e.address.toLowerCase(), storageKeys: e.storageKeys });
+    } catch { /* not given: cold, as a transaction of its own has it */ }
+  }
   // What to keep of the earlier transactions when the node won't run them all (a full block's are too much for a
   // public node's simulated block): the account's own and the other bundles, which most often change what the
   // operation meets. On Arbitrum One three keepers' operations failed (Ostium's NotInitiated) where another
@@ -485,7 +498,7 @@ async function replay(item: string): Promise<void> {
   const rejected = p.warnings.find(w => w.code === 'userop_rejected')?.message;
   const fallbackNote = p.decoding.notes.find(x => /validation reverts on a stand-in/.test(x));
   const simCost = p.details.find(d => d.label === 'Gas cost (simulated)')?.raw;
-  const moved = new Map<string, bigint>(), fees = new Map<string, bigint>();
+  const fees = new Map<string, bigint>();
   const paymaster = op.paymasterAndData.length >= 42 ? `0x${op.paymasterAndData.slice(2, 42)}`.toLowerCase() : null;
   // The operation's own part of the receipt: the bundle's validation (up to BeforeExecution), and what ran from the
   // previous operation's UserOperationEvent to its own. Another operation of the bundle can move this account's
@@ -495,32 +508,22 @@ async function replay(item: string): Promise<void> {
   const validated = r.logs.findIndex(l => isEp(l) && l.topics[0] === BEFORE_EXECUTION);
   const previous = r.logs.slice(0, ownEvent).map((l, i) => (isEp(l) && l.topics[0] === UOE ? i : -1)).filter(i => i >= 0).at(-1) ?? validated;
   const own = r.logs.filter((_, i) => i <= validated || (i > previous && i <= ownEvent));
-  // (Only a token's: a staking contract's or vault's Deposit(address,uint256) has WETH9's signature too, and moves no
-  // token of the account's. One that answers decimals() is taken as a token.)
-  for (const l of own) if ((l.topics[0] === DEPOSIT || l.topics[0] === WITHDRAWAL) && l.topics.length === 2 && `0x${l.topics[1].slice(26)}` === sender && await tokenLike(l.address.toLowerCase())) {
-    const token = l.address.toLowerCase(), v = BigInt(l.data.slice(0, 66));
-    moved.set(token, (moved.get(token) ?? 0n) + (l.topics[0] === DEPOSIT ? v : -v));
-  }
-  // (Not the chain's own log of a native transfer, from Glamsterdam on: tokens are what is compared here.)
   // The fee in a token: what the paymaster took, sent to it or (followed by the paymaster's own event, its postOp's)
   // to where it keeps its fees, a treasury (Pimlico's singleton paymaster: its charge to the treasury in its data,
   // then UserOperationSponsored); else the smallest transfer out. An operation on Ethereum sent 0.1 USDC into a swap
-  // and paid 0.39 USDC to the treasury: the swap, taken as the fee, left a quarter of the rounding allowed.
+  // and paid 0.39 USDC to the treasury: the swap, taken as the fee, left a quarter of the rounding allowed. (The
+  // operation's account's: it pays for the operation.)
   const charged = new Set<string>();
   own.forEach((l, i) => {
-    if (l.topics[0] !== TRANSFER || l.topics.length !== 3 || l.address.toLowerCase() === NATIVE_LOG_ADDRESS) return;
-    const from = `0x${l.topics[1].slice(26)}`, to = `0x${l.topics[2].slice(26)}`, token = l.address.toLowerCase(), v = BigInt(l.data);
-    if (from === sender) {
-      moved.set(token, (moved.get(token) ?? 0n) - v);
-      if (paymaster && (to === paymaster || own[i + 1]?.address.toLowerCase() === paymaster)) { fees.set(token, charged.has(token) ? fees.get(token)! + v : v); charged.add(token); }
-      else if (!charged.has(token) && (!fees.has(token) || v < fees.get(token)!)) fees.set(token, v);
-    }
-    if (to === sender) moved.set(token, (moved.get(token) ?? 0n) + v);
+    if (l.topics[0] !== TRANSFER || l.topics.length !== 3 || l.address.toLowerCase() === NATIVE_LOG_ADDRESS || `0x${l.topics[1].slice(26)}` !== sender) return;
+    const to = `0x${l.topics[2].slice(26)}`, token = l.address.toLowerCase(), v = BigInt(l.data);
+    if (paymaster && (to === paymaster || own[i + 1]?.address.toLowerCase() === paymaster)) { fees.set(token, charged.has(token) ? fees.get(token)! + v : v); charged.add(token); }
+    else if (!charged.has(token) && (!fees.has(token) || v < fees.get(token)!)) fees.set(token, v);
   });
-  for (const [k, v] of moved) if (v === 0n) moved.delete(k);
-  // Simulated movements only: a preview whose calls revert shows what they ask for (basis 'requested'), with a warning.
-  const simulated = new Map((p.assetChanges ?? []).filter(c => c.asset && c.asset !== 'native' && c.raw && c.basis !== 'requested').map(c => [c.asset!.toLowerCase(), (c.direction === 'out' ? -1n : 1n) * BigInt(c.raw!)]));
-  const tokens = [...new Set([...moved.keys(), ...simulated.keys()])].map(t => ({ token: t, actual: (moved.get(t) ?? 0n).toString(), simulated: (simulated.get(t) ?? 0n).toString() }));
+  // What the preview shows moving, account by account (scripts/userop-tokens.ts), against what moved for each in the
+  // receipt: compared as the operation's account's, a Safe's 14,783 USDT going out (its owner, the account, ran a
+  // transaction on it) showed on Arbitrum One against the account's own movements, which were none.
+  const tokens = await compareTokens(own, sender, p.assetChanges ?? [], tokenLike);
   const abs = (x: bigint) => (x < 0n ? -x : x);
   // A gas-priced fee (a paymaster's, or a fee collector's) moves with the gas: within 1% of the smallest transfer out.
   // A share-based token's balance can move a base unit or two from the amount its Transfer event logs: the preview reads
@@ -540,16 +543,16 @@ async function replay(item: string): Promise<void> {
   // the paymaster's fee (charged): the smallest transfer out, taken as the fee where no paymaster's is seen, moves by
   // the gas's percentage at most, else an amount that is wrong passes as a fee.
   const feeSlack = (token: string) => BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? (charged.has(token) ? 1.3 : 1) * Math.abs(gasPercent) : 0)));
-  const feeLike = (t: { token: string; actual: string; simulated: string }) => fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack(t.token);
+  const feeLike = (t: Compared) => !t.account && fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack(t.token);
   // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
   // ten-thousandth (as scripts/accuracy.ts allows).
-  const secondLate = (t: { actual: string; simulated: string }) => timeBumped && abs(BigInt(t.simulated) - BigInt(t.actual)) * 10_000n <= abs(BigInt(t.actual));
+  const secondLate = (t: Compared) => timeBumped && abs(BigInt(t.simulated) - BigInt(t.actual)) * 10_000n <= abs(BigInt(t.actual));
   // A gas-priced fee taken inside an amount (a relayer keeping its fee from a swap's output before it reaches the
   // account, so no transfer of the account's shows it): the amount is off by less, in proportion, than the gas is,
   // and against the account when the simulated gas is higher. Three Ethereum swaps were 0.006-0.022% off so, their
   // gas 0.02-0.16% high.
-  const feeInside = (t: { actual: string; simulated: string }) => {
-    if (gasPercent === undefined || gasPercent === 0 || Math.abs(gasPercent) >= 5) return false;
+  const feeInside = (t: Compared) => {
+    if (t.account || gasPercent === undefined || gasPercent === 0 || Math.abs(gasPercent) >= 5) return false;
     const d = BigInt(t.simulated) - BigInt(t.actual);
     return (d < 0n) === (gasPercent > 0) && abs(d) * 100_000n <= abs(BigInt(t.actual)) * BigInt(Math.ceil(Math.abs(gasPercent) * 1000));
   };
@@ -562,9 +565,9 @@ async function replay(item: string): Promise<void> {
   // the preview has (the account's other operations in the block would move it too, so only an exact match counts).
   let byBalance = 0, createdElsewhere = false;
   if (tokenMatch === 'other') {
-    const balanceAt = async (token: string, tag: string) => { try { return BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: token, data: `0x70a08231${sender.slice(2).padStart(64, '0')}` }, tag]))); } catch { return undefined; } };
+    const balanceAt = async (token: string, account: string, tag: string) => { try { return BigInt(String(await rpc.call(CHAIN, 'eth_call', [{ to: token, data: `0x70a08231${account.slice(2).padStart(64, '0')}` }, tag]))); } catch { return undefined; } };
     for (const t of tokens.filter(x => x.actual !== x.simulated)) {
-      const before = await balanceAt(t.token, parent), after = await balanceAt(t.token, r.blockNumber);
+      const before = await balanceAt(t.token, t.account ?? sender, parent), after = await balanceAt(t.token, t.account ?? sender, r.blockNumber);
       if (before !== undefined && after !== undefined && (after - before).toString() === t.simulated) { t.actual = t.simulated; byBalance++; }
     }
     if (byBalance) tokenMatch = matchOf();
@@ -576,10 +579,42 @@ async function replay(item: string): Promise<void> {
   if (tokenMatch === 'other') {
     const absent = async (token: string) => { try { return String(await rpc.call(CHAIN, 'eth_getCode', [token, parent])) === '0x'; } catch { return false; } };
     for (const a of tokens.filter(x => x.simulated === '0' && x.actual !== '0')) {
-      const b = tokens.find(x => x.actual === '0' && x.simulated === a.actual);
+      const b = tokens.find(x => x.actual === '0' && x.simulated === a.actual && x.account === a.account);
       if (b && p.warnings.some(w => w.code === 'token_created_here') && await absent(a.token) && await absent(b.token)) { a.simulated = a.actual; tokens.splice(tokens.indexOf(b), 1); createdElsewhere = true; }
     }
     if (createdElsewhere) tokenMatch = matchOf();
+  }
+  // A token whose events don't say what its balanceOf does, where other transactions in the block move the balance
+  // too (so the balance across the block can't decide): an Aave debt token's mint logs the interest accrued since the
+  // account's last action with the amount (a borrow of 150 USDC on Base logged 150.179495 of debt), and a token
+  // that pays out pending rewards when its holder sends logs them as coming in (on BNB Chain an account sending 315.77
+  // logged 315.75 back), where balanceOf had counted both already; holders' rewards there grow as others trade in the
+  // block. The operation as it was mined, its real signature in place of the stand-in, is run on the state the
+  // preview ran on, between reads of the account's balance: where that run logs for the token and the account what
+  // the receipt logs (it did what happened: the same Transfers, and a wrapper's Deposits and Withdrawals, which move
+  // the balance as much; a receipt logging none for them says nothing of the run) and the account's operation fared
+  // as it did, its balance change is what happened, and is compared in place of the events'.
+  let byReplay = 0;
+  if (tokenMatch === 'other') {
+    const differing = tokens.filter(x => x.actual !== x.simulated);
+    const reads: SimulationRequest[] = differing.map(t => ({ chainId: CHAIN, from: '0x0000000000000000000000000000000000000000', to: t.token, data: `0x70a08231${(t.account ?? sender).slice(2).padStart(64, '0')}` as Hex, value: 0n }));
+    // (Its gas limit the bundle's, and what the warm access list costs to name on top: EIP-2930's 2,400 an address and 1,900 a slot.)
+    const naming = warm.reduce((sum, w) => sum + 2_400n + (typeof w === 'string' ? 0n : 1_900n * BigInt(w.storageKeys.length)), 0n);
+    const mined: SimulationRequest = { chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, gas: BigInt(tx.gas) + naming, ...(bundlePrice !== undefined && { gasPrice: bundlePrice }),
+      data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [[op] as never, beneficiary] }) };
+    const out = await node.simulateBatch([...reads, mined, ...reads]).catch(() => null);
+    const minedRun = out?.[reads.length];
+    const replayed = minedRun?.status === 'success' ? (minedRun.logs ?? []).find(l => l.address === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender && BigInt(l.data.slice(0, 66)) === BigInt(op.nonce)) : undefined;
+    if (replayed && (BigInt(`0x${replayed.data.slice(66, 130)}`) === 1n) === succeeded) {
+      differing.forEach((t, i) => {
+        const before = out![i]?.status === 'success' ? out![i].returnData : undefined, after = out![reads.length + 1 + i]?.status === 'success' ? out![reads.length + 1 + i].returnData : undefined;
+        const account = t.account ?? sender;
+        if (!/^0x[0-9a-f]{64}$/i.test(before ?? '') || !/^0x[0-9a-f]{64}$/i.test(after ?? '') || !movedAlike(minedRun!.logs ?? [], own, t.token, account)) return;
+        t.actual = (BigInt(after!) - BigInt(before!)).toString();
+        byReplay++;
+      });
+    }
+    if (byReplay) tokenMatch = matchOf();
   }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
@@ -588,7 +623,7 @@ async function replay(item: string): Promise<void> {
     gas: gasCompared ? { simulated: gasCompared.simulated, actual: gasCompared.actual.toString(), percent: gasPercent, ...(gasCompared.gasless && { gasless: true }) } : undefined,
     // Without any simulation (the node refused it) there are no simulated movements to compare.
     ...(!ran(p) && { notSimulated: true }),
-    ...(byBalance && { tokensByBalance: byBalance }), ...(createdElsewhere && { tokenCreated: true }),
+    ...(byBalance && { tokensByBalance: byBalance }), ...(byReplay && { tokensByReplay: byReplay }), ...(createdElsewhere && { tokenCreated: true }),
     // The node didn't answer the reads of balances after the run (a public node rate limiting): the amounts are the
     // events', which the preview's note says, with the node's answer (src/evm/transaction.ts simulationNote).
     ...(unread && { unread }),

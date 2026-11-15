@@ -55,10 +55,11 @@ export interface RpcSimulatorOptions {
   /**
    * Replays (accuracy checks): simulate on top of `block` instead of 'latest', with these simulated-block fields,
    * and (eth_simulateV1) after `before`, calls run first in the same simulated block (the replayed block's earlier
-   * transactions) whose results are dropped. `warm`: addresses the replayed transaction had warm from its start
-   * (its EIP-7702 authorities), added to each request's access list.
+   * transactions) whose results are dropped. `warm`: what the replayed transaction had warm from its start (its
+   * EIP-7702 authorities) or by its turn (what a bundle's earlier operations touched): addresses, or addresses with
+   * storage slots, added to each request's access list.
    */
-  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[]; warm?: string[]; state?: StateChanges } | undefined;
+  replay?: (chainId: number) => { block: string; blockOverrides?: Record<string, string>; before?: SimulationRequest[]; warm?: (string | { address: string; storageKeys: string[] })[]; state?: StateChanges } | undefined;
 }
 
 /**
@@ -274,7 +275,7 @@ export class RpcSimulator implements Simulator {
   /** The requests with a replay's warm addresses in their access lists (see RpcSimulatorOptions.replay). */
   private warmed(reqs: SimulationRequest[]): SimulationRequest[] {
     const warm = reqs.length ? this.replay?.(reqs[0].chainId)?.warm : undefined;
-    return warm?.length ? reqs.map(r => ({ ...r, accessList: [...(r.accessList ?? []), ...warm.map(address => ({ address, storageKeys: [] }))] })) : reqs;
+    return warm?.length ? reqs.map(r => ({ ...r, accessList: [...(r.accessList ?? []), ...warm.map(w => (typeof w === 'string' ? { address: w, storageKeys: [] } : w))] })) : reqs;
   }
   /** What the simulated block had already changed (a replay's, else the requests' own block's: BlockAt.state). */
   private stateOf(reqs: SimulationRequest[]): StateChanges | undefined {

@@ -179,7 +179,8 @@ const safeOp: TypedAdapter = async (data, env) => {
           const after = run?.after?.every(r => r.status === 'success') ? run.after : undefined;
           const config = after && safeConfig(after.map(r => r.returnData as Hex));
           if (before && config) reportConfigChanges(before, config, b);
-          return { assetChanges: changes, note: '' };
+          // Its calls can have failed (reportRun warned so): only a run whose calls succeeded is the batch run in order.
+          return { assetChanges: changes, note: '', succeeded: run!.executed, logs: run!.result.logs };
         }
       }
       const run = await simulateExecution({ chainId, entryPoint, sender: safe, callData, ...(deploys && { initCode: initCode as Hex }), watch }, env.deps);
