@@ -863,6 +863,14 @@ test('Arbitrum: a replay’s local run has the gas the chain left it after the L
   assert.equal(elsewhere.status, 'success');
 });
 
+test("Arbitrum charges no calldata floor (EIP-7623); the other chains from Prague on do", async () => {
+  // 1,000 bytes of calldata to an account with no code: 21,000 + 16 a byte = 37,000 on Arbitrum's node, the floor's
+  // 21,000 + 40 a byte = 61,000 on Ethereum's, Base's, OP Mainnet's, Polygon's and BNB Chain's (2026-11-15).
+  const call = { chainId: 999, from: USER, to: '0x0000000000000000000000000000000000001111', data: `0x${'ab'.repeat(1000)}` as Hex, value: 0n };
+  const gasOn = async (profile: typeof CHAIN_PROFILES[number]) => (await fork({ profiles: { 999: { ...profile } } }).simulateBatch([call]))![0].gasUsed;
+  assert.deepEqual([await gasOn(CHAIN_PROFILES[42161]), await gasOn(CHAIN_PROFILES[1]), await gasOn(CHAIN_PROFILES[8453])], [37_000n, 61_000n, 61_000n]);
+});
+
 test('Polygon lets a contract be 32,768 bytes long: a creation Ethereum’s limit refuses succeeds there', async () => {
   // The code creates a contract of `size` zero bytes and returns its address, or zero where the creation failed.
   const creating = (size: number) => `0x6561${size.toString(16).padStart(4, '0')}6000f360d01b600052600660006000f060005260206000f3`;

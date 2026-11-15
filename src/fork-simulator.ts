@@ -1216,14 +1216,14 @@ const authorizationCount = (req: SimulationRequest) => (req.authorizationList?.l
 
 /**
  * The gas a transaction with this call would use: the 21,000 base, calldata, access list and EIP-7702
- * authorizations, the execution, less the refund (at most a fifth of the total), and from Prague on, at least
- * EIP-7623's calldata floor.
+ * authorizations, the execution, less the refund (at most a fifth of the total), and where the chain has it (`floored`:
+ * from Prague on, Arbitrum aside), at least EIP-7623's calldata floor.
  */
-function transactionGas(req: SimulationRequest, execution: bigint, refund: bigint, prague: boolean, amsterdam = false): bigint {
+function transactionGas(req: SimulationRequest, execution: bigint, refund: bigint, floored: boolean, amsterdam = false): bigint {
   const { intrinsic, floor } = intrinsicGas(req, amsterdam);
   const used = intrinsic + execution;
   const net = used - (refund < used / 5n ? refund : used / 5n);
-  return (prague || amsterdam) && floor > net ? floor : net;
+  return (floored || amsterdam) && floor > net ? floor : net;
 }
 
 /** What a transaction pays before its call runs (what its gas limit is less, for the call), and the least it can pay (the calldata floor). */
@@ -2035,7 +2035,10 @@ export class ForkSimulator implements Simulator {
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
       // What the call spent, and under Amsterdam what its state took from the reservoir (less what it gave back to it).
       const spent = ex.executionGasUsed + authState + (metered ? reservoir - metered.stateGasReservoir : 0n);
-      const gasUsed = transactionGas(req, spent > 0n ? spent : 0n, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork), profile.hardfork === 'amsterdam');
+      // EIP-7623's calldata floor from Prague on, but not on Arbitrum, whose node charges none (1,000 bytes of calldata
+      // to an empty account: 37,000 gas there, the floor's 61,000 on Ethereum, Base, OP Mainnet, Polygon and BNB
+      // Chain; 2026-11-15).
+      const gasUsed = transactionGas(req, spent > 0n ? spent : 0n, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork) && !profile.arbitrum, profile.hardfork === 'amsterdam');
       // The fee itself is paid once everything this call reports has been read: the calls after it in the batch are
       // the transactions after it, and meet a sender that has paid (the gas used at its price) and a fee recipient
       // that has been tipped (the price over the base fee), as on the chain.
