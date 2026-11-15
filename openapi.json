@@ -1302,6 +1302,10 @@
             "items": {
               "$ref": "#/components/schemas/TraceEvent"
             }
+          },
+          "node": {
+            "type": "string",
+            "description": "Set when the call ran on the chain's node, not in the local EVM, and says what it is (an Arbitrum Stylus program, WASM): its outcome, output, events and gas are the node's run; the calls it made aren't known."
           }
         }
       },

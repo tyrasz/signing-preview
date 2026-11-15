@@ -225,6 +225,7 @@ export async function describeTrace(root: TraceCall, stateChanges: StateChange[]
     if (fromLabel) entry.fromLabel = fromLabel;
     if (call.value > 0n) entry.value = call.value.toString();
     if (call.precompile) entry.precompile = true;
+    if (call.node) entry.node = call.node;
     const creating = call.type === 'create' || call.type === 'create2';
     if (creating) entry.function = `new contract (${(call.input.length - 2) / 2} bytes of creation code)`;
     else if (call.input.length >= 10 && !call.precompile) {
@@ -341,7 +342,9 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
     // recorded for the transaction (the last call traced).
     const state = env.recorded && i === traced.length - 1 ? compareWithAccessList(t.stateChanges, env.recorded) : undefined;
     const stateDiffers = state && !state.agrees ? `The state the traced run changed isn't what the block's access list records for this transaction (${state.differences!.slice(0, 3).join('; ')}${state.differences!.length > 3 ? `; and ${state.differences!.length - 3} more` : ''}): the trace is a guide to what it did, not its record.` : undefined;
-    const note = [s?.traceNote, differs, gasDiffers, stateDiffers, standInNote, t.rulesNote].filter(Boolean).join(' ');
+    // A call the local EVM handed to the chain's node (a Stylus program, TraceCall.node): said, with what isn't known.
+    const byNode = t.trace.node ? `${t.trace.to} is a Stylus (WASM) program, which the local EVM can't run: the chain's node ran the call, and the trace shows it as one frame with the node's outcome, return data, events and gas (the L2 part). What the program called, and the storage it wrote, the node doesn't say.` : undefined;
+    const note = [s?.traceNote, byNode, differs, gasDiffers, stateDiffers, standInNote, t.rulesNote].filter(Boolean).join(' ');
     return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(gasAgrees !== undefined && { gasAgrees }), ...(state && { stateAgrees: state.agrees }), ...(note && { note }) });
   }));
 }
