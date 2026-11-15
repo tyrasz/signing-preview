@@ -43,7 +43,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { BULLBIT_IMPLEMENTATION, implementationOf, kernelEnableSignature, okxDigest, readKernelEnable, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { BULLBIT_IMPLEMENTATION, implementationOf, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
@@ -220,8 +220,8 @@ const ERC1967_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca50
 /** Alchemy's Modular Account v2: its implementations and its EIP-7702 delegate (as src/erc4337-sim.ts shapes them). */
 const MODULAR_ACCOUNTS_V2 = new Set(['0x000000000000c5a9089039570dd36455b5c07383', '0x00000000000002377b26b1eda7b0bc371c60dd4f', '0x69007702764179f14f51cdce752f4f775d74e139']);
 
-/** Rhinestone's SmartSession module (source verified on Sourcify, Arbitrum One). */
-const SESSION_VALIDATORS = ['0x00000000008bdaba73cd9815d79069c247eb4bda'];
+/** A SmartSession session's validator and its config (getSessionValidatorAndConfig(account, permission id)). */
+const SESSION_VALIDATOR = parseAbi(['function getSessionValidatorAndConfig(address account, bytes32 permissionId) view returns (address sessionValidator, bytes sessionValidatorData)']);
 
 type Row = Record<string, unknown>;
 const rows: Row[] = [];
@@ -229,6 +229,8 @@ const blocks = new Set<number>();
 const skipped: Record<string, number> = {};
 const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
 const STAND_IN_REJECTED = /doesn't accept (it as theirs|as signed)/;
+/** Why the preview says the account doesn't take the stand-in as the signer's, where it says (src/typed-data/user-operation.ts). */
+const rejectedWhy = (p: Preview) => p.decoding.notes.map(x => /doesn't accept it as theirs \((.*)\), so its own signature check/.exec(x)?.[1]).find(Boolean);
 /** The key Chrome adds to some passkeys' clientDataJSON, as it appears in a signature (hex, no 0x). */
 const CHROME_EXTRA_KEY = Buffer.from('"other_keys_can_be_added_here"').toString('hex');
 
@@ -260,9 +262,9 @@ async function replay(item: string): Promise<void> {
     enqueueNext(Array.from({ length: Math.min(ops.length, BUNDLE_MAX) - 1 }, (_, i) => `${hash}#${i + 1}`));
   }
   const op = ops[index], sender = op.sender.toLowerCase();
-  // A session key's operation (an ERC-7579 account validating through Rhinestone's SmartSession module, which its
-  // nonce names): the dApp holding the key signs it, not the user's wallet, so nothing previews it.
-  if (SESSION_VALIDATORS.some(v => BigInt(op.nonce).toString(16).padStart(64, '0').includes(v.slice(2)))) return skip("a session key's operation (signed by a dApp, not a wallet)");
+  // A session key's operation (an account validating through Rhinestone's SmartSession, which its nonce names, as the
+  // preview takes it: a Kernel in enable mode installing it is replayed in enable mode): see below.
+  const session = smartSessionOf(BigInt(op.nonce));
   // A transaction's receipt; OP Mainnet's public node refuses receipts by hash ("archive requests") but serves its
   // block's receipts.
   type Receipt = { transactionHash: string; blockNumber: Hex; effectiveGasPrice?: Hex; gasUsed?: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
@@ -381,6 +383,22 @@ async function replay(item: string): Promise<void> {
   // the preview reading nothing: the operation is skipped rather than replayed on missing state.
   let code: string;
   try { code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest'])); } catch { return skip('its state is no longer served by the node'); }
+  // A session key's operation: its session's keys sign it, not the account's owners. A session in use (mode 0x00,
+  // then its permission ID) through Rhinestone's OwnableValidator is signed by its keys over the operation's hash as
+  // a message, which personal_sign is, by one of them (the key recovered from the signature below), the others its
+  // cosigners (src/erc4337-sim.ts, smartSessionStub). Another session validator's form, or a session the operation
+  // enables, nothing a wallet signs takes (a dApp's key signs it): skipped.
+  if (session) {
+    const enabled = op.signature.startsWith('0x00') && op.signature.length >= 2 + 33 * 2;
+    let validator: string | undefined;
+    if (enabled) {
+      try {
+        const out = await atParent.call(CHAIN, 'eth_call', [{ to: session, data: encodeFunctionData({ abi: SESSION_VALIDATOR, functionName: 'getSessionValidatorAndConfig', args: [sender as Hex, `0x${op.signature.slice(4, 68)}`] }) }, 'latest']);
+        validator = decodeFunctionResult({ abi: SESSION_VALIDATOR, functionName: 'getSessionValidatorAndConfig', data: out as Hex })[0].toLowerCase();
+      } catch { return skip('a read of its state failed'); }
+    }
+    if (validator !== OWNABLE_VALIDATOR) return skip(`a session key's operation (SmartSession) ${enabled ? "through a session validator the stand-in doesn't take" : 'enabling its session'} (signed by a dApp's key, not a wallet)`);
+  }
   // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
   // validator or permission it installs (the Enable), which signs the operation (a dApp's session key, mostly); its
   // signature carries what it installs and both signatures, as the dApp's SDK builds it. It is previewed with that
@@ -646,7 +664,9 @@ async function replay(item: string): Promise<void> {
   }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
-    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }),
+    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session }),
+    // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
+    ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
     gas: gasCompared ? { simulated: gasCompared.simulated, actual: gasCompared.actual.toString(), percent: gasPercent, ...(gasCompared.gasless && { gasless: true }) } : undefined,
@@ -777,6 +797,7 @@ console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
+if (count(r => !!r.session)) say(`  session keys' operations (SmartSession, through Rhinestone's OwnableValidator): ${count(r => !!r.session)}, the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
 if (count(r => !!r.enableMode)) say(`  Kernel's enable mode (previewed with ${ENABLE_DUMMIES ? "the SDK's dummies for" : 'their own'} signatures): ${count(r => !!r.enableMode)}, the stand-in validated for ${count(r => !!r.enableMode && r.standIn === 'validated')}${count(r => r.standIn === 'as signed') ? `, run with the signatures as they were for ${count(r => r.standIn === 'as signed')} (no stand-in made)` : ''}`);
 say(`  gas paid (for ${count(r => !!(g(r) as { gasless?: boolean } | undefined)?.gasless)} gasless operations, the gas used), of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
@@ -784,7 +805,7 @@ if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's 
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`].filter(Boolean);
+    r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 

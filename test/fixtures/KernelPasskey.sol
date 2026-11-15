@@ -145,3 +145,32 @@ contract SenderCreatorLike {
         sender = ok && ret.length == 32 ? abi.decode(ret, (address)) : address(0);
     }
 }
+
+/// Send's account (SendAccount, its verified source on Base): passkeys kept by slot; a signature of version 1,
+/// validUntil (uint48), the key's slot and its WebAuthn assertion as abi.encode(Signature), whose challenge is the
+/// version, validUntil and the operation's hash; any other version refused. Checked as its verifier does (Daimo's
+/// WebAuthn library, user verification not required; here ZeroDev's copy of it, through the P256 precompile). Tests
+/// put its code at Send's implementation address, behind Proxy1967.
+contract SendLike {
+    struct Signature { bytes authenticatorData; string clientDataJSON; uint256 challengeLocation; uint256 responseTypeLocation; uint256 r; uint256 s; }
+    address public entryPoint;
+    mapping(uint8 => bytes32[2]) public keys;
+    function init(address ep, uint8 slot, bytes32 x, bytes32 y) external { require(entryPoint == address(0), "initialized"); entryPoint = ep; keys[slot] = [x, y]; }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        bytes calldata sig = op.signature;
+        if (sig.length < 8 || uint8(sig[0]) != 1) return 1;
+        uint48 validUntil = uint48(bytes6(sig[1:7]));
+        uint8 slot = uint8(sig[7]);
+        Signature memory s = abi.decode(sig[8:], (Signature));
+        bool ok = WebAuthn.verifySignature(abi.encodePacked(uint8(1), validUntil, hash), s.authenticatorData, false, s.clientDataJSON, s.challengeLocation, s.responseTypeLocation, s.r, s.s, uint256(keys[slot][0]), uint256(keys[slot][1]), true);
+        return ok ? uint256(validUntil) << 160 : 1;
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory ret) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(ret, 32), mload(ret)) }
+    }
+    receive() external payable {}
+}

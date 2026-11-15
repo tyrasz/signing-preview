@@ -456,3 +456,57 @@ contract KernelEcdsaSignerMock {
         return RecoverMock.recover(hash, sig) == key || RecoverMock.recover(RecoverMock.eth(hash), sig) == key ? 0 : 1;
     }
 }
+/// Rhinestone's SmartSession using sessions whose validator is Rhinestone's OwnableValidator, in one contract (their
+/// verified sources): a signature of the mode (0x00, use; any other is no mode and reverts), the session's permission
+/// ID and its owners' signatures over the operation's hash as a message, a threshold of them in any order. Tests put
+/// its code at SmartSession's address.
+contract SmartSessionLike {
+    mapping(address => bytes32[]) ids;
+    mapping(address => mapping(bytes32 => bytes)) configs;
+    function enable(bytes32 id, uint256 threshold, address[] calldata owners) external { ids[msg.sender].push(id); configs[msg.sender][id] = abi.encode(threshold, owners); }
+    function getPermissionIDs(address account) external view returns (bytes32[] memory) { return ids[account]; }
+    function getSessionValidatorAndConfig(address account, bytes32 id) external view returns (address, bytes memory) { return (0x2483DA3A338895199E5e538530213157e931Bf06, configs[account][id]); }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash) external view returns (uint256) {
+        require(uint8(op.signature[0]) == 0, "UnsupportedSmartSessionMode");
+        bytes memory config = configs[op.sender][bytes32(op.signature[1:33])];
+        require(config.length > 0, "InvalidPermissionId");
+        (uint256 threshold, address[] memory owners) = abi.decode(config, (uint256, address[]));
+        bytes32 h = RecoverMock.eth(hash);
+        uint256 valid;
+        for (uint256 i = 0; i < threshold; i++) {
+            bytes calldata s = op.signature[33 + 65 * i:98 + 65 * i];
+            address a = ecrecover(h, uint8(s[64]), bytes32(s[0:32]), bytes32(s[32:64]));
+            for (uint256 j = 0; j < owners.length; j++) if (owners[j] == a) { valid++; break; }
+        }
+        return valid >= threshold ? 0 : 1;
+    }
+}
+/// Safe7579's validation (a Safe made an ERC-7579 account): the validator the nonce's top 20 bytes name is called
+/// with the operation, its revert reported as ExecutionFailed().
+contract Account7579 {
+    error ExecutionFailed();
+    address public entryPoint;
+    constructor(address ep) { entryPoint = ep; }
+    function enableSession(SmartSessionLike module, bytes32 id, uint256 threshold, address[] calldata owners) external { module.enable(id, threshold, owners); }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256 v) {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory ret) = validatorOf(op.nonce).call(abi.encodeCall(SmartSessionLike.validateUserOp, (op, hash)));
+        if (!ok) revert ExecutionFailed();
+        v = abi.decode(ret, (uint256));
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+    /// Safe7579's: the nonce's top 20 bytes.
+    function validatorOf(uint256 nonce) internal pure virtual returns (address) { return address(uint160(nonce >> 96)); }
+}
+/// Biconomy Nexus's validation, as Account7579's but for where its nonce names the validator: after 3 bytes of its own
+/// (which MEE varies) and a mode byte, before the 8-byte sequence.
+contract NexusLike is Account7579 {
+    constructor(address ep) Account7579(ep) {}
+    function validatorOf(uint256 nonce) internal pure override returns (address) { return address(uint160(nonce >> 64)); }
+}

@@ -5,11 +5,11 @@
 // Account v2, Bleap's cosigning module (verified on Sourcify), Pimlico's paymaster, a bridge's relaying paymaster
 // (UnrecycledBundle), Solady's SafeTransferLib (TransferFromFailed), Ostium's price upkeep (NotInitiated), and
 // NonAdminSelfCall and a Kernel execution hook's ModuleCallNotAllowed (OpenChain's signature database, from
-// verified contracts).
+// verified contracts), and Rhinestone's Safe7579 reporting a module's revert (ExecutionFailed, verified on Sourcify).
 import { decodeErrorResult, parseAbiItem, toFunctionSelector, type Abi, type Hex } from 'viem';
 
 export const KNOWN_ERRORS = [
-  'InvalidSignatureType()', 'BundlerNotAllowed(address)', 'UnrecycledBundle()', 'TransferFromFailed()', 'NotInitiated(uint256)', 'NonAdminSelfCall()', 'UserOpValidationFunctionReverted(bytes24,bytes)', 'ValidationFunctionMissing(bytes4)',
+  'InvalidSignatureType()', 'ExecutionFailed()', 'BundlerNotAllowed(address)', 'UnrecycledBundle()', 'TransferFromFailed()', 'NotInitiated(uint256)', 'NonAdminSelfCall()', 'UserOpValidationFunctionReverted(bytes24,bytes)', 'ValidationFunctionMissing(bytes4)',
   'InvalidValidator()', 'InvalidNonce()', 'ModuleCallNotAllowed(address)', 'OnlyExecuteUserOp()', 'InvalidValidationType()', 'PermissionNotAlllowedForUserOp()', 'NotRootPermission()',
   'ERC20InsufficientAllowance(address,uint256,uint256)', 'ERC20InsufficientBalance(address,uint256,uint256)', 'ERC20InvalidReceiver(address)', 'ERC20InvalidSpender(address)',
   'ReentrancyGuardReentrantCall()', 'AccessControlUnauthorizedAccount(address,bytes32)', 'EnforcedPause()', 'AboveMaximum()',
@@ -46,6 +46,7 @@ export const KNOWN_ERRORS = [
 /** What the most common ones mean for the person signing. */
 const MEANING: Record<string, string> = {
   InvalidSignatureType: "the signature isn't of a type the account takes",
+  ExecutionFailed: 'a call the account made failed (a Safe through Safe7579 reports a module that reverts so)',
   BundlerNotAllowed: 'the paymaster only pays for operations its own bundlers submit',
   UnrecycledBundle: 'the paymaster only pays for bundles sent through its own contract, which relays them to the EntryPoint',
   TransferFromFailed: 'a token transfer from the account failed: too little balance or allowance',

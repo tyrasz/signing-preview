@@ -410,7 +410,14 @@ interface Stub {
   storage?: Record<string, string>;
   /** Code set at other addresses for the run, and the ones among them to start warm (code moved there: not an account the chain would touch). */
   code?: Record<string, Hex>; warm?: string[];
+  /**
+   * Why the account may not take this stand-in as the signer's (who signs it instead, as far as the request tells):
+   * the preview says so where the account rejects it.
+   */
+  why?: string;
 }
+/** An address shortened for a note: its first and last four hex digits. */
+const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 /**
  * Another stand-in ECDSA signature in a stand-in, and whose ecrecover is to recover it as; with `digest`, only over
  * that digest (what that key signs: see ecrecoverAs), at first.
@@ -622,24 +629,36 @@ export function zeroDevWebAuthnStub(hash: Hex, usePrecompiled: boolean): Hex {
 const KERNEL = parseAbi(['function rootValidator() view returns (bytes21)', 'struct PermissionConfig { bytes1 permissionFlag; address signer; bytes22[] policyData; }', 'function permissionConfig(bytes4 pId) view returns (PermissionConfig)']);
 /**
  * Signers of Kernel permissions that take the owner's signature and then a cosigner's (65 bytes each), whose
- * cosigner() names that key: Bleap's CosigningModuleV2 (source verified on Sourcify, Base; the same address on
- * Arbitrum One).
+ * cosigner() names that key and signers(account, permission id) the owner: Bleap's CosigningModuleV2 (source verified
+ * on Sourcify, Base; the same address on Arbitrum One) and CosigningModuleV1 (verified on Sourcify, Arbitrum One and
+ * Base), the same layout and the same cosigner; V1's install data is the owner's 20 bytes, V2's abi.encode(owner).
+ * Bleap's accounts are deployed with V1 as their root permission, and their first operation moves the root to V2:
+ * deployments were 20 of 1,595 Arbitrum One v0.7 operations in two hours and 3 of 1,037 on BNB Chain (2026-11-15),
+ * every existing Bleap account's operation in those samples on V2. The owner and the cosigner sign the operation's
+ * hash as a message, which both modules check first (then the bare hash, for enable mode).
  */
-const COSIGNING_SIGNERS = new Set(['0x5b424d5133fae2ce64ce739cec0796343e957131']);
-const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
+const COSIGNING_SIGNERS = new Set(['0x5b424d5133fae2ce64ce739cec0796343e957131', '0x61576d9ef23514bfe6f080e22ccfff473cf11a1a']);
+const COSIGNER = parseAbi(['function cosigner() view returns (address)', 'function signers(address wallet, bytes32 id) view returns (address)']);
+/** The owner in a cosigning signer's install data: V2's abi.encode(owner), V1's the owner's 20 bytes. */
+export const cosigningOwner = (data: Hex): string | undefined => {
+  const hex = data.slice(2).toLowerCase();
+  const owner = hex.length === 40 ? `0x${hex}` : hex.length === 64 && /^0{24}/.test(hex) ? `0x${hex.slice(24)}` : undefined;
+  return owner && BigInt(owner) !== 0n ? owner : undefined;
+};
 /** ZeroDev's WebAuthnSigner, a Kernel permission's signer (source verified on Sourcify, Ethereum): its signature is zeroDevWebAuthnStub's form. */
 const ZERODEV_WEBAUTHN_SIGNERS = new Set(['0x65deec8fee717dc044d0cfd63ccf55f02ccac2b3']);
 const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
 /** What a Kernel v3 account being deployed is set up with: its root validator, and each validation its initialize() installs, with its install data. */
 export type KernelSetup = { root: Hex; installs: Map<string, Hex>; /** The Kernel implementation its factory deploys (implementation()). */ implementation?: string };
 /**
- * The signer of permission `pId` (4 bytes, no 0x) a deploying Kernel installs: its install data is abi.encode(bytes[]),
- * the policies, then the signer (each a 2-byte flag, the module's address, its own data).
+ * The signer of permission `pId` (4 bytes, no 0x) a deploying Kernel installs, and the signer's own install data: the
+ * permission's install data is abi.encode(bytes[]), the policies, then the signer (each a 2-byte flag, the module's
+ * address, its own data).
  */
-function setupPermissionSigner(setup: KernelSetup, pId: string): string | undefined {
+function setupPermissionSigner(setup: KernelSetup, pId: string): { module: string; data: Hex } | undefined {
   const data = setup.installs.get(`0x02${pId}${'00'.repeat(16)}`.toLowerCase());
   if (!data) return undefined;
-  try { const [items] = decodeAbiParameters([{ type: 'bytes[]' }], data); const last = items.at(-1); return last && last.length >= 2 + 44 ? `0x${last.slice(6, 46)}`.toLowerCase() : undefined; } catch { return undefined; }
+  try { const [items] = decodeAbiParameters([{ type: 'bytes[]' }], data); const last = items.at(-1); return last && last.length >= 2 + 44 ? { module: `0x${last.slice(6, 46)}`.toLowerCase(), data: `0x${last.slice(46)}` } : undefined; } catch { return undefined; }
 }
 /**
  * A Kernel v3 account ZeroDev's FactoryStaker is deploying: kernelV3Stub, with the root validator its initialize()
@@ -726,7 +745,7 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
       // A deploying account's permission: its signer from the install data (nothing to read on-chain yet).
       const installed = deploying && setupPermissionSigner(deploying, id.slice(0, 8));
       const out = installed ? undefined : await view(encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [`0x${id.slice(0, 8)}`] }));
-      const config = installed ? { signer: installed } : out && decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out });
+      const config = installed ? { signer: installed.module } : out && decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: out });
       // Policies before the signer each read their own part of the signature, tagged with their index; one that
       // starts with 0xff (the signer's) gives every policy an empty part, as these wallets' signatures do.
       // ZeroDev's WebAuthn signer: 0xff, then a passkey's assertion over the operation's hash, as its WebAuthn
@@ -735,10 +754,18 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
         const hash = await c.hash();
         if (hash) { const precompiled = await zeroDevPrecompiled(c); return [{ signature: `0xff${zeroDevWebAuthnStub(hash, precompiled).slice(2)}` as Hex, p256: precompiled || 'daimo' }]; }
       }
+      // Bleap's cosigning signers: 0xff, the owner's signature, then its cosigner's. The owner is the one the module
+      // records for the account (a deploying account's in its install data): where the signer asked isn't it, the
+      // stand-in recovers as someone the module doesn't take, and the preview names who signs.
       if (config && COSIGNING_SIGNERS.has(config.signer.toLowerCase())) {
-        const cosigner = String(await rpc.call(c.chainId, 'eth_call', [{ to: config.signer, data: encodeFunctionData({ abi: COSIGNER, functionName: 'cosigner' }) }, 'latest']));
-        if (/^0x0{24}[0-9a-f]{40}$/i.test(cosigner) && !/^0x0+$/.test(cosigner)) {
-          return [{ signature: `0xff${STUB_SIGNATURE.slice(2)}${STUB_COSIGNATURE.slice(2)}` as Hex, cosigners: [{ signature: STUB_COSIGNATURE, signer: `0x${cosigner.slice(26)}`.toLowerCase() }] }];
+        const module = config.signer.toLowerCase();
+        const word = (out: string) => /^0x0{24}[0-9a-f]{40}$/i.test(out) && !/^0x0+$/.test(out) ? `0x${out.slice(26)}`.toLowerCase() : undefined;
+        const [cosigner, owner] = await Promise.all([
+          rpc.call(c.chainId, 'eth_call', [{ to: module, data: encodeFunctionData({ abi: COSIGNER, functionName: 'cosigner' }) }, 'latest']).then(o => word(String(o))),
+          installed ? cosigningOwner(installed.data) : rpc.call(c.chainId, 'eth_call', [{ to: module, data: encodeFunctionData({ abi: COSIGNER, functionName: 'signers', args: [c.sender as Hex, `0x${id.slice(0, 8)}${'00'.repeat(28)}`] }) }, 'latest']).then(o => word(String(o)), () => undefined)]);
+        if (cosigner) {
+          return [{ signature: `0xff${STUB_SIGNATURE.slice(2)}${STUB_COSIGNATURE.slice(2)}` as Hex, cosigners: [{ signature: STUB_COSIGNATURE, signer: cosigner }],
+            ...(owner && owner !== c.signer.toLowerCase() && { why: `Bleap's cosigning module (${shortAddr(module)}) takes the signature of the owner it records for the account, ${owner}, with its cosigner's, and the signer asked isn't that owner` }) }];
         }
       }
     } catch { /* not readable: the ECDSA forms */ }
@@ -958,7 +985,7 @@ export async function kernelEnableStub(c: StubContext, e: KernelEnable, deployin
       } else if (signer && COSIGNING_SIGNERS.has(signer)) {
         // (Bleap's owners sign the typed data, the digest itself, which it checks second; its cosigner the
         // personal_sign form, checked first: 15 of 15 on Base.)
-        const [owner, cosigner] = (await Promise.all([installed ? decodeAbiParameters([{ type: 'address' }], installed.data)[0] : read(signer, 'signers', [c.sender, id]), read(signer, 'cosigner')])).map(address);
+        const [owner, cosigner] = (await Promise.all([installed ? cosigningOwner(installed.data) : read(signer, 'signers', [c.sender, id]), read(signer, 'cosigner')])).map(address);
         enableSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_OWNER, owner, await form(`0x${parts.signer.slice(2, 132)}`, owner, digest, 'hash')),
           ecdsa(ENABLE_OWNER_COSIGNER, cosigner, await form(`0x${parts.signer.slice(132, 262)}`, cosigner, digest, 'message'))]);
       } else return [];
@@ -980,7 +1007,7 @@ export async function kernelEnableStub(c: StubContext, e: KernelEnable, deployin
         userOpSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_KEY, key, await form(parts.signer, key, opHash, 'message'))]);
       } else if (entry && ZERODEV_PASSKEY_SIGNERS.has(entry.module)) userOpSig = concatHex([parts.policies, '0xff', await passkey(opHash, parts.signer)]);
       else if (entry && COSIGNING_SIGNERS.has(entry.module)) {
-        const key = address(decodeAbiParameters([{ type: 'address' }], entry.data)[0]), cosigner = address(await read(entry.module, 'cosigner'));
+        const key = address(cosigningOwner(entry.data)), cosigner = address(await read(entry.module, 'cosigner'));
         userOpSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_KEY, key, await form(`0x${parts.signer.slice(2, 132)}`, key, opHash, 'message')),
           ecdsa(ENABLE_KEY_COSIGNER, cosigner, await form(`0x${parts.signer.slice(132, 262)}`, cosigner, opHash, 'message'))]);
       } else return [];
@@ -1321,6 +1348,116 @@ async function bullbitStub(c: StubContext): Promise<Stub[]> {
   } catch { return [eoa]; }
 }
 
+// --- Send's account (SendAccount, verified on Sourcify, Base; based on Daimo's account) ---
+// A 1-of-n multisig of passkeys, each in a slot (keys(slot): its public key's x and y). validateUserOp takes
+//   version (0x01) | validUntil (uint48) | key slot (uint8) | abi.encode(authenticatorData, clientDataJSON,
+//   challengeLocation, responseTypeLocation, r, s)
+// any other version failing (so STUB_SIGNATURE's 0xff was refused before any check ran: on Base the operations came
+// out 11.6% low): the key's WebAuthn assertion, whose challenge is version | validUntil | the operation's hash,
+// base64url-encoded, checked by its verifier (SendVerifier, behind an upgradeable proxy; the WebAuthn library of its
+// published source checks the type and challenge where the assertion says they are, and the user's presence). The
+// implementation it runs now is unpublished; its code names both P256VERIFY and Daimo's verifier contract, and it
+// asks the precompile: its stand-in alone validates there. The stand-in is that assertion as Send's app makes it
+// (origin https://send.app, its RP ID's hash, user present, verified and backed up: the flags 0x1d its operations
+// carry), valid for a day, by the key in slot 0, else the slot the account's latest earlier operation used.
+export const SEND_IMPLEMENTATION = '0x13f091e58b60fd0bd8052b8e7045553d83d80de0';
+const SEND = parseAbi(['function keys(uint8 slot, uint256 i) view returns (bytes32)']);
+/** Send's stand-in signature for this operation's hash, by the key in `slot`, valid until `validUntil` (seconds). */
+export function sendStandIn(userOpHash: Hex, slot: number, validUntil: bigint): Hex {
+  const until = `0x${validUntil.toString(16).padStart(12, '0')}` as Hex;
+  const clientDataJSON = `{"type":"webauthn.get","challenge":"${base64url(concatHex(['0x01', until, userOpHash]))}","origin":"https://send.app","crossOrigin":false}`;
+  const authenticatorData = concatHex([sha256(stringToHex('send.app')), '0x1d', '0x00000000']);
+  // (Its Signature struct is webauthn-sol's WebAuthnAuth, the two locations under other names.)
+  return concatHex(['0x01', until, `0x${slot.toString(16).padStart(2, '0')}`, encodeAbiParameters([WEBAUTHN_AUTH],
+    [{ authenticatorData, clientDataJSON, challengeIndex: BigInt(clientDataJSON.indexOf('"challenge"')), typeIndex: BigInt(clientDataJSON.indexOf('"type"')), r: BigInt(P256_STUB.r), s: BigInt(P256_STUB.s) }])]);
+}
+async function sendStub(c: StubContext): Promise<Stub[]> {
+  // Its keys are passkeys, so a passkey wallet asks the account itself to sign (as Coinbase's, coinbaseFor). An
+  // Ethereum key isn't one of them: the plain stand-in, which the account refuses, and the preview says who signs.
+  if (c.signer !== c.sender) return [{ signature: STUB_SIGNATURE, why: "Send's account is signed by its passkeys (a passkey wallet signs as the account itself), and the signer asked isn't the account" }];
+  const hash = await c.hash();
+  if (!hash || !c.deps.rpc?.has(c.chainId)) return [{ signature: STUB_SIGNATURE }];
+  const keyAt = async (slot: number) => {
+    try { return BigInt(String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: SEND, functionName: 'keys', args: [slot, 0n] }) }, 'latest']))) !== 0n; } catch { return false; }
+  };
+  let slot = 0;
+  if (!await keyAt(0)) {
+    const last = await lastSignature({ ...c, match: s => s.startsWith('0x01') && s.length > 2 + 8 * 2, key: 'send' });
+    if (last) slot = parseInt(last.slice(16, 18), 16);
+  }
+  const validUntil = BigInt(Math.floor(Date.now() / 1000) + 86_400);
+  return [{ signature: sendStandIn(hash, slot, validUntil), p256: true }];
+}
+
+// --- Rhinestone's SmartSession (session keys for ERC-7579 accounts; both deployments verified on Sourcify, Arbitrum One) ---
+// An account validates through it when its nonce names it (Safe7579, the adapter that makes a Safe an ERC-7579
+// account, reads its validator from the nonce's top 20 bytes; Biconomy Nexus's and Kernel's nonces name it too). Its
+// signature is a mode byte (0x00: use a session the account has enabled), the session's permission ID (32 bytes), then
+// what the session's validator takes: Rhinestone's OwnableValidator's (a threshold of its owners' ECDSA signatures over
+// the operation's hash as a message, in any order) or another's. SmartSession first runs the session's policies on
+// the operation (each user-operation and action policy, for real), then the validator: STUB_SIGNATURE's 0xff is no mode
+// at all, and validation reverted (Safe7579 reports a validator's revert as ExecutionFailed(), AA23), so only the calls
+// were simulated. Such an operation is signed by the session's keys, not by the account's owners: a dApp's mostly (on
+// Arbitrum One in a day, 16 Safes' 34 operations through OwnableValidator sessions, all 2-of-2, each Safe's own key
+// and one shared cosigner; on Base 10 accounts' 18, 1-of-1 and 2-of-2; 2026-11-15).
+// The stand-in names the account's enabled session (getPermissionIDs) whose OwnableValidator owners include the signer,
+// with the signer's stand-in and other owners' (cosigners) to its threshold. Where none does, or its validator is
+// another, no one the request names can sign it: the stand-in is the first session's form, and the preview says who signs.
+const SMART_SESSIONS = new Set(['0x00000000002b0ecfbd0496ee71e01257da0e37de', '0x00000000008bdaba73cd9815d79069c247eb4bda']);
+/** Rhinestone's OwnableValidator (verified on Sourcify, Ethereum), as a session's validator: its config abi.encode(threshold, owners). */
+export const OWNABLE_VALIDATOR = '0x2483da3a338895199e5e538530213157e931bf06';
+/**
+ * Other session validators, by name: Biconomy's K1MeeValidator (verified on Sourcify, Arbitrum One and Base), whose
+ * signature is in its own modes (a supertransaction's Merkle root among them), the validator of most SmartSession
+ * operations seen (Arbitrum One: 671 of 705 in a day, 49 accounts; Base: 37 of 55, 16 accounts; 2026-11-15).
+ */
+const SESSION_VALIDATOR_NAMES: Record<string, string> = { '0x0000000031ef4155c978d48a8a7d4edba03b04fe': "Biconomy's K1MeeValidator" };
+const SMART_SESSION = parseAbi(['function getPermissionIDs(address account) view returns (bytes32[])', 'function getSessionValidatorAndConfig(address account, bytes32 permissionId) view returns (address sessionValidator, bytes sessionValidatorData)']);
+/**
+ * The SmartSession module an operation's nonce names (its 24-byte key), if any; not a Kernel in enable mode installing
+ * it (mode byte 0x01, the module in Kernel's validator slot after its mode and type bytes), whose signature carries
+ * the enable data (kernelEnableStub). Only there: Biconomy Nexus's key starts with 3 bytes of its own, which MEE
+ * varies, then its mode byte and the validator, and its first byte can be 0x01 too (Base, 0x0fb9…d93f).
+ */
+export const smartSessionOf = (nonce: bigint): string | undefined => {
+  const key = nonce.toString(16).padStart(64, '0');
+  const module = [...SMART_SESSIONS].find(m => key.slice(0, 48).includes(m.slice(2)));
+  return module && !(key.startsWith('01') && key.slice(4, 44) === module.slice(2)) ? module : undefined;
+};
+async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]> {
+  const bare: Stub = { signature: STUB_SIGNATURE, why: `it validates through Rhinestone's SmartSession (${shortAddr(module)}, which its nonce names), as a session key's operation whose signature names the session and carries its keys' signatures, and the account's sessions couldn't be read` };
+  const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
+  if (!rpc) return [bare];
+  const view = async <F extends 'getPermissionIDs' | 'getSessionValidatorAndConfig'>(functionName: F, args: readonly unknown[]) =>
+    decodeFunctionResult({ abi: SMART_SESSION, functionName, data: String(await rpc.call(c.chainId, 'eth_call', [{ to: module, data: encodeFunctionData({ abi: SMART_SESSION, functionName, args } as never) }, 'latest'])) as Hex } as never) as unknown;
+  try {
+    const ids = (await view('getPermissionIDs', [c.sender]) as readonly Hex[]).slice(0, 8);
+    if (!ids.length) return [{ ...bare, why: `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation, and the account has no session enabled` }];
+    const sessions = await Promise.all(ids.map(async id => {
+      const [validator, config] = await view('getSessionValidatorAndConfig', [c.sender, id]) as readonly [string, Hex];
+      let owners: string[] = [], threshold = 0;
+      if (validator.toLowerCase() === OWNABLE_VALIDATOR) {
+        try { const [t, o] = decodeAbiParameters([{ type: 'uint256' }, { type: 'address[]' }], config); threshold = Number(t); owners = o.map(a => a.toLowerCase()); } catch { /* not its config */ }
+      }
+      return { id, validator: validator.toLowerCase(), owners, threshold };
+    }));
+    const signer = c.signer.toLowerCase();
+    const mine = sessions.find(s => s.owners.includes(signer) && s.threshold > 0);
+    // The signer's stand-in, then other owners' to the threshold, each recovered as its owner (ecrecoverAsMany).
+    const form = (s: typeof sessions[number], signs: string | undefined) => {
+      const others = s.owners.filter(o => o !== signs).slice(0, Math.max(s.threshold - (signs ? 1 : 0), 0));
+      const cosigners = others.map((o, k) => ({ signature: stubSignature(k + 1), signer: o }));
+      return { signature: concatHex(['0x00', s.id, ...(signs ? [STUB_SIGNATURE] : []), ...cosigners.map(x => x.signature)]), ...(cosigners.length && { cosigners }) };
+    };
+    if (mine) return [form(mine, signer)];
+    const first = sessions.find(s => s.owners.length) ?? sessions[0];
+    const keys = first.owners.length ? `${first.threshold} of ${first.owners.map(shortAddr).join(', ')}` : undefined;
+    const why = `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by its session's keys${keys ? ` (${keys})` : ` (through ${SESSION_VALIDATOR_NAMES[first.validator] ?? `session validator ${shortAddr(first.validator)}`}, whose form the stand-in doesn't take)`}, not by the account's owners${keys ? ', and the signer asked isn\'t one of them' : ''}`;
+    // (Not the signer's: its stand-in, then all but one of the owners, so the session's check runs on as many signatures.)
+    return [{ ...(first.owners.length ? form(first, signer) : { signature: concatHex(['0x00', first.id, STUB_SIGNATURE]) }), why }];
+  } catch { return [bare]; }
+}
+
 // --- Splits' Smart Vault (verified source on Sourcify, Base) ---
 // A multi-signer account (EOAs and passkeys, by index, with a threshold). validateUserOp reads the signature's first
 // byte as its SignatureTypes enum: 0 for one operation, 1 for a Merkle tree of them, 2 (ERC-1271's) reverts, and
@@ -1424,6 +1561,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   [SHRINCS_IMPLEMENTATION]: shrincsStub, [SHRINCS_IMPLEMENTATION_2]: shrincsStub, [BULLBIT_IMPLEMENTATION]: bullbitStub,
   // Splits' Smart Vault (see splitsVaultStub).
   [SPLITS_VAULT_IMPLEMENTATION]: splitsVaultStub,
+  // Send's account (see sendStub).
+  [SEND_IMPLEMENTATION]: sendStub,
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
@@ -1452,6 +1591,11 @@ export async function implementationOf(deps: Dependencies, chainId: number, acco
 async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promise<Stub[]> {
   const factory = initCode && initCode.length >= 42 ? `0x${initCode.slice(2, 42)}`.toLowerCase() : undefined;
   if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)].flat();
+  // A session key's operation (an existing account validating through SmartSession, which its nonce names), whatever
+  // the account: SmartSession takes the signature as it is (not a Kernel in enable mode installing it, whose signature
+  // carries more: smartSessionOf leaves it out).
+  const session = !factory ? smartSessionOf(c.nonce) : undefined;
+  if (session) return smartSessionStub(c, session);
   const runs = delegate?.toLowerCase() ?? await implementationOf(c.deps, c.chainId, c.sender);
   const shape = runs ? STUB_SHAPES[runs] : undefined;
   return shape ? [await shape({ ...c, runs })].flat() : [{ signature: STUB_SIGNATURE }];
@@ -1661,6 +1805,8 @@ export interface OperationRun {
    * (Kernel's enable mode) the operation's own enable data with stand-ins for the owner's and the new key's signatures.
    */
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
+  /** Why the account may not take the stand-in as the signer's (Stub's `why`): said where it rejects it. */
+  why?: string;
   /** The `after` calls' results. */
   after?: SimulationResult[];
   /** What was simulated for `result` (and the `after` calls): for tracing it. */
@@ -1830,7 +1976,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const own = stub.cosigners?.some(c => c.digest);
   let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
   if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
-  return result && { ...result, standIn };
+  return result && { ...result, standIn, ...(stub.why && { why: stub.why }) };
   }
 }
 
