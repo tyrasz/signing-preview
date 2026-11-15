@@ -208,10 +208,15 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
   if (!sim) return null;
   // The calls, after `before` where there is any (their results left out).
   const pre = op.before ?? [];
-  const batch = async (reqs: SimulationRequest[]): Promise<(SimulationResult | null)[] | null> => pre.length
-    ? (sim.simulateBatch ? (await sim.simulateBatch([...pre, ...reqs]))?.slice(pre.length) ?? null : null)
-    : reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
+  // (The EntryPoint answers balanceOf with deposits: a simulator that reads it around the calls, where they or an
+  // operation before them name it, reports the account's deposit as a token's balance. It is no token but the
+  // account's own coin, as in a whole operation's changes (withoutGas, with no gas, which isn't paid here): what the
+  // calls give someone else of it is listed as the native coin sent, and what they keep in it isn't.)
+  const own = (r: SimulationResult | null) => r && { ...r, transfers: withoutGas(r, sender, entryPoint, 0n) };
+  const batch = async (reqs: SimulationRequest[]): Promise<(SimulationResult | null)[] | null> => (pre.length
+    ? (sim.simulateBatch ? (await sim.simulateBatch([...pre, ...reqs]))?.slice(pre.length) ?? null : null)
+    : reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null)?.map(own) ?? null;
   let data = op.callData;
   if (data.toLowerCase().startsWith(EXECUTE_USER_OP) && op.packed) {
     data = encodeFunctionData({ abi: PACKED, functionName: 'executeUserOp', args: [{ sender: sender as Hex, ...op.packed, callData: op.callData, signature: '0x' }, op.userOpHash ?? `0x${'00'.repeat(32)}`] });
@@ -329,6 +334,7 @@ const RESULT = [{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, {
 const USER_OPERATION_EVENT = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f';
 const USER_OPERATION_REVERT_REASON = '0x1c4fada7374c0a9ee8841fc38afe82932dc0f8e69012e927f061a8bae611a201';
 const POST_OP_REVERT_REASON = '0xf62676f440ff169a3a9afdbf812e89e7f95975ee8e5c31214ffdef631c5f4792';
+const STAKE_WITHDRAWN = '0xb7c918e0e249f999e965cafeb6c664271b3f4317d296461500e71da39f0cbda3'; // StakeWithdrawn(address indexed account, address withdrawAddress, uint256 amount), v0.6 to v0.9
 const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
 /** The simulated bundler when no other is known (simulateHandleOp doesn't check its caller; paymasters can check tx.origin, see recentBundlers). */
 const BUNDLER = '0x0000000000000000000000000000000000004337';
@@ -1997,7 +2003,7 @@ const BLOCK_RANGE_FLAG = 1n << 47n;
 export interface OperationRun {
   /** The bundler would reject the operation: the EntryPoint's reason ("AA21 didn't pay prefund"), with the revert inside it. */
   rejected?: string;
-  /** The operation ran: its effects for the account, without the gas prefund the account pays the EntryPoint. */
+  /** The operation ran: its effects for the account, without its gas (the native coin as its calls move it: withoutGas). */
   result: SimulationResult;
   /** Whether its calls succeeded (UserOperationEvent), and why they didn't. */
   executed: boolean; revertReason?: string;
@@ -2173,7 +2179,9 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const data = ep!.version === '0.6'
     ? encodeFunctionData({ abi: HANDLE_V06, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] })
     : encodeFunctionData({ abi: HANDLE, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] }); // v0.7 to v0.9: packed
-  const run = (bundler: string, recover: Hex) => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(price !== undefined && price > 0n && { gasPrice: price }), ...(op.watch?.length && { watch: op.watch }),
+  // (The EntryPoint is watched too: its balanceOf is the account's deposit, which is read around the run with the
+  // account's balance, for the coin its calls move: withoutGas.)
+  const run = (bundler: string, recover: Hex) => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(price !== undefined && price > 0n && { gasPrice: price }), watch: [entryPoint, ...(op.watch ?? []).filter(t => t.toLowerCase() !== entryPoint)],
     // The moved precompile is warm, as precompiles are (EIP-2929), so validation costs what it will.
     // An account the bundle delegates (EIP-7702) is warm from its authorization on, as the chain has it.
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] },
@@ -2250,6 +2258,49 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   }
 }
 
+/**
+ * A whole operation's transfers with the account's native coin as its calls move it, without the gas: `gas` is what
+ * the account's EntryPoint deposit pays for it (the operation's cost, unless a paymaster pays).
+ *
+ * The account's EntryPoint deposit counts as its own coin: the EntryPoint takes the gas from it, keeps there what is
+ * left of the prefund, and only the account can withdraw it. The account's balance alone also goes down by the
+ * prefund it pays in while it is validated (what the EntryPoint asks for, or more), which none of its calls do, and
+ * no simulator tells that payment apart from what its calls send: a balance read before and after (the local EVM's)
+ * nets the two into one change, and eth_simulateV1's transfer per call frame shows the prefund as the account sending
+ * the EntryPoint coin, as a deposit its calls make does. So where the simulator read both the account's balance and
+ * its deposit (readAssets: the EntryPoint answers balanceOf with deposits), the account's coin is what the two
+ * together changed by, plus the gas: what its calls sent and received, the coin of its deposit they gave someone
+ * else (depositTo another account, withdrawTo another address) included, and none they kept in it. It is listed as
+ * the simulator's own transfers between the account and others, and the rest as one between the account and the
+ * EntryPoint. Where it didn't read both (the amounts are the events'), the coin moving between the account and the
+ * EntryPoint is left out, as its deposit's. The deposit itself is no token: never listed as one.
+ *
+ * The account's stake (addStake) is not its deposit: it stays locked until unlockStake and a delay after it, so
+ * staking shows as the coin leaving its balance, and taking the stake back as the coin coming in. A stake withdrawn
+ * to any other address (withdrawStake) moves neither the account's balance nor its deposit, and the EntryPoint's own
+ * transfer isn't the account's: it is listed from the EntryPoint's StakeWithdrawn event, as coin the account sends,
+ * so that a drain of it shows. That needs no read, so it is listed either way.
+ */
+export function withoutGas(r: SimulationResult, account: string, entryPoint: string, gas: bigint): SimulationResult['transfers'] {
+  const withEntryPoint = (t: SimulationResult['transfers'][number]) => t.asset === 'native' && t.from !== t.to
+    && ((t.from === account && t.to === entryPoint) || (t.from === entryPoint && t.to === account));
+  const out = r.transfers.filter(t => t.asset !== entryPoint && !withEntryPoint(t));
+  const stake: SimulationResult['transfers'] = [];
+  for (const l of r.logs ?? []) {
+    if (l.address.toLowerCase() !== entryPoint || l.topics[0]?.toLowerCase() !== STAKE_WITHDRAWN || !l.topics[1] || `0x${l.topics[1].slice(26)}`.toLowerCase() !== account) continue;
+    try {
+      const [to, raw] = decodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], l.data as Hex);
+      if (to.toLowerCase() !== account && raw > 0n) stake.push({ asset: 'native', from: account, to: to.toLowerCase(), raw });
+    } catch { /* not the EntryPoint's event */ }
+  }
+  if (!r.readAssets?.includes('native') || !r.readAssets.includes(entryPoint)) return [...out, ...stake];
+  const net = (ts: SimulationResult['transfers'], asset: string) => ts.reduce((sum, t) => t.asset !== asset ? sum : sum + (t.to === account ? t.raw : 0n) - (t.from === account ? t.raw : 0n), 0n);
+  const rest = net(r.transfers, 'native') + net(r.transfers, entryPoint) + gas - net(out, 'native');
+  if (rest < 0n) out.push({ asset: 'native', from: account, to: entryPoint, raw: -rest });
+  else if (rest > 0n) out.push({ asset: 'native', from: entryPoint, to: account, raw: rest });
+  return [...out, ...stake];
+}
+
 async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, req: SimulationRequest, version: '0.6' | '0.7' | '0.8' | '0.9'): Promise<OperationRun | null> {
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
   if (op.at) req = { ...req, at: op.at };
@@ -2282,10 +2333,12 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   };
   const revertReason = success ? undefined : reason(USER_OPERATION_REVERT_REASON);
   const postOpReverted = reason(POST_OP_REVERT_REASON);
-  // The prefund the account pays the EntryPoint during validation is gas, shown as `paid` (the rest stays deposited).
-  // The EntryPoint answers balanceOf with deposits, so a balance read can list the deposit too: also gas.
-  const transfers = r.transfers.filter(t => !(t.asset === 'native' && t.from === sender && t.to === entryPoint) && t.asset !== entryPoint);
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData); // address 0 is none
+  // Without a paymaster, the gas is taken from the account's deposit (what it paid in during validation, the prefund,
+  // and what it held there before), and what's left of the prefund stays there. So it is with an account that is its
+  // own paymaster: the paymaster's deposit the gas comes from is the account's.
+  const ownDeposit = !paymaster || op.paymasterAndData.slice(0, 42).toLowerCase() === sender;
+  const transfers = withoutGas(r, sender, entryPoint, ownDeposit ? paid : 0n);
   return { result: { ...r, transfers }, executed: success, ...(revertReason && { revertReason }), ...(postOpReverted && { postOpReverted }),
     paid, gasUsed: actualGasUsed, account: validity(accountData), ...(paymaster && { paymaster: validity(paymasterData) }), ...(results!.length > 1 && { after: results!.slice(1) as SimulationResult[] }), requests };
 }

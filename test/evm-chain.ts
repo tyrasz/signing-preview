@@ -40,6 +40,8 @@ export interface TestChain {
   /**
    * Answer eth_simulateV1 too (off by default: the chain stands for one without it): blocks of calls run in order
    * on the chain's state, each block's code overrides applied before its calls, nothing kept afterwards.
+   * Asked with traceTransfers, each call's logs end with a node's pseudo-logs of the native coin it moved: one
+   * Transfer from 0xeeee…eeee per call frame that sent value and didn't fail.
    */
   simulateV1?: boolean;
   /** The chain's answer to eth_config (EIP-7910), when it has one. */
@@ -72,6 +74,10 @@ export async function testChain(): Promise<TestChain> {
     },
     fetchImpl: undefined as unknown as typeof fetch,
   };
+  // The block calls run in: ethereumjs's default one, at the chain's base fee (0, as eth_getBlockByNumber has it). With
+  // none, a call reading BASEFEE (an EntryPoint pricing an operation's gas) throws out of the EVM midway, which leaves
+  // what it had written in the chain's state.
+  const block = () => ({ header: { number: 0n, coinbase: at('0x0000000000000000000000000000000000000000'), timestamp: 0n, difficulty: 0n, prevRandao: new Uint8Array(32), gasLimit: 0n, baseFeePerGas: 0n, slotNumber: 0n, getBlobGasPrice: () => undefined } }) as never;
   const answer = async (method: string, params: unknown[]): Promise<{ result?: unknown; error?: { code: number; message: string; data?: string } }> => {
     chain.stats.calls[method] = (chain.stats.calls[method] ?? 0) + 1;
     const p = params as string[];
@@ -98,7 +104,7 @@ export async function testChain(): Promise<TestChain> {
           const from = tx.from ?? '0x0000000000000000000000000000000000000000', value = BigInt(tx.value ?? 0);
           const balance = (await sm.getAccount(at(from)))?.balance ?? 0n;
           if (value > balance) return { error: { code: -32000, message: `insufficient funds for gas * price + value: have ${balance} want ${value}` } };
-          const res = await evm.runCall({ caller: at(from), origin: at(from), to: at(tx.to), data: hexToBytes(tx.data as Hex), value, gasLimit: BigInt(tx.gas ?? 30_000_000) });
+          const res = await evm.runCall({ caller: at(from), origin: at(from), to: at(tx.to), data: hexToBytes(tx.data as Hex), value, gasLimit: BigInt(tx.gas ?? 30_000_000), block: block() });
           const ret = bytesToHex(res.execResult.returnValue);
           return res.execResult.exceptionError ? { error: { code: 3, message: 'execution reverted', data: ret } } : { result: ret };
         } finally {
@@ -108,7 +114,22 @@ export async function testChain(): Promise<TestChain> {
       case 'eth_config': return chain.config === undefined ? { error: { code: -32601, message: 'Method not found' } } : { result: chain.config };
       case 'eth_simulateV1': {
         if (!chain.simulateV1) return { error: { code: -32601, message: 'Method not found' } };
-        const [{ blockStateCalls }] = params as [{ blockStateCalls: { calls?: { from?: string; to?: string; data?: Hex; value?: string; gas?: string }[]; stateOverrides?: Record<string, { code?: Hex }> }[] }];
+        const [{ blockStateCalls, traceTransfers }] = params as [{ blockStateCalls: { calls?: { from?: string; to?: string; data?: Hex; value?: string; gas?: string }[]; stateOverrides?: Record<string, { code?: Hex }> }[]; traceTransfers?: boolean }];
+        // traceTransfers: the native coin each frame sent, kept with its parent's once the frame returns (a frame that
+        // fails takes its own and its callees' with it), as a node drops a failed frame's logs.
+        type Moved = { from: string; to: string; value: bigint };
+        const frames: Moved[][] = [], sent: Moved[] = [];
+        const entered = (m: { caller: { toString(): string }; to?: { toString(): string }; value: bigint; delegatecall: boolean }, next?: () => void) => {
+          frames.push(m.value > 0n && !m.delegatecall ? [{ from: m.caller.toString(), to: m.to?.toString() ?? '', value: m.value }] : []);
+          next?.();
+        };
+        const left = (r: { createdAddress?: { toString(): string }; execResult: { exceptionError?: unknown } }, next?: () => void) => {
+          const own = frames.pop() ?? [];
+          if (!r.execResult.exceptionError) { if (own[0] && !own[0].to && r.createdAddress) own[0].to = r.createdAddress.toString(); (frames.at(-1) ?? sent).push(...own); }
+          next?.();
+        };
+        const word = (v: bigint | string) => `0x${(typeof v === 'string' ? v.slice(2) : v.toString(16)).padStart(64, '0')}` as Hex;
+        if (traceTransfers) { evm.events!.on('beforeMessage', entered); evm.events!.on('afterMessage', left); }
         await sm.checkpoint();
         try {
           const blocks = [];
@@ -119,14 +140,21 @@ export async function testChain(): Promise<TestChain> {
             const calls = [];
             for (const c of b.calls ?? []) {
               const from = c.from ?? '0x0000000000000000000000000000000000000000';
-              const res = await evm.runCall({ caller: at(from), origin: at(from), ...(c.to && { to: at(c.to) }), data: hexToBytes(c.data ?? '0x'), value: BigInt(c.value ?? 0), gasLimit: BigInt(c.gas ?? 30_000_000) });
+              sent.length = 0;
+              // Each call is a transaction of its own: nothing warm from the calls before it (EIP-2929), and storage's
+              // "original" values taken afresh (EIP-2200), so a call costs the same gas wherever it runs in a block.
+              await evm.journal.cleanup();
+              (sm as { originalStorageCache?: { clear(): void } }).originalStorageCache?.clear();
+              const res = await evm.runCall({ caller: at(from), origin: at(from), ...(c.to && { to: at(c.to) }), data: hexToBytes(c.data ?? '0x'), value: BigInt(c.value ?? 0), gasLimit: BigInt(c.gas ?? 30_000_000), block: block() });
               const logs = (res.execResult.logs ?? []).map(([address, topics, data]) => ({ address: bytesToHex(address), topics: topics.map(t => bytesToHex(t)), data: bytesToHex(data) }));
+              if (traceTransfers && !res.execResult.exceptionError) for (const t of sent) logs.push({ address: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', word(t.from), word(t.to)], data: word(t.value) });
               calls.push({ status: res.execResult.exceptionError ? '0x0' : '0x1', returnData: bytesToHex(res.execResult.returnValue), gasUsed: `0x${res.execResult.executionGasUsed.toString(16)}`, logs });
             }
             blocks.push({ calls });
           }
           return { result: blocks };
         } finally {
+          if (traceTransfers) { evm.events!.removeListener('beforeMessage', entered); evm.events!.removeListener('afterMessage', left); }
           await sm.revert();
         }
       }

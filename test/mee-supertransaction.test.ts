@@ -37,7 +37,7 @@ const sweeper = await chain.deploy('Sweeper', '', []);
 await chain.putCode(EP, ENTRY_POINT_SIMULATIONS_V07 as Hex);
 await chain.putCode(fx.validator.address, fx.validator.code);
 await chain.putCode(SS, `0x${compiled('SmartSessionLike').evm.deployedBytecode.object}`);
-const A = parseAbi(['function mint(address,uint256)', 'function transfer(address,uint256)', 'function approve(address,uint256)', 'function transferFrom(address,address,uint256)', 'function deposit()',
+const A = parseAbi(['function mint(address,uint256)', 'function transfer(address,uint256)', 'function approve(address,uint256)', 'function transferFrom(address,address,uint256)', 'function deposit()', 'function withdraw(uint256)',
   'function execute(address,uint256,bytes)', 'function enableSessionWith(address,bytes32,address,bytes)', 'function sweep(address,address)', 'function onInstall(bytes)']);
 const call = (fn: string, args: unknown[]) => encodeFunctionData({ abi: A, functionName: fn, args } as never);
 const deps: Dependencies = {
@@ -134,6 +134,36 @@ test('Operations on one chain are simulated in the order they run: a send of wha
   const q = await sign(pair(hashOf(second), hashOf(first)), [{ operation: second }, { operation: first }]);
   assert.ok(!codes(q).includes('userop_execution_reverts') && !codes(q).includes('userop_rejected'), codes(q).join());
   assert.ok(q.assetChanges.some(c => c.direction === 'out' && c.symbol === 'WRAP' && c.amount === '0.25' && c.basis === 'simulated_state'), JSON.stringify(q.assetChanges));
+});
+
+test('Operations run in order list the native coin each one moves, without the gas prefunds they pay', async () => {
+  const n = await nexus(0x22);
+  await chain.exec(wrap, call('mint', [n, E]));
+  await chain.setBalance(wrap, 10n * E);
+  // Op 1 unwraps 1 WRAP (1 HYPE in), op 2 sends 1.5 HYPE to Bob: more than the account held before op 1. Op 2's gas
+  // comes partly from what op 1 left in the account's deposit, the rest from its balance.
+  const op1 = operation({ sender: n, nonce: nonceKey('569434'), callData: call('execute', [wrap, 0n, call('withdraw', [E])]) });
+  const op2 = operation({ sender: n, nonce: nonceKey('569435'), callData: call('execute', [BOB, 3n * E / 2n, '0x']) });
+  const p = await sign(pair(hashOf(op1), hashOf(op2)), [{ operation: op1 }, { operation: op2 }]);
+  assert.ok(!codes(p).includes('userop_execution_reverts'), codes(p).join());
+  assert.deepEqual(p.assetChanges.filter(c => c.asset === 'native').map(c => [c.direction, c.amount, c.basis]), [['in', '1', 'simulated_state'], ['out', '1.5', 'simulated_state']]);
+  assert.deepEqual(changes(p, 'WRAP'), ['out 1']);
+});
+
+test('An operation run whole after one run by its calls alone (from the EntryPoint) still lists the native coin it sends', async () => {
+  // Op 1 is another account's, whose validation reverts on any signature (AA23): only its calls run, sent from the
+  // EntryPoint. Op 2 wraps 0.5 HYPE. The local EVM didn't read the account's deposit around op 2 (it took the
+  // EntryPoint, op 1's sender, for an account rather than a token): only "in 0.5 WRAP" was listed.
+  const other = await chain.deploy('RevertingAccount', 'address', [EP]);
+  await chain.setBalance(other, E);
+  const n = await nexus(0x23);
+  const op1 = operation({ sender: other, callData: call('execute', [BOB, 1n, '0x']) });
+  const op2 = operation({ sender: n, nonce: nonceKey('569434'), callData: call('execute', [wrap, E / 2n, call('deposit', [])]) });
+  const p = await sign(pair(hashOf(op1), hashOf(op2)), [{ operation: op1 }, { operation: op2 }], { account: n });
+  assert.ok(p.decoding.notes.some(x => /^Operation 1 .*The operation's calls were simulated as the EntryPoint runs it/.test(x)), p.decoding.notes.join(' | '));
+  assert.ok(p.decoding.notes.some(x => /^Operation 2 .*The whole operation was simulated/.test(x)), p.decoding.notes.join(' | '));
+  const mine = p.assetChanges.filter(c => c.account === n).map(c => `${c.direction} ${c.amount} ${c.symbol} ${c.basis}`);
+  assert.deepEqual(mine.sort(), ['in 0.5 WRAP simulated_state', 'out 0.5 HYPE simulated_state']);
 });
 
 test('Past a chain’s first 8 operations, each is simulated alone (in order, the work grows with the square of their number), and one that fails so may depend on the others', async () => {

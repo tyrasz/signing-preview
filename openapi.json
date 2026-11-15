@@ -937,7 +937,7 @@
           },
           "asset": {
             "type": "string",
-            "description": "Token or collection address, or \"native\"."
+            "description": "Token or collection address, or \"native\". For an ERC-4337 operation (or a SafeOp) simulated whole, the native coin is what its calls send and receive, with the account's EntryPoint deposit counted as its own: the gas it pays (its prefund included) isn't among the changes, and is in the details (\"Gas cost (simulated)\")."
           },
           "basis": {
             "enum": [

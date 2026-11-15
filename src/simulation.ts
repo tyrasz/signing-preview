@@ -530,16 +530,19 @@ export class RpcSimulator implements Simulator {
     // 2026-11-15) is added as a transfer of its own, the logged ones kept for whom they name. Not for a blob call
     // (its blob gas is paid too), nor the block's fee recipient (paid the tips).
     const recipient = blockOverrides?.feeRecipient?.toLowerCase();
-    const unloggedNative = (p: SimulationResult, i: number, owner: string, x: bigint, y: bigint, gasUsed = p.gasUsed) => {
-      if (reqs[i].blobVersionedHashes?.length || owner === recipient) return;
+    // (Whether the owner's native transfers now add up to what its balance did: a call that read it, its readAssets.)
+    const unloggedNative = (p: SimulationResult, i: number, owner: string, x: bigint, y: bigint, gasUsed = p.gasUsed): boolean => {
+      if (reqs[i].blobVersionedHashes?.length || owner === recipient) return false;
       const fee = reqs[i].gasPrice !== undefined && reqs[i].from.toLowerCase() === owner ? (gasUsed ?? 0n) * reqs[i].gasPrice! : 0n;
       const logged = p.transfers.reduce((sum, t) => t.asset !== 'native' ? sum : sum + (t.to === owner ? t.raw : 0n) - (t.from === owner ? t.raw : 0n), 0n);
       const unlogged = y - x + fee - logged;
-      // (Elsewhere, too, for an account that isn't the call's sender, a UserOperation's: its call's target, the
-      // EntryPoint, is where its prefund goes, which the operation's preview leaves out as such.)
+      // (Elsewhere, too, for an account that isn't the call's sender, a UserOperation's: its call's target is the
+      // EntryPoint, and what the account pays the EntryPoint is for the operation's preview to tell apart, its
+      // prefund from its deposits: withoutGas, in src/erc4337-sim.ts.)
       const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner || owner !== reqs[i].from.toLowerCase() ? ELSEWHERE : to;
       if (unlogged < 0n) p.transfers.push({ asset: 'native', from: owner, to: target, raw: -unlogged });
       else if (unlogged > 0n) p.transfers.push({ asset: 'native', from: target, to: owner, raw: unlogged });
+      return true;
     };
     const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]);
     // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
@@ -562,8 +565,11 @@ export class RpcSimulator implements Simulator {
     const starved = !out || out.length !== calls.length ? /intrinsic gas too low/i.test((body as { error?: { message?: string } }).error?.message ?? '')
       : callIndex.some(differs) ? reqs.some(r => r.gas === undefined) : undefined;
     if (starved !== undefined) {
-      // (The native coin too, as below.)
-      const pairs = owners.flatMap(owner => [...[...new Set(logged)].filter(t => !skip(t) && !nftCollections.has(t)), 'native'].map(token => ({ owner, token })));
+      // (The native coin too, as below. And a whole UserOperation's EntryPoint: its request, run for the account from
+      // a bundler, watches its target, whose balanceOf is the account's deposit, which no event says the change of and
+      // the operation's preview counts as the account's coin: withoutGas, in src/erc4337-sim.ts.)
+      const deposits = reqs.filter(r => r.account && r.account.toLowerCase() !== r.from.toLowerCase() && r.to && r.watch?.some(w => w.toLowerCase() === r.to!.toLowerCase())).map(r => r.to!.toLowerCase());
+      const pairs = owners.flatMap(owner => [...[...new Set([...logged, ...deposits])].filter(t => !skip(t) && !nftCollections.has(t)), 'native'].map(token => ({ owner, token })));
       const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs, tag).catch(() => undefined) : undefined;
       if (!again) {
         if (!out) { const why = (body as { error?: { message?: string } }).error?.message ?? 'no answer'; for (const p of parsed) p.stateReadError = why; }
@@ -571,16 +577,19 @@ export class RpcSimulator implements Simulator {
       }
       parsed.forEach((p, i) => {
         if (p.status !== 'success') return;
+        const own = (reqs[i].account ?? reqs[i].from).toLowerCase(), readAssets: string[] = [];
         for (const { owner, token } of pairs) {
           const x = again.get(`${i}:${owner}:${token}`), y = again.get(`${i + 1}:${owner}:${token}`);
           if (x === undefined || y === undefined) continue;
-          if (token === 'native') { unloggedNative(p, i, owner, x, y); continue; }
+          if (token === 'native') { if (unloggedNative(p, i, owner, x, y) && owner === own) readAssets.push(token); continue; }
+          if (owner === own) readAssets.push(token);
           const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner ? ELSEWHERE : to;
           p.transfers = p.transfers.filter(t => t.asset !== token || (t.from !== owner && t.to !== owner));
           if (y < x) p.transfers.push({ asset: token, from: owner, to: target, raw: x - y });
           else if (y > x) p.transfers.push({ asset: token, from: target, to: owner, raw: y - x });
         }
         p.balancesRead = true;
+        p.readAssets = readAssets;
       });
       return;
     }
@@ -602,10 +611,12 @@ export class RpcSimulator implements Simulator {
     const read = (at: number, j: number) => again?.get(`${at}:${balances[at][j].owner}:${balances[at][j].token}`) ?? word(out[balances[at][j].index]);
     parsed.forEach((p, i) => {
       if (p.status !== 'success') return;
+      const own = (reqs[i].account ?? reqs[i].from).toLowerCase(), readAssets: string[] = [];
       for (const [j, b] of balances[i + 1].entries()) {
         if (isNft.has(b.token)) continue;
         const x = read(i, j), y = read(i + 1, j);
         if (x === undefined || y === undefined) continue; // balanceOf unreadable: keep the logs
+        if (b.owner === own) readAssets.push(b.token);
         // The balance difference replaces whatever the logs said about this token and owner.
         // A call to the account itself (an EIP-7702 account running its own batch) moved the tokens elsewhere.
         const to = (reqs[i].to ?? READER).toLowerCase(), target = to === b.owner ? ELSEWHERE : to;
@@ -616,9 +627,10 @@ export class RpcSimulator implements Simulator {
       // The native coin (unloggedNative).
       owners.forEach((owner, j) => {
         const x = word(out[natives[i][j]]), y = word(out[natives[i + 1][j]]);
-        if (x !== undefined && y !== undefined) unloggedNative(p, i, owner, x, y, BigInt(out[callIndex[i]].gasUsed));
+        if (x !== undefined && y !== undefined && unloggedNative(p, i, owner, x, y, BigInt(out[callIndex[i]].gasUsed)) && owner === own) readAssets.push('native');
       });
       p.balancesRead = true;
+      p.readAssets = readAssets;
     });
   }
 

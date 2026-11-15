@@ -568,6 +568,14 @@ export interface SimulationResult {
   standInsStale?: string[];
   /** The amounts were read from balances before and after the call (not taken from the logs). */
   balancesRead?: boolean;
+  /**
+   * The assets ('native', or a token's address) whose balance of the call's account (SimulationRequest.account, else
+   * its sender) was read before and after it, so that its amounts for them are the reads': an asset among them that
+   * no transfer lists didn't change. Set by simulators that read balances (the local EVM; eth_simulateV1's reads
+   * after the call). An ERC-4337 operation's preview counts on it for the account's EntryPoint deposit, which no
+   * event says the change of.
+   */
+  readAssets?: string[];
   /** Why the balances and allowances couldn't be read after the call (the node's answer), when they couldn't: its amounts are then its events'. */
   stateReadError?: string;
   /** The call's trace and the state it changed, when the request asked for them and the simulator can (see SimulationRequest.trace). */

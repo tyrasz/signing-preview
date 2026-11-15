@@ -1740,8 +1740,11 @@ export class ForkSimulator implements Simulator {
     const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and
-    // Withdrawal, not Transfer, so logs alone miss the wrapped token.
-    const skip = (a: string) => reqs.some(r => hexOf(r.from) === a || (r.account && hexOf(r.account) === a)) || a === ZERO || BigInt(a) < 0x10000n;
+    // Withdrawal, not Transfer, so logs alone miss the wrapped token. The accounts whose balances are read aren't
+    // tokens (as eth_simulateV1's reads have it), but a call's sender for another account is none of them: an
+    // operation's calls alone are run from its EntryPoint, and an operation run whole after them needs the EntryPoint
+    // read, for its account's deposit (withoutGas, in src/erc4337-sim.ts).
+    const skip = (a: string) => reqs.some(r => hexOf(r.account ?? r.from) === a) || a === ZERO || BigInt(a) < 0x10000n;
     const tokens = new Set<string>((this.opts.watchTokens ? [
       ...reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(hexOf).slice(0, 40),
       ...builtinTokens(chainId).map(t => hexOf(t.address)),
@@ -2546,6 +2549,8 @@ export class ForkSimulator implements Simulator {
       }
       // ERC-721 contracts count NFTs in balanceOf; those are shown per token ID from their Transfer events instead.
       const nftLogs = new Set(logs.filter(l => l.topics[0] === TRANSFER && l.topics.length === 4).map(l => hexOf(l.address)));
+      // (The native coin is always read: above.)
+      const read = ['native'];
       for (const t of new Set([...watch, ...logNet.keys()])) {
         if (t === 'native' || nftLogs.has(t) || await state.stylus(t)) { if (t !== 'native' && !nftLogs.has(t)) add(t, logNet.get(t) ?? 0n); continue; }
         if (await isNft(t)) continue;
@@ -2553,6 +2558,7 @@ export class ForkSimulator implements Simulator {
         const b = before.has(t) ? before.get(t) : i === 0 ? await balanceBefore(t, from) : undefined;
         const a = before.has(t) || i === 0 ? await balanceOf(t, from) : undefined;
         // The balance read wins; a token whose balanceOf can't be read keeps its log amounts.
+        if (b !== undefined && a !== undefined) read.push(t);
         add(t, b !== undefined && a !== undefined ? a - b : (logNet.get(t) ?? 0n));
       }
       const approvalState: SimulatedApproval[] = [];
@@ -2562,7 +2568,7 @@ export class ForkSimulator implements Simulator {
         const s = r && decodeState(ap, bytesToHex(r) as Hex);
         if (s) approvalState.push(s);
       }
-      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })),
+      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', readAssets: read, returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })),
         ...(traced?.trace && { trace: traced.trace, stateChanges: traced.stateChanges }) });
       await settle();
     }

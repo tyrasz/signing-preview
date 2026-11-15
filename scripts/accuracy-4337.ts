@@ -30,7 +30,8 @@
 // 0.05%). It is compared with the receipt: the outcome, whether the
 // operation ran whole, whether the account accepted the stand-in signature, the gas it paid (UserOperationEvent's
 // actualGasCost) and the token movements of the account (and of any other account the preview shows: a Safe it runs a
-// transaction on; scripts/userop-tokens.ts).
+// transaction on; scripts/userop-tokens.ts). The native coin its calls moved is reported beside them, not judged:
+// what the account's balance and EntryPoint deposit together did across the block, plus the gas the deposit paid.
 //
 // The signer isn't on the chain: it is the account itself for an EIP-7702 account, else whoever the operation's
 // real signature recovers to (its last 65 bytes, or a Coinbase Smart Wallet's wrapped one), over the personal_sign
@@ -105,6 +106,7 @@ const OP = VERSION === '0.6'
 const HANDLE_OPS = parseAbi([`function handleOps(${OP}[] ops, address beneficiary)`]);
 type Op = { sender: Hex; nonce: bigint; initCode: Hex; callData: Hex; callGasLimit?: bigint; verificationGasLimit?: bigint; accountGasLimits?: Hex; preVerificationGas: bigint; maxFeePerGas?: bigint; maxPriorityFeePerGas?: bigint; gasFees?: Hex; paymasterAndData: Hex; signature: Hex };
 const UOE = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f';
+const STAKE_WITHDRAWN = '0xb7c918e0e249f999e965cafeb6c664271b3f4317d296461500e71da39f0cbda3'; // StakeWithdrawn(address indexed account, address withdrawAddress, uint256 amount)
 /** EntryPoint's BeforeExecution(): the end of a bundle's validation, from v0.6 on. */
 const BEFORE_EXECUTION = '0xbb47ee3e183a558b1a2ff0874b079f3fc5478b7454eacf2bfc5af2ff5878f972';
 /** Whether a contract answers decimals(), as a token does (remembered for the run). */
@@ -713,6 +715,37 @@ async function replay(item: string): Promise<void> {
     }
     if (byReplay) tokenMatch = matchOf();
   }
+  // The native coin: what the preview shows the account's calls moving (its EntryPoint deposit counted as its own,
+  // without the gas: src/erc4337-sim.ts withoutGas), against what its balance and its deposit together did across the
+  // block, plus the gas the deposit paid (unless a paymaster paid it). Reported, not judged: the block's other
+  // transactions can move the account's coin too. Said where they may have: another operation of the account's in the
+  // block, or a bundle the account sends itself (an EIP-7702 account paying the transaction's fee, perhaps its own
+  // beneficiary).
+  let native: Row | undefined;
+  if (ran(p)) {
+    const simulated = (p.assetChanges ?? []).filter(c => c.asset === 'native' && c.basis !== 'requested' && (c.account ?? sender).toLowerCase() === sender)
+      .reduce((sum, c) => sum + (c.direction === 'out' ? -1n : 1n) * BigInt(c.raw ?? '0'), 0n);
+    const holds = async (tag: string) => {
+      try {
+        const [balance, deposit] = await Promise.all([call<string>('eth_getBalance', [sender, tag]), call<string>('eth_call', [{ to: EP, data: `0x70a08231${sender.slice(2).padStart(64, '0')}` }, tag])]);
+        return BigInt(balance) + BigInt(deposit);
+      } catch { return undefined; }
+    };
+    const [was, is] = [await holds(parent), await holds(r.blockNumber)];
+    // (An account that is its own paymaster pays its gas from its own deposit, as with none.)
+    const sponsored = !!paymaster && !/^0x0{40}$/.test(paymaster) && paymaster !== sender;
+    // Its stake withdrawn to another address leaves neither its balance nor its deposit: the preview lists it as sent,
+    // from the EntryPoint's StakeWithdrawn event (withoutGas), and so it is counted here, from the receipt's.
+    const staked = r.logs.filter(l => isEp(l) && l.topics[0] === STAKE_WITHDRAWN && `0x${l.topics[1].slice(26)}` === sender && `0x${l.data.slice(26, 66)}`.toLowerCase() !== sender)
+      .reduce((sum, l) => sum + BigInt(`0x${l.data.slice(66, 130)}`), 0n);
+    const others = await call<unknown[]>('eth_getLogs', [{ address: EP, topics: [UOE, null, `0x${sender.slice(2).padStart(64, '0')}`], fromBlock: r.blockNumber, toBlock: r.blockNumber }]).then(l => l.length - 1, () => undefined);
+    const mixed = others === undefined ? 'its other operations in the block unknown' : others > 0 ? `${others} other operation${others === 1 ? '' : 's'} of the account's in the block`
+      : tx.from.toLowerCase() === sender || beneficiary.toLowerCase() === sender ? 'the account sends its own bundle' : undefined;
+    if (was !== undefined && is !== undefined) {
+      const actual = is - was + (sponsored ? 0n : actualGasCost) - staked;
+      native = { simulated: simulated.toString(), actual: actual.toString(), match: simulated === actual ? 'exact' : 'other', ...(mixed && { mixed }) };
+    }
+  }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session, sessionValidator }),
@@ -728,6 +761,7 @@ async function replay(item: string): Promise<void> {
     // events', which the preview's note says, with the node's answer (src/evm/transaction.ts simulationNote).
     ...(unread && { unread }),
     tokens: tokens.length && ran(p) ? tokenMatch : undefined, tokenDiffs: tokenMatch === 'exact' || !ran(p) ? undefined : tokens.filter(t => t.actual !== t.simulated),
+    ...(native && (native.simulated !== '0' || native.actual !== '0') && { native }),
   });
   const row = rows.at(-1)!;
   // Run a second after its block (BNB Chain, above): its gas isn't judged, and an outcome that differs is reported.
@@ -853,11 +887,14 @@ if (count(r => !!r.session)) say(`  session keys' operations (SmartSession): ${c
 if (count(r => !!r.enableMode)) say(`  Kernel's enable mode (previewed with ${ENABLE_DUMMIES ? "the SDK's dummies for" : 'their own'} signatures): ${count(r => !!r.enableMode)}, the stand-in validated for ${count(r => !!r.enableMode && r.standIn === 'validated')}${count(r => r.standIn === 'as signed') ? `, run with the signatures as they were for ${count(r => r.standIn === 'as signed')} (no stand-in made)` : ''}`);
 say(`  gas paid (for ${count(r => !!(g(r) as { gasless?: boolean } | undefined)?.gasless)} gasless operations, the gas used), of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
+const nat = (r: Row) => r.native as { simulated: string; actual: string; match: string; mixed?: string } | undefined;
+say(`  the native coin its calls move (reported, not judged), of ${count(r => !!nat(r))} that moved some: exact ${count(r => nat(r)?.match === 'exact')}, other ${count(r => nat(r)?.match === 'other')} (of which ${count(r => nat(r)?.match === 'other' && !!nat(r)!.mixed)} where the block may have moved it otherwise)`);
 if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's contract (${count(r => !!r.relayedBy)}), gas reported but not judged: of ${count(r => !!bg(r))}, within 0.5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) < 0.5)}, 5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 0.5 && Math.abs(bg(r)!.percent) < 5)}, more ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 5)}`);
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`].filter(Boolean);
+    r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`,
+    nat(r)?.match === 'other' && `native coin: simulated ${nat(r)!.simulated}, actual ${nat(r)!.actual}${nat(r)!.mixed ? ` (${nat(r)!.mixed})` : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 

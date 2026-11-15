@@ -242,6 +242,26 @@ contract TokenPaymaster {
         token.transferFrom(abi.decode(context, (address)), address(this), actualGasCost / 1e9 + 1);
     }
 }
+/// An account that is its own paymaster: the gas comes out of its own EntryPoint deposit, as a paymaster's does.
+contract SelfPaymasterAccount is Account4337 {
+    constructor(address o, address ep) Account4337(o, ep) {}
+    function validatePaymasterUserOp(PackedUserOperation calldata, bytes32, uint256) external view returns (bytes memory, uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        return ("", 0);
+    }
+}
+/// An account whose validation reverts whatever the signature (a stand-in's too: AA23), so that only its calls run.
+contract RevertingAccount {
+    address public entryPoint;
+    constructor(address ep) { entryPoint = ep; }
+    function validateUserOp(PackedUserOperation calldata, bytes32, uint256) external pure returns (uint256) { revert("no signature will do"); }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
 /// A contract that works by the transaction's priority fee (tx.gasprice above the base fee), as a pool taxing
 /// swaps by it does: here it only runs for a tip of at least `atLeast`.
 contract TipReader {

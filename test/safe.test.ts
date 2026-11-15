@@ -723,3 +723,43 @@ test('A SafeOp is simulated on the state the caller set: the whole operation ben
   assert.equal(set.asked.find(rs => rs[0].to === OP_SAFE && rs[0].from === EP7)![0].stateOverrides?.[OP_SAFE]?.balance, `0x${(5n * E).toString(16)}`);
   assert.ok(set.reads.some(p => (p[0] as { data: string }).data === '0xa0e67e2b' && (p[2] as Record<string, unknown>)?.[OP_SAFE]));
 });
+
+test('A SafeOp run whole lists the native coin its calls send, without the gas prefund the Safe pays the EntryPoint', async () => {
+  const { encodeAbiParameters: enc } = await import('viem');
+  const E = 10n ** 18n, OP_SAFE = SAFE_OP_V03.message.safe.toLowerCase(), EP7 = SAFE_OP_V03.message.entryPoint;
+  const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const view = (data: string) => {
+    const sel = data.slice(0, 10);
+    if (sel === '0xa619486e') return enc([{ type: 'address' }], [SINGLETON]);
+    if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [OWNERS as Hex[]]);
+    if (sel === '0xe75235b8') return word(2n);
+    if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[SAFE_OP_V03.domain.verifyingContract.toLowerCase() as Hex], '0x0000000000000000000000000000000000000001']);
+    if (sel === '0x5624b25b') return enc([{ type: 'bytes' }], [`0x${'00'.repeat(32)}`]);
+    if (sel === '0x35567e1a') return word(BigInt(SAFE_OP_V03.message.nonce));
+    return word(1n);
+  };
+  // The EntryPoint's run as a local EVM reports it: the Safe's balance read before and after (the prefund it paid in
+  // validation and the 0.5 ETH its call sent, together), and its EntryPoint deposit (what's left of the prefund).
+  const PREFUND = 3n * 10n ** 14n, PAID = 10n ** 14n;
+  const ran = (success: boolean) => ({ status: 'success' as const, source: 'mock', basis: 'fork' as const, readAssets: ['native', EP7],
+    transfers: [{ asset: 'native', from: OP_SAFE, to: EP7, raw: PREFUND + (success ? E / 2n : 0n) }, { asset: EP7, from: EP7, to: OP_SAFE, raw: PREFUND - PAID }],
+    returnData: enc([{ type: 'tuple', components: [{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }, { type: 'bytes' }] }], [[100_000n, PAID, 0n, 0n, false, '0x']]),
+    logs: [{ address: EP7, topics: ['0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f', `0x${'11'.repeat(32)}`, `0x${OP_SAFE.slice(2).padStart(64, '0')}`, `0x${'0'.repeat(64)}`],
+      data: enc([{ type: 'uint256' }, { type: 'bool' }, { type: 'uint256' }, { type: 'uint256' }], [BigInt(SAFE_OP_V03.message.nonce), success, PAID, 100_000n]) }] });
+  const env = (success: boolean): Dependencies => {
+    // (The reads of the Safe's setup after the run answer as before it.)
+    const answer = (r: SimulationRequest) => r.to === EP7 ? ran(success) : { status: 'success' as const, source: 'mock', transfers: [], returnData: view(r.data) };
+    return { ...deps, rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? view((p[0] as { data: string }).data) : m === 'eth_getCode' ? '0x6080' : m === 'eth_getStorageAt' ? word(0n) : null },
+      simulator: { simulate: async r => answer(r), simulateBatch: async rs => rs.map(answer) } };
+  };
+  const sendHalf = { callData: encodeFunctionData({ abi: parseAbi(['function executeUserOp(address to, uint256 value, bytes data, uint8 operation)']), functionName: 'executeUserOp', args: [BOB, E / 2n, '0x', 0] }) };
+  const run = (d: Dependencies) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNERS[0], JSON.stringify({ ...SAFE_OP_V03, message: { ...SAFE_OP_V03.message, ...sendHalf } })] }, { now: NOW }, d);
+  const native = (p: Awaited<ReturnType<typeof sign>>) => p.assetChanges.filter(c => c.asset === 'native').map(c => [c.direction, c.amount, c.basis]);
+  const p = await run(env(true));
+  assert.match(p.decoding.notes.join(' '), /The whole operation was simulated as EntryPoint v0\.7 runs it/);
+  assert.deepEqual(native(p), [['out', '0.5', 'simulated_state']]);
+  // Its call failing: only the gas is paid, and nothing is listed as simulated.
+  const failed = await run(env(false));
+  assert.ok(codes(failed).includes('userop_execution_reverts'), codes(failed).join());
+  assert.deepEqual(native(failed).filter(c => c[2] !== 'requested'), []);
+});
