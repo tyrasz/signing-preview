@@ -615,6 +615,67 @@
               }
             }
           },
+          "meeOperations": {
+            "type": "array",
+            "description": "For personal_sign (or eth_sign) of a Biconomy MEE supertransaction's hash (the root of a Merkle tree of its UserOperations' hashes, on any chains, none of which the message shows): the operations, as the wallet's quote holds them, each with its chain, its EntryPoint (v0.6 or v0.7) and the operation as bundlers' RPC carries it (at most 64). The root is rebuilt from their hashes (or, from an operation's proof, shown to be among its leaves); each is then previewed whole on its chain, signed as one of the supertransaction's (K1MeeValidator's simple mode, with the root and its proof: only a K1MeeValidator session's operation, through SmartSession, takes that signature here; any other account's is shown not accepting it). Operations that don't make up the root, or whose proofs don't reach it, are a danger mismatch; operations shown by their proofs alone carry a danger that the root covers others. Takes precedence over userOperation.",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "required": [
+                "chainId",
+                "entryPoint",
+                "operation"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "chainId": {
+                  "type": "integer"
+                },
+                "entryPoint": {
+                  "type": "string",
+                  "pattern": "^0x[0-9a-fA-F]{40}$"
+                },
+                "operation": {
+                  "type": "object",
+                  "description": "The operation as bundlers' RPC carries it (v0.6 fields, or v0.7's with factory/factoryData and the paymaster's fields unpacked). A signature in it is left out."
+                },
+                "proof": {
+                  "type": "array",
+                  "description": "The hashes that take this operation's leaf to the root (OpenZeppelin's MerkleProof), for a wallet that holds only some of the supertransaction's operations.",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^0x[0-9a-fA-F]{64}$"
+                  }
+                },
+                "lowerBoundTimestamp": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$"
+                    }
+                  ],
+                  "description": "With upperBoundTimestamp: the operation's leaf is MEE's hash of its hash and these (an operation its account's own K1MeeValidator checks); without them, its hash (a session key's, through SmartSession)."
+                },
+                "upperBoundTimestamp": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$"
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "trace": {
             "type": "boolean",
             "description": "Also return the simulated call's trace (the calls it makes, decoded, with their events) and the state it changes, as `trace` in the preview. It takes a second run, in a local EVM over the chain's state, so it is off unless asked for."

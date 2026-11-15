@@ -183,6 +183,185 @@ test('A quiet paymaster that only pays for its own bundlers: its last bundles ar
   assert.deepEqual(polygon.windows, [[0, 200], [0, 2000], [0, 10_000], [0, 20_000], [10_000, 20_000], [20_000, 30_000]]);
 });
 
+// A factory whose accounts only deploy for its own bundler (BundlerFactory, as OKX Wallet's on Ethereum), one for each
+// case (what a lookup finds is remembered by factory): the account it deploys, and a preview of the operation.
+const ACCOUNT_DEPLOYED = '0xd51a9c61267aa6196961883ecf5ff2da6619c37dac0fa92122513fb32c032d2d';
+const ELSEWHERE = '0xb0d1e70000000000000000000000000000034337';
+const factoryData = encodeFunctionData({ abi: parseAbi(['function createAccount(address owner, uint256 salt)']), functionName: 'createAccount', args: [OWNER as Hex, 5n] });
+async function bundlerFactory(allowed: string) {
+  const { compiled } = await import('./evm-chain.ts');
+  const { encodeAbiParameters, getContractAddress } = await import('viem');
+  // The SenderCreator (the EntryPoint's first creation) calls the factory, as on-chain.
+  await chain.putCode(getContractAddress({ from: EP as Hex, nonce: 1n }), `0x${compiled('SenderCreatorLike').evm.deployedBytecode.object}`);
+  const factory = await chain.deploy('BundlerFactory', 'address,address', [EP, allowed]);
+  const fresh = getContractAddress({ opcode: 'CREATE2', from: factory as Hex, salt: numberToHex(5n, { size: 32 }),
+    bytecode: concatHex([`0x${compiled('Account4337').evm.bytecode.object}`, encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [OWNER as Hex, EP as Hex])]) }).toLowerCase();
+  await chain.exec(usdc, call('mint', [fresh, 100_000_000n]));
+  await chain.setBalance(fresh, E);
+  const op = operation({ sender: fresh, factory, factoryData, verificationGasLimit: '0xf4240' });
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  const run = (d: Dependencies) => previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, d);
+  return { factory, fresh, run };
+}
+/**
+ * A node with recent deployments at `head`: `senders` sent this factory's, one each, and ELSEWHERE another factory's
+ * (whose logs are skipped). Its log reads (and their windows, as [newest, oldest] blocks back) and the transactions
+ * it was asked for.
+ */
+function deploymentsNode(factory: string, senders: string[], head = 0x100) {
+  const lookups: any[] = [], windows: [number, number][] = [], fetched: string[] = [];
+  const word = (a: string) => `0x${'00'.repeat(12)}${a.slice(2)}`;
+  const rpc = { has: (c: number) => deps.rpc!.has(c), call: async (c: number, m: string, ps: any[]) => {
+    if (m === 'eth_blockNumber') return numberToHex(head);
+    if (m === 'eth_getLogs') {
+      lookups.push(ps[0]);
+      windows.push([head - Number(BigInt(ps[0].toBlock)), head - Number(BigInt(ps[0].fromBlock))]);
+      return ps[0].topics[0] === ACCOUNT_DEPLOYED ? [{ transactionHash: `0x${'0e'.repeat(32)}`, data: `${word(ELSEWHERE)}${'00'.repeat(32)}` },
+        ...senders.map((_, i) => ({ transactionHash: `0x${(i + 1).toString(16).padStart(64, '0')}`, data: `${word(factory)}${'00'.repeat(32)}` }))] : [];
+    }
+    if (m === 'eth_getTransactionByHash') { fetched.push(ps[0]); return { from: ps[0] === `0x${'0e'.repeat(32)}` ? ELSEWHERE : senders[Number(BigInt(ps[0])) - 1], input: '0x' }; }
+    return deps.rpc!.call(c, m, ps);
+  } } as Dependencies['rpc'];
+  return { rpc, lookups, windows, fetched };
+}
+/** The test chain's simulator, answering no run sent by `failing` (null, as a node under load does), and who sent each run of an operation. */
+function simulatorFailing(failing: string[] = []) {
+  const real = deps.simulator!, sent: string[] = [];
+  const fails = (rs: SimulationRequest[]) => {
+    for (const r of rs) if (r.to && [EP, EP6, EP8, EP9].includes(r.to.toLowerCase())) sent.push(r.from.toLowerCase());
+    return rs.some(r => failing.includes(r.from.toLowerCase()));
+  };
+  const simulator = { ...real, simulate: (r: SimulationRequest) => (fails([r]) ? Promise.resolve(null) : real.simulate(r)),
+    simulateBatch: (rs: SimulationRequest[]) => (fails(rs) ? Promise.resolve(null) : real.simulateBatch!(rs)) } as unknown as Dependencies['simulator'];
+  return { simulator, sent };
+}
+const rejectedOf = (p: Preview) => p.warnings.find(w => w.code === 'userop_rejected')?.message ?? '';
+
+test('A factory whose accounts only deploy for its own bundler: the operation runs as a bundler its recent deployments came through', async () => {
+  const { simulateExecution } = await import('../src/erc4337-sim.ts');
+  const ALLOWED = '0xb0d1e70000000000000000000000000000024337', OTHER = '0xb0d1e70000000000000000000000000000044337', LATER = '0xb0d1e70000000000000000000000000000084337';
+  const { factory, fresh, run } = await bundlerFactory(ALLOWED);
+  // No deployments to look in: as the simulation's own bundler, deploying the account fails, and that stands.
+  const alone = await run(deps);
+  assert.match(rejectedOf(alone), /deploying the account fails \(AA13/);
+  assert.doesNotMatch(rejectedOf(alone), /fails the same way/);
+  // Its deployments came through ALLOWED: the operation runs as it, and the preview says so.
+  const found = deploymentsNode(factory, [ALLOWED]);
+  const accepted = await run({ ...deps, rpc: found.rpc });
+  assert.equal(rejectedOf(accepted), '', codes(accepted).join());
+  assert.ok(accepted.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.7 runs it: deploying the account through its factory/.test(n)), accepted.decoding.notes.join(' | '));
+  assert.ok(accepted.decoding.notes.some(n => n.startsWith(`Simulated as sent by ${ALLOWED}, a bundler that recently deployed accounts through this account's factory: sent by anyone else`) && /\(AA13 initCode failed or OOG/.test(n)), accepted.decoding.notes.join(' | '));
+  assert.deepEqual(usdcChange(accepted), ['out 50']);
+  // The lookup reads the EntryPoint's AccountDeployed logs (the factory isn't indexed) and keeps the factory's own.
+  assert.deepEqual(found.lookups[0].topics, [ACCOUNT_DEPLOYED]);
+  assert.ok(!found.fetched.includes(`0x${'0e'.repeat(32)}`), 'another factory’s deployment isn’t looked at');
+  // Its deployments came only through bundlers it no longer takes: the rejection stands, and says so. The busiest
+  // (OTHER, two deployments) is rejected exactly as anyone else is (the same revert data, for the same gas): the
+  // failure doesn't turn on who sends it, so the other isn't run.
+  const stale = await bundlerFactory(ALLOWED);
+  const runs = simulatorFailing();
+  const refused = await stale.run({ ...deps, rpc: deploymentsNode(stale.factory, [OTHER, LATER, OTHER]).rpc, simulator: runs.simulator });
+  assert.match(rejectedOf(refused), /deploying the account fails \(AA13.*\)\. It fails the same way sent by the busiest of the 2 bundlers that recently deployed accounts through this account's factory\./);
+  assert.deepEqual(runs.sent.filter(s => s === OTHER || s === LATER), [OTHER]);
+  // A factory with no deployments: every deployment's log is read, so back 10,000 blocks and no further.
+  const quiet = await bundlerFactory(ALLOWED);
+  const far = deploymentsNode(quiet.factory, [], 1_000_000);
+  assert.match(rejectedOf(await quiet.run({ ...deps, rpc: far.rpc })), /deploying the account fails \(AA13 initCode failed or OOG\)\. Nothing/);
+  assert.deepEqual(far.windows, [[0, 200], [0, 2000], [0, 10_000]]);
+  // Its calls alone deploy it as that bundler too (from it, through the SenderCreator's address), else deploying fails.
+  const input = { chainId: 999, entryPoint: EP, sender: fresh, callData: sendUsdc, initCode: concatHex([factory as Hex, factoryData]) };
+  assert.match((await simulateExecution(input, deps))?.result.revertReason ?? '', /deploying the account failed/);
+  const deployed = await simulateExecution({ ...input, origin: ALLOWED }, deps);
+  assert.equal(deployed?.result.status, 'success', deployed?.result.revertReason);
+  assert.ok(deployed?.result.transfers.some(t => t.asset === usdc && t.from === fresh && t.raw === 50_000_000n), JSON.stringify(deployed?.result.transfers, (_, v) => (typeof v === 'bigint' ? `${v}` : v)));
+});
+
+test('A factory’s bundlers the node didn’t answer runs as aren’t said to fail: the rejection is the plain one, and a later preview runs as them', async () => {
+  const ALLOWED = '0xb0d1e70000000000000000000000000000064337', B1 = '0xb0d1e70000000000000000000000000000074337';
+  const plain = /deploying the account fails \(AA13 initCode failed or OOG\)\. Nothing it does happens unless that changes\.$/;
+  // Every run as its bundlers fails on the node (null, as under load: HTTP 429): nothing is said of them.
+  const down = await bundlerFactory(ALLOWED);
+  const node = deploymentsNode(down.factory, [B1, ALLOWED]);
+  assert.match(rejectedOf(await down.run({ ...deps, rpc: node.rpc, simulator: simulatorFailing([B1, ALLOWED]).simulator })), plain);
+  // The node answering again, the next preview runs as ALLOWED (the bundlers found are remembered).
+  const up = await down.run({ ...deps, rpc: node.rpc });
+  assert.equal(rejectedOf(up), '', codes(up).join());
+  assert.ok(up.decoding.notes.some(n => n.startsWith(`Simulated as sent by ${ALLOWED}`)), up.decoding.notes.join(' | '));
+  // The run as the busiest (ALLOWED, the one it takes) not answered, the other's rejected: still the plain rejection.
+  const partly = await bundlerFactory(ALLOWED);
+  const runs = simulatorFailing([ALLOWED]);
+  assert.match(rejectedOf(await partly.run({ ...deps, rpc: deploymentsNode(partly.factory, [B1, ALLOWED, ALLOWED]).rpc, simulator: runs.simulator })), plain);
+  assert.deepEqual(runs.sent.filter(s => s === ALLOWED || s === B1), [ALLOWED, B1]);
+});
+
+test('An account whose validation only takes its own bundler: the operation runs as one its recent operations came through', async () => {
+  const { compiled } = await import('./evm-chain.ts');
+  const { executes } = await import('../src/erc4337-sim.ts');
+  const ALLOWED = '0xb0d1e70000000000000000000000000000054337';
+  const picky = await chain.deploy('BundlerAccount', 'address,address,address', [OWNER, EP, ALLOWED]);
+  await chain.exec(usdc, call('mint', [picky, 100_000_000n]));
+  await chain.setBalance(picky, E);
+  const op = operation({ sender: picky });
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  const run = (d: Dependencies) => previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, d);
+  const lookups: any[] = [];
+  const rpc = { has: (c: number) => deps.rpc!.has(c), call: async (c: number, m: string, ps: any[]) => {
+    if (m === 'eth_blockNumber') return '0x100';
+    if (m === 'eth_getLogs') { lookups.push(ps[0]); return ps[0].topics[2] === `0x${'00'.repeat(12)}${picky.slice(2)}` ? [{ transactionHash: `0x${'ac'.repeat(32)}`, data: '0x' }] : []; }
+    if (m === 'eth_getTransactionByHash') return { from: ALLOWED, input: '0x' };
+    return deps.rpc!.call(c, m, ps);
+  } } as Dependencies['rpc'];
+  // Without its operations to look in, validation reverts as any other bundler (only the calls are simulated).
+  const alone = await run(deps);
+  assert.ok(alone.decoding.notes.some(n => /validation reverts on a stand-in for the signature \(AA23/.test(n)), alone.decoding.notes.join(' | '));
+  const accepted = await run({ ...deps, rpc });
+  assert.ok(accepted.decoding.notes.some(n => n.startsWith(`Simulated as sent by ${ALLOWED}, a bundler that recently sent this account's operations: sent by anyone else (the transaction's origin), the account's validation reverts (AA23`)), accepted.decoding.notes.join(' | '));
+  assert.ok(accepted.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.7 runs it/.test(n) && !/doesn't accept/.test(n)), accepted.decoding.notes.join(' | '));
+  assert.deepEqual(usdcChange(accepted), ['out 50']);
+  // The lookup is the account's own UserOperationEvents, by its indexed address.
+  assert.deepEqual(lookups[0].topics, ['0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f', null, `0x${'00'.repeat(12)}${picky.slice(2)}`]);
+  // Only an account whose code reads tx.origin is looked up so: ORIGIN (0x32) as an instruction that can run, not as
+  // PUSH data, in the compiler's metadata, or in bytes no instruction reaches (after one that ends execution, up to
+  // the next JUMPDEST), where the compiler keeps its data.
+  assert.equal(executes(`0x${compiled('BundlerAccount').evm.deployedBytecode.object}`, 0x32), true);
+  assert.equal(executes(`0x${compiled('Account4337').evm.deployedBytecode.object}`, 0x32), false);
+  assert.equal(executes('0x6032600055', 0x32), false); // PUSH1 0x32; PUSH1 0; SSTORE
+  assert.equal(executes('0x60016000553200', 0x32), true); // ...; ORIGIN; STOP
+  assert.equal(executes('0x600160005500a13232' + '0003', 0x32), false); // ...; STOP; then metadata (a1 32 32) and its length
+  assert.equal(executes('0x600160005500a13232', 0x32), false); // the same bytes after STOP: nothing reaches them
+  assert.equal(executes('0x600160005500a1325b32', 0x32), true); // ...but after a JUMPDEST, which a jump can reach
+  assert.equal(executes('0x00615b3232', 0x32), false); // STOP; PUSH2 0x5b32 (no JUMPDEST: push data); then 0x32
+  assert.equal(executes('0x60fe3200', 0x32), true); // PUSH1 0xfe (push data, not INVALID); ORIGIN
+  // A Base account implementation's data after its code: "\x19Ethereum Signed Message:\n32", whose "32" is 0x33 0x32.
+  assert.equal(executes(`0x6000600055fe${Buffer.from('\x19Ethereum Signed Message:\n32').toString('hex')}`, 0x32), false);
+  assert.equal(executes('0x3200', 0x32), true);
+});
+
+test('An account that sends its own operations isn’t taken for its bundler: it isn’t run as sent by itself, with a bundler’s balance', async () => {
+  // SelfAccount only validates what it sends itself (tx.origin): with 0.01 HYPE, its calls send 0.5.
+  const self = await chain.deploy('SelfAccount', 'address,address', [OWNER, EP]);
+  await chain.setBalance(self, E / 100n);
+  const op = operation({ sender: self, callData: call('execute', [BOB, E / 2n, '0x']) });
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  // Its last operation came in a transaction it sent itself.
+  const lookups: any[] = [];
+  const rpc = { has: (c: number) => deps.rpc!.has(c), call: async (c: number, m: string, ps: any[]) => {
+    if (m === 'eth_blockNumber') return '0x100';
+    if (m === 'eth_getLogs') { lookups.push(ps[0]); return ps[0].topics[2] === `0x${'00'.repeat(12)}${self.slice(2)}` ? [{ transactionHash: `0x${'ad'.repeat(32)}`, data: '0x' }] : []; }
+    if (m === 'eth_getTransactionByHash') return { from: self, input: '0x' };
+    return deps.rpc!.call(c, m, ps);
+  } } as Dependencies['rpc'];
+  const runs = simulatorFailing();
+  const p = await previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, { ...deps, rpc, simulator: runs.simulator });
+  // Its operations were looked up, and it was left out: run as itself, it validated on the bundler's balance (10^24
+  // wei) and showed 0.5 HYPE sent, which it can't.
+  assert.ok(lookups.some(l => l.topics[2] === `0x${'00'.repeat(12)}${self.slice(2)}`), JSON.stringify(lookups));
+  assert.ok(!runs.sent.includes(self), runs.sent.join());
+  assert.ok(!p.decoding.notes.some(n => n.startsWith('Simulated as sent by')), p.decoding.notes.join(' | '));
+  assert.ok(p.decoding.notes.some(n => /validation reverts on a stand-in for the signature \(AA23/.test(n)), p.decoding.notes.join(' | '));
+  assert.ok(codes(p).includes('userop_execution_reverts'), codes(p).join());
+});
+
 test('The operation runs at the price its bundle pays: a contract reading tx.gasprice sees the base fee plus the operation’s priority fee', async () => {
   const tips = await chain.deploy('TipReader', '', []);
   const T = parseAbi(['function requireTip(uint256 atLeast) view']);

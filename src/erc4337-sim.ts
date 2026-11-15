@@ -70,7 +70,18 @@ export interface ExecutionInput {
   watch?: string[];
   /** State the caller set for the simulation (PreviewContext.stateOverrides), beneath the run's own (see mergeOverrides). */
   stateOverrides?: SimulationRequest['stateOverrides'];
+  /** The bundler to deploy the account as (tx.origin), for a factory that only deploys for its own (see simulateOperation). */
+  origin?: string;
 }
+
+/**
+ * Code for the SenderCreator's address that calls a factory as the SenderCreator does (calldata: the factory's
+ * address, then its data), returning or reverting with what the factory does: a deployment sent by someone else
+ * than the SenderCreator, for a factory that checks the transaction's origin.
+ *   len = calldatasize - 20; calldatacopy(0, 20, len); ok = call(gas, calldata[0:20], 0, 0, len, 0, 0)
+ *   returndatacopy(0, 0, returndatasize); if ok return(0, returndatasize) else revert(0, returndatasize)
+ */
+export const SENDER_FORWARDER = '0x366014900380601460003760006000826000600060003560601c5af13d600060003e6029573d6000fd5b3d6000f3' as Hex;
 
 export interface Execution { result: SimulationResult; deployed: boolean; direct?: boolean; /** The account has no code: calling it runs nothing (it may get an EIP-7702 delegation in the same transaction). */ noCode?: boolean }
 
@@ -100,6 +111,31 @@ export function readsTransientStorage(code: string): boolean {
     const op = parseInt(hex.slice(i, i + 2), 16);
     if (op === 0x5c) return true;
     if (op >= 0x60 && op <= 0x7f) i += (op - 0x5f) * 2;
+  }
+  return false;
+}
+
+/** Instructions that end execution: nothing after one runs unless it is jumped to (a JUMPDEST). */
+const HALTS = new Set([0x00, 0x56, 0xf3, 0xfd, 0xfe, 0xff]); // STOP, JUMP, RETURN, REVERT, INVALID, SELFDESTRUCT
+/**
+ * Whether code has this opcode where it can run: not in PUSH data, the Solidity compiler's metadata (CBOR at the end,
+ * its length in the last two bytes), or bytes no instruction can reach (after one that ends execution, up to the next
+ * JUMPDEST), which can hold any byte. The compiler puts its data there, after the code: a Base account implementation
+ * keeps "\x19Ethereum Signed Message:\n32" so, whose "32" is CALLER and ORIGIN's bytes (0x33 0x32).
+ */
+export function executes(code: string, opcode: number): boolean {
+  let hex = (code.startsWith('0x') ? code.slice(2) : code).toLowerCase();
+  const meta = hex.length >= 4 ? parseInt(hex.slice(-4), 16) : 0;
+  if (meta > 0 && (meta + 2) * 2 <= hex.length && /^a[1-4]/.test(hex.slice(-(meta + 2) * 2))) hex = hex.slice(0, -(meta + 2) * 2);
+  // `live`: the instruction at i can be reached (from the start, by running on, or by a jump to a JUMPDEST: the EVM's
+  // own reading of where JUMPDESTs are, PUSH data skipped from the start, data regions included).
+  let live = true;
+  for (let i = 0; i < hex.length; i += 2) {
+    const op = parseInt(hex.slice(i, i + 2), 16);
+    if (op === 0x5b) live = true;
+    if (live && op === opcode) return true;
+    if (op >= 0x60 && op <= 0x7f) i += (op - 0x5f) * 2;
+    else if (HALTS.has(op)) live = false;
   }
   return false;
 }
@@ -193,7 +229,10 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
   const creator = SENDER_CREATORS[entryPoint];
   if (factory && (await deployed()) !== true) {
     if (!creator || !sim.simulateBatch) return null;
-    const deploy: SimulationRequest = { chainId: op.chainId, from: creator, account: sender, to: factory, data: `0x${op.initCode!.slice(42)}` as Hex, value: 0n };
+    // As a bundler the factory takes, where it only deploys for its own: from it, through the SenderCreator's address.
+    const deploy: SimulationRequest = op.origin
+      ? { chainId: op.chainId, from: op.origin.toLowerCase(), account: sender, to: creator, data: op.initCode!, value: 0n, stateOverrides: { [creator]: { code: SENDER_FORWARDER } } }
+      : { chainId: op.chainId, from: creator, account: sender, to: factory, data: `0x${op.initCode!.slice(42)}` as Hex, value: 0n };
     const results = await sim.simulateBatch([deploy, exec]);
     if (!results) return null;
     if (results[0].status === 'reverted') return { result: { ...results[0], revertReason: `deploying the account failed${results[0].revertReason ? `: ${results[0].revertReason}` : ''}` }, deployed: true };
@@ -308,7 +347,43 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
   // The paymaster's own data starts after its address, and from v0.7 on its two gas limits.
   const at = SIMULATIONS[entryPoint]?.version === '0.6' ? 20 : 52;
   const config = paymasterAndData.length > 2 + at * 2 ? paymasterAndData.slice(2 + at * 2, 4 + at * 2).toLowerCase() : undefined;
-  const key = `${chainId}:${entryPoint}:${paymaster}:${config ?? ''}`;
+  return bundlersFrom(deps, chainId, entryPoint, { key: `${paymaster}:${config ?? ''}`, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`],
+    weigh: t => {
+      // The paymaster's data in the bundle's calldata: its address, then (at the same offset) its first byte.
+      const input = (t?.input ?? '').toLowerCase(), i = input.indexOf(paymaster.slice(2));
+      return config !== undefined && i >= 0 && input.slice(i + at * 2, i + at * 2 + 2) === config ? 100 : 1;
+    } });
+}
+const ACCOUNT_DEPLOYED = '0xd51a9c61267aa6196961883ecf5ff2da6619c37dac0fa92122513fb32c032d2d';
+/**
+ * Bundlers that recently sent a factory's deployments (the EntryPoint's AccountDeployed, whose factory isn't indexed:
+ * the logs of every deployment, kept where they name it), or an account's own operations (its UserOperationEvents),
+ * the busiest first (at most five), looked for and remembered as a paymaster's are (recentBundlers), but a factory's
+ * no further back than FACTORY_REACH. For an account whose deployment or validation checks the bundler sending it
+ * (tx.origin), as a paymaster can: see simulateOperation.
+ */
+const originBundlers = (deps: Dependencies, chainId: number, entryPoint: string, by: 'factory' | 'account', address: string): Promise<string[]> => {
+  const a = address.toLowerCase(), word = `0x${'00'.repeat(12)}${a.slice(2)}`;
+  return bundlersFrom(deps, chainId, entryPoint, by === 'factory'
+    ? { key: `factory:${a}`, topics: [ACCOUNT_DEPLOYED], keep: l => l.data.slice(0, 66).toLowerCase() === word, reach: FACTORY_REACH }
+    : { key: `account:${a}`, topics: [USER_OPERATION_EVENT, null, word] });
+};
+/**
+ * How far back (blocks from the head) a factory's deployments are looked for: every deployment's log is read, and
+ * nearly every AA13 has nothing to do with the sender. Read as far back as a paymaster's (eight reads, 100,000
+ * blocks), a preview of an operation whose factory had no deployments on Base took 4.6 s, against 1.3 s without the
+ * lookup; reading 10,000 (three reads), 2.1 s. The OKX factory's bundler on Ethereum was found within 2,000 blocks
+ * (4 of its deployments in 10,000), and Ethereum's public node answers no further back than 10,000.
+ */
+const FACTORY_REACH = 10_000n;
+/**
+ * A lookup of recent bundlers: an EntryPoint's logs with these topics (those `keep` takes), the transactions they
+ * came in and who sent them, each counted by `weigh` (one each without it). `key` names it in the cache. `reach`:
+ * the furthest back from the head it reads (the spans up to it, none of the older windows).
+ */
+interface BundlerQuery { key: string; topics: (string | null)[]; keep?: (log: { data: string }) => boolean; weigh?: (tx: { input?: string } | null) => number; reach?: bigint }
+async function bundlersFrom(deps: Dependencies, chainId: number, entryPoint: string, query: BundlerQuery): Promise<string[]> {
+  const key = `${chainId}:${entryPoint}:${query.key}`;
   const known = RECENT_BUNDLERS.get(key);
   if (known && Date.now() - known.at < (known.bundlers.length ? FOUND_FOR : EMPTY_FOR)) { return known.bundlers; }
   const inflight = RECENT_BUNDLERS_INFLIGHT.get(key);
@@ -329,7 +404,7 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
       // Blocks back from the head the node has answered for: a span no wider (a capping node narrows every wider
       // one to its cap) is a window already read, and isn't read again.
       let covered = 0n;
-      const SPANS = [200n, 2000n, 10_000n, 20_000n], PAGES = 4;
+      const SPANS = [200n, 2000n, 10_000n, 20_000n].filter(s => query.reach === undefined || s <= query.reach), PAGES = query.reach === undefined ? 4 : 0;
       for (let n = 0; n < SPANS.length + PAGES; n++) {
         // After the spans from the head, older windows as wide as the node answers, each just before the last: only
         // once the widest span was answered, and none past one the node refused (a node that keeps less history
@@ -338,8 +413,8 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
         let span = page ? capBlocks ?? 20_000n : capBlocks !== undefined && SPANS[n] > capBlocks ? capBlocks : SPANS[n];
         if (page ? covered < span || covered >= head : span <= covered) { if (page) break; continue; }
         const end = head - (page ? covered : 0n);
-        const read = (s: bigint) => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(end > s ? end - s : 0n).toString(16)}`, toBlock: `0x${end.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
-        let logs: { transactionHash: string }[];
+        const read = (s: bigint) => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: query.topics, fromBlock: `0x${(end > s ? end - s : 0n).toString(16)}`, toBlock: `0x${end.toString(16)}` }]) as Promise<{ transactionHash: string; data: string }[]>;
+        let logs: { transactionHash: string; data: string }[];
         try {
           logs = await read(span).catch(async e => { if (capped(e)) throw e; await new Promise(r => setTimeout(r, 500)); return read(span); });
         } catch (e) {
@@ -354,17 +429,14 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
           try { logs = await read(span); } catch { refused = true; if (page) break; continue; }
         }
         covered = (page ? covered : 0n) + span;
-        const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
+        const hashes = [...new Set((logs ?? []).filter(l => !query.keep || query.keep(l)).map(l => l.transactionHash).reverse())].slice(0, 16);
         if (!hashes.length) continue;
         const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
         const score = new Map<string, number>();
         for (const t of txs) {
           const from = t?.from?.toLowerCase();
           if (!from) continue;
-          // The paymaster's data in the bundle's calldata: its address, then (at the same offset) its first byte.
-          const input = (t?.input ?? '').toLowerCase(), i = input.indexOf(paymaster.slice(2));
-          const same = config !== undefined && i >= 0 && input.slice(i + at * 2, i + at * 2 + 2) === config;
-          score.set(from, (score.get(from) ?? 0) + (same ? 100 : 1));
+          score.set(from, (score.get(from) ?? 0) + (query.weigh?.(t) ?? 1));
         }
         const bundlers = [...score].sort((a, b) => b[1] - a[1]).map(([f]) => f).slice(0, 5);
         if (bundlers.length) { RECENT_BUNDLERS.set(key, { at: Date.now(), bundlers }); return bundlers; }
@@ -415,6 +487,8 @@ interface Stub {
    * the preview says so where the account rejects it.
    */
   why?: string;
+  /** What the preview says where the account accepts it (how the signature it stands in for differs from others). */
+  note?: string;
 }
 /** An address shortened for a note: its first and last four hex digits. */
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
@@ -437,6 +511,10 @@ type StubContext = {
   paymasterAndData?: Hex;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
   hash: () => Promise<Hex | undefined>;
+  /** What the signer's wallet signs (OperationInput's digest). */
+  digest?: Hex;
+  /** The supertransaction's hash the signer signs, and the proof of the operation's hash in it (OperationInput's). */
+  supertransaction?: SupertransactionProof;
 };
 const OWNERS = parseAbi(['function nextOwnerIndex() view returns (uint256)', 'function ownerAtIndex(uint256 index) view returns (bytes)']);
 
@@ -1394,25 +1472,69 @@ async function sendStub(c: StubContext): Promise<Stub[]> {
 // account, reads its validator from the nonce's top 20 bytes; Biconomy Nexus's and Kernel's nonces name it too). Its
 // signature is a mode byte (0x00: use a session the account has enabled), the session's permission ID (32 bytes), then
 // what the session's validator takes: Rhinestone's OwnableValidator's (a threshold of its owners' ECDSA signatures over
-// the operation's hash as a message, in any order) or another's. SmartSession first runs the session's policies on
-// the operation (each user-operation and action policy, for real), then the validator: STUB_SIGNATURE's 0xff is no mode
-// at all, and validation reverted (Safe7579 reports a validator's revert as ExecutionFailed(), AA23), so only the calls
-// were simulated. Such an operation is signed by the session's keys, not by the account's owners: a dApp's mostly (on
-// Arbitrum One in a day, 16 Safes' 34 operations through OwnableValidator sessions, all 2-of-2, each Safe's own key
-// and one shared cosigner; on Base 10 accounts' 18, 1-of-1 and 2-of-2; 2026-11-15).
-// The stand-in names the account's enabled session (getPermissionIDs) whose OwnableValidator owners include the signer,
-// with the signer's stand-in and other owners' (cosigners) to its threshold. Where none does, or its validator is
-// another, no one the request names can sign it: the stand-in is the first session's form, and the preview says who signs.
+// the operation's hash as a message, in any order), Biconomy's K1MeeValidator's (below) or another's. SmartSession
+// first runs the session's policies on the operation (each user-operation and action policy, for real), then the
+// validator: STUB_SIGNATURE's 0xff is no mode at all, and validation reverted (Safe7579 reports a validator's revert as
+// ExecutionFailed(), AA23), so only the calls were simulated. Such an operation is signed by the session's keys, not
+// by the account's owners: a dApp's mostly (on Arbitrum One in a day, 16 Safes' 34 operations through OwnableValidator
+// sessions, all 2-of-2, each Safe's own key and one shared cosigner; on Base 10 accounts' 18, 1-of-1 and 2-of-2;
+// 2026-11-15).
+// The stand-in names the account's enabled session (getPermissionIDs) whose keys include the signer: an
+// OwnableValidator session's with the signer's stand-in and other owners' (cosigners) to its threshold; a
+// K1MeeValidator session's in the form its key signs (k1meeSessionPart). Where none does, or its validator is another,
+// no one the request names can sign it: the stand-in is the first session's form, and the preview says who signs.
 const SMART_SESSIONS = new Set(['0x00000000002b0ecfbd0496ee71e01257da0e37de', '0x00000000008bdaba73cd9815d79069c247eb4bda']);
 /** Rhinestone's OwnableValidator (verified on Sourcify, Ethereum), as a session's validator: its config abi.encode(threshold, owners). */
 export const OWNABLE_VALIDATOR = '0x2483da3a338895199e5e538530213157e931bf06';
+// Biconomy's K1MeeValidator 1.0.3 (its MEE 2.1.0 deployment; verified on Sourcify, Arbitrum One, Base and OP
+// Mainnet), the validator of most SmartSession operations seen (Arbitrum One: 671 of 705 in a day, 49 accounts; Base:
+// 37 of 55; OP Mainnet: all 112 in four hours; 2026-11-15). As a session's validator (validateSignatureWithData) its
+// config's first 20 bytes are the session's key, and it takes one of its own modes: a 65-byte signature over the
+// operation's hash (as it is or as a message: no prefix, the modes' fallback), or after a 4-byte type, simple mode
+// (0x177eee00: the supertransaction's hash, the root of a Merkle tree of the hashes of its operations, on any chain,
+// with the proof of this operation's hash in it, and the key's signature over the root), on-chain mode (0x177eee01: a
+// transaction carrying the root, signed and sent by the key) or permit mode (0x177eee02: an ERC-2612 permit with the
+// root as its deadline). Every operation seen came in simple mode, as Biconomy's MEE node sends a session's (its SDK,
+// @biconomy/abstractjs, has the key sign the supertransaction's hash as a message for MEE before 2.2.1; from then on
+// it signs the operation's hash, for a later validator): a tree of two leaves (one proof element), the root signed as
+// a message (on Arbitrum One 19 of 19 in two hours; Base 28 of 28 in a day; OP Mainnet 164 of 164 in 4.4 hours;
+// 2026-11-15). Each session has a key of its own (an account had 105 sessions, 105 keys), never the account's owner
+// (K1MeeValidator's own owner for the account): a key held for the account apart from its owner's, a dApp's or an
+// agent's.
+// The stand-in is in the form of what the key is asked to sign. The operation's hash (personal_sign or eth_sign of
+// it, with the operation in context.userOperation): the plain form, whose validation costs less than simple mode's
+// with one proof element, the proof and the longer signature copied along the way (47 operations replayed so on Base,
+// OP Mainnet and Arbitrum One came out 1,238 to 1,368 gas under their receipts; 2,117 in test/k1mee-session.test.ts's
+// mock accounts): what the same operation sent through MEE costs more, as the preview notes. A supertransaction's hash
+// (src/supertransaction.ts, with its operations in context.meeOperations): simple mode, with that root and this
+// operation's proof in it.
+/** Biconomy's K1MeeValidator 1.0.3, as a session's validator: its config, the session's key (its first 20 bytes). */
+export const K1MEE_VALIDATOR = '0x0000000031ef4155c978d48a8a7d4edba03b04fe';
+/** Other session validators, by name. */
+const SESSION_VALIDATOR_NAMES: Record<string, string> = { [K1MEE_VALIDATOR]: "Biconomy's K1MeeValidator" };
+/** A supertransaction's hash (the root of a Merkle tree of its operations' hashes) and the proof of an operation's hash in it. */
+export interface SupertransactionProof { root: Hex; proof: readonly Hex[] }
 /**
- * Other session validators, by name: Biconomy's K1MeeValidator (verified on Sourcify, Arbitrum One and Base), whose
- * signature is in its own modes (a supertransaction's Merkle root among them), the validator of most SmartSession
- * operations seen (Arbitrum One: 671 of 705 in a day, 49 accounts; Base: 37 of 55, 16 accounts; 2026-11-15).
+ * Why an account refused the stand-in for a supertransaction signer's, where no stand-in says why (simulateOperation):
+ * the root's signature is stood in for only in a K1MeeValidator session's simple mode.
  */
-const SESSION_VALIDATOR_NAMES: Record<string, string> = { '0x0000000031ef4155c978d48a8a7d4edba03b04fe': "Biconomy's K1MeeValidator" };
+const SUPERTRANSACTION_WHY = "the signature of a supertransaction's hash is stood in for only as a K1MeeValidator session's (SmartSession), in simple mode; an account that checks the operation's hash doesn't take it, and an account's own K1MeeValidator's simple mode, with the operation's time bounds, isn't stood in for";
+/**
+ * A K1MeeValidator session's part of the signature (after SmartSession's mode and permission ID), its key's 65-byte
+ * `signature` in the form of what it signed: the operation's hash, the plain form (the signature alone); or a
+ * supertransaction's hash (`tree`), simple mode as Biconomy's MEE node sends it: 0x177eee00, then abi.encode(root,
+ * proof, signature). The validator checks the signature over what was signed as it is first, then as a message, and
+ * in simple mode the proof of the operation's hash (OpenZeppelin's MerkleProof: each pair hashed in order).
+ */
+export function k1meeSessionPart(signature: Hex, tree?: SupertransactionProof): Hex {
+  return tree ? concatHex(['0x177eee00', encodeAbiParameters(parseAbiParameters('bytes32, bytes32[], bytes'), [tree.root, tree.proof, signature])]) : signature;
+}
+/** Sessions read at a time, newest first, until one of the signer's turns up; and at most. */
+const SESSIONS_AT_ONCE = 32, SESSIONS_READ = 1024;
 const SMART_SESSION = parseAbi(['function getPermissionIDs(address account) view returns (bytes32[])', 'function getSessionValidatorAndConfig(address account, bytes32 permissionId) view returns (address sessionValidator, bytes sessionValidatorData)']);
+/** Multicall3 (the same address on every chain the previewer simulates on: src/simulation.ts), for reads of many sessions at once. */
+const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11';
+const AGGREGATE3 = parseAbi(['struct Call3 { address target; bool allowFailure; bytes callData; }', 'struct Result { bool success; bytes returnData; }', 'function aggregate3(Call3[] calls) payable returns (Result[] returnData)']);
 /**
  * The SmartSession module an operation's nonce names (its 24-byte key), if any; not a Kernel in enable mode installing
  * it (mode byte 0x01, the module in Kernel's validator slot after its mode and type bytes), whose signature carries
@@ -1431,30 +1553,80 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
   const view = async <F extends 'getPermissionIDs' | 'getSessionValidatorAndConfig'>(functionName: F, args: readonly unknown[]) =>
     decodeFunctionResult({ abi: SMART_SESSION, functionName, data: String(await rpc.call(c.chainId, 'eth_call', [{ to: module, data: encodeFunctionData({ abi: SMART_SESSION, functionName, args } as never) }, 'latest'])) as Hex } as never) as unknown;
   try {
-    const ids = (await view('getPermissionIDs', [c.sender]) as readonly Hex[]).slice(0, 8);
+    const ids = await view('getPermissionIDs', [c.sender]) as readonly Hex[];
     if (!ids.length) return [{ ...bare, why: `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation, and the account has no session enabled` }];
-    const sessions = await Promise.all(ids.map(async id => {
-      const [validator, config] = await view('getSessionValidatorAndConfig', [c.sender, id]) as readonly [string, Hex];
+    const session = (id: Hex, [validator, config]: readonly [string, Hex]) => {
       let owners: string[] = [], threshold = 0;
-      if (validator.toLowerCase() === OWNABLE_VALIDATOR) {
+      const v = validator.toLowerCase();
+      if (v === OWNABLE_VALIDATOR) {
         try { const [t, o] = decodeAbiParameters([{ type: 'uint256' }, { type: 'address[]' }], config); threshold = Number(t); owners = o.map(a => a.toLowerCase()); } catch { /* not its config */ }
       }
-      return { id, validator: validator.toLowerCase(), owners, threshold };
-    }));
+      // K1MeeValidator's session key: its config's first 20 bytes (shorter, it reverts).
+      const key = v === K1MEE_VALIDATOR && config.length >= 42 && !/^0x0{40}/.test(config) ? `0x${config.slice(2, 42)}`.toLowerCase() : undefined;
+      return { id, validator: v, owners, threshold, key };
+    };
+    // Sessions read together, through Multicall3 (one call for them all; a public node limits how fast it is asked),
+    // else one by one.
+    const read = async (chunk: Hex[]) => {
+      const each = (id: Hex) => encodeFunctionData({ abi: SMART_SESSION, functionName: 'getSessionValidatorAndConfig', args: [c.sender as Hex, id] });
+      try {
+        const data = encodeFunctionData({ abi: AGGREGATE3, functionName: 'aggregate3', args: [chunk.map(id => ({ target: module as Hex, allowFailure: false, callData: each(id) }))] });
+        const out = decodeFunctionResult({ abi: AGGREGATE3, functionName: 'aggregate3', data: String(await rpc.call(c.chainId, 'eth_call', [{ to: MULTICALL3, data }, 'latest'])) as Hex });
+        if (out.length !== chunk.length) throw new Error('not all read');
+        return out.map((r, i) => session(chunk[i], decodeFunctionResult({ abi: SMART_SESSION, functionName: 'getSessionValidatorAndConfig', data: r.returnData })));
+      } catch {
+        return Promise.all(chunk.map(async id => session(id, await view('getSessionValidatorAndConfig', [c.sender, id]) as readonly [string, Hex])));
+      }
+    };
     const signer = c.signer.toLowerCase();
-    const mine = sessions.find(s => s.owners.includes(signer) && s.threshold > 0);
+    const signs = (s: ReturnType<typeof session>) => s.key === signer || (s.owners.includes(signer) && s.threshold > 0);
+    // Newest first (the last enabled), a chunk at a time, until a session of the signer's turns up: MEE enables a
+    // session, with a key of its own, for each grant, and an account on Arbitrum One had 105 (105 keys, any of which
+    // can sign for it: with only the newest 32 read, the 73rd's key was told it isn't one). Where none is the
+    // signer's, all of them (up to SESSIONS_READ), so that the preview counts them all.
+    const newest = [...ids].reverse().slice(0, SESSIONS_READ);
+    const sessions: ReturnType<typeof session>[] = [];
+    for (let i = 0; i < newest.length; i += SESSIONS_AT_ONCE) {
+      const chunk = await read(newest.slice(i, i + SESSIONS_AT_ONCE));
+      sessions.push(...chunk);
+      if (chunk.some(signs)) break;
+    }
+    // A K1MeeValidator session's stand-in for `who` (the session's key, or the signer asked, whom it doesn't take), in
+    // the form of what the key signs (k1meeSessionPart): a stand-in ecrecover recovers as `who` over what the wallet
+    // signs (the digest), and over the other form of it, which the validator tries first or second, as no one's (as the
+    // key's real signature recovers someone else there), each for the precompile's price.
+    const k1mee = (s: typeof sessions[number], who: string): Stub => ({
+      signature: concatHex(['0x00', s.id, k1meeSessionPart(STUB_COSIGNATURE, c.supertransaction)]), cosigners: [{ signature: STUB_COSIGNATURE, signer: who, ...(c.digest && { digest: c.digest }) }],
+      ...(!c.supertransaction && { note: "The session's key signs the operation's hash itself, which Biconomy's K1MeeValidator takes as it is (its plain form). Sent through Biconomy's MEE node (MEE 2.1.0, whose validator this is), the key would sign a supertransaction's hash instead, a Merkle root of its operations' hashes, and the operation would carry it and its proof (simple mode): with one proof element, as every one seen had, its validation costs about 1,300 gas more than simulated here (1,238 to 1,368 more for 47 such operations replayed against their receipts on Base, OP Mainnet and Arbitrum One). To preview that request, sign the supertransaction's hash with its operations in context.meeOperations." }),
+    });
+    // The signer's own sessions: K1MeeValidator's, newest first (a key has one session, mostly); then the first
+    // OwnableValidator session (in the account's order) whose owners include it.
+    const keyed = sessions.filter(s => s.key === signer);
+    const mine = [...sessions].reverse().find(s => s.owners.includes(signer) && s.threshold > 0);
     // The signer's stand-in, then other owners' to the threshold, each recovered as its owner (ecrecoverAsMany).
     const form = (s: typeof sessions[number], signs: string | undefined) => {
       const others = s.owners.filter(o => o !== signs).slice(0, Math.max(s.threshold - (signs ? 1 : 0), 0));
       const cosigners = others.map((o, k) => ({ signature: stubSignature(k + 1), signer: o }));
       return { signature: concatHex(['0x00', s.id, ...(signs ? [STUB_SIGNATURE] : []), ...cosigners.map(x => x.signature)]), ...(cosigners.length && { cosigners }) };
     };
-    if (mine) return [form(mine, signer)];
-    const first = sessions.find(s => s.owners.length) ?? sessions[0];
-    const keys = first.owners.length ? `${first.threshold} of ${first.owners.map(shortAddr).join(', ')}` : undefined;
-    const why = `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by its session's keys${keys ? ` (${keys})` : ` (through ${SESSION_VALIDATOR_NAMES[first.validator] ?? `session validator ${shortAddr(first.validator)}`}, whose form the stand-in doesn't take)`}, not by the account's owners${keys ? ', and the signer asked isn\'t one of them' : ''}`;
-    // (Not the signer's: its stand-in, then all but one of the owners, so the session's check runs on as many signatures.)
-    return [{ ...(first.owners.length ? form(first, signer) : { signature: concatHex(['0x00', first.id, STUB_SIGNATURE]) }), why }];
+    if (keyed.length || mine) return [...keyed.map(s => k1mee(s, signer)), ...(mine ? [form(mine, signer)] : [])];
+    // None of the signer's (all read): the first OwnableValidator session's, else the newest K1MeeValidator
+    // session's, whose policies the operation's calls most likely meet. Counted from all of the account's sessions.
+    const first = [...sessions].reverse().find(s => s.owners.length) ?? sessions.find(s => s.key) ?? sessions[0];
+    const named = sessions.filter(s => s.key).map(s => shortAddr(s.key!));
+    const counted = sessions.length < ids.length ? ` among the newest ${sessions.length} of its ${ids.length}` : '';
+    const MEE_SIGNS = "which takes the key's signature over the operation's hash, or over a supertransaction's hash with the operation's proof";
+    const keys = first.owners.length ? ` (${first.threshold} of ${first.owners.map(shortAddr).join(', ')})`
+      : first.key ? (named.length === 1 && !counted ? `'s key (${named[0]}, through Biconomy's K1MeeValidator, ${MEE_SIGNS})`
+        : `' keys (${named.length} sessions${counted}, each a key of its own through Biconomy's K1MeeValidator, the newest ${named.slice(0, 3).join(', ')}${named.length > 3 ? ` and ${named.length - 3} more` : ''}, ${MEE_SIGNS})`)
+      : ` (through ${SESSION_VALIDATOR_NAMES[first.validator] ?? `session validator ${shortAddr(first.validator)}`}, whose form the stand-in doesn't take)`;
+    const one = first.key && named.length === 1 && !counted;
+    const why = first.key
+      ? `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by ${one ? 'its session' : 'one of its sessions'}${keys}, not by the account's owners, and the signer asked isn't ${one ? 'it' : 'one of them'}`
+      : `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by its session's keys${keys}, not by the account's owners${first.owners.length ? ', and the signer asked isn\'t one of them' : ''}`;
+    // (Not the signer's: its stand-in, then all but one of the owners, so the session's check runs on as many
+    // signatures; for a K1MeeValidator session, its form with the signer's stand-in, which it refuses.)
+    return [{ ...(first.owners.length ? form(first, signer) : first.key ? k1mee(first, signer) : { signature: concatHex(['0x00', first.id, STUB_SIGNATURE]) }), why }];
   } catch { return [bare]; }
 }
 
@@ -1765,6 +1937,12 @@ export interface OperationInput {
    * the stand-in recovers only over it, unless the account rejects it then (it signs some other form).
    */
   digest?: Hex;
+  /**
+   * The signer signs a supertransaction's hash, a Merkle root of its operations' hashes, not this operation's
+   * (Biconomy's MEE: src/supertransaction.ts): the root, and the proof of this operation's hash in it. `digest` is
+   * then the root's form the wallet signs.
+   */
+  supertransaction?: SupertransactionProof;
   /** EIP-7702: the delegate the account will have when the operation runs, if it doesn't have it yet. */
   delegate?: string;
   watch?: string[];
@@ -1807,6 +1985,16 @@ export interface OperationRun {
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
   /** Why the account may not take the stand-in as the signer's (Stub's `why`): said where it rejects it. */
   why?: string;
+  /**
+   * Sent by anyone else, the account's deployment (`factory`) or validation (`account`) fails (`rejected`, as the
+   * simulation's own bundler): the operation was simulated as `bundler`, which recently sent that factory's
+   * deployments or the account's operations; or, without `bundler`, as each of the `tried` that did, and it failed
+   * as them too (each run answered). With `of`, `tried` were the busiest of `of` found: the last failed exactly as
+   * anyone else does, and the rest weren't run (see simulateOperation).
+   */
+  origin?: { by: 'factory' | 'account'; rejected: string; bundler?: string; tried: number; of?: number };
+  /** What to say where the account accepts the stand-in (Stub's `note`). */
+  note?: string;
   /** The `after` calls' results. */
   after?: SimulationResult[];
   /** What was simulated for `result` (and the `after` calls): for tracing it. */
@@ -1886,7 +2074,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       [sender as Hex, op.nonce, keccak256(op.initCode), keccak256(op.callData), f.accountGasLimits, op.preVerificationGas, f.gasFees, keccak256(op.paymasterAndData)]));
     return keccak256(encodeAbiParameters(parseAbiParameters('bytes32, address, uint256'), [packed, entryPoint as Hex, 0n]));
   };
-  const context: StubContext = { deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint, replayableHash };
+  const context: StubContext = { deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint, replayableHash, ...(op.digest && { digest: op.digest }), ...(op.supertransaction && { supertransaction: op.supertransaction }) };
   const supplied: Stub | undefined = op.signature && op.signature !== '0x' ? { signature: op.signature, wallet: true, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }), ...(op.warm?.length && { warm: op.warm }) } : undefined;
   // A supplied signature runs as it is, except a Kernel operation's in enable mode (its nonce's first byte 0x01): the
   // enable data it carries is kept, with stand-ins for the signatures in it (kernelEnableStub), which a dApp's SDK
@@ -1908,6 +2096,25 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const tip = NO_TIPS.has(op.chainId) ? 0n : op.maxPriorityFeePerGas;
   const price = fee === undefined ? undefined : op.maxFeePerGas >= fee ? (op.maxFeePerGas < fee + tip ? op.maxFeePerGas : fee + tip)
     : fee + (NO_TIPS.has(op.chainId) ? 0n : await suggestedTip(deps, op.chainId));
+  // An account whose deployment, or validation, checks the bundler sending it (tx.origin), as a paymaster can: OKX
+  // Wallet's accounts that one of its factories deploys (0x335e…9fe3 on Ethereum) only initialize when the bundler is
+  // on OKX's list (isWhitelistedBundler), else InvalidBundler() (AA13), and the operation was shown as one bundlers
+  // would reject. Where deploying the account fails (AA13), the operation runs once more as each bundler that
+  // recently sent the factory's deployments; where an existing account's validation reverts (AA23) and its code reads
+  // tx.origin, as each that sent its own operations (not the account itself). The first it gets past that with is
+  // used for every run after it; with none, the rejection stands, and says it failed as those bundlers too (when
+  // the node answered each run). A bundler rejected exactly as anyone else is ends the runs. The lookup is only made
+  // on such a failure, and for a factory reads back 10,000 blocks at most (deployments are many, and few factories
+  // care: see README); a deploying account's validation isn't retried so (its code can't be read before it exists).
+  const factory = op.initCode.length >= 42 && !op.delegate && !/^0x7702(00)*$/i.test(op.initCode.slice(0, 42)) ? `0x${op.initCode.slice(2, 42)}`.toLowerCase() : null;
+  let origin: NonNullable<OperationRun['origin']> | undefined;
+  let readsOrigin: Promise<boolean> | undefined;
+  const originCheck = async (rejected: string): Promise<'factory' | 'account' | null> => {
+    if (rejected.startsWith('AA13')) return factory ? 'factory' : null;
+    if (!rejected.startsWith('AA23') || factory) return null;
+    readsOrigin ??= runningCode(deps, op.chainId, sender).then(code => !!code && executes(code, 0x32));
+    return (await readsOrigin) ? 'account' : null;
+  };
   // Each candidate shape in turn, until the account accepts one (validation neither reverts nor fails).
   // Failing that, the best of them: a run that went through with the signature refused (the signer isn't the
   // account's: the whole operation's gas, and why) over a later shape's rejection (Kernel's ECDSA validator reverts on
@@ -1954,7 +2161,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...((op.delegate || stub.storage) && { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: stub.storage }) } }) }) }, ep!.version);
   const standIn = stub.wallet ? 'wallet' as const : stub.enable ? 'enable' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
-    const ran = await run(first, recover);
+    const ran = await run(origin?.bundler ?? first, recover);
     // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one.
     if (paymaster && ran?.rejected?.startsWith('AA33')) {
       // An empty list here can be a passing node failure (the lookup is not remembered when so), not "no bundlers":
@@ -1966,17 +2173,47 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
         if (again && !again.rejected?.startsWith('AA33')) return again;
       }
     }
+    // Deploying the account, or its validation, failed: once more as the bundlers its factory's deployments, or its
+    // own operations, came through lately, in case it only takes them. A deployment is tried so once per operation
+    // (it runs before the signature is looked at); validation once for each stand-in, which it may be refusing.
+    const by = !origin?.bundler && ran?.rejected ? await originCheck(ran.rejected) : null;
+    if (by && ran?.rejected && !(by === 'factory' && origin)) {
+      const code = ran.rejected.slice(0, 4);
+      // Not the account itself: one that sends its own operations (an EIP-7702 account, say) is its own "bundler",
+      // and a run as it would hand it the bundler's balance (BUNDLER_BALANCE) to validate and spend.
+      const found = (await originBundlers(deps, op.chainId, entryPoint, by, by === 'factory' ? factory! : sender)).filter(b => b !== first && b !== sender);
+      // `answered`: the runs that came back. One that didn't (null: the node failed, as under load) says nothing of
+      // that bundler, so the rejection is said to stand as these bundlers too only when every run made answered.
+      let answered = 0, unanswered = 0;
+      for (const bundler of found) {
+        const again = await run(bundler, recover);
+        if (!again) { unanswered++; continue; }
+        if (!again.rejected?.startsWith(code)) { origin = { by, rejected: ran.rejected, bundler, tried: answered + 1 }; return again; }
+        answered++;
+        // Rejected exactly as the simulation's own bundler was (the same revert data, for the same gas): that bundler
+        // was taken as anyone else is, so the failure doesn't turn on who sends it, and the rest aren't run (an AA13
+        // that has nothing to do with the sender cost up to five runs more). The OKX factory's deployments all came
+        // through the one bundler it accepts.
+        if (again.result.returnData === ran.result.returnData && again.result.gasUsed !== undefined && again.result.gasUsed === ran.result.gasUsed) break;
+      }
+      if (!unanswered) origin = { by, rejected: ran.rejected, tried: answered, ...(answered < found.length && { of: found.length }) };
+    }
     return ran;
   };
   // Over the digest the wallet will sign first (or, an enable-mode stand-in's, the digest each key signs); if the
-  // account checks another form of the hash, over any.
+  // account checks another form of the hash, over any. Not for a supertransaction's signer (op.supertransaction):
+  // what it signs is the root, not a form of this operation's hash, and an account that takes the stand-in only over
+  // another digest doesn't take that signature (an account checking the operation's hash, or a passkey's assertion
+  // over it: run over any digest, either showed validating, where only a K1MeeValidator session's simple mode takes
+  // the root's signature).
   const recoverGas = ecrecoverPrice(op.chainId);
   // (An enable-mode stand-in's signatures are all its own, none STUB_SIGNATURE: ecrecover stands in for those alone.)
   const recover = (cosigners: Cosigner[] | undefined, digest?: Hex) => stub.enable && cosigners?.length ? ecrecoverAsMany(cosigners, recoverGas) : ecrecoverAs(signer, digest, cosigners, recoverGas);
   const own = stub.cosigners?.some(c => c.digest);
   let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
-  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
-  return result && { ...result, standIn, ...(stub.why && { why: stub.why }) };
+  if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
+  const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
+  return result && { ...result, standIn, ...(why && { why }), ...(stub.note && { note: stub.note }), ...(origin && { origin }) };
   }
 }
 

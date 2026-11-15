@@ -137,6 +137,15 @@ function sanitizeContext(raw: unknown): PreviewContext {
       .filter(o => typeof o.chainId === 'number' && Number.isSafeInteger(o.chainId) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
       .map(o => ({ chainId: o.chainId as number, operation: o.operation as Record<string, unknown> }));
   }
+  // At most 64 operations, each proof at most 32 hashes (a tree of 2^32 leaves).
+  if (Array.isArray(c.meeOperations)) {
+    const bound = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) || (typeof v === 'string' && /^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$/.test(v));
+    out.meeOperations = c.meeOperations.slice(0, 64).filter(o => o && typeof o === 'object').map(o => o as Record<string, unknown>)
+      .filter(o => typeof o.chainId === 'number' && Number.isSafeInteger(o.chainId) && typeof o.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(o.entryPoint) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
+      .map(o => ({ chainId: o.chainId as number, entryPoint: o.entryPoint as string, operation: o.operation as Record<string, unknown>,
+        ...(Array.isArray(o.proof) && o.proof.length <= 32 && o.proof.every(h => typeof h === 'string' && /^0x[0-9a-fA-F]{64}$/.test(h)) && { proof: o.proof as string[] }),
+        ...(bound(o.lowerBoundTimestamp) && { lowerBoundTimestamp: o.lowerBoundTimestamp as number | string }), ...(bound(o.upperBoundTimestamp) && { upperBoundTimestamp: o.upperBoundTimestamp as number | string }) }));
+  }
   return out;
 }
 

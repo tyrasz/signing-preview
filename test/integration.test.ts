@@ -101,6 +101,35 @@ test('HTTP API: a UserOperation supplied in the context decodes the hash being s
   });
 });
 
+test('HTTP API: the operations of a Biconomy MEE supertransaction, supplied in the context, are checked against the hash being signed', async () => {
+  const { userOpHash, readOperation } = await import('../src/userop-hash.ts');
+  const { concatHex, keccak256 } = await import('viem');
+  const ep = '0x0000000071727de22e5e9d8baf0edac6f37da032';
+  const transfer = `0xb61d27f6${'0'.repeat(24)}a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48${'0'.repeat(64)}${'0'.repeat(62)}60${'0'.repeat(62)}44a9059cbb${'0'.repeat(24)}b0b0000000000000000000000000000000000002${(1_000_000).toString(16).padStart(64, '0')}${'0'.repeat(56)}`;
+  const operation = { sender: '0x5ca1ab1e00000000000000000000000000000007', nonce: '0x1', callData: transfer, callGasLimit: '0x10000', verificationGasLimit: '0x10000', preVerificationGas: '0x5000', maxFeePerGas: '0x3b9aca00', maxPriorityFeePerGas: '0x1' };
+  const hash = userOpHash(readOperation(operation, '0.7')!, ep, 1, '0.7');
+  const other = `0x${'ab'.repeat(32)}` as const;
+  const root = keccak256(BigInt(hash) < BigInt(other) ? concatHex([hash, other]) : concatHex([other, hash]));
+  await withServer(async url => {
+    const post = (signed: string, context: unknown) => fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ request: { method: 'personal_sign', params: [signed, ALICE] }, context }) }).then(r => r.json());
+    const codes = (p: { warnings: { code: string }[] }) => p.warnings.map(w => w.code);
+    // A tree of one operation: its root is the operation's hash.
+    const one = await post(hash, { chainId: 1, meeOperations: [{ chainId: 1, entryPoint: ep, operation }] });
+    assert.equal(one.title, 'Sign a supertransaction: Send 1 USDC');
+    assert.equal(one.decoding.decoder, 'mee_supertransaction');
+    assert.ok(codes(one).includes('mee_supertransaction_verified'));
+    // The same operation with its proof, in a tree of two: shown, the root covering another.
+    const partial = await post(root, { chainId: 1, meeOperations: [{ chainId: 1, entryPoint: ep, operation, proof: [other] }] });
+    assert.ok(codes(partial).includes('mee_supertransaction_partial'));
+    assert.equal(partial.attention, 'danger');
+    // Without it, or on another chain: a mismatch.
+    assert.ok(codes(await post(root, { chainId: 1, meeOperations: [{ chainId: 1, entryPoint: ep, operation }] })).includes('mee_supertransaction_mismatch'));
+    assert.ok(codes(await post(hash, { chainId: 1, meeOperations: [{ chainId: 10, entryPoint: ep, operation }] })).includes('mee_supertransaction_mismatch'));
+    // A malformed entry (no EntryPoint) is dropped: none supplied, a mismatch.
+    assert.ok(codes(await post(hash, { chainId: 1, meeOperations: [{ chainId: 1, operation }] })).includes('mee_supertransaction_mismatch'));
+  });
+});
+
 test('HTTP API: the Safe operations behind a multi-chain root, supplied in the context, are checked against it', async () => {
   const { hashTypedData } = await import('viem');
   const MC = '0x22939e839e3c0f479b713eaf95e0df128554aead';

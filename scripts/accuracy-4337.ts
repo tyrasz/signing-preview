@@ -2,6 +2,7 @@
 //   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict] [--dump preview.json]
 //   [--enable-dummies] (a Kernel operation in enable mode previewed with the SDK's dummy for each signature in it)
 //   [--differing dir/] (the row and preview of each operation whose preview differed, to look at once its state is gone)
+//   [--sessions] (only bundles carrying a session key's operation, through Rhinestone's SmartSession: a few of many)
 //
 // --concurrency replays that many operations at once (each on its own state; oldest first where the node keeps state
 // longer, newest first on Arbitrum, OP Mainnet and Polygon, whose public nodes keep the least), while --follow keeps
@@ -18,6 +19,9 @@
 //   their own, what they touched warm for it as in the bundle: gas reported apart, as a slot they wrote is still
 //   dearer to write again in a transaction of its own);
 //   - a SafeOp, for a Safe whose fallback handler is one of the known 4337 modules (src/typed-data/safe.ts);
+//   - a session key's operation through Biconomy's K1MeeValidator in simple mode (src/erc4337-sim.ts), as its key
+//     signed it: personal_sign (or eth_sign) of the supertransaction's hash in its signature, with the operation and
+//     its proof as context.meeOperations (src/supertransaction.ts; the root's other leaves only hashes here);
 //   - otherwise, for v0.6 and v0.7, personal_sign of the operation's hash with the operation as context.userOperation;
 //   - for v0.8 and v0.9, the PackedUserOperation typed data (an EIP-7702 account's delegate where its marker is).
 // Each is previewed on the state the operation met: the parent block, with the block's own header (base fee
@@ -43,7 +47,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { BULLBIT_IMPLEMENTATION, implementationOf, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { BULLBIT_IMPLEMENTATION, implementationOf, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
@@ -55,6 +59,8 @@ const arg = (name: string, fallback: string) => { const i = process.argv.indexOf
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
 const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.includes('--strict'), ENABLE_DUMMIES = process.argv.includes('--enable-dummies');
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '1'))), BACKFILL = Number(arg('backfill', '0'));
+/** --sessions: only bundles with an operation whose nonce names SmartSession (smartSessionOf), read from its UserOperationEvent. */
+const SESSIONS = process.argv.includes('--sessions');
 // The chain's *_RPC_URL replaces its public RPC (empty counts as unset, as an unset CI secret is; EVM_RPCS).
 const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
 /**
@@ -222,6 +228,20 @@ const MODULAR_ACCOUNTS_V2 = new Set(['0x000000000000c5a9089039570dd36455b5c07383
 
 /** A SmartSession session's validator and its config (getSessionValidatorAndConfig(account, permission id)). */
 const SESSION_VALIDATOR = parseAbi(['function getSessionValidatorAndConfig(address account, bytes32 permissionId) view returns (address sessionValidator, bytes sessionValidatorData)']);
+/**
+ * A K1MeeValidator session's operation in simple mode (SmartSession's mode and permission ID, then 0x177eee00 and the
+ * supertransaction's hash, the proof of the operation's hash in it and the key's signature over it): the root, the
+ * proof, and whom the signature recovers to over the root as a message (as Biconomy's SDK signs it) and as it is. The
+ * plain form (65 bytes over the operation's hash) is innerSignatures'.
+ */
+async function k1meeSimple(sig: Hex): Promise<{ root: Hex; proof: Hex[]; message?: string; bare?: string } | undefined> {
+  if (sig.slice(68, 76) !== '177eee00') return undefined;
+  try {
+    const [root, proof, signature] = decodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32[]' }, { type: 'bytes' }], `0x${sig.slice(76)}`);
+    const recovered = (hash: Hex) => recoverAddress({ hash, signature }).then(a => a.toLowerCase(), () => undefined);
+    return { root, proof: [...proof], message: await recovered(hashMessage({ raw: root })), bare: await recovered(root) };
+  } catch { return undefined; }
+}
 
 type Row = Record<string, unknown>;
 const rows: Row[] = [];
@@ -229,6 +249,11 @@ const blocks = new Set<number>();
 const skipped: Record<string, number> = {};
 const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
 const STAND_IN_REJECTED = /doesn't accept (it as theirs|as signed)/;
+/** A supertransaction's preview of one operation (src/supertransaction.ts), its details, warnings and notes as the operation's own. */
+function asOperation(p: Preview): Preview {
+  const own = (x: string) => x.replace(/^Operation 1 \([^)]*\): /, '');
+  return { ...p, details: p.details.map(d => ({ ...d, label: own(d.label) })), warnings: p.warnings.map(w => ({ ...w, message: own(w.message) })), decoding: { ...p.decoding, notes: p.decoding.notes.map(own) } };
+}
 /** Why the preview says the account doesn't take the stand-in as the signer's, where it says (src/typed-data/user-operation.ts). */
 const rejectedWhy = (p: Preview) => p.decoding.notes.map(x => /doesn't accept it as theirs \((.*)\), so its own signature check/.exec(x)?.[1]).find(Boolean);
 /** The key Chrome adds to some passkeys' clientDataJSON, as it appears in a signature (hex, no 0x). */
@@ -386,18 +411,33 @@ async function replay(item: string): Promise<void> {
   // A session key's operation: its session's keys sign it, not the account's owners. A session in use (mode 0x00,
   // then its permission ID) through Rhinestone's OwnableValidator is signed by its keys over the operation's hash as
   // a message, which personal_sign is, by one of them (the key recovered from the signature below), the others its
-  // cosigners (src/erc4337-sim.ts, smartSessionStub). Another session validator's form, or a session the operation
-  // enables, nothing a wallet signs takes (a dApp's key signs it): skipped.
+  // cosigners (src/erc4337-sim.ts, smartSessionStub). One through Biconomy's K1MeeValidator is signed by the session's
+  // key (its config's first 20 bytes): in simple mode, as all seen were, the key signed the supertransaction's hash
+  // (the root in its signature), which is what is replayed: personal_sign of the root (eth_sign where the key signed it
+  // as it is), with the operation and its proof (the root's other leaves, operations the harness doesn't have, as
+  // hashes) as context.meeOperations (src/supertransaction.ts); otherwise the operation's hash. Another session
+  // validator's form, or a session the operation enables, nothing a wallet signs takes: skipped.
+  let sessionValidator: string | undefined, sessionKey: string | undefined, supertransaction: { root: Hex; proof: Hex[]; bare: boolean } | undefined;
   if (session) {
     const enabled = op.signature.startsWith('0x00') && op.signature.length >= 2 + 33 * 2;
-    let validator: string | undefined;
+    let validator: string | undefined, config: Hex = '0x';
     if (enabled) {
       try {
         const out = await atParent.call(CHAIN, 'eth_call', [{ to: session, data: encodeFunctionData({ abi: SESSION_VALIDATOR, functionName: 'getSessionValidatorAndConfig', args: [sender as Hex, `0x${op.signature.slice(4, 68)}`] }) }, 'latest']);
-        validator = decodeFunctionResult({ abi: SESSION_VALIDATOR, functionName: 'getSessionValidatorAndConfig', data: out as Hex })[0].toLowerCase();
+        const [v, c] = decodeFunctionResult({ abi: SESSION_VALIDATOR, functionName: 'getSessionValidatorAndConfig', data: out as Hex });
+        validator = v.toLowerCase(); config = c;
       } catch { return skip('a read of its state failed'); }
     }
-    if (validator !== OWNABLE_VALIDATOR) return skip(`a session key's operation (SmartSession) ${enabled ? "through a session validator the stand-in doesn't take" : 'enabling its session'} (signed by a dApp's key, not a wallet)`);
+    if (validator !== OWNABLE_VALIDATOR && validator !== K1MEE_VALIDATOR) return skip(`a session key's operation (SmartSession) ${enabled ? "through a session validator the stand-in doesn't take" : 'enabling its session'} (signed by a dApp's key, not a wallet)`);
+    sessionValidator = validator === OWNABLE_VALIDATOR ? 'OwnableValidator' : 'K1MeeValidator';
+    if (validator === K1MEE_VALIDATOR) {
+      const configured = config.length >= 42 ? `0x${config.slice(2, 42)}`.toLowerCase() : undefined;
+      const simple = await k1meeSimple(op.signature);
+      // The key over the root as it is, else as a message (else the session's, as configured).
+      const bare = !!simple?.bare && simple.bare === configured;
+      sessionKey = bare ? configured : simple?.message ?? configured;
+      if (simple) supertransaction = { root: simple.root, proof: simple.proof, bare };
+    }
   }
   // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
   // validator or permission it installs (the Enable), which signs the operation (a dApp's session key, mostly); its
@@ -443,6 +483,13 @@ async function replay(item: string): Promise<void> {
     const typed = safeOpTyped(op, fallback, (module.signaturePrefix?.length ?? 0) / 2);
     digest = hashTypedData(typed as never);
     request = signer => ({ method: 'eth_signTypedData_v4', params: [signer, JSON.stringify(typed)] });
+  } else if (supertransaction && (VERSION === '0.6' || VERSION === '0.7')) {
+    // A K1MeeValidator session's operation in simple mode: the supertransaction's hash its key signed (above).
+    kind = 'supertransaction';
+    digest = supertransaction.root;
+    ctx = { ...context, meeOperations: [{ chainId: CHAIN, entryPoint: EP, operation: rpcForm(op), proof: supertransaction.proof }] };
+    const { root, bare: asIs } = supertransaction;
+    request = signer => asIs && signer === sessionKey ? { method: 'eth_sign', params: [signer, root] } : { method: 'personal_sign', params: [root, signer] };
   } else if (VERSION === '0.6' || VERSION === '0.7') {
     kind = 'hash';
     const form = { ...rpcForm(op), ...(supplied && { signature: supplied }) };
@@ -498,20 +545,24 @@ async function replay(item: string): Promise<void> {
   // First, a Kernel permission's recorded owner (whose signature recovers to someone else).
   const recorded = code.length > 2 && !module ? await permissionOwner((to, data) => atParent.call(CHAIN, 'eth_call', [{ to, data }, 'latest']) as Promise<string>, sender, BigInt(op.nonce)) : undefined;
   if (recorded) { const i = signers.indexOf(recorded); if (i >= 0) signers.splice(i, 1); signers.unshift(recorded); }
+  // First of all, a K1MeeValidator session's key (above).
+  if (sessionKey) { const i = signers.indexOf(sessionKey); if (i >= 0) signers.splice(i, 1); signers.unshift(sessionKey); }
   add(sender);
   let p!: Preview, tried = 0;
+  // A supertransaction's preview shows its operation as "Operation 1 (chain): …": read as the operation's own.
+  const previewOf = async (q: { method: string; params: unknown[] }) => { const r = await previewRequest(q, ctx, deps); return kind === 'supertransaction' ? asOperation(r) : r; };
   // Public nodes refuse heavy simulations: with the block's earlier transactions, a full block can be one. The
   // preview then has no simulation at all, and runs again without them.
   const ran = (q: Preview) => q.decoding.notes.some(x => /simulat/.test(x)) || q.details.some(d => d.label === 'Gas cost (simulated)');
   let prefixDropped: string | undefined;
   for (const signer of signers.slice(0, 3)) {
     tried++;
-    p = await previewRequest(request(signer), ctx, deps);
-    if (!ran(p) && prefix === pricedBefore) { prefix = before; p = await previewRequest(request(signer), ctx, deps); }
+    p = await previewOf(request(signer));
+    if (!ran(p) && prefix === pricedBefore) { prefix = before; p = await previewOf(request(signer)); }
     // Then with only the account's own and the other bundles among them, then with none.
     const narrow = async (why: string) => {
-      if (related.length > essential.length && related.length < prefix.length) { prefix = related; prefixDropped = `${why}: only the account's own and the other bundles ran first`; p = await previewRequest(request(signer), ctx, deps); return; }
-      prefix = essential; prefixDropped = why; p = await previewRequest(request(signer), ctx, deps);
+      if (related.length > essential.length && related.length < prefix.length) { prefix = related; prefixDropped = `${why}: only the account's own and the other bundles ran first`; p = await previewOf(request(signer)); return; }
+      prefix = essential; prefixDropped = why; p = await previewOf(request(signer));
     };
     if (!ran(p) && prefix.length > essential.length) await narrow('the node refused the block with them');
     if (!ran(p) && prefix.length > essential.length) await narrow('the node refused the block with them');
@@ -524,7 +575,7 @@ async function replay(item: string): Promise<void> {
     // The whole operation didn't run and nothing says why (no rejection, no validation revert): the node failed the
     // simulation, which a heavy block refused under load does (alone, the same operations ran whole). Once more.
     const unexplained = (q: Preview) => ran(q) && !q.decoding.notes.some(x => /whole operation was simulated|validation reverts on a stand-in/.test(x)) && !q.warnings.some(w => w.code === 'userop_rejected');
-    if (unexplained(p)) { await new Promise(r => setTimeout(r, 1500)); p = await previewRequest(request(signer), ctx, deps); }
+    if (unexplained(p)) { await new Promise(r => setTimeout(r, 1500)); p = await previewOf(request(signer)); }
     // A wrong guess shows as the account rejecting the stand-in, or as its validation reverting on a shape for
     // another key (a passkey account given an ECDSA stand-in for a non-owner): either way, the next candidate.
     if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x) || /validation reverts on a stand-in/.test(x))) break;
@@ -664,7 +715,7 @@ async function replay(item: string): Promise<void> {
   }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
-    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session }),
+    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session, sessionValidator }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
@@ -740,7 +791,8 @@ async function replay(item: string): Promise<void> {
 }
 
 const head = Number(await call<string>('eth_blockNumber', []));
-const pending = async (from: number, to: number) => [...new Set((await call<{ transactionHash: string }[]>('eth_getLogs', [{ address: EP, topics: [UOE], fromBlock: hex(BigInt(from)), toBlock: hex(BigInt(to)) }])).map(l => l.transactionHash))];
+const pending = async (from: number, to: number) => [...new Set((await call<{ transactionHash: string; data: Hex }[]>('eth_getLogs', [{ address: EP, topics: [UOE], fromBlock: hex(BigInt(from)), toBlock: hex(BigInt(to)) }]))
+  .filter(l => !SESSIONS || smartSessionOf(BigInt(l.data.slice(0, 66)))).map(l => l.transactionHash))];
 // Replays, CONCURRENCY at a time. On Ethereum, oldest first: a backfill's oldest blocks are the first whose state
 // the node stops serving (about 128 blocks, 25 minutes), and the newest still have time. On Arbitrum, newest first:
 // its 30 seconds of state are gone for anything queued behind.
@@ -797,7 +849,7 @@ console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
-if (count(r => !!r.session)) say(`  session keys' operations (SmartSession, through Rhinestone's OwnableValidator): ${count(r => !!r.session)}, the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
+if (count(r => !!r.session)) say(`  session keys' operations (SmartSession): ${count(r => !!r.session)} (${['OwnableValidator', 'K1MeeValidator'].map(v => `through ${v} ${count(r => r.sessionValidator === v)}`).join(', ')}), the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
 if (count(r => !!r.enableMode)) say(`  Kernel's enable mode (previewed with ${ENABLE_DUMMIES ? "the SDK's dummies for" : 'their own'} signatures): ${count(r => !!r.enableMode)}, the stand-in validated for ${count(r => !!r.enableMode && r.standIn === 'validated')}${count(r => r.standIn === 'as signed') ? `, run with the signatures as they were for ${count(r => r.standIn === 'as signed')} (no stand-in made)` : ''}`);
 say(`  gas paid (for ${count(r => !!(g(r) as { gasless?: boolean } | undefined)?.gasless)} gasless operations, the gas used), of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);

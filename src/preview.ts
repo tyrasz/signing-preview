@@ -20,6 +20,7 @@ import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts'
 import { kernelEnableAdapter } from './typed-data/kernel-enable.ts';
 import { previewMessage } from './message.ts';
 import { previewSignedOperation } from './userop-hash.ts';
+import { previewSupertransaction } from './supertransaction.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, genericTypedDataAdapter];
 
@@ -74,7 +75,8 @@ async function previewOf(request: SigningRequest, context: PreviewContext, deps:
       return previewTypedData(method, params, context, deps);
     case 'personal_sign':
     case 'eth_sign':
-      return await previewSignedOperation(method, params, context, deps) ?? previewMessage(method, params, context);
+      // A supertransaction's hash, with its operations (context.meeOperations); an operation's own hash (context.userOperation).
+      return await previewSupertransaction(method, params, context, deps) ?? await previewSignedOperation(method, params, context, deps) ?? previewMessage(method, params, context);
   }
   const b = new PreviewBuilder().warn('info', 'not_a_signing_request', `${method} is not a signing request, so there is nothing to preview.`);
   return { schema: 'signing-preview/1', method, kind: 'unsupported', network: null, title: method, summary: 'Not a signing request.', details: [], assetChanges: [], warnings: b.warnings, attention: 'info', decoding: { status: 'opaque', decoder: 'none', notes: [] } };

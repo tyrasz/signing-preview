@@ -294,6 +294,17 @@ export interface PreviewContext {
    */
   safeOperations?: { chainId: number; operation: Record<string, unknown> }[];
   /**
+   * A Biconomy MEE supertransaction's hash (personal_sign or eth_sign of it) is the root of a Merkle tree of its
+   * UserOperations' hashes, on any chains, none of which the message shows. The wallet holding them (its quote)
+   * supplies them, each with its chain and EntryPoint (v0.6 or v0.7) and the operation as bundlers' RPC carries it;
+   * with `lowerBoundTimestamp` and `upperBoundTimestamp`, its leaf is MEE's hash of the operation's hash and those (an
+   * operation its account's own K1MeeValidator checks), without, the operation's hash (a session key's, through
+   * SmartSession). The root is rebuilt from them, and they are shown only if they make it up; or, for a wallet that
+   * holds only some of them, each with its `proof` (the hashes OpenZeppelin's MerkleProof takes it to the root with),
+   * shown with a danger that the root covers operations that aren't. A signature in an operation is left out.
+   */
+  meeOperations?: { chainId: number; entryPoint: string; operation: Record<string, unknown>; proof?: string[]; lowerBoundTimestamp?: number | string; upperBoundTimestamp?: number | string }[];
+  /**
    * The account's transactions the wallet has sent and that aren't mined yet, oldest first. The transaction being
    * previewed is simulated after them, as it will run, instead of on the latest state alone.
    */

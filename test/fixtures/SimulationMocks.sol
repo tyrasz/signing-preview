@@ -255,6 +255,64 @@ contract BundlerPaymaster {
     }
     function postOp(uint8, bytes calldata, uint256, uint256) external {}
 }
+/// A factory whose accounts only deploy when its own bundler sends the operation (tx.origin), as those of an OKX
+/// Wallet factory on Ethereum do (their initialization asks OKX's list of bundlers, and reverts InvalidBundler()).
+contract BundlerFactory {
+    error InvalidBundler();
+    address public entryPoint;
+    address public bundler;
+    constructor(address ep, address b) { entryPoint = ep; bundler = b; }
+    function createAccount(address owner, uint256 salt) external returns (address) {
+        if (tx.origin != bundler) revert InvalidBundler();
+        return address(new Account4337{salt: bytes32(salt)}(owner, entryPoint));
+    }
+}
+/// An account whose validation only takes operations its own bundler sends (tx.origin).
+contract BundlerAccount {
+    error InvalidBundler();
+    address public owner;
+    address public entryPoint;
+    address public bundler;
+    constructor(address o, address ep, address b) { owner = o; entryPoint = ep; bundler = b; }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (tx.origin != bundler) revert InvalidBundler();
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        bytes calldata sig = op.signature;
+        if (sig.length != 65) return 1;
+        bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        return ecrecover(h, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64])) == owner ? 0 : 1;
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
+/// An account whose validation only takes operations it sends itself (tx.origin is the account: an EIP-7702 account
+/// can be its own bundler), its prefund and its calls paid from its own balance.
+contract SelfAccount {
+    error InvalidBundler();
+    address public owner;
+    address public entryPoint;
+    constructor(address o, address ep) { owner = o; entryPoint = ep; }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (tx.origin != address(this)) revert InvalidBundler();
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        bytes calldata sig = op.signature;
+        if (sig.length != 65) return 1;
+        bytes32 h = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        return ecrecover(h, uint8(sig[64]), bytes32(sig[0:32]), bytes32(sig[32:64])) == owner ? 0 : 1;
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
 /// The same account for EntryPoint v0.6, whose operations aren't packed.
 struct UserOperationV06 { address sender; uint256 nonce; bytes initCode; bytes callData; uint256 callGasLimit; uint256 verificationGasLimit; uint256 preVerificationGas; uint256 maxFeePerGas; uint256 maxPriorityFeePerGas; bytes paymasterAndData; bytes signature; }
 contract Account4337V06 {
@@ -456,20 +514,34 @@ contract KernelEcdsaSignerMock {
         return RecoverMock.recover(hash, sig) == key || RecoverMock.recover(RecoverMock.eth(hash), sig) == key ? 0 : 1;
     }
 }
-/// Rhinestone's SmartSession using sessions whose validator is Rhinestone's OwnableValidator, in one contract (their
-/// verified sources): a signature of the mode (0x00, use; any other is no mode and reverts), the session's permission
-/// ID and its owners' signatures over the operation's hash as a message, a threshold of them in any order. Tests put
-/// its code at SmartSession's address.
+/// A SmartSession session's validator (ISessionValidator): the session's config is what it checks the signature by.
+interface SessionValidatorLike { function validateSignatureWithData(bytes32 hash, bytes calldata sig, bytes calldata data) external view returns (bool); }
+/// Rhinestone's SmartSession, in one contract (their verified sources): a signature of the mode (0x00, use; any other
+/// is no mode and reverts), the session's permission ID, then what the session's validator takes. A session whose
+/// validator is Rhinestone's OwnableValidator (enable: its owners' signatures over the operation's hash as a message,
+/// a threshold of them in any order) is checked here; another's (enableWith: Biconomy's K1MeeValidator) is called as
+/// SmartSession calls it, with the operation's hash, the rest of the signature and the session's config. Tests put its
+/// code at SmartSession's addresses.
 contract SmartSessionLike {
+    address constant OWNABLE = 0x2483DA3A338895199E5e538530213157e931Bf06;
     mapping(address => bytes32[]) ids;
     mapping(address => mapping(bytes32 => bytes)) configs;
+    mapping(address => mapping(bytes32 => address)) validators;
     function enable(bytes32 id, uint256 threshold, address[] calldata owners) external { ids[msg.sender].push(id); configs[msg.sender][id] = abi.encode(threshold, owners); }
+    function enableWith(bytes32 id, address validator, bytes calldata config) external { ids[msg.sender].push(id); validators[msg.sender][id] = validator; configs[msg.sender][id] = config; }
+    function validatorOf(address account, bytes32 id) internal view returns (address v) { v = validators[account][id]; if (v == address(0)) v = OWNABLE; }
     function getPermissionIDs(address account) external view returns (bytes32[] memory) { return ids[account]; }
-    function getSessionValidatorAndConfig(address account, bytes32 id) external view returns (address, bytes memory) { return (0x2483DA3A338895199E5e538530213157e931Bf06, configs[account][id]); }
+    function getSessionValidatorAndConfig(address account, bytes32 id) external view returns (address, bytes memory) { return (validatorOf(account, id), configs[account][id]); }
     function validateUserOp(PackedUserOperation calldata op, bytes32 hash) external view returns (uint256) {
         require(uint8(op.signature[0]) == 0, "UnsupportedSmartSessionMode");
-        bytes memory config = configs[op.sender][bytes32(op.signature[1:33])];
+        bytes32 id = bytes32(op.signature[1:33]);
+        bytes memory config = configs[op.sender][id];
         require(config.length > 0, "InvalidPermissionId");
+        address v = validatorOf(op.sender, id);
+        if (v != OWNABLE) {
+            bytes memory sig = op.signature[33:];
+            return SessionValidatorLike(v).validateSignatureWithData(hash, sig, config) ? 0 : 1;
+        }
         (uint256 threshold, address[] memory owners) = abi.decode(config, (uint256, address[]));
         bytes32 h = RecoverMock.eth(hash);
         uint256 valid;
@@ -481,6 +553,20 @@ contract SmartSessionLike {
         return valid >= threshold ? 0 : 1;
     }
 }
+/// Multicall3's aggregate3 (its verified source, the same address on every chain): each call in turn, its result kept,
+/// reverting where a call that may not fail does.
+contract Multicall3Like {
+    struct Call3 { address target; bool allowFailure; bytes callData; }
+    struct Result { bool success; bytes returnData; }
+    function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory results) {
+        results = new Result[](calls.length);
+        for (uint256 i = 0; i < calls.length; i++) {
+            (bool ok, bytes memory ret) = calls[i].target.call(calls[i].callData);
+            require(ok || calls[i].allowFailure, "Multicall3: call failed");
+            results[i] = Result(ok, ret);
+        }
+    }
+}
 /// Safe7579's validation (a Safe made an ERC-7579 account): the validator the nonce's top 20 bytes name is called
 /// with the operation, its revert reported as ExecutionFailed().
 contract Account7579 {
@@ -488,6 +574,7 @@ contract Account7579 {
     address public entryPoint;
     constructor(address ep) { entryPoint = ep; }
     function enableSession(SmartSessionLike module, bytes32 id, uint256 threshold, address[] calldata owners) external { module.enable(id, threshold, owners); }
+    function enableSessionWith(SmartSessionLike module, bytes32 id, address validator, bytes calldata config) external { module.enableWith(id, validator, config); }
     function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256 v) {
         require(msg.sender == entryPoint, "entrypoint");
         (bool ok, bytes memory ret) = validatorOf(op.nonce).call(abi.encodeCall(SmartSessionLike.validateUserOp, (op, hash)));

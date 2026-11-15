@@ -226,25 +226,56 @@ const hashPair = (a: Hex, b: Hex) => keccak256(BigInt(a) < BigInt(b) ? concatHex
  * to exactly these leaves: no other operation has a proof to it.
  */
 export function merkleRoots(leaves: Hex[]): Set<string> {
-  const roots = new Set<string>();
-  if (!leaves.length) return roots;
-  for (const order of [leaves, [...leaves].sort((a, z) => (BigInt(a) < BigInt(z) ? -1 : BigInt(a) > BigInt(z) ? 1 : 0))]) {
+  return new Set(merkleTrees(leaves).map(t => t.root));
+}
+
+/**
+ * The trees of merkleRoots, each with its root (lower case) and each leaf's proof, in the order the leaves were given:
+ * the nodes OpenZeppelin's MerkleProof (or Solady's) hashes the leaf with, in turn, to reach the root.
+ */
+export function merkleTrees(leaves: Hex[]): { root: string; proofs: Hex[][] }[] {
+  const trees: { root: string; proofs: Hex[][] }[] = [];
+  if (!leaves.length) return trees;
+  const given = leaves.map((_, i) => i);
+  const sorted = [...given].sort((a, z) => (BigInt(leaves[a]) < BigInt(leaves[z]) ? -1 : BigInt(leaves[a]) > BigInt(leaves[z]) ? 1 : 0));
+  for (const order of [given, sorted]) {
+    // OpenZeppelin's: leaf k of the order at tree[length - 1 - k]; a node's sibling is the next one (odd) or the one
+    // before (even), its parent at (i - 1) / 2.
     const tree: Hex[] = new Array(2 * order.length - 1);
-    order.forEach((leaf, i) => { tree[tree.length - 1 - i] = leaf; });
+    order.forEach((leaf, k) => { tree[tree.length - 1 - k] = leaves[leaf]; });
     for (let i = tree.length - 1 - order.length; i >= 0; i--) tree[i] = hashPair(tree[2 * i + 1], tree[2 * i + 2]);
-    roots.add(tree[0].toLowerCase());
+    const proofs: Hex[][] = leaves.map(() => []);
+    order.forEach((leaf, k) => {
+      for (let i = tree.length - 1 - k; i > 0; i = (i - 1) >> 1) proofs[leaf].push(tree[i % 2 ? i + 1 : i - 1]);
+    });
+    trees.push({ root: tree[0].toLowerCase(), proofs });
     for (const odd of ['carry', 'self'] as const) {
-      let level = order;
+      // Each node, with the leaves under it (whose proofs its sibling joins).
+      let level = order.map(leaf => ({ hash: leaves[leaf], under: [leaf] }));
+      const proofs: Hex[][] = leaves.map(() => []);
       while (level.length > 1) {
-        const next: Hex[] = [];
-        for (let i = 0; i < level.length; i += 2) next.push(i + 1 < level.length ? hashPair(level[i], level[i + 1]) : odd === 'self' ? hashPair(level[i], level[i]) : level[i]);
+        const next: typeof level = [];
+        for (let i = 0; i < level.length; i += 2) {
+          const a = level[i], z = level[i + 1];
+          if (z) {
+            for (const leaf of a.under) proofs[leaf].push(z.hash);
+            for (const leaf of z.under) proofs[leaf].push(a.hash);
+            next.push({ hash: hashPair(a.hash, z.hash), under: [...a.under, ...z.under] });
+          } else if (odd === 'self') {
+            for (const leaf of a.under) proofs[leaf].push(a.hash);
+            next.push({ hash: hashPair(a.hash, a.hash), under: a.under });
+          } else next.push(a);
+        }
         level = next;
       }
-      roots.add(level[0].toLowerCase());
+      trees.push({ root: level[0].hash.toLowerCase(), proofs });
     }
   }
-  return roots;
+  return trees;
 }
+
+/** OpenZeppelin's MerkleProof.processProof: the root `proof` reaches from `leaf`, each pair hashed in order (lower case). */
+export const proofRoot = (proof: readonly Hex[], leaf: Hex): string => proof.reduce((node, sibling) => hashPair(node, sibling), leaf).toLowerCase();
 
 /**
  * Safe4337MultiChainSignatureModule's multi-chain signature: one signature over the root of a Merkle tree whose

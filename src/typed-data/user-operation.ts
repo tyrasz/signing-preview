@@ -8,7 +8,7 @@ import { callerOverrides, decodeTransaction, simulationNote, warnOverridden } fr
 import { netChanges } from '../evm/effects.ts';
 import type { AssetChange } from '../types.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
-import { entryPointDeposit, simulateExecution, simulateOperation, type ExecutionInput, type OperationRun } from '../erc4337-sim.ts';
+import { entryPointDeposit, simulateExecution, simulateOperation, type ExecutionInput, type OperationRun, type SupertransactionProof } from '../erc4337-sim.ts';
 import { pinLatest } from '../block.ts';
 import { tracePreviews, noTrace, type TraceEnv } from '../evm/trace.ts';
 import { tokenInfo } from '../evm/common.ts';
@@ -133,6 +133,8 @@ export interface Operation {
   signature?: Hex;
   /** The digest the signature is over (the message's personal_sign form, or the typed data's digest). */
   digest?: Hex;
+  /** Signed as one of a supertransaction's operations (src/supertransaction.ts): its root, and this operation's proof in it. */
+  supertransaction?: SupertransactionProof;
 }
 
 /** What the EntryPoint's rejection codes mean (eth-infinitism's EntryPoint, all versions). */
@@ -157,6 +159,10 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   if (!run) return null;
   const sender = u.sender.toLowerCase();
   const native = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}`;
+  // An account that only deploys, or validates, for certain bundlers (tx.origin): who the operation ran as, or that
+  // the bundlers it took lately fared no better (see simulateOperation).
+  const origin = run.origin, sent = origin?.by === 'factory' ? "deployed accounts through this account's factory" : "sent this account's operations";
+  if (origin?.bundler) b.note(`Simulated as sent by ${origin.bundler}, a bundler that recently ${sent}: sent by anyone else (the transaction's origin), ${origin.by === 'factory' ? "deploying the account fails" : "the account's validation reverts"} (${origin.rejected}), so only bundlers it accepts can include this operation.`);
   if (run.rejected) {
     const code = run.rejected.slice(0, 4);
     // A reverting validation is most likely the stand-in signature's shape (passkeys, wrapped signatures): the
@@ -166,7 +172,10 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
     if (code === 'AA20' && !how.deploys) return null;
     // A nonce ahead of the account's waits for the operations before it (the nonce check notes that): not a rejection.
     if (code === 'AA25' && b.notes.some(n => /must run before this one/.test(n))) return null;
-    if (!REJECTION_COVERED[code] || !b.warnings.some(w => w.code === REJECTION_COVERED[code])) b.warn('caution', 'userop_rejected', `Bundlers would reject this operation: ${REJECTIONS[code] ?? 'the EntryPoint refuses it'} (${run.rejected}). Nothing it does happens unless that changes.`);
+    // (Only the busiest were run when one was rejected exactly as anyone else is: `of` says how many there were.)
+    const asThem = origin && !origin.bundler && origin.tried && origin.rejected.startsWith(code)
+      ? ` It fails the same way sent by ${origin.of ? `the busiest ${origin.tried === 1 ? '' : `${origin.tried} `}of the ${origin.of} bundlers` : origin.tried === 1 ? 'the bundler' : `each of the ${origin.tried} bundlers`} that recently ${sent}.` : '';
+    if (!REJECTION_COVERED[code] || !b.warnings.some(w => w.code === REJECTION_COVERED[code])) b.warn('caution', 'userop_rejected', `Bundlers would reject this operation: ${REJECTIONS[code] ?? 'the EntryPoint refuses it'} (${run.rejected}).${asThem} Nothing it does happens unless that changes.`);
     return null;
   }
   const sim = run.result;
@@ -208,6 +217,8 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
   b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : run.standIn === 'enable' ? ` (Kernel's enable mode: installing what the operation's signature names, with stand-ins for the two signatures in it, which don't exist until they're signed: the owner's approval of what it installs, its Enable signature, and the operation's own by the key it installs${run.account?.signatureFailed ? `, but the account doesn't accept it as theirs${run.why ? ` (${run.why})` : ''}, so its own signature check isn't simulated` : ''})` : u.signature ? ` (with the wallet's stand-in signature${run.account?.signatureFailed ? ", which the account doesn't accept as signed, as gas-estimation stubs often aren't" : ''})` : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? `, but the account doesn't accept it as theirs${run.why ? ` (${run.why})` : ''}, so its own signature check isn't simulated` : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
+  // What the stand-in's form leaves out, where the account took it (a K1MeeValidator session's plain form).
+  if (run.note && !run.account?.signatureFailed) b.note(run.note);
   return changes;
 }
 
@@ -266,6 +277,8 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   const overrides = callerOverrides(env.context);
   let assetChanges: AssetChange[] = inner.assetChanges;
   let whole: AssetChange[] | null = null;
+  // The bundler the account deploys for, where its factory takes only its own (OperationRun's origin).
+  let deployer: string | undefined;
   if (env.deps.simulator && chainId !== null && u.gas && nonce !== null && u.paymasterAndData !== undefined) {
     // The EntryPoint receives an EIP-7702 account's initCode with the 0x7702 marker where the typed data has its delegate.
     const onChainInit = lead && mine && !deploys && !initCode.startsWith(EIP7702_MARKER) && u.entryPointName && !u.entryPointName.endsWith('v0.6') && !u.entryPointName.endsWith('v0.7')
@@ -274,8 +287,9 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
       // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
       const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
       const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData, callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
-        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(u.supertransaction && { supertransaction: u.supertransaction }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
       if (run) warnOverridden(b, overrides);
+      if (run?.origin?.by === 'factory') deployer = run.origin.bundler;
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
       // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment.
       if (whole && env.context.trace && run?.requests) {
@@ -290,7 +304,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   // Otherwise its calls alone, as the EntryPoint makes them: the account deployed first if it's new, then called.
   if (whole === null && env.deps.simulator && chainId !== null) {
     try {
-      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(deploys && deployer && { origin: deployer }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
       const sim = run?.result;
       if (sim && !run.noCode) warnOverridden(b, overrides);
       const how = run?.direct ? "directly from the account: this account only runs calls it validated in the same transaction (a flag kept in transient storage), which can't be done before it's signed"
