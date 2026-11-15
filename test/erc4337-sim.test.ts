@@ -136,6 +136,53 @@ test('A paymaster that only pays for its own bundler: the operation runs as a bu
   assert.equal(lookups.length, 1);
 });
 
+test('A quiet paymaster that only pays for its own bundlers: its last bundles are looked for as far back as the node answers', async () => {
+  const ALLOWED = '0xb0d1e70000000000000000000000000000014337', HEAD = 1_000_000;
+  // Each node: the paymaster's last operation `last` blocks back; `refuse` gives the node's answer to a window it won't
+  // read (from and to, blocks back from the head), if any. Returns the windows asked, as [newest, oldest] blocks back.
+  const lookup = async (last: number, refuse: (newest: number, oldest: number) => Error | undefined) => {
+    const picky = await chain.deploy('BundlerPaymaster', 'address,address', [EP, ALLOWED]);
+    await chain.exec(EP, call('depositTo', [picky]), '0xde9100000000000000000000000000000000d001', E);
+    const op = operation(withPaymaster(picky));
+    const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+    const windows: [number, number][] = [];
+    const rpc = { has: (c: number) => deps.rpc!.has(c), call: async (c: number, m: string, ps: any[]) => {
+      if (m === 'eth_blockNumber') return numberToHex(HEAD);
+      if (m === 'eth_getLogs') {
+        const newest = HEAD - Number(BigInt(ps[0].toBlock)), oldest = HEAD - Number(BigInt(ps[0].fromBlock));
+        windows.push([newest, oldest]);
+        const e = refuse(newest, oldest);
+        if (e) throw e;
+        return newest <= last && last <= oldest ? [{ transactionHash: `0x${'cd'.repeat(32)}` }] : [];
+      }
+      if (m === 'eth_getTransactionByHash') return { from: ALLOWED, input: '0x' };
+      return deps.rpc!.call(c, m, ps);
+    } } as Dependencies['rpc'];
+    const p = await previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, { ...deps, rpc });
+    return { p, windows };
+  };
+  const ran = (p: Preview) => !codes(p).includes('userop_rejected') && p.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.7 runs it/.test(n));
+  // A node that answers any window (Base's, up to 50,000 blocks), the paymaster's last operation 74,000 blocks back:
+  // found in the older windows of 20,000, each just before the last.
+  const base = await lookup(74_000, () => undefined);
+  assert.ok(ran(base.p), base.p.warnings.map(w => w.message).join(' | '));
+  assert.deepEqual(base.windows, [[0, 200], [0, 2000], [0, 10_000], [0, 20_000], [20_000, 40_000], [40_000, 60_000], [60_000, 80_000]]);
+  // Ethereum's public node: 10,000 blocks back and no further (HTTP 403, "Archive requests require a personal token").
+  const archive = (newest: number, oldest: number) => (oldest > 10_000 ? new Error('eth_getLogs: HTTP 403') : undefined);
+  const eth = await lookup(6_137, archive);
+  assert.ok(ran(eth.p), eth.p.warnings.map(w => w.message).join(' | '));
+  assert.deepEqual(eth.windows, [[0, 200], [0, 2000], [0, 10_000]]);
+  // Further back than it answers: the 20,000 refused (asked again once), and no older window asked after it.
+  const beyond = await lookup(15_000, archive);
+  assert.match(beyond.p.warnings.find(w => w.code === 'userop_rejected')?.message ?? '', /AA33/);
+  assert.ok(beyond.windows.every(([, oldest]) => oldest <= 20_000), JSON.stringify(beyond.windows));
+  // A node that caps a query at 10,000 blocks, naming it (Polygon's): the older windows within the cap, none read twice.
+  const capped = (newest: number, oldest: number) => (oldest - newest > 10_000 ? Object.assign(new Error('capped'), { rpcError: { message: 'exceed maximum block range: 10000' } }) : undefined);
+  const polygon = await lookup(25_000, capped);
+  assert.ok(ran(polygon.p), polygon.p.warnings.map(w => w.message).join(' | '));
+  assert.deepEqual(polygon.windows, [[0, 200], [0, 2000], [0, 10_000], [0, 20_000], [10_000, 20_000], [20_000, 30_000]]);
+});
+
 test('The operation runs at the price its bundle pays: a contract reading tx.gasprice sees the base fee plus the operation’s priority fee', async () => {
   const tips = await chain.deploy('TipReader', '', []);
   const T = parseAbi(['function requireTip(uint256 atLeast) view']);
@@ -571,6 +618,96 @@ test('OKX Wallet’s account: the stand-in names a key, so validation runs its c
   const otherCall = encodeFunctionData({ abi: O, functionName: 'createAccount', args: [owners, 9n] });
   assert.equal(await echo(otherCall), otherCall);
   assert.equal(await echo('0x'), '0x');
+});
+
+test('An EIP-7702 delegate in Biconomy Smart Account v2’s form with a cosigner: the stand-in passes its own code’s checks and its registry’s, for the gas a signed operation uses', async () => {
+  // The delegate's and its registry's code as deployed (unpublished), and an account delegating to it whose key signs.
+  const { readFileSync } = await import('node:fs');
+  const { COSIGNED_7702_COSIGNER, STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
+  const { ecrecoverPrice } = await import('../src/chains.ts');
+  const { keccak256, encodeAbiParameters, encodePacked, parseAbiParameters, decodeAbiParameters } = await import('viem');
+  const { createAddressFromString: at, hexToBytes: toBytes } = await import('@ethereumjs/util');
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/cosigned-7702.json', import.meta.url), 'utf8')) as Record<'delegate' | 'registry', { address: string; code: Hex }> & { operation: Record<string, Hex> & { userOpHash: Hex; sender: string } };
+  await chain.putCode(fx.delegate.address, fx.delegate.code);
+  await chain.putCode(fx.registry.address, fx.registry.code);
+  const key = privateKeyToAccount(`0x${'7a'.repeat(32)}`), cosigner = privateKeyToAccount(`0x${'c0'.repeat(32)}`);
+  const user = key.address.toLowerCase();
+  // The registry's verifying signers: a mapping at slot 1 (the stand-in's cosigner, and the one signing for real below).
+  const slot = (a: string) => toBytes(keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [a as Hex, 1n])));
+  const list = async (a: string, on: boolean) => chain.evm.stateManager.putStorage(at(fx.registry.address), slot(a), on ? new Uint8Array([1]) : new Uint8Array(0));
+  await list(COSIGNED_7702_COSIGNER, true);
+  await list(cosigner.address, true);
+  await chain.putCode(user, `0xef0100${fx.delegate.address.slice(2)}` as Hex);
+  await chain.exec(usdc, call('mint', [user, 100_000_000n]));
+  await chain.setBalance(user, E);
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute_ncC(address dest, uint256 value, bytes func)']), functionName: 'execute_ncC', args: [usdc as Hex, 0n, call('transfer', [BOB, 50_000_000n])] });
+  const op = operation({ sender: user, callData: execute, paymasterAndData: '0x' });
+  const notes = (p: Preview) => p.decoding.notes.join(' | ');
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated as EntryPoint v0\.6/.test(n));
+  const gasUsed = (p: Preview) => BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+
+  // Before: the bare stand-in isn't the form the account decodes, so its validation reverts and only the calls run.
+  let p = await preview({ ...op, signature: STUB_SIGNATURE }, user, '0.6');
+  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23/);
+  assert.equal(whole(p), undefined);
+
+  // The stand-in: the account asked to sign, its cosigner listed. Validated, and the calls run.
+  p = await preview(op, user, '0.6');
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts' || c === 'userop_rejected'), []);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  const standIn = gasUsed(p);
+
+  // A real signature in the account's form, by its key and a listed cosigner: the cosigner's over the operation's hash,
+  // the key's over the root of a tree of two leaves, the operation's (with a validity window) and another.
+  const hash = userOpHash(readOperation(op, '0.6')!, EP6, 999, '0.6');
+  const validUntil = 1_900_000_000, validAfter = 1_700_000_000, other = `0x${'ab'.repeat(32)}` as Hex;
+  const leaf = keccak256(encodePacked(['uint48', 'uint48', 'bytes32'], [validUntil, validAfter, hash]));
+  const root = keccak256(BigInt(leaf) < BigInt(other) ? concatHex([leaf, other]) : concatHex([other, leaf]));
+  const owner = encodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), [validUntil, validAfter, root, [other], await key.signMessage({ message: { raw: root } })]);
+  const module = encodeAbiParameters(parseAbiParameters('bytes, bytes'), [await cosigner.signMessage({ message: { raw: hash } }), owner]);
+  const signed = { ...op, signature: encodeAbiParameters(parseAbiParameters('bytes, address'), [module, '0xd88b687ba4237e6b9893020285103f45d8949ea3']) };
+  p = await preview(signed, user, '0.6');
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  // Its two signatures pass through the replaced ecrecover to the real precompile, about 200 gas more each than calling
+  // it, where the stand-in's cost exactly the chain's price for it (HyperEVM's 15,000 here, which this test's EVM
+  // charges 3,000): otherwise the stand-in uses the gas the signed operation does.
+  const real = gasUsed(p), priced = 2n * BigInt(ecrecoverPrice(999) - 3000);
+  assert.ok(real + priced - standIn >= 350n && real + priced - standIn <= 450n, `${real} ${standIn}`);
+  // A cosignature over another hash: refused.
+  const miscosigned = { ...op, signature: encodeAbiParameters(parseAbiParameters('bytes, address'), [encodeAbiParameters(parseAbiParameters('bytes, bytes'), [await cosigner.signMessage({ message: { raw: keccak256(hash) } }), owner]), '0xd88b687ba4237e6b9893020285103f45d8949ea3']) };
+  assert.match(whole(await preview(miscosigned, user, '0.6')) ?? '', /doesn't accept/);
+
+  // A real operation of the delegate's (BNB Chain), its validateUserOp run here as the EntryPoint calls it, with the
+  // hash it was signed over: its cosignature is the stand-in's cosigner's, and its form is the one the stand-in takes.
+  const onChain = fx.operation;
+  await chain.putCode(onChain.sender, `0xef0100${fx.delegate.address.slice(2)}` as Hex);
+  const VALIDATE = parseAbi(['struct UserOperation { address sender; uint256 nonce; bytes initCode; bytes callData; uint256 callGasLimit; uint256 verificationGasLimit; uint256 preVerificationGas; uint256 maxFeePerGas; uint256 maxPriorityFeePerGas; bytes paymasterAndData; bytes signature; }',
+    'function validateUserOp(UserOperation op, bytes32 hash, uint256 missing) returns (uint256)']);
+  const fields = { sender: onChain.sender as Hex, initCode: onChain.initCode, callData: onChain.callData, paymasterAndData: onChain.paymasterAndData, signature: onChain.signature,
+    ...Object.fromEntries((['nonce', 'callGasLimit', 'verificationGasLimit', 'preVerificationGas', 'maxFeePerGas', 'maxPriorityFeePerGas'] as const).map(k => [k, BigInt(onChain[k])])) } as never;
+  const validate = async (h: Hex) => {
+    const r = await chain.evm.runCall({ caller: at(EP6), to: at(onChain.sender), data: toBytes(encodeFunctionData({ abi: VALIDATE, functionName: 'validateUserOp', args: [fields, h, 0n] })), gasLimit: 1_000_000n });
+    assert.equal(r.execResult.exceptionError, undefined);
+    return BigInt(`0x${Buffer.from(r.execResult.returnValue).toString('hex')}`);
+  };
+  const [moduleSig] = decodeAbiParameters(parseAbiParameters('bytes, address'), onChain.signature);
+  const [, ownerSig] = decodeAbiParameters(parseAbiParameters('bytes, bytes'), moduleSig);
+  const [until, after, , proof] = decodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), ownerSig);
+  assert.equal(proof.length, 1);
+  // Validated (no failure or aggregator in the low bits), within the window its key signed.
+  assert.equal(await validate(onChain.userOpHash), (BigInt(after) << 208n) | (BigInt(until) << 160n));
+  // Over any other hash: refused (1), not reverted.
+  assert.equal(await validate(keccak256(onChain.userOpHash)), 1n);
+
+  // Another key asked: the account takes only its own.
+  p = await preview(op, OWNER, '0.6');
+  assert.match(whole(p) ?? notes(p), /doesn't accept/);
+  // The registry no longer listing the stand-in's cosigner: refused, as the cosigner's signature will be.
+  await list(COSIGNED_7702_COSIGNER, false);
+  p = await preview(op, user, '0.6');
+  assert.match(whole(p) ?? notes(p), /doesn't accept/);
 });
 
 test('A whole operation’s trace: the EntryPoint’s run of it, from validation to the calls and the gas payment', async () => {

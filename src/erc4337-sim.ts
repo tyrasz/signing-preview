@@ -287,10 +287,13 @@ const NO_TIPS = new Set([42161, 421614]);
  * simulated as: paymasters that only accept certain bundlers (tx.origin) refuse any other, which says nothing about
  * the operation itself, and some charge another bundler different gas. A paymaster can take any bundler for some of
  * its operations and only its own for others, by a setting in its data: bundlers whose operations had the same first
- * byte of paymaster data as this one come first, the busiest first. Looks back 200 blocks, then 2,000, then 20,000
- * (minutes on Arbitrum) while that finds none, and remembers what it found for ten minutes, none included when every
- * read was answered: a busy paymaster's logs over many blocks are a heavy read that nodes refuse under load, and an
- * empty answer left the refusal standing.
+ * byte of paymaster data as this one come first, the busiest first. Looks back 200 blocks, then 2,000, 10,000 and
+ * 20,000 (minutes on Arbitrum), then four older windows of 20,000 (or the node's cap) while that finds none, and
+ * remembers what it found for ten minutes, none included when every read was answered: a busy paymaster's logs over
+ * many blocks are a heavy read that nodes refuse under load, and an empty answer left the refusal standing. A quiet
+ * paymaster's last bundles can be a day back: the one sponsoring an EIP-7702 delegate's operations (see
+ * cosigned7702Stub) takes only its own bundlers, and its last operation was 6,600 blocks back on Ethereum (whose
+ * public node answers 10,000 blocks back, no more) and 93,000 on Base when previewed (2026-11-15).
  */
 const RECENT_BUNDLERS = new Map<string, { at: number; bundlers: string[] }>();
 /** Lookups in flight, by key: concurrent operations of one paymaster share one (and so one node read), not one each. */
@@ -323,22 +326,36 @@ async function recentBundlers(deps: Dependencies, chainId: number, entryPoint: s
       // quiet paymaster's bundlers are over a wide span, which a capping node refuses whole, so the span is narrowed
       // to the cap and asked again rather than given up on (which used to be remembered as "no bundlers").
       let capBlocks: bigint | undefined;
-      for (const want of [200n, 2000n, 20_000n]) {
-        const span = capBlocks !== undefined && want > capBlocks ? capBlocks : want;
-        const read = (s: bigint) => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(head > s ? head - s : 0n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
+      // Blocks back from the head the node has answered for: a span no wider (a capping node narrows every wider
+      // one to its cap) is a window already read, and isn't read again.
+      let covered = 0n;
+      const SPANS = [200n, 2000n, 10_000n, 20_000n], PAGES = 4;
+      for (let n = 0; n < SPANS.length + PAGES; n++) {
+        // After the spans from the head, older windows as wide as the node answers, each just before the last: only
+        // once the widest span was answered, and none past one the node refused (a node that keeps less history
+        // refuses every deeper one: Ethereum's public node, 10,000 blocks back, with HTTP 403).
+        const page = n >= SPANS.length;
+        let span = page ? capBlocks ?? 20_000n : capBlocks !== undefined && SPANS[n] > capBlocks ? capBlocks : SPANS[n];
+        if (page ? covered < span || covered >= head : span <= covered) { if (page) break; continue; }
+        const end = head - (page ? covered : 0n);
+        const read = (s: bigint) => rpc.call(chainId, 'eth_getLogs', [{ address: entryPoint, topics: [USER_OPERATION_EVENT, null, null, `0x${'00'.repeat(12)}${paymaster.slice(2).toLowerCase()}`], fromBlock: `0x${(end > s ? end - s : 0n).toString(16)}`, toBlock: `0x${end.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
         let logs: { transactionHash: string }[];
         try {
           logs = await read(span).catch(async e => { if (capped(e)) throw e; await new Promise(r => setTimeout(r, 500)); return read(span); });
         } catch (e) {
-          if (!capped(e)) { refused = true; continue; }
+          if (!capped(e)) { refused = true; if (page) break; continue; }
           // The node named its cap: query within it. If that is no narrower than what we just asked, stop.
           const m = capMessage(e).match(/(\d[\d,]{2,})/); const named = m ? BigInt(m[1].replace(/,/g, '')) : (span > 2n ? span / 2n : 0n);
           if (named <= 0n || (capBlocks !== undefined && named >= capBlocks)) break;
           capBlocks = named;
-          try { logs = await read(named); } catch { refused = true; continue; }
+          span = named;
+          // Already read that far back from the head: on to the older windows.
+          if (!page && span <= covered) continue;
+          try { logs = await read(span); } catch { refused = true; if (page) break; continue; }
         }
+        covered = (page ? covered : 0n) + span;
         const hashes = [...new Set((logs ?? []).map(l => l.transactionHash).reverse())].slice(0, 16);
-        if (!hashes.length) { if (capBlocks !== undefined && span >= capBlocks) break; continue; }
+        if (!hashes.length) continue;
         const txs = await Promise.all(hashes.map(h => rpc.call(chainId, 'eth_getTransactionByHash', [h]).catch(() => null) as Promise<{ from?: string; input?: string } | null>));
         const score = new Map<string, number>();
         for (const t of txs) {
@@ -1047,6 +1064,43 @@ const BICONOMY_ECDSA_MODULE = '0x0000001c5b32f37f5bea87bdd5374eb2ac54ea8e';
 /** Biconomy Smart Account v2's form: abi.encode(the module's signature, the validation module). */
 const biconomyStub = (): Stub => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, BICONOMY_ECDSA_MODULE]) });
 
+// --- An EIP-7702 delegate in Biconomy Smart Account v2's form, with a cosigner ---
+// Unpublished (not on Sourcify, nor its registry or module); read from its code (4,078 bytes, the same at its address on
+// Ethereum, BNB Chain, Base and Arbitrum One; not deployed on Polygon) and its operations. EntryPoint v0.6 is the only
+// one it takes (its ENTRY_POINT()). Its account answers Smart Account v2's calls (execute_ncC, executeBatch_y6U,
+// execute, executeBatch) and takes its signature, abi.encode(the module's signature, a module), but checks it itself:
+// the module is never called (its operations name 0xd88b…9ea3, "Multichain PassKeys Ownership Registry Module" 0.2.0).
+// The module's signature is abi.encode(a cosignature, the owner's signature), and validation passes only with both:
+// - the cosignature, over the operation's hash (personal_sign, else as is), checked by a registry (0x980d…083b,
+//   isValidSignature(hash, signature) answering a bool): one of its verifying signers' (a mapping at slot 1), unless
+//   it is switched (slot 2) to take or refuse every signature;
+// - the owner's, in the form of Biconomy's MultichainECDSAValidator (published in @biconomy-devx/account-contracts-v2):
+//   abi.encode(validUntil, validAfter, a Merkle root, the proof, the signature), the account's own key signing the
+//   root (personal_sign, else as is; OpenZeppelin's ECDSA.recover, which reverts on a malformed signature) of a tree
+//   with keccak256(abi.encodePacked(validUntil, validAfter, the operation's hash)) among its leaves: one signature for
+//   operations on several chains. A proof that doesn't reach the root fails validation (1); validUntil 0 is none.
+// The stand-in: the cosignature recovered as the verifying signer that cosigned every operation seen (63 of 63 on BNB
+// Chain and Ethereum, November 2026; listed in the registry on all four chains), and STUB_SIGNATURE over the root of a
+// tree of two leaves, the operation's (no time bounds) and another: most of its operations are signed so, together
+// with one other (39 of 63; 21 alone, 3 with two or three others). Each element of the proof costs about 355 gas: an
+// operation signed alone costs about 390 less than the stand-in, one signed with two or three others about 320 more.
+const COSIGNED_7702_DELEGATE = '0x13e00e089f81ad9f36b655c9e9a07c6bf1489a5a';
+const COSIGNED_7702_MODULE = '0xd88b687ba4237e6b9893020285103f45d8949ea3';
+/** The registry's verifying signer that cosigns the delegate's operations. */
+export const COSIGNED_7702_COSIGNER = '0x9ff3c744db7ea31eb38689482ea7cb38438865c6';
+/** The other leaf of the stand-in's tree (any word: the account only hashes it with the operation's leaf). */
+const COSIGNED_7702_SIBLING = `0x${'00'.repeat(31)}01` as Hex;
+async function cosigned7702Stub(c: StubContext): Promise<Stub> {
+  const hash = await c.hash();
+  const leaf = hash && keccak256(concatHex(['0x000000000000', '0x000000000000', hash]));
+  // OpenZeppelin's MerkleProof hashes each pair in sorted order. Without the hash, a root the proof can't reach: the
+  // account refuses the signature (validation returns 1) rather than reverting.
+  const root = leaf ? keccak256(BigInt(leaf) < BigInt(COSIGNED_7702_SIBLING) ? concatHex([leaf, COSIGNED_7702_SIBLING]) : concatHex([COSIGNED_7702_SIBLING, leaf])) : `0x${'00'.repeat(32)}` as Hex;
+  const owner = encodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), [0, 0, root, [COSIGNED_7702_SIBLING], STUB_SIGNATURE]);
+  const module = encodeAbiParameters(parseAbiParameters('bytes, bytes'), [STUB_COSIGNATURE, owner]);
+  return { signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [module, COSIGNED_7702_MODULE]), cosigners: [{ signature: STUB_COSIGNATURE, signer: COSIGNED_7702_COSIGNER }] };
+}
+
 // --- OKX Wallet's smart account ---
 // Unpublished; read from its behaviour on BNB Chain and Base (its function names from OpenChain, its checks from
 // running real operations' validateUserOp in a local EVM and watching what it hashes and calls). It keeps its keys
@@ -1356,6 +1410,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // module, which recovers the owner over the personal_sign form of the hash (or the hash itself); seen so on
   // Ethereum (EntryPoint v0.6). Accounts it has upgraded to Nexus keep the proxy and run Nexus's code instead.
   '0x0000002512019dafb59528b82cb92d3c5d2423ac': biconomyStub,
+  // An EIP-7702 delegate in that form, with a cosigner and the owner's signature over a Merkle root (see cosigned7702Stub).
+  [COSIGNED_7702_DELEGATE]: cosigned7702Stub,
   // ZeroDev Kernel v3.1 and v3.2: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub, '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1': kernelV3Stub,
   // ZeroDev's Kernel for EIP-7702 (an EIP-7702 delegate; its verified source): the nonce names what validates as in
