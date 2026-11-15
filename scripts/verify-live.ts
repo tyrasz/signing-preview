@@ -560,18 +560,39 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
   // Real holders without code: a HYPE holder among recent senders, and a recent USDC recipient.
   const head = BigInt(String(await live.call(999, 'eth_blockNumber', [])));
   const eoa = async (a: string) => String(await live.call(999, 'eth_getCode', [a, 'latest'])) === '0x';
-  let hypeHolder: string | undefined, usdcHolder: string | undefined;
-  for (let n = head - 2n; n > head - 600n && !(hypeHolder && usdcHolder); n -= 3n) {
-    const blk = await live.call(999, 'eth_getBlockByNumber', [toHex(n), true]) as { transactions: { from: string }[] };
-    for (const t of blk.transactions) if (!hypeHolder && BigInt(String(await live.call(999, 'eth_getBalance', [t.from, 'latest']))) >= 12n * E && await eoa(t.from)) hypeHolder = t.from.toLowerCase();
-    if (usdcHolder) continue;
-    const receipts = await live.call(999, 'eth_getBlockReceipts', [toHex(n)]) as { logs: { address: string; topics: string[] }[] }[];
-    for (const l of receipts.flatMap(r => r.logs)) {
-      if (usdcHolder || l.address.toLowerCase() !== H.usdc.toLowerCase() || l.topics.length !== 3 || l.topics[0] !== keccak256(toHex('Transfer(address,address,uint256)'))) continue;
-      const to = '0x' + l.topics[2].slice(26);
-      if ((await readAt(hl, H.usdc, 'function balanceOf(address) view returns (uint256)', [to]) as bigint) >= 2_000_000n && await eoa(to)) usdcHolder = to;
+  const usdcOf = async (a: string) => await readAt(hl, H.usdc, 'function balanceOf(address) view returns (uint256)', [a]) as bigint;
+  // A recent USDC recipient can move its USDC on before the checks below run (a minute or more later: the scheduled
+  // run of 2026-11-15 had the transfer and the supply revert under both simulators, and neither said why). The
+  // recipients passed over are remembered, and the holder is checked again, and replaced if need be, before each use.
+  const usdcSeen = new Set<string>();
+  let hypeHolder: string | undefined, usdcHolder: string | undefined, scanFrom = head - 2n;
+  // From the newest blocks back: a USDC recipient not seen before, and (needHype) a HYPE holder among the senders.
+  const scan = async (needHype: boolean) => {
+    let found: string | undefined;
+    for (let n = scanFrom; n > head - 600n && !(found && (hypeHolder || !needHype)); n -= 3n) {
+      scanFrom = n - 3n;
+      if (needHype && !hypeHolder) {
+        const blk = await live.call(999, 'eth_getBlockByNumber', [toHex(n), true]) as { transactions: { from: string }[] };
+        for (const t of blk.transactions) if (!hypeHolder && BigInt(String(await live.call(999, 'eth_getBalance', [t.from, 'latest']))) >= 12n * E && await eoa(t.from)) hypeHolder = t.from.toLowerCase();
+      }
+      if (found) continue;
+      const receipts = await live.call(999, 'eth_getBlockReceipts', [toHex(n)]) as { logs: { address: string; topics: string[] }[] }[];
+      for (const l of receipts.flatMap(r => r.logs)) {
+        if (found || l.address.toLowerCase() !== H.usdc.toLowerCase() || l.topics.length !== 3 || l.topics[0] !== keccak256(toHex('Transfer(address,address,uint256)'))) continue;
+        const to = '0x' + l.topics[2].slice(26);
+        if (usdcSeen.has(to)) continue;
+        usdcSeen.add(to);
+        if (await usdcOf(to) >= 2_000_000n && await eoa(to)) found = to;
+      }
     }
-  }
+    return found;
+  };
+  usdcHolder = await scan(true);
+  /** The USDC holder, still holding 2 USDC now: another recent recipient if it has moved them on. */
+  const holdingUsdc = async () => {
+    while (usdcHolder && await usdcOf(usdcHolder) < 2_000_000n) { console.log(`  (${usdcHolder} no longer holds 2 USDC: another recent recipient is used)`); usdcHolder = await scan(false); }
+    return usdcHolder;
+  };
   // Both HyperEVM simulators: the fork simulator (every log; a long budget here so it is what answers) and the probe.
   const simulators = [
     ['fork', new RpcSimulator({ 999: urls[999] }, { fork: new ForkSimulator({ 999: urls[999] }, { timeoutMs: 60_000 }), forkBudgetMs: 60_000 }), /local EVM/],
@@ -598,9 +619,12 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
       check(!by(p) && p.simulation?.status === 'success' && p.assetChanges.some(c => c.asset === 'native' && c.direction === 'out' && c.raw === (10n * E).toString() && c.basis === 'simulated_state') && kIn?.raw === quote.toString(),
         `${name}: Kinetiq stake 10 HYPE`.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE${by(p)}`);
     } else console.log('skip stake: no recent EOA sender holding 12 HYPE');
-    if (usdcHolder) {
+    if (await holdingUsdc()) {
       const t = await patient(() => sendWith(usdcHolder!, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] })));
-      check(!by(t) && t.simulation?.status === 'success' && moved(t) === 'out 1 USDC (simulated_state)', `${name}: USDC transfer of 1`.padEnd(34), moved(t) + by(t));
+      // On a failure, who it was run for, why it failed and what that account holds now.
+      const why = async (p: Awaited<ReturnType<typeof send>>) => p.simulation?.status === 'success' ? '' : ` [${usdcHolder}: ${p.simulation?.revertReason ?? p.simulation?.status}; it holds ${formatUnits(await usdcOf(usdcHolder!), 6)} USDC now]`;
+      check(!by(t) && t.simulation?.status === 'success' && moved(t) === 'out 1 USDC (simulated_state)', `${name}: USDC transfer of 1`.padEnd(34), moved(t) + by(t) + await why(t));
+      await holdingUsdc();
       const batch = await patient(() => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x3e7', from: usdcHolder, atomicRequired: true, calls: [
         { to: H.usdc, data: encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [m.pool as Address, 1_000_000n] }) },
         { to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function supply(address,uint256,address,uint16)']), functionName: 'supply', args: [H.usdc, 1_000_000n, usdcHolder as Address, 0] }) },
@@ -609,7 +633,7 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
       // The hUSDC isn't in the calldata: the fork simulator sees its mint event, the probe has HyperLend's decoder
       // watch it. Aave-style scaled balances round by a unit or two.
       check(sourcePattern.test(batch.simulation?.source ?? '') && batch.simulation?.status === 'success' && batch.assetChanges.some(c => c.direction === 'out' && c.raw === '1000000') && !!hIn && Math.abs(Number(hIn.raw) - 1_000_000) <= 2,
-        `${name}: approve + HyperLend supply`.padEnd(34), `${batch.simulation?.status}: ${moved(batch)}`);
+        `${name}: approve + HyperLend supply`.padEnd(34), `${batch.simulation?.status}: ${moved(batch)}${await why(batch)}`);
     } else console.log('skip USDC checks: no recent EOA holding 2 USDC');
   }
 }
