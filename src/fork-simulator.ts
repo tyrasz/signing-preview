@@ -17,6 +17,8 @@ import { Common, createCustomCommon, Hardfork, Mainnet } from '@ethereumjs/commo
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
 import { keccak256 } from 'viem';
+import { createHash } from 'node:crypto';
+import { secp256k1 } from '@noble/curves/secp256k1';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { builtinTokens, CHAINS, PERMIT2, PRECOMPILE_SCALE } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
@@ -45,6 +47,11 @@ export interface ChainProfile {
   blockTime: number;
   /** Precompiles the local EVM doesn't have; their calls are answered by eth_call on the chain (HyperEVM's HyperCore reads). */
   forwardedPrecompiles?: string[];
+  /**
+   * The chain's own precompiles, each priced and failing as the chain's node does (address to how): the local EVM
+   * runs what it can compute itself and has the chain answer the rest (BNB Chain's: BSC_OWN).
+   */
+  ownPrecompiles?: Record<string, OwnPrecompile>;
   /** Gas a forwarded precompile call costs. */
   precompileGas?: (inputBytes: number, outputBytes: number, selector?: string) => bigint;
   /**
@@ -115,6 +122,14 @@ export interface ChainProfile {
   missingOpcodes?: number[];
 }
 
+/**
+ * A chain's own precompile as its node runs it. `gas` is its price, from the input and the block's time (a fork can
+ * change it). A call it can't answer
+ * either reverts, giving back the gas it didn't use (`fails: 'revert'`), or fails taking all the gas it was given
+ * (`'all'`). `run` computes the answer locally (undefined: a call that fails); without it the chain answers (eth_call).
+ */
+export interface OwnPrecompile { name: string; gas: (input: Uint8Array, time: bigint) => bigint; fails: 'revert' | 'all'; run?: (input: Uint8Array) => Uint8Array | undefined }
+
 export interface TimedPrecompile { name: string; address: string; from: bigint; gas: bigint; answer: (block: { timestamp: bigint; milliseconds: bigint }) => Uint8Array }
 
 /**
@@ -164,8 +179,50 @@ const low = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
  * does HyperCore's reads. What one of them would change (ArbSys sending a message to L1) isn't kept.
  */
 const ARBOS = [...Array.from({ length: 15 }, (_, i) => low(0x64 + i)), low(0xff)];
-/** BNB Chain's own precompiles (light-client and BLS checks at 0x64 to 0x69), answered by the chain. */
-const BSC_PRECOMPILES = Array.from({ length: 6 }, (_, i) => low(0x64 + i));
+/**
+ * BNB Chain's SECP256K1_SIGNATURE_RECOVER (0x69) as its node runs it: exactly 129 bytes, a compressed public key
+ * (33), a signature's r and s (64, s in the lower half of the order) and the 32-byte digest it signs. It answers the
+ * key's Tendermint address, RIPEMD-160 of the key's SHA-256 (20 bytes); anything else fails. Measured on its node
+ * (2026-11-15) with signatures made on the spot: a valid one answers that address; a high s, the wrong digest, an r
+ * of 0, a 33-byte key starting 04, a 65-byte key (161 bytes in) and a byte more fail.
+ */
+export const tendermintSignatureRecover = (input: Uint8Array): Uint8Array | undefined => {
+  if (input.length !== 129) return undefined;
+  const key = input.subarray(0, 33);
+  try {
+    if (!secp256k1.verify(input.subarray(33, 97), input.subarray(97), key, { lowS: true, prehash: false, format: 'compact' })) return undefined;
+  } catch { return undefined; }
+  return new Uint8Array(createHash('ripemd160').update(createHash('sha256').update(key).digest()).digest());
+};
+/**
+ * BNB Chain's own precompiles at 0x64 to 0x69 (its eth_config's names), each priced as its node prices it: measured
+ * on the node (reth-bsc 0.1.4, 2026-11-15) by the gas a STATICCALL to each spends from a contract, and, where a call
+ * that fails takes all the gas it is given, by the least gas a call straight to it needs to fail some other way than
+ * running out. Before, each was answered by the chain at a flat 2,000 gas, and a call that failed took all its gas:
+ * a valid BLS signature with one key came out 2,500 low, a secp256k1 one 1,000 low, and a BLS or double-sign check
+ * that reverts (with the rest of its gas given back on the node) took all the gas it was given.
+ * - 0x64 HEADER_VALIDATE_DEPRECATED, 0x65 IAVL_MERKLE_PROOF_VALIDATE_DEPRECATED: fail whatever the input (none, 1,
+ *   32, 100, 129 or 1,000 bytes), taking all the gas.
+ * - 0x66 BLS_SIGNATURE_VERIFY: a 32-byte message, a 96-byte signature and 48-byte public keys; 1,000 gas and 3,500 a
+ *   key (1 key 4,500, 2 keys 8,000, 10 keys 36,000), 1,000 for an input of any other length. It answers 0x01 when the
+ *   signature holds (one key, or two aggregated: signed on the spot with the proof-of-possession domain) and nothing
+ *   when it doesn't; an input it can't read reverts, keeping the rest of the gas. Answered by the chain.
+ * - 0x67 COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR: 3,000 gas and 16 a byte of input (1 byte 3,016, 100 bytes 4,600,
+ *   1,000 bytes 19,000, zero bytes or not); an input it can't read fails, taking all the gas. Answered by the chain.
+ * - 0x68 VERIFY_DOUBLE_SIGN_EVIDENCE: 10,000 gas (none to 2,000 bytes in); evidence it can't read reverts, keeping
+ *   the rest. Answered by the chain. From the chain's fork of 2026-12-08 (its node's eth_simulateV1 in a block at
+ *   that time) 16 more a byte of input: 1 byte 10,016, 100 bytes 11,600, 1,000 bytes 26,000; the other five's prices
+ *   are the same then.
+ * - 0x69 SECP256K1_SIGNATURE_RECOVER: 3,000 gas; run here (tendermintSignatureRecover). A failure takes all the gas.
+ */
+const BSC_OWN: Record<string, OwnPrecompile> = {
+  [low(0x64)]: { name: 'HEADER_VALIDATE_DEPRECATED', gas: () => 0n, fails: 'all', run: () => undefined },
+  [low(0x65)]: { name: 'IAVL_MERKLE_PROOF_VALIDATE_DEPRECATED', gas: () => 0n, fails: 'all', run: () => undefined },
+  [low(0x66)]: { name: 'BLS_SIGNATURE_VERIFY', gas: i => 1_000n + (i.length > 128 && (i.length - 128) % 48 === 0 ? 3_500n * BigInt((i.length - 128) / 48) : 0n), fails: 'revert' },
+  [low(0x67)]: { name: 'COMET_BFT_LIGHT_BLOCK_VALIDATE_PASTEUR', gas: i => 3_000n + 16n * BigInt(i.length), fails: 'all' },
+  [low(0x68)]: { name: 'VERIFY_DOUBLE_SIGN_EVIDENCE', gas: (i, time) => 10_000n + (time >= BNB_MILLI_TIMESTAMP.from ? 16n * BigInt(i.length) : 0n), fails: 'revert' },
+  [low(0x69)]: { name: 'SECP256K1_SIGNATURE_RECOVER', gas: () => 3_000n, fails: 'all', run: tendermintSignatureRecover },
+};
 
 /**
  * Measured on each chain with a code override (2026-11-05, the others 2026-11-10): HyperEVM runs Cancun rules (no
@@ -191,8 +248,9 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   // creation cost what they do on Ethereum. With Ethereum's prices every transaction that touched storage came out
   // low, by a multiple of 840.
   137: { hardfork: 'osaka', ...NEXT_BLOCK[137], storageGas: { coldRead: 5460, coldWrite: 2940 }, precompilePrices: POLYGON_PRECOMPILES, missingOpcodes: [0x49, 0x4a], noPointEvaluation: true, maxCodeSize: 32_768 },
-  // (Its fork of 2026-12-08 checked ahead: the rules check's 370 programs alike on its node at the fork's time.)
-  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10', next: { forkId: '0x23d35e07', on: '2026-11-12' } }, ...NEXT_BLOCK[56], forwardedPrecompiles: BSC_PRECOMPILES, tipsTo: '0xfffffffffffffffffffffffffffffffffffffffe',
+  // (Its fork of 2026-12-08 checked ahead: the rules check's 370 programs alike on its node at the fork's time, and on
+  // 2026-11-15 its 387, the chain's own precompiles among them.)
+  56: { hardfork: 'osaka', checked: { forkId: '0xd38cc282', on: '2026-11-10', next: { forkId: '0x23d35e07', on: '2026-11-15' } }, ...NEXT_BLOCK[56], ownPrecompiles: BSC_OWN, tipsTo: '0xfffffffffffffffffffffffffffffffffffffffe',
     timedPrecompiles: [BNB_MILLI_TIMESTAMP] },
   // HyperEVM prices most precompiles its own way, measured on its node (2026-11-12; until a day before it charged
   // Ethereum's): ecrecover 15,000; modexp ten times Osaka's formula (EIP-7883, at least 5,000, inputs to 1,024 bytes
@@ -1527,7 +1585,7 @@ export class ForkSimulator implements Simulator {
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never, ...(profile.eips && { eips: profile.eips }) });
     source.time = block.header.timestamp;
     // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
-    const own = getActivePrecompiles(common), forwards = new Set((profile.forwardedPrecompiles ?? []).map(hexOf));
+    const own = getActivePrecompiles(common), forwards = new Set([...(profile.forwardedPrecompiles ?? []), ...Object.keys(profile.ownPrecompiles ?? {})].map(hexOf));
     // (The chain's own precompiles a fork adds the local EVM has on both sides of it, an empty account before: none
     // is refused, whatever the node's current fork lists.)
     for (const p of profile.timedPrecompiles ?? []) forwards.add(p.address);
@@ -1627,24 +1685,41 @@ export class ForkSimulator implements Simulator {
     // The point-evaluation precompile (EIP-4844's, at 0x0a) needs a KZG library and trusted setup this package doesn't
     // carry. It is a pure function of its input, so the chain's node answers it, at the precompile's fixed price.
     const pointEvaluation = getActivePrecompiles(common).has(POINT_EVALUATION.slice(2)) && !profile.noPointEvaluation ? [POINT_EVALUATION] : [];
-    const forwarded = [...(profile.forwardedPrecompiles ?? []), ...pointEvaluation].map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
-      // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
-      if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
-      const key = `${address}_${bytesToHex(input.data)}`;
+    // The chain's answer to a forwarded call (eth_call); undefined in a speculative run that hasn't fetched it yet.
+    const ask = async (address: string, data: Uint8Array) => {
+      const key = `${address}_${bytesToHex(data)}`;
       let c = source.calls.get(key);
       if (!c && misses) {
         misses.calls.add(key);
         c = source.guessCall(key);
-        if (!c) return { executionGasUsed: 2000n, returnValue: new Uint8Array(0) };
+        if (!c) return undefined;
       }
       if (!c) {
         await source.fetch({ ...newMisses(), calls: new Set([key]) });
         c = source.calls.get(key)!;
       }
+      return c;
+    };
+    const forwarded = [...(profile.forwardedPrecompiles ?? []), ...pointEvaluation].map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
+      // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
+      if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      const c = await ask(address, input.data);
+      if (!c) return { executionGasUsed: 2000n, returnValue: new Uint8Array(0) };
       const gas = address === POINT_EVALUATION ? profile.pointEvaluationGas ?? 50_000n : profile.precompileGas?.(input.data.length, c.data.length, bytesToHex(input.data.subarray(0, 4))) ?? 2000n;
       // (Given less than it costs, it runs out, as the node's does.)
       if (gas > input.gasLimit) return { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) };
       return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
+    } }));
+    // The chain's own precompiles at their own prices (ChainProfile.ownPrecompiles): run here, or answered by the chain.
+    const chainOwn = Object.entries(profile.ownPrecompiles ?? {}).map(([address, p]) => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
+      const gas = p.gas(input.data, block.header.timestamp), none = new Uint8Array(0);
+      if (gas > input.gasLimit) return { executionGasUsed: input.gasLimit, returnValue: none, exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) };
+      const c = p.run ? (out => ({ ok: !!out, data: out ?? none }))(p.run(input.data)) : await ask(address, input.data);
+      // (A speculative run without the chain's answer yet: the price, and nothing back.)
+      if (!c) return { executionGasUsed: gas, returnValue: none };
+      if (c.ok) return { executionGasUsed: gas, returnValue: c.data };
+      return p.fails === 'revert' ? { executionGasUsed: gas, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) }
+        : { executionGasUsed: input.gasLimit, returnValue: none, exceptionError: new EVMError(`${p.name} failed` as EVMError['error']) };
     } }));
     // BLOCKHASH: the recent blocks' hashes, fetched like the rest of the state (the EVM checks the 256-block window).
     const blockchain = {
@@ -1695,7 +1770,7 @@ export class ForkSimulator implements Simulator {
     // Base's NonceManager and TxContext (BASE_AA_PRECOMPILES), given the sender of the transaction each EVM runs.
     const origins = new WeakMap<object, Address>();
     const ownAa = aa.length ? baseAaPrecompiles(on => origins.get(on as object)) : [];
-    const precompiles = [...scaled, ...timed, ...forwarded, ...moved, ...absent, ...ownAa];
+    const precompiles = [...scaled, ...timed, ...forwarded, ...chainOwn, ...moved, ...absent, ...ownAa];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
     if (ownAa.length) evm.events!.on('beforeMessage', baseAaHook(origins, evm));
     // What a cleared slot gives back reaches the caller that paid for it, as on the chain (see repayCallers).

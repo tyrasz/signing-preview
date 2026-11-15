@@ -10,7 +10,9 @@
 //     the stack and the memory size. The node (eth_simulateV1, or eth_call where it has none) and the local EVM run
 //     the same code on the same named block: the same outcome, the same bytes returned, the same events, the same gas;
 //   - the precompiles, each called with inputs it accepts (a signature to recover, points to add, a pairing that
-//     holds, a KZG proof, a P-256 signature) and with none: the same answer at the same price;
+//     holds, a KZG proof, a P-256 signature) and with none: the same answer at the same price; and each chain's own
+//     (ArbOS's, BNB Chain's light-client and signature checks, Base's B20 contracts), BNB Chain's and Base's with
+//     inputs they accept and inputs they refuse;
 //   - crafted programs for what an opcode alone doesn't reach (storage, creations and their size limits, calls with
 //     value, SELFDESTRUCT), and EIP-7702 authorizations by accounts of each kind.
 // On Arbitrum, whose node adds a charge for L1 data, gas is compared less that charge; not where the node has only
@@ -23,6 +25,8 @@ import { appendFileSync, writeFileSync } from 'node:fs';
 import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { getActivePrecompiles } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
+import { secp256k1 } from '@noble/curves/secp256k1';
+import { bls12_381 } from '@noble/curves/bls12-381';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { hashMessage, keccak256, toFunctionSelector, type Hex } from 'viem';
 import { CHAIN_PROFILES, chainPrecompilesAt, ForkSimulator, hasReference, nodeRulesOf, timedPrecompilesAt } from '../src/fork-simulator.ts';
@@ -267,6 +271,37 @@ function arbosPrograms(): Program[] {
     ...of('ArbSys', 0x64, ['arbBlockNumber()', 'arbChainID()', 'arbOSVersion()', 'isTopLevelCall()', 'getStorageGasAvailable()']),
     // (Not getCurrentTxL1GasFees(): what it returns is the call's own, which differs between the two runs.)
     ...of('ArbGasInfo', 0x6c, ['getPricesInWei()', 'getL1BaseFeeEstimate()', 'getMinimumGasPrice()', 'getPricesInArbGas()', 'getGasAccountingParams()', 'getL1GasPriceEstimate()']),
+  ];
+}
+
+/**
+ * BNB Chain's own precompiles (0x64 to 0x69: ChainProfile.ownPrecompiles), each from a contract that reports the gas
+ * the call spent, with inputs either way: a BLS signature (one key, two aggregated, the wrong key, inputs it can't
+ * read, which revert and give back the rest of the gas) and a secp256k1 one (a Tendermint key's address, or a
+ * failure that takes all the gas), each made on the spot by keys made for the run; the light-client and evidence
+ * checks with inputs they can't read; the two that are deprecated, which fail whatever they are given.
+ */
+function bnbPrograms(): Program[] {
+  const hex = (b: Uint8Array) => Buffer.from(b).toString('hex'), of = (address: number, label: string, data: string): Program => ({ precompile: true, label: `0x${address.toString(16)} ${label}`, code: caller(address), data: `0x${data}` });
+  const message = createHash('sha256').update('signing-preview rules check').digest();
+  // BLS, as the chain's validators sign their votes: the proof-of-possession domain, keys in G1, signatures in G2.
+  const DST = 'BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_';
+  const [k1, k2] = [bls12_381.utils.randomPrivateKey(), bls12_381.utils.randomPrivateKey()], [p1, p2] = [bls12_381.getPublicKey(k1), bls12_381.getPublicKey(k2)];
+  const [s1, s2] = [bls12_381.sign(message, k1, { DST }), bls12_381.sign(message, k2, { DST })], both = bls12_381.aggregateSignatures([s1, s2]);
+  // secp256k1, as a Tendermint key signs: a compressed key, r and s (s low), the 32-byte digest.
+  const key = secp256k1.utils.randomPrivateKey(), signed = secp256k1.sign(message, key, { lowS: true }), pub = hex(secp256k1.getPublicKey(key, true));
+  const rs = (s: bigint) => `${word(signed.r)}${word(s)}`;
+  return [
+    ...[0x64, 0x65].flatMap(a => [of(a, 'with no input', ''), of(a, '100 bytes', 'ab'.repeat(100))]),
+    of(0x66, 'BLS, one key', `${hex(message)}${hex(s1)}${hex(p1)}`),
+    of(0x66, 'BLS, two keys aggregated', `${hex(message)}${hex(both)}${hex(p1)}${hex(p2)}`),
+    of(0x66, 'BLS, the wrong key', `${hex(message)}${hex(s1)}${hex(p2)}`),
+    of(0x66, 'BLS, with no input', ''), of(0x66, 'BLS, 129 bytes', 'ab'.repeat(129)), of(0x66, 'BLS, three keys it can\'t read', 'ab'.repeat(128 + 3 * 48)),
+    of(0x67, 'light block, with no input', ''), of(0x67, 'light block, 100 bytes', 'ab'.repeat(100)),
+    of(0x68, 'double-sign evidence, with no input', ''), of(0x68, 'double-sign evidence, 1,000 bytes', 'ab'.repeat(1000)),
+    of(0x69, 'secp256k1, a signature that holds', `${pub}${rs(signed.s)}${hex(message)}`),
+    of(0x69, 'secp256k1, s high', `${pub}${rs(secp256k1.CURVE.n - signed.s)}${hex(message)}`),
+    of(0x69, 'secp256k1, a byte more', `${pub}${rs(signed.s)}${hex(message)}00`),
   ];
 }
 
@@ -656,7 +691,7 @@ async function check(chainId: number): Promise<Report> {
     report.fork.push(`fork id ${rules.forkId}${rules.activation ? `, active since ${day(rules.activation)}` : ''}: ${same ? `the one checked on ${rules.forkId === profile!.checked!.forkId ? profile!.checked!.on : `${profile!.checked!.next!.on}, ahead`}` : profile?.checked ? `NOT the one checked on ${profile.checked.on} (${profile.checked.forkId})` : 'no fork recorded as checked for this chain'}`);
     if (profile?.checked && !same) report.drift = true;
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: (amsterdam ? 'amsterdam' : profile.hardfork) as never });
-    const own = new Set([...getActivePrecompiles(common).keys()].map(k => `0x${k}`)), forwards = new Set((profile.forwardedPrecompiles ?? []).map(a => a.toLowerCase()));
+    const own = new Set([...getActivePrecompiles(common).keys()].map(k => `0x${k}`)), forwards = new Set([...(profile.forwardedPrecompiles ?? []), ...Object.keys(profile.ownPrecompiles ?? {})].map(a => a.toLowerCase()));
     for (const p of timedPrecompilesAt(profile, BigInt(head.timestamp))) own.add(p.address);
     for (const a of chainPrecompilesAt(chainId, BigInt(head.timestamp))) own.add(a);
     // (Base's registries run from their Solidity references: said apart.)
@@ -698,6 +733,7 @@ async function check(chainId: number): Promise<Report> {
     ...(profile.arbitrum ? arbosPrograms() : []),
     ...(chainId === 8453 ? b20Programs() : []),
     ...(chainId === 8453 ? baseAaPrograms() : []),
+    ...(chainId === 56 ? bnbPrograms() : []),
   ];
   if (!ONLY_FUZZ) await compare(chain, chainId, programs, report);
   // --fuzz N: as many random programs again (see fuzzPrograms), from --seed.

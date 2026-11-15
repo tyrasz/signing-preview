@@ -1450,3 +1450,46 @@ test('A traced preview, sent through the HTTP server, matches the API’s schema
     assert.ok(valid(preview), JSON.stringify(valid.errors?.slice(0, 3)));
   } finally { server.close(); }
 });
+
+test('BNB Chain’s own precompiles at its node’s prices: secp256k1 run here, BLS, light-block and evidence checks answered by the chain', async () => {
+  // A contract that STATICCALLs the precompile with its calldata and returns whether the call succeeded, the gas it
+  // spent (118 of it the contract's own: its pushes, the warm call, GAS) and what came back.
+  const callerOf = (t: number) => `0x3660006000375a6000600036600060${t.toString(16)}5afa5a9060005290036020523d600060403e3d6040016000f3` as Hex;
+  const AT = '0x00000000000000000000000000000000c0de0056', at = (a: number) => `0x${a.toString(16).padStart(40, '0')}`;
+  // The chain's answers (eth_call to each), here from code that answers 0x01 to any input and reverts on none.
+  for (const a of [0x66, 0x67, 0x68]) await chain.putCode(at(a), '0x3615600d5760015f5360015ff35b5f5ffd');
+  try {
+    const bsc = new ForkSimulator({ 56: URL_ }, { fetchImpl: chain.fetchImpl });
+    const run = async (t: number, data: string) => {
+      const r = (await bsc.simulateBatch([{ chainId: 56, from: USER, to: AT, data: `0x${data}`, value: 0n, gas: 1_000_000n, stateOverrides: { [AT]: { code: callerOf(t) } } }]))![0];
+      const out = r.returnData!.slice(2), spent = Number(BigInt(`0x${out.slice(64, 128)}`)) - 118;
+      // (A call that fails taking all its gas: said as such, the figure being what the call was given.)
+      return [BigInt(`0x${out.slice(0, 64)}`) === 1n, spent > 900_000 ? 'all' : spent, `0x${out.slice(128)}`];
+    };
+    // secp256k1, as the chain's node answered it for this input (measured 2026-11-15): a Tendermint key's address
+    // for 3,000 gas; with s high it fails, taking all the gas.
+    const pub = '0324653eac434488002cc06bbfb7f10fe18991e35f9fe4302dbea6d2353dc0ab1c', r = '1172c11d559a8ebbd6684e02ffac7b7605803d7253d44aed1d681b8814a96b60', s = 0x3d0f3081364d3671f28071abe6f99825e1eac50b88746f5fa6d762ecabcb9eben;
+    const digest = '07'.repeat(32), n = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+    assert.deepEqual(await run(0x69, `${pub}${r}${s.toString(16)}${digest}`), [true, 3_000, '0x14db4138d56a2ecfb10881a9be394d9f321985b2']);
+    assert.deepEqual(await run(0x69, `${pub}${r}${(n - s).toString(16).padStart(64, '0')}${digest}`), [false, 'all', '0x']);
+    assert.deepEqual(await run(0x69, `${pub}${r}${s.toString(16)}${digest}00`), [false, 'all', '0x']);
+    // BLS: 1,000 and 3,500 a key; an input it can't read reverts, and the rest of the gas comes back.
+    assert.deepEqual(await run(0x66, 'ab'.repeat(128 + 48)), [true, 4_500, '0x01']);
+    assert.deepEqual(await run(0x66, 'ab'.repeat(128 + 3 * 48)), [true, 11_500, '0x01']);
+    assert.deepEqual(await run(0x66, 'ab'.repeat(129)), [true, 1_000, '0x01']);
+    assert.deepEqual(await run(0x66, ''), [false, 1_000, '0x']);
+    // The light-block check: 3,000 and 16 a byte; a failure takes all the gas. Double-sign evidence: 10,000, reverting.
+    assert.deepEqual(await run(0x67, 'ab'.repeat(100)), [true, 4_600, '0x01']);
+    assert.deepEqual(await run(0x67, ''), [false, 'all', '0x']);
+    assert.deepEqual(await run(0x68, ''), [false, 10_000, '0x']);
+    // The two deprecated ones fail whatever they are given.
+    assert.deepEqual([await run(0x64, 'ab'.repeat(100)), await run(0x65, '')], [[false, 'all', '0x'], [false, 'all', '0x']]);
+    // None of them is forwarded at a flat price any more. From the chain's fork of 2026-12-08 the double-sign check
+    // costs 16 more a byte (measured on its node in a block at that time).
+    assert.equal(CHAIN_PROFILES[56].forwardedPrecompiles, undefined);
+    const evidence = CHAIN_PROFILES[56].ownPrecompiles![at(0x68)].gas, kilobyte = new Uint8Array(1000);
+    assert.deepEqual([evidence(kilobyte, 1_796_696_999n), evidence(kilobyte, 1_796_697_000n), evidence(new Uint8Array(0), 1_796_697_000n)], [10_000n, 26_000n, 10_000n]);
+  } finally {
+    for (const a of [0x66, 0x67, 0x68]) await chain.putCode(at(a), '0x');
+  }
+});
