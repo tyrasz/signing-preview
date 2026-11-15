@@ -34,6 +34,27 @@ const KERNEL_FACTORY_STAKER = '0xd703aae79538628d27099b8c4f621be4ccd142d5';
 const KERNEL_V3_EXECUTION_HOOK = new Set(['0xbac849bb641841b44e965fb01a4bf5f074f84b4d', '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1', '0xd6cedde84be40893d153be9d467cd6ad37875b28']);
 const PACKED = parseAbi(['function executeUserOp((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) userOp, bytes32 userOpHash)']);
 
+type Overrides = NonNullable<SimulationRequest['stateOverrides']>;
+/** A storage slot as eth_simulateV1 takes it: 32 bytes of lowercase hex. */
+const slotKey = (slot: string) => `0x${slot.replace(/^0x/i, '').toLowerCase().padStart(64, '0')}`;
+/**
+ * The state a run sets for itself (`own`: the stand-ins for signatures that can't exist yet, the EntryPoint's
+ * simulation code, an EIP-7702 delegation the operation is signed for) over the state the caller set
+ * (PreviewContext.stateOverrides, `given`), account by account and slot by slot: where both set the same field of an
+ * account (its code, its balance) or the same storage slot, the run's own wins, since the stand-ins don't work
+ * without it; the caller's other fields and slots stay. Without anything given, `own` as it is.
+ */
+export function mergeOverrides(given: SimulationRequest['stateOverrides'], own: SimulationRequest['stateOverrides']): SimulationRequest['stateOverrides'] {
+  if (!given || !Object.keys(given).length) return own;
+  const out: Overrides = {};
+  for (const [a, o] of [...Object.entries(given), ...Object.entries(own ?? {})]) {
+    const k = a.toLowerCase(), prev = out[k] ?? {};
+    const stateDiff = prev.stateDiff || o.stateDiff ? Object.fromEntries([...Object.entries(prev.stateDiff ?? {}), ...Object.entries(o.stateDiff ?? {})].map(([s, v]) => [slotKey(s), v])) : undefined;
+    out[k] = { ...prev, ...o, ...(stateDiff && { stateDiff }) };
+  }
+  return out;
+}
+
 export interface ExecutionInput {
   chainId: number; entryPoint: string; sender: string; callData: Hex;
   /** Factory + factoryData, when the operation deploys the account. */
@@ -46,6 +67,8 @@ export interface ExecutionInput {
   /** The gas the EntryPoint gives the call (callGasLimit). */
   callGasLimit?: bigint;
   watch?: string[];
+  /** State the caller set for the simulation (PreviewContext.stateOverrides), beneath the run's own (see mergeOverrides). */
+  stateOverrides?: SimulationRequest['stateOverrides'];
 }
 
 export interface Execution { result: SimulationResult; deployed: boolean; direct?: boolean; /** The account has no code: calling it runs nothing (it may get an EIP-7702 delegation in the same transaction). */ noCode?: boolean }
@@ -159,11 +182,15 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     // With headroom: on-chain, validation (and a token paymaster's checks) has already warmed the contracts and
     // slots the call reads, so a standalone run pays cold-access costs the operation doesn't (EIP-2929).
     ...(op.callGasLimit !== undefined && op.callGasLimit > 0n && { gas: op.callGasLimit + op.callGasLimit / 10n + COLD_HEADROOM + intrinsic(data) }),
-    ...((op.delegate || hook) && { stateOverrides: { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` as Hex }), ...(hook && { stateDiff: hook }) } } }) };
+    // The caller's state (op.stateOverrides) beneath the run's own: the delegation the operation expects and the hook.
+    ...((op.delegate || hook || op.stateOverrides) && { stateOverrides: mergeOverrides(op.stateOverrides, (op.delegate || hook) ? { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` as Hex }), ...(hook && { stateDiff: hook }) } } : undefined) }) };
+  // Whether the account has code: the code the caller set for it, else the chain's.
+  const given = op.stateOverrides?.[sender]?.code;
+  const deployed = async () => (given !== undefined ? given !== '0x' : hasCode(deps, op.chainId, sender));
   // A new account: the SenderCreator calls the factory first, as the EntryPoint has it do.
   const factory = op.initCode && op.initCode.length >= 42 && !op.delegate ? `0x${op.initCode.slice(2, 42)}`.toLowerCase() : null;
   const creator = SENDER_CREATORS[entryPoint];
-  if (factory && (await hasCode(deps, op.chainId, sender)) !== true) {
+  if (factory && (await deployed()) !== true) {
     if (!creator || !sim.simulateBatch) return null;
     const deploy: SimulationRequest = { chainId: op.chainId, from: creator, account: sender, to: factory, data: `0x${op.initCode!.slice(42)}` as Hex, value: 0n };
     const results = await sim.simulateBatch([deploy, exec]);
@@ -178,7 +205,7 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     }
     return { result: results[1], deployed: true };
   }
-  if (!factory && !op.delegate && (await hasCode(deps, op.chainId, sender)) === false) return { result: { status: 'success', source: 'no code at the account', transfers: [], limited: true }, deployed: false, noCode: true };
+  if (!factory && !op.delegate && (await deployed()) === false) return { result: { status: 'success', source: 'no code at the account', transfers: [], limited: true }, deployed: false, noCode: true };
   const result = await sim.simulate(exec);
   if (!result) return null;
   // An account that only runs calls it validated in the same transaction (a flag in transient storage, set by
@@ -187,7 +214,7 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     const code = await runningCode(deps, op.chainId, sender);
     const calls = code && readsTransientStorage(code) ? callsOf(op.callData) : null;
     if (calls) {
-      const reqs: SimulationRequest[] = calls.map(c => ({ chainId: op.chainId, from: sender, to: c.to, data: c.data, value: c.value, ...(op.watch?.length && { watch: op.watch }) }));
+      const reqs: SimulationRequest[] = calls.map(c => ({ chainId: op.chainId, from: sender, to: c.to, data: c.data, value: c.value, ...(op.watch?.length && { watch: op.watch }), ...(op.stateOverrides && { stateOverrides: op.stateOverrides }) }));
       const results = reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
       if (results && results.every(r => r)) {
         const failed = results.find(r => r!.status === 'reverted');
@@ -1239,7 +1266,10 @@ export interface OperationInput {
   watch?: string[];
   /** Calls to simulate right after the operation, in the same block (e.g. reading what it changed). */
   after?: SimulationRequest[];
-  /** More state for the simulation (e.g. a Safe's approvals standing in for its owners' signatures). */
+  /**
+   * More state for the simulation: what the caller set (PreviewContext.stateOverrides), and a Safe's approvals
+   * standing in for its owners' signatures. The run's own stand-ins go over it (see mergeOverrides).
+   */
   stateOverrides?: SimulationRequest['stateOverrides'];
   /** Addresses to start warm: code moved there for a stand-in (not an account the chain would touch). */
   warm?: string[];
@@ -1388,12 +1418,17 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(stub.p256 === true ? [{ address: '0x0000000000000000000000000000000000000100', storageKeys: [] }, { address: P256_MOVED, storageKeys: [] }] : []),
       // The verifier itself stays cold, as it is on-chain; only the call on to its moved code is warm.
       ...(verifier ? [{ address: VERIFIER_MOVED, storageKeys: [] }] : []), ...(stub.warm ?? []).map(address => ({ address, storageKeys: [] }))],
-    // The bundler can afford the priced call's gas, whoever stands in for it.
-    stateOverrides: { ...op.stateOverrides, ...(price !== undefined && price > 0n && { [bundler]: { balance: BUNDLER_BALANCE } }), [entryPoint]: { ...entryPointOverride(entryPoint, op.chainId)!, ...(op.stateOverrides?.[entryPoint]?.stateDiff && { stateDiff: { ...entryPointOverride(entryPoint, op.chainId)!.stateDiff, ...op.stateOverrides[entryPoint].stateDiff } }) }, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
+    // The run's own state over op.stateOverrides (the caller's, and a Safe's approvals: see mergeOverrides). The
+    // bundler can afford the priced call's gas, whoever stands in for it. Where the caller set an address a stand-in
+    // needs, the stand-in's code and slots are used there, its balance and other slots the caller's: the EntryPoint
+    // runs its simulation code (with the storage it keeps for itself) over the caller's deposits and nonces; ecrecover,
+    // P256VERIFY and a P-256 verifier answer the stand-in signature, and any other the chain's own way; the account
+    // has the delegation the operation is signed for, and a stand-in key's storage.
+    stateOverrides: mergeOverrides(op.stateOverrides, { ...(price !== undefined && price > 0n && { [bundler]: { balance: BUNDLER_BALANCE } }), [entryPoint]: entryPointOverride(entryPoint, op.chainId)!, '0x0000000000000000000000000000000000000001': { code: recover, movePrecompileToAddress: ECRECOVER_MOVED },
       ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
       ...(verifier && { [verifierAt!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code: verifier } }),
       ...Object.fromEntries(Object.entries(stub.code ?? {}).map(([address, code]) => [address, { code }])),
-      ...((op.delegate || stub.storage) && { [sender]: { ...op.stateOverrides?.[sender], ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: { ...op.stateOverrides?.[sender]?.stateDiff, ...stub.storage } }) } }) } }, ep!.version);
+      ...((op.delegate || stub.storage) && { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: stub.storage }) } }) }) }, ep!.version);
   const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
     const ran = await run(first, recover);

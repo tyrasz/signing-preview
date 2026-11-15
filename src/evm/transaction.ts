@@ -453,6 +453,20 @@ export function overriddenWarning(overrides: NonNullable<SimulationRequest['stat
   return `Simulated with state set by whoever asked for this preview (${kinds.join(', ')} of ${n} account${n === 1 ? '' : 's'}), not the chain's own: it shows what would happen if the chain were in that state.`;
 }
 
+/**
+ * The state the caller set (PreviewContext.stateOverrides) for the simulations a preview runs beyond the
+ * transaction's own: a UserOperation's, a SafeOp's, a Safe transaction's. None for a replay, which runs on the
+ * chain's state as it was.
+ */
+export function callerOverrides(context: PreviewContext): SimulationRequest['stateOverrides'] {
+  return !context.replay && context.stateOverrides && Object.keys(context.stateOverrides).length ? context.stateOverrides : undefined;
+}
+
+/** The caution that what the preview shows was simulated with the caller's state (once, however many runs used it). */
+export function warnOverridden(b: PreviewBuilder, overrides: SimulationRequest['stateOverrides']): void {
+  if (overrides) b.warn('caution', 'state_overridden', overriddenWarning(overrides));
+}
+
 /** The wallet's own transactions still waiting to be mined, as simulation requests run before this one. */
 export function pendingRequests(tx: Tx, context: PreviewContext): SimulationRequest[] {
   return (context.pendingTransactions ?? []).filter(p => p && typeof p === 'object').map(p => ({

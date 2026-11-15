@@ -7,7 +7,7 @@
 import { decodeFunctionData, parseAbi, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from './format.ts';
 import { CHAINS } from './chains.ts';
-import { decodeTransaction, simulationNote } from './evm/transaction.ts';
+import { callerOverrides, decodeTransaction, simulationNote, warnOverridden } from './evm/transaction.ts';
 import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
 import type { AssetChange, SimulationRequest, SimulationResult, Warning } from './types.ts';
@@ -102,7 +102,8 @@ async function describeCall(c: Call, safe: string, chainId: number, env: Adapter
     if (t) return { title: t, status: 'full' };
   }
   const d = await decodeTransaction({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, env.deps, env.context);
-  for (const w of d.b.warnings) b.warnings.push({ ...w, message: `${p}${w.message}` });
+  // (The caution that a run used the caller's state, from a Safe this one calls execTransaction on, is said once.)
+  for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `${p}${w.message}` });
   return d;
 }
 
@@ -207,11 +208,14 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
       else if (r) { ran = true; assetChanges = r.assetChanges; if (r.note) b.note(r.note); if (r.succeeded) inOrder = r.logs ?? []; }
     } catch { ran = false; }
   }
-  // Otherwise simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way).
+  // Otherwise simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way),
+  // with the state the caller set for the simulation (context.stateOverrides).
   if (!ran && sim && calls.every(c => c.operation === 0)) {
-    const reqs = calls.map((c, i) => ({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data, value: c.value, ...((decoded[i] as Decoded).watch?.length && { watch: (decoded[i] as Decoded).watch }) }));
+    const overrides = callerOverrides(env.context);
+    const reqs = calls.map((c, i) => ({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data, value: c.value, ...((decoded[i] as Decoded).watch?.length && { watch: (decoded[i] as Decoded).watch }), ...(overrides && { stateOverrides: overrides }) }));
     try {
       const results = reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
+      if (results?.every(r => r)) warnOverridden(b, overrides);
       if (results && results.every(r => r?.status === 'success')) {
         inOrder = results.flatMap(r => r!.logs ?? []);
         const basis = results.every(r => r!.basis === 'state' || r!.basis === 'fork' || r!.balancesRead) ? 'simulated_state' as const : 'simulated_events' as const;
@@ -270,8 +274,11 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
   return async () => {
     // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
     const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
-    const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(at && { at }) });
+    // With the state the caller set for the simulation (context.stateOverrides), beneath the stand-ins'.
+    const overrides = callerOverrides(env.context);
+    const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(at && { at }), ...(overrides && { stateOverrides: overrides }) });
     if (!run) return null;
+    warnOverridden(b, overrides);
     if (env.context.trace && run.requests) {
       const traceEnv: TraceEnv = { chainId, account: t.safe.toLowerCase(), accountLabel: 'the Safe', deps: env.deps };
       const traces = await tracePreviews(run.requests.slice(0, 1), [run.result], traceEnv);

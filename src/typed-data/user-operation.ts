@@ -4,7 +4,7 @@
 import { type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS, chainName } from '../chains.ts';
-import { decodeTransaction, simulationNote } from '../evm/transaction.ts';
+import { callerOverrides, decodeTransaction, simulationNote, warnOverridden } from '../evm/transaction.ts';
 import { netChanges } from '../evm/effects.ts';
 import type { AssetChange } from '../types.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
@@ -262,6 +262,8 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   for (const n of inner.b.notes) b.note(n);
 
   // The whole operation simulated as the EntryPoint runs it: validation, the calls, gas and the paymaster's charge.
+  // With the state the caller set for it (context.stateOverrides), beneath the stand-ins the run needs.
+  const overrides = callerOverrides(env.context);
   let assetChanges: AssetChange[] = inner.assetChanges;
   let whole: AssetChange[] | null = null;
   if (env.deps.simulator && chainId !== null && u.gas && nonce !== null && u.paymasterAndData !== undefined) {
@@ -272,7 +274,8 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
       // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
       const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
       const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData, callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
-        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }) }, env.deps);
+        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+      if (run) warnOverridden(b, overrides);
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
       // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment.
       if (whole && env.context.trace && run?.requests) {
@@ -287,8 +290,9 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   // Otherwise its calls alone, as the EntryPoint makes them: the account deployed first if it's new, then called.
   if (whole === null && env.deps.simulator && chainId !== null) {
     try {
-      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }) }, env.deps);
+      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
       const sim = run?.result;
+      if (sim && !run.noCode) warnOverridden(b, overrides);
       const how = run?.direct ? "directly from the account: this account only runs calls it validated in the same transaction (a flag kept in transient storage), which can't be done before it's signed"
         : `as the EntryPoint runs it${run?.deployed ? ', after deploying the account through its factory' : ''}${delegate ? ', with the account delegating as the operation expects' : ''}`;
       if (run?.noCode) b.warn('info', 'userop_account_no_code', `The account ${shortAddress(sender)} has no code, so the EntryPoint calling it would run nothing. The operation only does something if the account is delegated (EIP-7702) in the same transaction, and the preview can't simulate that.`);

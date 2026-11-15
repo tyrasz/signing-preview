@@ -11,7 +11,7 @@ import { p256 } from '@noble/curves/nist';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
 import type { BlockAt } from './block.ts';
-import { base64url, ecdsaStandIn, lastSignature, P256_STUB, passkeyVerifiersStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
+import { base64url, ecdsaStandIn, lastSignature, mergeOverrides, P256_STUB, passkeyVerifiersStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
 import { effectOf, roomFor } from './evm/effects.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 
@@ -84,11 +84,15 @@ export function config(out: (Hex | undefined)[]): SafeConfig | undefined {
   } catch { return partial; }
 }
 
-/** The Safe's configuration now (owners, threshold, singleton, guard, fallback handler, modules), undefined if it isn't a readable Safe. */
-export async function readConfig(deps: Dependencies, chainId: number, safe: string): Promise<SafeConfig | undefined> {
+/**
+ * The Safe's configuration now (owners, threshold, singleton, guard, fallback handler, modules), undefined if it isn't
+ * a readable Safe. With `overrides` (the state the caller set for the simulation), as it is in that state: eth_call
+ * takes them as its third parameter (a node that refuses them leaves the Safe unread, and its simulation not run).
+ */
+export async function readConfig(deps: Dependencies, chainId: number, safe: string, overrides?: SimulationRequest['stateOverrides']): Promise<SafeConfig | undefined> {
   const rpc = deps.rpc;
   if (!rpc?.has(chainId)) return undefined;
-  const c = config(await Promise.all(reads(safe.toLowerCase()).map(r => rpc.call(chainId, 'eth_call', [{ to: r.to, data: r.data }, 'latest']).then(o => String(o) as Hex).catch(() => undefined))));
+  const c = config(await Promise.all(reads(safe.toLowerCase()).map(r => rpc.call(chainId, 'eth_call', [{ to: r.to, data: r.data }, 'latest', ...(overrides ? [overrides] : [])]).then(o => String(o) as Hex).catch(() => undefined))));
   return c?.partial ? undefined : c;
 }
 
@@ -324,16 +328,21 @@ const SUBMITTER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
 /**
  * execTransaction simulated for this SafeTx (or `request`: an execTransaction transaction as sent, with its own
  * signatures), followed by the configuration reads. Null without an RPC and a simulator that runs batches.
+ * `stateOverrides`: the state the caller set for the simulation (PreviewContext.stateOverrides), beneath the
+ * stand-ins' (see mergeOverrides). The Safe's nonce, the transaction's hash and its configuration before it are read
+ * in that state too, so the approvals stand in for the owners it has there and the configuration is compared like
+ * with like.
  */
-export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt } = {}): Promise<SafeRun | null> {
+export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt; stateOverrides?: SimulationRequest['stateOverrides'] } = {}): Promise<SafeRun | null> {
   const rpc = deps.rpc, sim = deps.simulator;
   if (!rpc?.has(chainId) || !sim?.simulateBatch) return null;
   const safe = t.safe.toLowerCase();
-  const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, 'latest'])) as Hex;
+  const given = opts.stateOverrides && Object.keys(opts.stateOverrides).length ? opts.stateOverrides : undefined;
+  const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, 'latest', ...(given ? [given] : [])])) as Hex;
   const before = config(await Promise.all(reads(safe).map(r => call(r.data).catch(() => undefined))));
   if (!before || before.partial) return null; // not a readable Safe
   let exec: SimulationRequest, signedByPasskey: SafeRun['passkey'] = false;
-  if (opts.request) exec = { ...opts.request, account: safe };
+  if (opts.request) exec = { ...opts.request, account: safe, ...(given && { stateOverrides: mergeOverrides(given, opts.request.stateOverrides) }) };
   else {
     // The transaction's hash at the Safe's current nonce, as execTransaction computes it.
     const nonce = BigInt(await call(encodeFunctionData({ abi: ABI, functionName: 'nonce' })));
@@ -357,7 +366,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     if (passkey) signedByPasskey = true;
     else if (zeal) signedByPasskey = 'inline';
     exec = { chainId, from: executor, account: safe, to: safe, value: 0n, accessList: [...standIn.accessList!, ...(passkey?.accessList ?? []), ...(zeal?.warm ?? []).map(address => ({ address, storageKeys: [] }))],
-      stateOverrides: { ...standIn.stateOverrides, ...passkey?.stateOverrides, ...zeal?.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) },
+      stateOverrides: mergeOverrides(given, { ...standIn.stateOverrides, ...passkey?.stateOverrides, ...zeal?.stateOverrides, ...(Object.keys(stateDiff).length && { [safe]: { stateDiff } }) }),
       data: encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [t.to as Hex, t.value, t.data, t.operation, t.safeTxGas, t.baseGas, t.gasPrice, t.gasToken as Hex, t.refundReceiver as Hex, signatures] }) };
   }
   if (opts.at) exec = { ...exec, at: opts.at };

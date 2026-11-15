@@ -94,8 +94,9 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     inner.push(d);
     const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[tx.chainId]?.nativeDecimals ?? 18)} ${native}` : '';
     b.detail(`Call ${i + 1}`, `${d.title}${value} (${shortAddress(c.target.toLowerCase())})`, c.target.toLowerCase());
-    // Every call's own warnings, numbered (two calls can raise the same kind).
-    for (const w of d.b.warnings) b.warnings.push({ ...w, message: `Call ${i + 1}: ${w.message}` });
+    // Every call's own warnings, numbered (two calls can raise the same kind), except the caution that a run used the
+    // caller's state (from a Safe a call runs execTransaction on), which is said once.
+    for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `Call ${i + 1}: ${w.message}` });
   }
   if (parsed.calls.length > MAX_CALLS) b.detail('More calls', String(parsed.calls.length - MAX_CALLS));
   if (parsed.delegatecall) b.warn('danger', 'smart_account_delegatecall', `This runs ${shortAddress(parsed.calls[0].target)}'s code inside your account (delegatecall): it can do anything with the account and everything in it.`);

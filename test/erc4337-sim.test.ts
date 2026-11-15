@@ -11,7 +11,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V09 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import type { Dependencies, Preview, SimulationResult } from '../src/types.ts';
+import type { Dependencies, Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
 import { codes, detail, NOW } from './helpers.ts';
 import { testChain } from './evm-chain.ts';
 
@@ -593,4 +593,80 @@ test('A whole operation’s trace: the EntryPoint’s run of it, from validation
   assert.ok(t.stateChanges!.some(s => s.address === EP));
   // Not asked for: none.
   assert.equal((await preview(operation())).trace, undefined);
+});
+
+test('State the caller sets (context.stateOverrides) is what a whole operation runs on, beneath the stand-ins it needs', async () => {
+  const runs: SimulationRequest[][] = [];
+  const sim = deps.simulator!;
+  const watched: Dependencies = { ...deps, simulator: { simulate: async r => { runs.push([r]); return sim.simulate(r); }, simulateBatch: async rs => { runs.push(rs); return sim.simulateBatch!(rs); } } };
+  const run = (op: Record<string, unknown>, context: Record<string, unknown>, version: '0.6' | '0.7' = '0.7') => {
+    const ep = version === '0.6' ? EP6 : EP;
+    return previewRequest({ method: 'personal_sign', params: [userOpHash(readOperation(op, version)!, ep, 999, version), OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: ep, operation: op }, ...context }, watched);
+  };
+  const native = (p: Preview) => p.assetChanges.filter(c => c.asset === 'native').map(c => `${c.direction} ${c.amount}`);
+  // The account holds 1 HYPE: sending 2 fails when the EntryPoint runs the calls.
+  const sendTwo = operation({ callData: call('execute', [BOB, 2n * E, '0x']) });
+  const own = await run(sendTwo, {});
+  assert.ok(codes(own).includes('userop_execution_reverts') && !codes(own).includes('state_overridden'), codes(own).join());
+  assert.ok(!own.decoding.notes.some(n => /context\.stateOverrides/.test(n)));
+  // Given 5, it runs: the same whole operation (validation, the calls and the gas), on the state set, and said so.
+  // The caller's code for ecrecover and the EntryPoint, and the slot the simulation code keeps its SenderCreator in,
+  // give way to the stand-ins'; the caller's other slot at the EntryPoint stays.
+  const SENDER_CREATOR_SLOT = `0x${'0'.repeat(63)}6`, OTHER_SLOT = `0x${'0'.repeat(62)}77`;
+  runs.length = 0;
+  const set = await run(sendTwo, { stateOverrides: { [account]: { balance: (5n * E).toString() }, '0x0000000000000000000000000000000000000001': { code: '0x00' }, [EP]: { code: '0x00', balance: '0x1', stateDiff: { '0x6': '0x1234', '0x77': '0x1' } } } });
+  assert.ok(!codes(set).includes('userop_execution_reverts'), codes(set).join());
+  assert.deepEqual(native(set), ['out 2']);
+  assert.ok(set.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.7 runs it/.test(n) && !/doesn't accept it as theirs/.test(n)), set.decoding.notes.join(' | '));
+  assert.ok(set.details.some(d => d.label === 'Gas cost (simulated)'));
+  assert.match(set.warnings.find(w => w.code === 'state_overridden')?.message ?? '', /^Simulated with state set by whoever asked for this preview \(balance, code, storage of 3 accounts\)/);
+  assert.equal(set.warnings.filter(w => w.code === 'state_overridden').length, 1);
+  assert.ok(!set.decoding.notes.some(n => /context\.stateOverrides/.test(n)), 'simulated with them: no note saying they were not');
+  const whole = runs.find(rs => rs[0].to === EP)![0].stateOverrides!;
+  assert.equal(whole[account].balance, `0x${(5n * E).toString(16)}`);
+  assert.ok(whole['0x0000000000000000000000000000000000000001'].code!.includes(OWNER.slice(2)), 'ecrecover is the stand-in');
+  assert.equal(whole['0x0000000000000000000000000000000000000001'].movePrecompileToAddress, '0x0000000000000000000000000000000000ec0001');
+  assert.equal(whole[EP].code, ENTRY_POINT_SIMULATIONS_V07);
+  assert.deepEqual([whole[EP].balance, whole[EP].stateDiff![OTHER_SLOT], whole[EP].stateDiff![SENDER_CREATOR_SLOT]], ['0x1', `0x${'0'.repeat(62)}01`, `0x${'0'.repeat(24)}efc2c1444ebcc4db75e7613d20c6a62ff67a167c`]);
+  // EntryPoint v0.6 takes them too, and v0.9's typed operations.
+  const v06 = await run(operation({ sender: account6, paymasterAndData: '0x', callData: call('execute', [BOB, 2n * E, '0x']) }), { stateOverrides: { [account6]: { balance: (5n * E).toString() } } }, '0.6');
+  assert.deepEqual([native(v06), codes(v06).includes('state_overridden'), codes(v06).includes('userop_execution_reverts')], [['out 2'], true, false]);
+  const typed = JSON.stringify({ domain: { name: 'ERC4337', version: '1', chainId: 999, verifyingContract: EP9 }, primaryType: 'PackedUserOperation',
+    types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+      PackedUserOperation: [{ name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' }, { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' }] },
+    message: { sender: account9, nonce: '0', initCode: '0x', callData: call('execute', [BOB, 2n * E, '0x']), accountGasLimits: concatHex([word(200_000n), word(200_000n)]), preVerificationGas: '50000', gasFees: concatHex([word(1_000_000_000n), word(2_000_000_000n)]), paymasterAndData: '0x' } });
+  const v09 = (context: Record<string, unknown>) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNER, typed] }, { now: NOW, ...context }, deps);
+  assert.ok(codes(await v09({})).includes('userop_execution_reverts'));
+  const v09set = await v09({ stateOverrides: { [account9]: { balance: (5n * E).toString() } } });
+  assert.deepEqual([native(v09set), codes(v09set).includes('state_overridden'), codes(v09set).includes('userop_execution_reverts')], [['out 2'], true, false]);
+  assert.ok(v09set.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.9 runs it/.test(n)));
+});
+
+test('An operation whose calls are run alone (the whole one is rejected) runs them on the state the caller set too', async () => {
+  // A paymaster with no deposit: the EntryPoint rejects the operation (AA31), and its calls are simulated on their own.
+  const sendTwo = operation({ ...withPaymaster(broke), callData: call('execute', [BOB, 2n * E, '0x']) });
+  const hash = userOpHash(readOperation(sendTwo, '0.7')!, EP, 999, '0.7');
+  const run = (context: Record<string, unknown>) => previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: sendTwo }, ...context }, deps);
+  const own = await run({});
+  assert.ok(codes(own).includes('userop_rejected') && codes(own).includes('userop_execution_reverts'), codes(own).join());
+  const set = await run({ stateOverrides: { [account]: { balance: (5n * E).toString() } } });
+  assert.ok(codes(set).includes('userop_rejected') && !codes(set).includes('userop_execution_reverts'), codes(set).join());
+  assert.deepEqual(set.assetChanges.filter(c => c.asset === 'native').map(c => `${c.direction} ${c.amount}`), ['out 2']);
+  assert.ok(set.decoding.notes.some(n => /operation's calls were simulated as the EntryPoint runs it/.test(n)), set.decoding.notes.join(' | '));
+  assert.ok(codes(set).includes('state_overridden'));
+});
+
+test('The caller’s state and a run’s own merge account by account and slot by slot, the run’s own winning where both set the same', async () => {
+  const { mergeOverrides } = await import('../src/erc4337-sim.ts');
+  const own = { '0x0000000000000000000000000000000000000001': { code: '0xaa', movePrecompileToAddress: '0x0000000000000000000000000000000000ec0001' }, [account]: { stateDiff: { [`0x${'0'.repeat(63)}1`]: '0x02' } } };
+  assert.equal(mergeOverrides(undefined, own), own, 'nothing given: the run’s own as it is');
+  assert.equal(mergeOverrides({}, own), own);
+  const given = { '0x0000000000000000000000000000000000000001': { code: '0xbb', balance: '0x5' }, [account.toUpperCase().replace('0X', '0x')]: { balance: '0x9', stateDiff: { '0x1': '0x07', '0x2': '0x08' } }, [BOB]: { code: '0xcc' } };
+  assert.deepEqual(mergeOverrides(given, own), {
+    '0x0000000000000000000000000000000000000001': { code: '0xaa', balance: '0x5', movePrecompileToAddress: '0x0000000000000000000000000000000000ec0001' },
+    [account]: { balance: '0x9', stateDiff: { [`0x${'0'.repeat(63)}1`]: '0x02', [`0x${'0'.repeat(63)}2`]: '0x08' } },
+    [BOB]: { code: '0xcc' },
+  });
+  // Nothing of its own: the caller's, keyed and slotted as simulators take them.
+  assert.deepEqual(mergeOverrides(given, undefined), { '0x0000000000000000000000000000000000000001': { code: '0xbb', balance: '0x5' }, [account]: { balance: '0x9', stateDiff: { [`0x${'0'.repeat(63)}1`]: '0x07', [`0x${'0'.repeat(63)}2`]: '0x08' } }, [BOB]: { code: '0xcc' } });
 });

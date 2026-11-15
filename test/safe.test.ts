@@ -546,3 +546,152 @@ test("A SafeOp whose calls fail when the EntryPoint runs them doesn't make a lat
   assert.match(failed.warnings.find(w => w.code === 'safe_tx_reverts')?.message ?? '', /^Call 2: .*ERC20InsufficientBalance/, JSON.stringify(failed.warnings));
   assert.ok(!failed.decoding.notes.some(n => /Call 2's Safe transaction/.test(n)), JSON.stringify(failed.decoding.notes));
 });
+
+// State the caller sets for the simulation (context.stateOverrides): a Safe holding 1 ETH asked to send 2. The mock
+// node runs the Safe's transfer from the balance the request gives the Safe, as a node applying the override would.
+test('A SafeTx, its plain-call fallback and an execTransaction are simulated on the state the caller set, beneath the stand-ins', async () => {
+  const { encodeAbiParameters: enc } = await import('viem');
+  const E = 10n ** 18n, HASH = `0x${'ab'.repeat(32)}` as Hex, ECRECOVER = '0x0000000000000000000000000000000000000001';
+  const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const view = (readable: boolean) => (data: string) => {
+    const sel = data.slice(0, 10);
+    if (!readable) return '0x';
+    if (sel === '0xa619486e') return enc([{ type: 'address' }], [SINGLETON]);
+    if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [OWNERS as Hex[]]);
+    if (sel === '0xe75235b8') return word(2n);
+    if (sel === '0xaffed0e0') return word(7n);
+    if (sel === '0xd8d11f78') return HASH;
+    if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[], '0x0000000000000000000000000000000000000001']);
+    if (sel === '0x5624b25b') return enc([{ type: 'bytes' }], [`0x${'00'.repeat(32)}`]);
+    if (sel === '0x2f54bf6e') return word(1n);
+    return '0x';
+  };
+  const safeBalance = (r: SimulationRequest) => BigInt(r.stateOverrides?.[SAFE]?.balance ?? E);
+  // The Safe sends 2 ETH (through execTransaction, or as the Safe's own call): only on a balance that covers it.
+  const sends = (r: SimulationRequest) => safeBalance(r) >= 2n * E
+    ? { status: 'success' as const, source: 'mock', transfers: [{ asset: 'native', from: SAFE, to: BOB.toLowerCase(), raw: 2n * E }], returnData: word(1n) }
+    : { status: 'reverted' as const, source: 'mock', transfers: [], revertReason: 'GS013' };
+  const env = (readable = true) => {
+    const reads: unknown[][] = [], batches: SimulationRequest[][] = [], singles: SimulationRequest[] = [];
+    const answer = (r: SimulationRequest) => (r.to === SAFE && (r.data.startsWith('0x6a761202') || r.from === SAFE) ? sends(r) : r.to === BOB.toLowerCase() && r.from === SAFE ? sends(r)
+      : { status: 'success' as const, source: 'mock', transfers: [], returnData: view(readable)(r.data) });
+    const d: Dependencies = { ...deps,
+      rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => { if (m === 'eth_call') { reads.push(p); return view(readable)((p[0] as { data: string }).data); } return m === 'eth_getCode' ? '0x6080' : null; } },
+      simulator: { simulate: async r => { singles.push(r); return answer(r); }, simulateBatch: async rs => { batches.push(rs); return rs.map(answer); } } };
+    return { d, reads, batches, singles };
+  };
+  const sendTwo = { to: BOB, value: (2n * E).toString(), data: '0x' };
+  const given = { [SAFE]: { balance: (5n * E).toString(), stateDiff: { '0x4': '0x1' } }, [ECRECOVER]: { code: '0x00' } };
+  const signWith = (context: Record<string, unknown>, d: Dependencies) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(safeTx(sendTwo))] }, { now: NOW, ...context }, d);
+  const native = (p: Awaited<ReturnType<typeof sign>>) => p.assetChanges.filter(c => c.asset === 'native').map(c => `${c.direction} ${c.amount}`);
+
+  // execTransaction itself: on the chain's state it fails; on the state set, it sends the 2 ETH, and says so once.
+  const chainOwn = env();
+  const own = await signWith({}, chainOwn.d);
+  assert.ok(codes(own).includes('safe_tx_reverts') && !codes(own).includes('state_overridden'), codes(own).join());
+  assert.ok(chainOwn.reads.every(p => p.length === 2), 'no overrides: eth_call as before');
+  const set = env();
+  const p = await signWith({ stateOverrides: given }, set.d);
+  assert.ok(!codes(p).includes('safe_tx_reverts'), codes(p).join());
+  assert.deepEqual(native(p), ['out 2']);
+  assert.equal(p.warnings.filter(w => w.code === 'state_overridden').length, 1);
+  assert.ok(!p.decoding.notes.some(n => /context\.stateOverrides/.test(n)), p.decoding.notes.join(' | '));
+  // The run: the caller's balance and slot at the Safe, under the approval standing in for the second owner; the
+  // stand-in ecrecover over the caller's code there. The Safe's nonce, hash and configuration were read in that state.
+  const exec = set.batches[0][0];
+  const approval = k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [OWNERS[1] as Hex, 8n]))]));
+  assert.equal(exec.stateOverrides![SAFE].balance, `0x${(5n * E).toString(16)}`);
+  assert.deepEqual(exec.stateOverrides![SAFE].stateDiff, { [`0x${'0'.repeat(63)}4`]: `0x${'0'.repeat(63)}1`, [approval]: `0x${'0'.repeat(63)}1` });
+  assert.ok(exec.stateOverrides![ECRECOVER].code!.includes(OWNERS[0].slice(2)) && exec.stateOverrides![ECRECOVER].movePrecompileToAddress, 'ecrecover is the stand-in');
+  // (The checks of whether the signer is an owner and the nonce is the Safe's next describe the chain as it is.)
+  const readsOf = (sel: string) => set.reads.filter(p => (p[0] as { data: string }).data.startsWith(sel));
+  assert.ok(['0xa0e67e2b', '0xe75235b8', '0xd8d11f78'].every(sel => readsOf(sel).length && readsOf(sel).every(p => (p[2] as Record<string, unknown>)?.[SAFE])), 'owners, threshold and hash read with the overrides');
+  assert.ok(readsOf('0x2f54bf6e').every(p => p.length === 2));
+
+  // The calls from the Safe, when execTransaction can't be run (the Safe doesn't answer as one): the same state.
+  const plainOwn = env(false), plainSet = env(false);
+  assert.ok(codes(await signWith({}, plainOwn.d)).includes('safe_tx_reverts'));
+  const plain = await signWith({ stateOverrides: given }, plainSet.d);
+  assert.deepEqual([native(plain), codes(plain).includes('safe_tx_reverts'), plain.warnings.filter(w => w.code === 'state_overridden').length], [['out 2'], false, 1]);
+  assert.equal(plainSet.singles[0].stateOverrides?.[SAFE]?.balance, `0x${(5n * E).toString(16)}`);
+  assert.match(plain.decoding.notes.join(' '), /Simulated as the Safe making the call/);
+  // Nothing simulated (no simulator here): no caution, and a note that the overrides weren't applied.
+  const unsimulated = await signWith({ stateOverrides: given }, deps);
+  assert.ok(!codes(unsimulated).includes('state_overridden'));
+  assert.match(unsimulated.decoding.notes.join(' '), /nothing in this request was simulated with them/);
+
+  // An execTransaction transaction, alone and in a batch: the transaction's own warning, said once.
+  const execData = encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [BOB, 2n * E, '0x', 0, 0n, 0n, 0n, ZERO, ZERO, `0x${'11'.repeat(130)}`] });
+  const tx = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SAFE, data: execData, chainId: '0x1' }] }, { now: NOW, stateOverrides: given }, env().d);
+  assert.equal(tx.warnings.filter(w => w.code === 'state_overridden').length, 1);
+  const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', from: ALICE, chainId: '0x1', calls: [{ to: SAFE, data: execData }, { to: SAFE, data: execData }] }] }, { now: NOW, stateOverrides: given }, env().d);
+  assert.equal(batch.warnings.filter(w => w.code === 'state_overridden').length, 1, batch.warnings.map(w => w.message).join(' | '));
+  assert.ok(!batch.warnings.some(w => /^Call \d: Simulated with state set/.test(w.message)));
+  // A SafeTx whose calls are execTransactions of a Safe (here itself), each run by its decoder too: said once.
+  const nested = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(safeTx({ to: MULTISEND_CALL_ONLY, operation: 1, data: multiSend([[0, SAFE, 0n, execData], [0, SAFE, 0n, execData]]) }))] }, { now: NOW, stateOverrides: given }, env().d);
+  assert.deepEqual(nested.warnings.filter(w => w.code === 'state_overridden').map(w => w.message.slice(0, 10)), ['Simulated ']);
+  // A smart account's batch of execTransactions, as a transaction to the account, as a UserOperation's calls and in a
+  // bundle of two such operations: said once, unnumbered, too.
+  const SA = parseAbi(['function executeBatch((address target, uint256 value, bytes data)[] calls)',
+    'function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
+  const overridden = (p: Awaited<ReturnType<typeof sign>>) => p.warnings.filter(w => w.code === 'state_overridden').map(w => w.message.slice(0, 10));
+  const accountBatch = encodeFunctionData({ abi: SA, functionName: 'executeBatch', args: [[{ target: SAFE, value: 0n, data: execData }, { target: SAFE, value: 0n, data: execData }]] });
+  const viaAccount = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: accountBatch, chainId: '0x1' }] }, { now: NOW, stateOverrides: given }, env().d);
+  assert.deepEqual(overridden(viaAccount), ['Simulated '], viaAccount.warnings.map(w => w.message).join(' | '));
+  const EP7 = '0x0000000071727de22e5e9d8baf0edac6f37da032', z = `0x${'00'.repeat(32)}` as Hex;
+  const packed = (sender: string) => ({ sender: sender as Hex, nonce: 0n, initCode: '0x' as Hex, callData: accountBatch, accountGasLimits: z, preVerificationGas: 0n, gasFees: z, paymasterAndData: '0x' as Hex, signature: '0x' as Hex });
+  const bundle = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: EP7, data: encodeFunctionData({ abi: SA, functionName: 'handleOps', args: [[packed(ALICE), packed(BOB)], ALICE as Hex] }), chainId: '0x1' }] }, { now: NOW, stateOverrides: given }, env().d);
+  assert.deepEqual(overridden(bundle), ['Simulated '], bundle.warnings.map(w => w.message).join(' | '));
+  const { readOperation, userOpHash } = await import('../src/userop-hash.ts');
+  const operation = { sender: ALICE, nonce: '0x0', callData: accountBatch, callGasLimit: '0x30d40', verificationGasLimit: '0x493e0', preVerificationGas: '0xc350', maxFeePerGas: '0x2faf080', maxPriorityFeePerGas: '0xf4240' };
+  const userOp = await previewRequest({ method: 'personal_sign', params: [userOpHash(readOperation(operation, '0.7')!, EP7, 1, '0.7'), ALICE] }, { now: NOW, chainId: 1, userOperation: { entryPoint: EP7, operation }, stateOverrides: given }, env().d);
+  assert.deepEqual(overridden(userOp), ['Simulated '], userOp.warnings.map(w => w.message).join(' | '));
+});
+
+test('A SafeOp is simulated on the state the caller set: the whole operation beneath its stand-ins, then the calls the module runs', async () => {
+  const { encodeAbiParameters: enc } = await import('viem');
+  const { ENTRY_POINT_SIMULATIONS_V07 } = await import('../src/entrypoint-simulations.ts');
+  const E = 10n ** 18n, OP_SAFE = SAFE_OP_V03.message.safe.toLowerCase(), EP7 = SAFE_OP_V03.message.entryPoint, ECRECOVER = '0x0000000000000000000000000000000000000001';
+  const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const view = (data: string) => {
+    const sel = data.slice(0, 10);
+    if (sel === '0xa619486e') return enc([{ type: 'address' }], [SINGLETON]);
+    if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [OWNERS as Hex[]]);
+    if (sel === '0xe75235b8') return word(2n);
+    if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[SAFE_OP_V03.domain.verifyingContract.toLowerCase() as Hex], '0x0000000000000000000000000000000000000001']);
+    if (sel === '0x5624b25b') return enc([{ type: 'bytes' }], [`0x${'00'.repeat(32)}`]);
+    if (sel === '0x35567e1a') return word(BigInt(SAFE_OP_V03.message.nonce));
+    return word(1n);
+  };
+  const env = () => {
+    const reads: unknown[][] = [], asked: SimulationRequest[][] = [];
+    // The whole operation can't be run by this node (no logs): the module's call is then run alone, from the EntryPoint.
+    const answer = (r: SimulationRequest) => r.to === OP_SAFE && r.from === EP7
+      ? BigInt(r.stateOverrides?.[OP_SAFE]?.balance ?? E) >= 2n * E ? { status: 'success' as const, source: 'mock', transfers: [{ asset: 'native', from: OP_SAFE, to: BOB.toLowerCase(), raw: 2n * E }] } : { status: 'reverted' as const, source: 'mock', transfers: [], revertReason: 'GS013' }
+      : null;
+    const d: Dependencies = { ...deps,
+      rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => { if (m === 'eth_call') { reads.push(p); return view((p[0] as { data: string }).data); } return m === 'eth_getCode' ? '0x6080' : m === 'eth_getStorageAt' ? word(0n) : null; } },
+      simulator: { simulate: async r => { asked.push([r]); return answer(r); }, simulateBatch: async rs => { asked.push(rs); return rs.map(answer).some(x => !x) ? null : rs.map(answer) as never; } } };
+    return { d, reads, asked };
+  };
+  const sendTwo = { callData: encodeFunctionData({ abi: parseAbi(['function executeUserOp(address to, uint256 value, bytes data, uint8 operation)']), functionName: 'executeUserOp', args: [BOB, 2n * E, '0x', 0] }) };
+  const run = (context: Record<string, unknown>, d: Dependencies) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNERS[0], JSON.stringify({ ...SAFE_OP_V03, message: { ...SAFE_OP_V03.message, ...sendTwo } })] }, { now: NOW, ...context }, d);
+  const native = (p: Awaited<ReturnType<typeof sign>>) => p.assetChanges.filter(c => c.asset === 'native').map(c => `${c.direction} ${c.amount}`);
+  const own = await run({}, env().d);
+  assert.ok(codes(own).includes('safe_tx_reverts') && !codes(own).includes('state_overridden'), codes(own).join());
+  const set = env();
+  const p = await run({ stateOverrides: { [OP_SAFE]: { balance: (5n * E).toString() }, [ECRECOVER]: { code: '0x00' }, [EP7]: { code: '0x00', stateDiff: { '0x77': '0x1' } } } }, set.d);
+  assert.deepEqual([native(p), codes(p).includes('safe_tx_reverts'), p.warnings.filter(w => w.code === 'state_overridden').length], [['out 2'], false, 1]);
+  assert.match(p.decoding.notes.join(' '), /The operation was simulated as the EntryPoint runs it: through the Safe's 4337 module/);
+  // The whole operation was asked for with the caller's state beneath its stand-ins: the EntryPoint's simulation
+  // code, ecrecover standing in for the signing owner, the other owner's approval at the Safe.
+  const whole = set.asked.find(rs => rs[0].to === EP7)![0].stateOverrides!;
+  assert.equal(whole[EP7].code, ENTRY_POINT_SIMULATIONS_V07);
+  assert.equal(whole[EP7].stateDiff![`0x${'0'.repeat(62)}77`], `0x${'0'.repeat(62)}01`);
+  assert.ok(whole[ECRECOVER].code!.includes(OWNERS[0].slice(2)));
+  assert.equal(whole[OP_SAFE].balance, `0x${(5n * E).toString(16)}`);
+  assert.equal(Object.keys(whole[OP_SAFE].stateDiff ?? {}).length, 1, 'the approval of the other owner the threshold needs');
+  // The calls alone carry it too; and the Safe's configuration before the run was read in that state.
+  assert.equal(set.asked.find(rs => rs[0].to === OP_SAFE && rs[0].from === EP7)![0].stateOverrides?.[OP_SAFE]?.balance, `0x${(5n * E).toString(16)}`);
+  assert.ok(set.reads.some(p => (p[0] as { data: string }).data === '0xa0e67e2b' && (p[2] as Record<string, unknown>)?.[OP_SAFE]));
+});

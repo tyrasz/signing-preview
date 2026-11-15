@@ -534,9 +534,10 @@ test('State the caller sets for a simulation reaches it, is checked, and the pre
     [{ [ALICE]: { code: '0x123' } }, /code must be hex/], [{ [ALICE]: { stateDiff: { '0x1': 'x' } } }, /stateDiff value must be hex/], [[], /must be an object keyed by address/]] as const) {
     await assert.rejects(send({ stateOverrides: bad }, d), (e: Error & { code?: string }) => e.code === 'INVALID_REQUEST' && said.test(e.message));
   }
-  // A signature isn't simulated with them, and says so.
+  // A message isn't simulated with them, and says so (UserOperations and Safe transactions are: test/erc4337-sim.test.ts).
   const message = await previewRequest({ method: 'personal_sign', params: ['0x68656c6c6f', ALICE] }, { now: NOW, chainId: 8453, stateOverrides: { [ALICE]: { balance: '0x1' } } }, d);
-  assert.match(message.decoding.notes.join(' '), /State overrides \(context\.stateOverrides\) apply to transactions and batches/);
+  assert.match(message.decoding.notes.join(' '), /State overrides \(context\.stateOverrides\) apply to what a preview simulates .*nothing in this request was simulated with them/);
+  assert.ok(!codes(message).includes('state_overridden'));
   // Over HTTP: the spec has them, a preview with them matches it, and a malformed one is a 400.
   const Ajv2020 = (Ajv2020Module as unknown as { default?: typeof Ajv2020Module }).default ?? Ajv2020Module;
   const spec = JSON.parse(readFileSync(new URL('../openapi.json', import.meta.url), 'utf8'));

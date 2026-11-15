@@ -50,7 +50,10 @@ export async function previewRequest(request: SigningRequest, context: PreviewCo
     // Only transactions and batches are simulated on a named block.
     else if (preview.kind === 'typed_data' || preview.kind === 'message') preview.decoding.notes.push('A past block (context.block) applies to transactions and batches: this request was previewed against the latest block.');
   }
-  if (ctx.stateOverrides && (preview.kind === 'typed_data' || preview.kind === 'message')) preview.decoding.notes.push('State overrides (context.stateOverrides) apply to transactions and batches: this request was previewed against the chain\'s own state.');
+  // State overrides reach whatever a preview simulates: transactions and batches, and the UserOperations, SafeOps and
+  // Safe transactions a signature authorizes (each says so with its 'state_overridden' caution). Anything else signed
+  // isn't simulated, and nothing here was simulated with them.
+  if (ctx.stateOverrides && (preview.kind === 'typed_data' || preview.kind === 'message') && !preview.warnings.some(w => w.code === 'state_overridden')) preview.decoding.notes.push('State overrides (context.stateOverrides) apply to what a preview simulates (transactions, batches, and the UserOperations, SafeOps and Safe transactions a signature authorizes), and nothing in this request was simulated with them: it was previewed against the chain\'s own state.');
   // What the balance changes are worth (now, or then), where the dependencies have prices (src/prices.ts).
   return addUsdValues(preview, deps, when);
 }
@@ -206,7 +209,10 @@ async function previewBatch(raw: unknown, context: PreviewContext, deps: Depende
       b.warn('caution', 'batch_partial_failure', `Call ${failed + 1} is expected to fail. The batch is not marked all-or-nothing, so the wallet may still carry out the other calls, leaving them in effect without it.`);
     }
   }
-  const warnings: Warning[] = [...b.warnings, ...calls.flatMap((c, i) => c.warnings.map(w => ({ ...w, message: `Call ${i + 1}: ${w.message}` })))];
+  // A call's own 'state_overridden' (from a run its decoder made with them, as for a Safe's execTransaction) is said
+  // once, for the batch.
+  if (context.stateOverrides && calls.some(c => c.warnings.some(w => w.code === 'state_overridden'))) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
+  const warnings: Warning[] = [...b.warnings, ...calls.flatMap((c, i) => c.warnings.filter(w => w.code !== 'state_overridden').map(w => ({ ...w, message: `Call ${i + 1}: ${w.message}` })))];
   const statuses = calls.map(c => c.decoding.status);
   return {
     schema: 'signing-preview/1', method: 'wallet_sendCalls', kind: 'batch',

@@ -635,7 +635,7 @@
           "stateOverrides": {
             "type": "object",
             "maxProperties": 32,
-            "description": "State to give accounts for the simulation, in place of the chain's own, keyed by address: what would happen if the chain were in that state. The preview says so (warning `state_overridden`). For transactions and batches.",
+            "description": "State to give accounts for the simulation, in place of the chain's own, keyed by address: what would happen if the chain were in that state. The preview says so (warning `state_overridden`). For transactions and batches, and the UserOperations, SafeOps and Safe transactions a signature authorizes (their simulations; the stand-ins for signatures that don't exist yet keep the code and storage slots they need).",
             "propertyNames": {
               "pattern": "^0x[0-9a-fA-F]{40}$"
             },

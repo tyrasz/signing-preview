@@ -4,9 +4,9 @@ import { concatHex, decodeAbiParameters, hexToBytes, keccak256, type Hex } from 
 import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
 import { describeSafeTx, reportConfigChanges, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
-import { simulateExecution, simulateOperation, STUB_SIGNATURE, stubSignature } from '../erc4337-sim.ts';
+import { mergeOverrides, simulateExecution, simulateOperation, STUB_SIGNATURE, stubSignature } from '../erc4337-sim.ts';
 import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf, safeSignatures, safeWebAuthnStub, SAFE_WEBAUTHN_SHARED_SIGNER, sharedSignerVerifiers, webAuthnSignerVerifiers, zealStandIn } from '../safe-sim.ts';
-import { decodeTransaction } from '../evm/transaction.ts';
+import { callerOverrides, decodeTransaction, warnOverridden } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
 import type { AssetChange } from '../types.ts';
@@ -128,11 +128,14 @@ const safeOp: TypedAdapter = async (data, env) => {
     const [to, value, inner, operation] = decoded as [string, bigint, Hex, number];
     // Run as the EntryPoint runs it: the EntryPoint calls the Safe, whose fallback handler (the module) has it
     // execute the call with execTransactionFromModule. Deploys the Safe first when the operation does.
+    // With the state the caller set (context.stateOverrides), beneath the stand-ins the runs need; the Safe's
+    // configuration before it is read in that state too, as the run's after it is.
+    const overrides = callerOverrides(env.context);
     const execution: SafeExecution = async watch => {
       // The whole operation as the EntryPoint runs it: the module's validation (with the owners' signatures stood in
       // for), the call, gas and any paymaster, then the Safe's configuration read again.
       if (known && sameAddress(entryPoint, known.entryPoint) && nonce !== null && verification !== null && call !== null && preVerification !== null && maxFee !== null && maxPriority !== null) {
-        const before = deploys ? undefined : await readConfig(env.deps, chainId, safe);
+        const before = deploys ? undefined : await readConfig(env.deps, chainId, safe, overrides);
         const digest = typedDataDigest(data);
         // The signing owner (or, if the signer isn't one, the first) signs with the ECDSA stand-in, which the replaced
         // ecrecover attributes to them, so the Safe's check costs what it will; any others the threshold needs approve.
@@ -169,7 +172,8 @@ const safeOp: TypedAdapter = async (data, env) => {
         const run = await simulateOperation({ chainId, entryPoint, sender: safe, nonce, initCode: initCode as Hex, callData, callGasLimit: call, verificationGasLimit: verification, preVerificationGas: preVerification,
           maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...(signer && { signer }), ...(cosigners.length && { cosigners }), watch,
           ...(verifiers && BigInt(verifiers.precompile) === 0x100n && { p256: true }), ...(verifiers && !zero(verifiers.fallback) && { verifier: verifiers.fallback }), ...(zeal && { warm: zeal.warm }),
-          ...((zeal || (approvals && Object.keys(approvals.stateDiff).length)) && { stateOverrides: { ...zeal?.stateOverrides, ...(approvals && Object.keys(approvals.stateDiff).length && { [safe]: { stateDiff: approvals.stateDiff } }) } }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
+          ...((zeal || (approvals && Object.keys(approvals.stateDiff).length) || overrides) && { stateOverrides: mergeOverrides(overrides, { ...zeal?.stateOverrides, ...(approvals && Object.keys(approvals.stateDiff).length && { [safe]: { stateDiff: approvals.stateDiff } }) }) }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
+        if (run) warnOverridden(b, overrides);
         const changes = await reportRun(run, { sender: safe, paymaster: pm.paymaster, entryPointName: known.entryPointName, signature }, chainId, env, b,
           { deploys, validation: passkey ? `with a stand-in for the owner's passkey signature (${zeal ? "a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : 'a WebAuthn assertion, which the P-256 verifier its passkey is checked with accepts, after running its real check'})${approvals && before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : cosigners.length ? ` and ${cosigners.length} other owner${cosigners.length === 1 ? '\'s' : 's\''}, which ecrecover attributes to each` : ''}`
             : approvals ? `with a stand-in for ${owner === env.signer?.toLowerCase() ? 'your' : 'an owner\'s'} signature, which ecrecover attributes to ${owner === env.signer?.toLowerCase() ? 'you' : 'that owner'}${before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : ''}`
@@ -183,7 +187,8 @@ const safeOp: TypedAdapter = async (data, env) => {
           return { assetChanges: changes, note: '', succeeded: run!.executed, logs: run!.result.logs };
         }
       }
-      const run = await simulateExecution({ chainId, entryPoint, sender: safe, callData, ...(deploys && { initCode: initCode as Hex }), watch }, env.deps);
+      const run = await simulateExecution({ chainId, entryPoint, sender: safe, callData, ...(deploys && { initCode: initCode as Hex }), watch, ...(overrides && { stateOverrides: overrides }) }, env.deps);
+      if (run && !run.noCode) warnOverridden(b, overrides);
       return run ? safeOutcome(run.result, safe, chainId, env, b, `The operation was simulated as the EntryPoint runs it${run.deployed ? ', after deploying the Safe' : ''}: through the Safe's 4337 module, delegatecalls included. Its signature check and gas payment aren't part of the simulation.`) : null;
     };
     r = await describeSafeTx({ safe, to, value, data: inner, operation: Number(operation), safeTxGas: 0n, baseGas: 0n, gasPrice: 0n, gasToken: ZERO, refundReceiver: ZERO }, chainId, { deps: env.deps, context: env.context }, b, execution);
@@ -283,7 +288,8 @@ const merkleTreeRoot: TypedAdapter = async (data, env) => {
     titles.push(r.title.replace(/^Safe operation: /, ''));
     b.detail(label, `${r.title.replace(/^Safe operation: /, '')}, from the Safe ${shortAddress(str(o.operation.safe))}`);
     for (const d of r.b.details) b.detail(`${label}: ${d.label}`, d.value, d.raw);
-    for (const w of r.b.warnings) b.warn(w.severity, w.code, `${label}: ${w.message}`);
+    // The caution that the run used state set by the caller is the preview's, once and unprefixed (every operation's run used it).
+    for (const w of r.b.warnings) b.warn(w.severity, w.code, w.code === 'state_overridden' ? w.message : `${label}: ${w.message}`);
     for (const n of r.b.notes) b.note(`${label}: ${n}`);
     // Balance changes of the context's chain go in the preview's list; another chain's are described with its operation.
     if (!network || o.chainId === network.chainId) assetChanges = assetChanges.concat(r.assetChanges ?? []);

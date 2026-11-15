@@ -52,7 +52,8 @@ export const entryPointAdapter: Adapter = async (tx, env) => {
       : await decodeTransaction({ chainId: tx.chainId, from: sender, to: sender, data: op.callData.toLowerCase() as Hex, value: 0n, ...(op.initCode !== '0x' && { codeInPlace: true }) }, env.deps, env.context);
     inner.push(d);
     b.detail(`UserOperation ${i + 1}`, `from ${who}: ${d.title}`, sender);
-    for (const w of d.b.warnings) if (w.severity !== 'info') b.warnings.push({ ...w, message: `UserOperation ${i + 1}: ${w.message}` });
+    // (The caution that a run used the caller's state, from a Safe the operation's calls run execTransaction on, is said once.)
+    for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else if (w.severity !== 'info') b.warnings.push({ ...w, message: `UserOperation ${i + 1}: ${w.message}` });
   }
   const own = ops.filter(op => sameAddress(op.sender, tx.from)).length;
   if (own < ops.length) b.warn('info', 'erc4337_bundle', `This submits ${ops.length - own === 1 ? 'a UserOperation' : `${ops.length - own} UserOperations`} of other accounts, as a bundler does: you pay the gas now, and the EntryPoint refunds it to ${sameAddress(beneficiary, tx.from) ? 'you' : shortAddress(beneficiary)} from the accounts' deposits.`);
