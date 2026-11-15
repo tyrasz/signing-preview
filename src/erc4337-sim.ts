@@ -12,11 +12,12 @@
 // deployed through its SenderCreator if it's new, then called with the operation's callData from the EntryPoint
 // (or with executeUserOp(userOp, userOpHash) when callData starts with its selector). Validation, the gas prefund
 // and refund, and a paymaster's postOp charge aren't part of it.
-import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, keccak256, encodeFunctionData, hexToBytes, parseAbi, parseAbiParameters, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, hashMessage, hashTypedData, keccak256, encodeFunctionData, hexToBytes, parseAbi, parseAbiParameters, recoverAddress, sha256, stringToHex, type Hex } from 'viem';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { ecrecoverPrice } from './chains.ts';
+import { KERNEL_ENABLE_FIELDS, KERNEL_V3_IMPLEMENTATIONS } from './typed-data/kernel-enable.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 
@@ -383,14 +384,29 @@ export const STUB_COSIGNATURE = stubSignature(1);
  * other stand-in ECDSA signatures in it and whose they are (ecrecover recovers each as its signer).
  */
 interface Stub {
-  signature: Hex; p256?: boolean | 'daimo'; verifier?: string; cosigners?: { signature: Hex; signer: string }[];
+  signature: Hex; p256?: boolean | 'daimo'; verifier?: string; cosigners?: Cosigner[];
+  /** The signature the wallet supplied with the operation, run as it is. */
+  wallet?: boolean;
+  /** Kernel's enable mode: the operation's own enable data, with stand-ins for its two signatures (kernelEnableStub). */
+  enable?: boolean;
   /** Storage slots of the account set for the run (a stand-in key registered as one of its own stands). */
   storage?: Record<string, string>;
   /** Code set at other addresses for the run, and the ones among them to start warm (code moved there: not an account the chain would touch). */
   code?: Record<string, Hex>; warm?: string[];
 }
+/**
+ * Another stand-in ECDSA signature in a stand-in, and whose ecrecover is to recover it as; with `digest`, only over
+ * that digest (what that key signs: see ecrecoverAs), at first.
+ */
+type Cosigner = { signature: Hex; signer: string; digest?: Hex };
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
+  /** The code the account runs (its implementation or EIP-7702 delegate), where stubFor read it. */
+  runs?: string;
+  /** The signature supplied with the operation (Kernel's enable mode keeps the enable data it carries). */
+  signature?: Hex;
+  /** The operation's hash with chain ID 0, as Kernel v3.2 and later validate a chain-agnostic signature (replayableUserOpHash). */
+  replayableHash?: () => Hex | undefined;
   /** The EntryPoint the operation goes to (where the account's earlier operations are logged). */
   entryPoint?: string;
   /** The operation's paymasterAndData (a multi-signer account's cosigners sign gas limits that name its paymaster). */
@@ -598,7 +614,7 @@ const COSIGNER = parseAbi(['function cosigner() view returns (address)']);
 const ZERODEV_WEBAUTHN_SIGNERS = new Set(['0x65deec8fee717dc044d0cfd63ccf55f02ccac2b3']);
 const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
 /** What a Kernel v3 account being deployed is set up with: its root validator, and each validation its initialize() installs, with its install data. */
-export type KernelSetup = { root: Hex; installs: Map<string, Hex> };
+export type KernelSetup = { root: Hex; installs: Map<string, Hex>; /** The Kernel implementation its factory deploys (implementation()). */ implementation?: string };
 /**
  * The signer of permission `pId` (4 bytes, no 0x) a deploying Kernel installs: its install data is abi.encode(bytes[]),
  * the policies, then the signer (each a 2-byte flag, the module's address, its own data).
@@ -617,7 +633,7 @@ function setupPermissionSigner(setup: KernelSetup, pId: string): string | undefi
 async function kernelDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> {
   try {
     // deployWithFactory hands createData to the KernelFactory's createAccount, which calls the new account with it.
-    const { args: [, createData] } = decodeFunctionData({ abi: KERNEL_DEPLOY, data: factoryData });
+    const { args: [factory, createData] } = decodeFunctionData({ abi: KERNEL_DEPLOY, data: factoryData });
     const init = decodeFunctionData({ abi: KERNEL_DEPLOY, data: createData as Hex });
     if (init.functionName !== 'initialize') return [{ signature: STUB_SIGNATURE }];
     const [root, , validatorData, , initConfig] = init.args as unknown as [Hex, Hex, Hex, Hex, readonly Hex[]];
@@ -628,9 +644,18 @@ async function kernelDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[
         if (d.functionName === 'installValidations') (d.args[0] as readonly Hex[]).forEach((vId, i) => installs.set(vId.toLowerCase(), (d.args[2] as readonly Hex[])[i]));
       } catch { /* another call */ }
     }
-    return kernelV3Stub(c, { root, installs });
+    // The Kernel it deploys (its version names an enable-mode operation's Enable domain): the factory's implementation().
+    let implementation: string | undefined;
+    if (c.nonce >> 248n === 1n && c.deps.rpc?.has(c.chainId)) {
+      try {
+        const out = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: factory, data: encodeFunctionData({ abi: KERNEL_FACTORY, functionName: 'implementation' }) }, 'latest']));
+        if (/^0x0{24}[0-9a-f]{40}$/i.test(out)) implementation = `0x${out.slice(26)}`.toLowerCase();
+      } catch { /* not readable */ }
+    }
+    return kernelV3Stub(c, { root, installs, ...(implementation && { implementation }) });
   } catch { return [{ signature: STUB_SIGNATURE }]; }
 }
+const KERNEL_FACTORY = parseAbi(['function implementation() view returns (address)']);
 /**
  * ZeroDev Kernel v3.1, by how it validates: what its nonce names (byte 1 the validation type: 0x00 its root
  * validation, 0x01 the validator in bytes 2-21, 0x02 the permission in bytes 2-5), the root read from
@@ -642,6 +667,15 @@ async function kernelDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[
  */
 async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<Stub[]> {
   const ecdsa: Stub[] = [{ signature: STUB_SIGNATURE }, { signature: `0xff${STUB_SIGNATURE.slice(2)}` as Hex }];
+  // Enable mode (the nonce's first byte 0x01): the enable data the operation's own signature carries, with stand-ins
+  // for its two signatures (kernelEnableStub). Without it (or where its shapes aren't known), Kernel can't read any
+  // stand-in as enable data: its validation reverts on one (the calls are then simulated alone), and the forms below
+  // aren't tried.
+  if (c.nonce >> 248n === 1n) {
+    const enable = c.signature && readKernelEnable(c.signature);
+    const stubs = enable ? await kernelEnableStub(c, enable, deploying).catch(() => []) : [];
+    return stubs.length ? stubs : [{ signature: STUB_SIGNATURE }];
+  }
   const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
   const view = async (data: Hex) => rpc ? String(await rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data }, 'latest'])) as Hex : undefined;
   // What validates: [type, id] from the nonce, or from rootValidator() for the root (a bytes21, left-aligned).
@@ -693,6 +727,251 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
     } catch { /* not readable: the ECDSA forms */ }
   }
   return ecdsa;
+}
+// --- ZeroDev Kernel v3's enable mode ---
+// An operation whose nonce's first byte is 0x01 installs the validation its nonce names (a validator, or a permission:
+// policies, then a signer) while it validates, and is then validated by it (ValidationManager's _enableMode and
+// _enableDigest, Kernel v3.1 to v3.3, verified source on Sourcify). Its signature carries what to install and two
+// signatures:
+//   [keccak256("kernel.replayable.signature"): v3.2 on, a chain-agnostic signature] ‖ hook (20 bytes) ‖
+//   abi.encode(bytes validatorData, bytes hookData, bytes selectorData, bytes enableSig, bytes userOpSig)
+// enableSig is the owner's, the account's root validation's, over the Enable typed data (see
+// src/typed-data/kernel-enable.ts: domain "Kernel", the account's version, the chain or 0 when replayable, the account;
+// its nonce currentNonce(), in v3.3 one more when that validation is installed at it); Kernel checks it against the
+// root (reverting with EnableNotApproved if it fails), installs what it names and validates userOpSig with it, as it
+// does any operation of that validation (a permission's: each policy's part, idx (1 byte) ‖ length (8) ‖ data, then
+// 0xff and the signer's). A dApp's SDK builds it, so the operation a preview is handed carries the enable data (its
+// signatures possibly dummies): kernelEnableStub keeps it and puts stand-ins in place of both signatures.
+/** Kernel v3.2's and v3.3's marker of a chain-agnostic signature (MAGIC_VALUE_SIG_REPLAYABLE). */
+const KERNEL_REPLAYABLE = keccak256(stringToHex('kernel.replayable.signature'));
+const KERNEL_ENABLE_PARTS = [{ type: 'bytes' }, { type: 'bytes' }, { type: 'bytes' }, { type: 'bytes' }, { type: 'bytes' }] as const;
+/** What an enable-mode operation's signature carries (see above). */
+export interface KernelEnable { replayable: boolean; hook: Hex; validatorData: Hex; hookData: Hex; selectorData: Hex; enableSig: Hex; userOpSig: Hex }
+/** An enable-mode signature read, or undefined where it isn't one (too short, or its parts don't decode). */
+export function readKernelEnable(signature: Hex): KernelEnable | undefined {
+  let s = signature.toLowerCase().slice(2);
+  const replayable = s.startsWith(KERNEL_REPLAYABLE.slice(2));
+  if (replayable) s = s.slice(64);
+  if (s.length < 40 + 64 * 10) return undefined;
+  try {
+    const [validatorData, hookData, selectorData, enableSig, userOpSig] = decodeAbiParameters(KERNEL_ENABLE_PARTS, `0x${s.slice(40)}`);
+    if (selectorData.length < 10) return undefined;
+    return { replayable, hook: `0x${s.slice(0, 40)}`, validatorData, hookData, selectorData, enableSig, userOpSig };
+  } catch { return undefined; }
+}
+/** An enable-mode signature, from its parts. */
+export function kernelEnableSignature(e: KernelEnable): Hex {
+  return concatHex([...(e.replayable ? [KERNEL_REPLAYABLE] : []), e.hook, encodeAbiParameters(KERNEL_ENABLE_PARTS, [e.validatorData, e.hookData, e.selectorData, e.enableSig, e.userOpSig])]);
+}
+/** The Enable digest Kernel checks enableSig against, for validation `vId` (bytes21) at validation nonce `nonce`. */
+export function kernelEnableDigest(e: KernelEnable, at: { account: string; chainId: number; version: string; vId: Hex; nonce: number }): Hex {
+  return hashTypedData({ domain: { name: 'Kernel', version: at.version, chainId: e.replayable ? 0 : at.chainId, verifyingContract: getAddress(at.account) },
+    types: { Enable: KERNEL_ENABLE_FIELDS.map(([name, type]) => ({ name, type })) }, primaryType: 'Enable',
+    message: { validationId: at.vId, nonce: at.nonce, hook: getAddress(e.hook), validatorData: e.validatorData, hookData: e.hookData, selectorData: e.selectorData } });
+}
+/**
+ * A permission signature's parts: its policies' (idx ‖ length ‖ data each, in order) and, after 0xff, the signer's.
+ * Undefined where it doesn't read so.
+ */
+function permissionParts(sig: Hex): { policies: Hex; signer: Hex } | undefined {
+  const s = sig.slice(2);
+  let at = 0, last = -1;
+  while (at < s.length) {
+    const idx = parseInt(s.slice(at, at + 2), 16);
+    if (idx === 0xff) return { policies: `0x${s.slice(0, at)}`, signer: `0x${s.slice(at + 2)}` };
+    if (idx <= last || at + 18 > s.length) return undefined;
+    const length = Number.parseInt(s.slice(at + 2, at + 18), 16);
+    at += 18 + length * 2;
+    last = idx;
+  }
+  return undefined;
+}
+/** Solady's MerkleProofLib.verify: each step hashes the sorted pair. */
+function merkleVerify(proof: readonly Hex[], root: Hex, leaf: Hex): boolean {
+  let node = leaf;
+  for (const p of proof) node = BigInt(node) < BigInt(p) ? keccak256(concatHex([node, p])) : keccak256(concatHex([p, node]));
+  return node.toLowerCase() === root.toLowerCase();
+}
+/** ZeroDev's ECDSA validators (an owner's address as install data; ecdsaValidatorStorage(account) holds it): the ECDSA validator, v3.0's, and the multi-chain one. */
+const ZERODEV_ECDSA_VALIDATORS = new Set(['0x845adb2c711129d4f3966735ed98a9f09fc4ce57', '0x8104e3ad430ea6d354d013a6789fdfc71e671c43', '0x5c97aa67ba578e3c54ec5942a7563ea9130e4f5f']);
+const ZERODEV_MULTICHAIN_VALIDATOR = '0x5c97aa67ba578e3c54ec5942a7563ea9130e4f5f';
+/** ZeroDev's passkey validators taking zeroDevWebAuthnStub's form (sources verified on Sourcify): 0.0.1 to 0.0.3. */
+const ZERODEV_PASSKEY_VALIDATORS = new Set(['0xd990393c670dcce8b4d8f858fb98c9912dbfaa06', '0xba45a2bfb8de3d24ca9d7f1b551e14dff5d690fd', ...ZERODEV_WEBAUTHN_VALIDATORS]);
+/** ZeroDev's ECDSA signer (a permission's: signer(id, account), its install data the key's address). */
+const ZERODEV_ECDSA_SIGNER = '0x6a6f069e2a08c2468e7724ab3250cdbfba14d4ff';
+/** ZeroDev's WebAuthn signers 0.0.1 to 0.0.4, which take zeroDevWebAuthnStub's form after the permission's 0xff. */
+const ZERODEV_PASSKEY_SIGNERS = new Set(['0x8aa55d4bfae101609078681a69b5bc3181516612', '0x58625164e306242c7613223bdeb68fbe11300606', '0x615d8641b6ce9406de7c3c01f57c552ab3a96f83', ...ZERODEV_WEBAUTHN_SIGNERS]);
+const KERNEL_STATE = parseAbi(['function currentNonce() view returns (uint32)', 'function validationConfig(bytes21 vId) view returns (uint32 nonce, address hook)', 'function ecdsaValidatorStorage(address account) view returns (address)',
+  'function signer(bytes32 id, address wallet) view returns (address)', 'function signers(address wallet, bytes32 id) view returns (address)', 'function cosigner() view returns (address)']);
+/**
+ * The stand-in ECDSA signatures of an enable-mode operation: the owner's Enable signature, the new key's, and a
+ * cosigner's of each. Each r is a point of the curve (as STUB_SIGNATURE's), so that asked over another digest first (a
+ * key's check of the bare hash before its personal_sign form), the real precompile recovers someone, as it does for
+ * the real signature: for stubSignature(2) it recovers no one, on which Solady's ECDSA.recover reverts, and a first
+ * version's validation reverted on it, then ran recovering it over any digest, two ecrecovers short (1.1% low on Base).
+ */
+const ENABLE_OWNER = stubSignature(6), ENABLE_KEY = stubSignature(3), ENABLE_OWNER_COSIGNER = stubSignature(12), ENABLE_KEY_COSIGNER = stubSignature(14);
+/** A ZeroDev passkey signature's usePrecompiled, where `sig` is one (a wallet's dummy included). */
+const precompiledIn = (sig: Hex): boolean | undefined => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
+/**
+ * A Kernel v3 operation in enable mode, signed: its own enable data (`e`) with stand-ins for both signatures.
+ * - enableSig, by the root (read from the account, or from its set-up when the operation deploys it): ZeroDev's ECDSA
+ *   validators, the owner's address (ecdsaValidatorStorage) recovering the stand-in over the Enable digest, or, the
+ *   multi-chain validator's Merkle form (the owner signs a root of several chains' Enable digests), the operation's own
+ *   root and proof where they prove this digest; ZeroDev's passkey validators, a passkey's assertion with the digest
+ *   as its challenge (usePrecompiled as in the operation's own, else as the account's wallet signs: zeroDevPrecompiled);
+ *   the validator that keeps signers by id, the operation's id and its owner's; an EIP-7702 account (v3.3's root of
+ *   type 0x00), the account itself; a root permission, its policies' parts as the
+ *   operation's own, then 0xff and its signer's: ZeroDev's ECDSA signer's key (signer(id, account)), or Bleap's
+ *   cosigning signer's owner (signers(account, id)) and its cosigner (cosigner()).
+ * - userOpSig, by what it installs: a validator, ZeroDev's ECDSA validators (the key in its install data) or passkey
+ *   validators (the operation's hash as the challenge); a permission, its policies' parts as the operation's own, then
+ *   0xff and its signer's: ZeroDev's ECDSA signer (the key in its install data), its WebAuthn signers, or Bleap's
+ *   cosigning signer (the key in its install data and the cosigner). Replayable, the hash is Kernel's chain-agnostic one.
+ * Each ECDSA stand-in is a different one (ENABLE_OWNER, ENABLE_KEY and their cosigners'), recovered as its own signer,
+ * first only over what that key signs, so that the checks before it fail as they will: the bare digest or hash, or its
+ * personal_sign form, as the operation's own signature by that key shows where it is one, else as wallets sign it
+ * (read from operations' own signatures, 2026-11-13 and 15): an owner signs the Enable as typed data, the digest itself,
+ * on Kernel v3.1 and v3.3 (71 of 72 ECDSA validator owners on Base, Arbitrum One, BNB Chain and Polygon, one on Polygon
+ * its personal_sign form; 13 of 13 EIP-7702 accounts, which take nothing else), but on Kernel v3.2 its personal_sign
+ * form (48 of 48 ECDSA validator owners on Base: guessed as the digest, the dummies' run was one ecrecover short, 0.5%
+ * low); a multi-chain owner its Merkle root as a message (61 of 61 on Base), Bleap's owner the digest and its cosigner
+ * the personal_sign form (15 of 15), and a key the operation's hash as a message (ZeroDev's SDK; 90 of 90 on Base).
+ * Empty where the root or the installed validation isn't one of these, or what to recover can't be read: the caller
+ * falls back.
+ */
+export async function kernelEnableStub(c: StubContext, e: KernelEnable, deploying?: KernelSetup): Promise<Stub[]> {
+  const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
+  if (!rpc) return [];
+  // The account's own views answer nothing (0x) while it has no code: an EIP-7702 account its bundle delegates (its
+  // first operation, on BNB Chain), whose storage is empty, as they then read it.
+  const call = async (to: string, data: Hex, words: number) => {
+    const out = String(await rpc.call(c.chainId, 'eth_call', [{ to, data }, 'latest'])) as Hex;
+    return out === '0x' && to === c.sender ? `0x${'00'.repeat(32 * words)}` as Hex : out;
+  };
+  const read = async (to: string, functionName: 'currentNonce' | 'validationConfig' | 'ecdsaValidatorStorage' | 'signer' | 'signers' | 'cosigner', args?: readonly unknown[]) => {
+    const data = await call(to, encodeFunctionData({ abi: KERNEL_STATE, functionName, ...(args && { args }) } as never), functionName === 'validationConfig' ? 2 : 1);
+    return decodeFunctionResult({ abi: KERNEL_STATE, functionName, data } as never) as unknown;
+  };
+  const address = (a: unknown) => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a) && BigInt(a) !== 0n ? a.toLowerCase() : undefined;
+  const n = c.nonce.toString(16).padStart(64, '0');
+  const type = n.slice(2, 4);
+  if (type !== '01' && type !== '02') return [];
+  const vId = (type === '01' ? `0x01${n.slice(4, 44)}` : `0x02${n.slice(4, 12)}${'00'.repeat(16)}`) as Hex;
+  // The root, and the Kernel (its version names the Enable's domain).
+  const root = deploying?.root.toLowerCase() ?? (await call(c.sender, encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }), 1)).slice(0, 44);
+  const version = KERNEL_V3_IMPLEMENTATIONS[(deploying ? deploying.implementation : c.runs) ?? ''];
+  // (Kernel v3.1 has no chain-agnostic signatures: it would read the marker as the hook.)
+  if (!/^0x[0-9a-f]{42}$/.test(root) || !version || version === '0.3.0-beta' || (e.replayable && version === '0.3.1')) return [];
+  // The validation nonce it is enabled at: the account's currentNonce() (1 after initialize()); v3.3 one more when the
+  // validation is installed at that nonce already.
+  let nonce: number;
+  if (deploying) nonce = 1 + (version === '0.3.3' && deploying.installs.has(vId) ? 1 : 0);
+  else {
+    nonce = Number(await read(c.sender, 'currentNonce'));
+    if (version === '0.3.3' && Number((await read(c.sender, 'validationConfig', [vId]) as readonly [number, string])[0]) === nonce) nonce++;
+  }
+  const digest = kernelEnableDigest(e, { account: c.sender, chainId: c.chainId, version, vId, nonce });
+  const opHash = e.replayable ? c.replayableHash?.() : await c.hash();
+  if (!opHash) return [];
+  const cosigners: Cosigner[] = [];
+  const ecdsa = (signature: Hex, signer: string | undefined, over: Hex) => { if (!signer) throw new Error('no signer'); cosigners.push({ signature, signer, digest: over }); return signature; };
+  // What a key signs, `hash` or its personal_sign form: as the operation's own signature by it shows, where it is one
+  // (a dummy recovers to someone else), else `usual`.
+  const form = async (own: Hex, signer: string | undefined, hash: Hex, usual: 'hash' | 'message') => {
+    const message = hashMessage({ raw: hash });
+    if (own.length === 132 && signer) {
+      for (const h of [hash, message]) { try { if ((await recoverAddress({ hash: h, signature: own })).toLowerCase() === signer) return h; } catch { /* not a signature */ } }
+    }
+    return usual === 'hash' ? hash : message;
+  };
+  const passkeys: (boolean | 'daimo')[] = [];
+  const passkey = async (hash: Hex, own: Hex) => { const precompiled = precompiledIn(own) ?? await zeroDevPrecompiled(c); passkeys.push(precompiled || 'daimo'); return zeroDevWebAuthnStub(hash, precompiled); };
+  // A permission's install data: its signer (the last entry: flag, address, data).
+  const signerEntry = (data: Hex | undefined) => {
+    if (!data) return undefined;
+    try { const [items] = decodeAbiParameters([{ type: 'bytes[]' }], data); const last = items.at(-1); return last && last.length >= 46 ? { module: `0x${last.slice(6, 46)}`.toLowerCase(), data: `0x${last.slice(46)}` as Hex } : undefined; } catch { return undefined; }
+  };
+  try {
+    // enableSig, by the root.
+    let enableSig: Hex;
+    const rootId = `0x${root.slice(4, 44)}`;
+    if (root.startsWith('0x01') && ZERODEV_ECDSA_VALIDATORS.has(rootId)) {
+      const owner = deploying ? address(`0x${deploying.installs.get(root)?.slice(2, 42)}`) : address(await read(rootId, 'ecdsaValidatorStorage', [c.sender]));
+      // The multi-chain validator's Merkle form: the owner's signature, the root, then abi.encode(bytes32[] proof).
+      let merkle: { root: Hex; rest: Hex } | undefined;
+      if (rootId === ZERODEV_MULTICHAIN_VALIDATOR && e.enableSig.length > 2 + 97 * 2) {
+        try {
+          const mroot = `0x${e.enableSig.slice(132, 196)}` as Hex;
+          const [proof] = decodeAbiParameters([{ type: 'bytes32[]' }], `0x${e.enableSig.slice(196)}`);
+          if (merkleVerify(proof, mroot, digest)) merkle = { root: mroot, rest: `0x${e.enableSig.slice(132)}` };
+        } catch { /* not that form */ }
+      }
+      // (Its wallet signs the typed data, the digest itself; on Kernel v3.2, its personal_sign form. A Merkle root, as
+      // a message.)
+      enableSig = merkle ? concatHex([ecdsa(ENABLE_OWNER, owner, await form(`0x${e.enableSig.slice(2, 132)}`, owner, merkle.root, 'message')), merkle.rest])
+        : ecdsa(ENABLE_OWNER, owner, await form(e.enableSig, owner, digest, version === '0.3.2' ? 'message' : 'hash'));
+    } else if (root.startsWith('0x01') && ZERODEV_PASSKEY_VALIDATORS.has(rootId)) enableSig = await passkey(digest, e.enableSig);
+    else if (root.startsWith('0x01') && SIGNER_ID_VALIDATORS.has(rootId) && e.enableSig.length === 2 + 97 * 2) {
+      // The validator that keeps signers by id (signerIdOf): the signer's id, then its ECDSA module's signature, as
+      // the operation's own names them. Its owner: a deploying account's from its set-up; else (the validator's
+      // storage is unpublished) the key whose id it is (ownerSignerId) of whoever the operation's own signature
+      // recovers to over the digest's personal_sign form, as its owners sign operations (none from a dummy), and the
+      // signer the preview is for; failing that, the first of them.
+      const id = `0x${e.enableSig.slice(2, 66)}` as Hex, own = `0x${e.enableSig.slice(66)}` as Hex;
+      let owner: string | undefined;
+      if (deploying) {
+        try { owner = address(`0x${decodeAbiParameters(SIGNER_CONFIGS, deploying.installs.get(root) ?? '0x')[0].find(x => x.id.toLowerCase() === id.toLowerCase())?.data.slice(2, 42)}`); } catch { owner = undefined; }
+      } else {
+        const recovered = own.toLowerCase() !== STUB_SIGNATURE ? (await recoverAddress({ hash: hashMessage({ raw: digest }), signature: own }).catch(() => undefined))?.toLowerCase() : undefined;
+        const candidates = [recovered, c.signer.toLowerCase() !== c.sender.toLowerCase() ? address(c.signer) : undefined].filter((a): a is string => !!a);
+        owner = candidates.find(a => ownerSignerId(a) === id.toLowerCase()) ?? candidates[0];
+      }
+      enableSig = concatHex([id, ecdsa(ENABLE_OWNER, owner, await form(own, owner, digest, 'message'))]);
+    } else if (root === `0x${'00'.repeat(21)}` && version === '0.3.3') enableSig = ecdsa(ENABLE_OWNER, c.sender, await form(e.enableSig, c.sender, digest, 'hash'));
+    else if (root.startsWith('0x02')) {
+      const pId = `0x${root.slice(4, 12)}` as Hex, id = `${pId}${'00'.repeat(28)}` as Hex;
+      // (A deploying account's: its signer and key from its install data, nothing being on-chain yet.)
+      const installed = deploying ? signerEntry(deploying.installs.get(root)) : undefined;
+      const signer = deploying ? installed?.module : address((decodeFunctionResult({ abi: KERNEL, functionName: 'permissionConfig', data: String(await rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'permissionConfig', args: [pId] }) }, 'latest'])) as Hex }) as { signer: string }).signer);
+      const parts = permissionParts(e.enableSig) ?? { policies: '0x' as Hex, signer: '0x' as Hex };
+      if (signer === ZERODEV_ECDSA_SIGNER) {
+        const key = installed ? address(`0x${installed.data.slice(2, 42)}`) : address(await read(signer, 'signer', [id, c.sender]));
+        enableSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_OWNER, key, await form(parts.signer, key, digest, 'hash'))]);
+      } else if (signer && COSIGNING_SIGNERS.has(signer)) {
+        // (Bleap's owners sign the typed data, the digest itself, which it checks second; its cosigner the
+        // personal_sign form, checked first: 15 of 15 on Base.)
+        const [owner, cosigner] = (await Promise.all([installed ? decodeAbiParameters([{ type: 'address' }], installed.data)[0] : read(signer, 'signers', [c.sender, id]), read(signer, 'cosigner')])).map(address);
+        enableSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_OWNER, owner, await form(`0x${parts.signer.slice(2, 132)}`, owner, digest, 'hash')),
+          ecdsa(ENABLE_OWNER_COSIGNER, cosigner, await form(`0x${parts.signer.slice(132, 262)}`, cosigner, digest, 'message'))]);
+      } else return [];
+    } else return [];
+
+    // userOpSig, by what it installs.
+    let userOpSig: Hex;
+    if (type === '01') {
+      const validator = `0x${n.slice(4, 44)}`;
+      const key = address(`0x${e.validatorData.slice(2, 42)}`);
+      if (ZERODEV_ECDSA_VALIDATORS.has(validator)) userOpSig = ecdsa(ENABLE_KEY, key, await form(e.userOpSig, key, opHash, 'message'));
+      else if (ZERODEV_PASSKEY_VALIDATORS.has(validator)) userOpSig = await passkey(opHash, e.userOpSig);
+      else return [];
+    } else {
+      const entry = signerEntry(e.validatorData);
+      const parts = permissionParts(e.userOpSig) ?? { policies: '0x' as Hex, signer: '0x' as Hex };
+      if (entry?.module === ZERODEV_ECDSA_SIGNER) {
+        const key = address(`0x${entry.data.slice(2, 42)}`);
+        userOpSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_KEY, key, await form(parts.signer, key, opHash, 'message'))]);
+      } else if (entry && ZERODEV_PASSKEY_SIGNERS.has(entry.module)) userOpSig = concatHex([parts.policies, '0xff', await passkey(opHash, parts.signer)]);
+      else if (entry && COSIGNING_SIGNERS.has(entry.module)) {
+        const key = address(decodeAbiParameters([{ type: 'address' }], entry.data)[0]), cosigner = address(await read(entry.module, 'cosigner'));
+        userOpSig = concatHex([parts.policies, '0xff', ecdsa(ENABLE_KEY, key, await form(`0x${parts.signer.slice(2, 132)}`, key, opHash, 'message')),
+          ecdsa(ENABLE_KEY_COSIGNER, cosigner, await form(`0x${parts.signer.slice(132, 262)}`, cosigner, opHash, 'message'))]);
+      } else return [];
+    }
+    // The passkeys' verifier: the precompile, Daimo's contract, or both.
+    const p256 = passkeys.includes(true) ? true : passkeys.length ? 'daimo' as const : undefined;
+    return [{ signature: kernelEnableSignature({ ...e, enableSig, userOpSig }), enable: true, ...(cosigners.length && { cosigners }), ...(p256 && { p256 }), ...(p256 === true && passkeys.includes('daimo') && { verifier: DAIMO_P256_VERIFIER }) }];
+  } catch { return []; }
 }
 const coinbaseWrapper = (ownerIndex: bigint, signatureData: Hex) => encodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], [{ ownerIndex, signatureData }]);
 /**
@@ -1119,7 +1398,7 @@ async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promi
   if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)].flat();
   const runs = delegate?.toLowerCase() ?? await implementationOf(c.deps, c.chainId, c.sender);
   const shape = runs ? STUB_SHAPES[runs] : undefined;
-  return shape ? [await shape(c)].flat() : [{ signature: STUB_SIGNATURE }];
+  return shape ? [await shape({ ...c, runs })].flat() : [{ signature: STUB_SIGNATURE }];
 }
 
 /** Where the real ecrecover and P256VERIFY move while their stand-ins take their addresses. */
@@ -1145,10 +1424,11 @@ function standIn(moved: string, r: Hex, s: Hex, rAt: number, answer: string): He
  * the real precompile, for about 200 gas more than calling it directly.
  *   if (calldata[64:96] == r && calldata[96:128] == s [&& calldata[0:32] == digest]) { burn; return signer }
  *   calldatacopy(0, 0, calldatasize); staticcall(gas, MOVED, 0, calldatasize, 0, 32); return its output
- * With `cosigners`, each of their stand-in signatures is recovered as its signer the same way, also for 3,000 gas.
+ * With `cosigners`, each of their stand-in signatures is recovered as its signer the same way, also for 3,000 gas
+ * (ecrecoverAsMany, where a stand-in over another digest than its own recovers as no one's key, for the price too).
  */
-export function ecrecoverAs(signer: string, digest?: Hex, cosigners: { signature: Hex; signer: string }[] = [], price = 3000): Hex {
-  if (cosigners.length) return ecrecoverAsMany([{ signature: STUB_SIGNATURE, signer }, ...cosigners], digest, price);
+export function ecrecoverAs(signer: string, digest?: Hex, cosigners: Cosigner[] = [], price = 3000): Hex {
+  if (cosigners.length) return ecrecoverAsMany([{ signature: STUB_SIGNATURE, signer, digest }, ...cosigners.map(c => ({ ...c, digest: c.digest ?? digest }))], price);
   const r = STUB_SIGNATURE.slice(2, 66), s = STUB_SIGNATURE.slice(66, 130);
   // The stand-in's path: 59 gas of its own (the checks, the jump, and returning a word; 74 with the digest's check), and the burn.
   const burn = price - (digest ? 74 : 59), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
@@ -1162,24 +1442,48 @@ export function ecrecoverAs(signer: string, digest?: Hex, cosigners: { signature
     + `73${signer.toLowerCase().slice(2)}60005260206000f3` as Hex;
 }
 /**
- * ecrecoverAs for several stand-in signatures, each recovered as its own signer: the checks in turn (each jumping to
- * its signature's burn and answer), then the real precompile for anything else. The k-th signature's path runs k + 1
- * checks before its jump, and burns what makes it exactly 3,000 gas too.
+ * What a stand-in signature with its own digest recovers as over any other digest (see ecrecoverAsMany): someone, as
+ * the real precompile recovers a signature over a digest it wasn't made for, but no account's key.
  */
-function ecrecoverAsMany(pairs: { signature: Hex; signer: string }[], digest?: Hex, price = 3000): Hex {
+const ECRECOVER_NOBODY = '0x0000000000000000000000000000000000ec0b0d';
+/**
+ * ecrecoverAs for several stand-in signatures, each recovered as its own signer: the checks of r and s in turn (each
+ * jumping to its signature's section), then the real precompile for anything else. A signature with a digest of its
+ * own (what that key signs: Kernel's enable mode, kernelEnableStub) is recovered as its signer over that digest, and
+ * over any other as ECRECOVER_NOBODY, as the real one would be (as someone else), without calling the real precompile:
+ * a check of another form of the hash first (the bare hash before its personal_sign form) costs what it will, where
+ * going on to the real precompile cost about 300 gas more each time (enable-mode operations came out a median 0.1%
+ * high, 2026-11-15). Every path through a stand-in signature's section costs exactly `price`: the k-th runs k + 1
+ * checks before its jump, and burns the rest.
+ *   for each: if (calldata[64:96] == r && calldata[96:128] == s) goto its section
+ *   calldatacopy(0, 0, calldatasize); staticcall(gas, MOVED, 0, calldatasize, 0, 32); return its output
+ *   section: [if (calldata[0:32] != digest) { burn; return NOBODY }] burn; return signer
+ */
+export function ecrecoverAsMany(pairs: Cosigner[], price = 3000): Hex {
   const hex2 = (n: number) => n.toString(16).padStart(4, '0');
-  // Each check: r, s (and the digest), then PUSH2 dest JUMPI: 40 gas (55 with the digest); the answer, 19.
-  const checkGas = digest ? 55 : 40;
-  const checks = pairs.map(p => `7f${p.signature.slice(2, 66)}60403514` + `7f${p.signature.slice(66, 130)}6060351416` + (digest ? `7f${digest.slice(2)}60003514${'16'}` : ''));
+  // Each check: r and s, then PUSH2 dest JUMPI: 40 gas. A section's digest check (JUMPDEST, the digest against
+  // calldata[0:32], PUSH2 JUMPI): 26 gas; each answer (PUSH20, MSTORE, RETURN), 18; a JUMPDEST, 1.
+  const checks = pairs.map(p => `7f${p.signature.slice(2, 66)}60403514` + `7f${p.signature.slice(66, 130)}6060351416`);
   const forward = `366000600037` + `6020600036600073${ECRECOVER_MOVED.slice(2)}5afa50` + `3d6000f3`;
   const head = checks.reduce((n, c) => n + c.length / 2 + 4, 0) + forward.length / 2; // each check, then 61 xxxx 57
+  // `burn` gas from `at` (the PUSH2's offset): PUSH2 turns; a loop of 26 gas a turn; POP; a sled of JUMPDESTs.
+  const burnFrom = (at: number, burn: number) => {
+    const turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
+    return `61${hex2(turns)}5b600190038061${hex2(at + 3)}5750${'5b'.repeat(sled)}`;
+  };
+  const answer = (who: string) => `73${who.toLowerCase().slice(2)}60005260206000f3`;
   const sections: string[] = [];
   const dests: number[] = [];
   let at = head;
   pairs.forEach((p, k) => {
-    const burn = price - ((k + 1) * checkGas + 19), turns = Math.floor((burn - 5) / 26), sled = burn - 5 - 26 * turns;
-    const loop = at + 1 + 3;
-    const section = `5b61${hex2(turns)}5b600190038061${hex2(loop)}5750${'5b'.repeat(sled)}` + `73${p.signer.toLowerCase().slice(2)}60005260206000f3`;
+    const before = 40 * (k + 1);
+    let section: string;
+    if (!p.digest) section = `5b${burnFrom(at + 1, price - before - 19)}${answer(p.signer)}`;
+    else {
+      const other = burnFrom(at + 42, price - before - 26 - 18) + answer(ECRECOVER_NOBODY); // after `5b 7f digest 6000 35 14 61 xxxx 57` (42 bytes)
+      const match = at + 42 + other.length / 2;
+      section = `5b7f${p.digest.slice(2)}6000351461${hex2(match)}57${other}5b${burnFrom(match + 1, price - before - 26 - 1 - 18)}${answer(p.signer)}`;
+    }
     dests.push(at);
     sections.push(section);
     at += section.length / 2;
@@ -1245,7 +1549,7 @@ export interface OperationInput {
   /** What to validate with: a stand-in shaped for the account (its wallet's stub signature), else STUB_SIGNATURE. */
   signature?: Hex;
   /** Other stand-in signatures in `signature` (stubSignature(k)), and whose ecrecover is to recover them as. */
-  cosigners?: { signature: Hex; signer: string }[];
+  cosigners?: Cosigner[];
   /**
    * A passkey's stand-in in `signature` (with P256_STUB): `p256`, P256VERIFY (0x100) checks it; `verifier`, a P-256
    * verifier contract taking the precompile's input does. Each accepts it, after running the real check on it.
@@ -1296,8 +1600,11 @@ export interface OperationRun {
   /** What the operation pays for gas, in the native token (from the account's deposit or the paymaster's), and its gas. */
   paid: bigint; gasUsed?: bigint;
   account?: Validity; paymaster?: Validity;
-  /** What stood in for the signature: the wallet's own stub, an ECDSA stand-in, or a passkey's (WebAuthn) stand-in. */
-  standIn?: 'wallet' | 'ecdsa' | 'passkey';
+  /**
+   * What stood in for the signature: the wallet's own stub, an ECDSA stand-in, a passkey's (WebAuthn) stand-in, or
+   * (Kernel's enable mode) the operation's own enable data with stand-ins for the owner's and the new key's signatures.
+   */
+  standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
   /** The `after` calls' results. */
   after?: SimulationResult[];
   /** What was simulated for `result` (and the `after` calls): for tracing it. */
@@ -1369,7 +1676,21 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
   const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
-  const stubs: Stub[] = op.signature && op.signature !== '0x' ? [{ signature: op.signature, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }), ...(op.warm?.length && { warm: op.warm }) }] : await stubFor({ deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint }, op.delegate, op.initCode);
+  // Kernel v3.2's and v3.3's chain-agnostic hash of the operation (replayableUserOpHash: getUserOpHash's with chain ID 0).
+  const replayableHash = () => {
+    if (ep.version === '0.6') return undefined;
+    const f = fields('0x') as { accountGasLimits: Hex; gasFees: Hex };
+    const packed = keccak256(encodeAbiParameters(parseAbiParameters('address, uint256, bytes32, bytes32, bytes32, uint256, bytes32, bytes32'),
+      [sender as Hex, op.nonce, keccak256(op.initCode), keccak256(op.callData), f.accountGasLimits, op.preVerificationGas, f.gasFees, keccak256(op.paymasterAndData)]));
+    return keccak256(encodeAbiParameters(parseAbiParameters('bytes32, address, uint256'), [packed, entryPoint as Hex, 0n]));
+  };
+  const context: StubContext = { deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint, replayableHash };
+  const supplied: Stub | undefined = op.signature && op.signature !== '0x' ? { signature: op.signature, wallet: true, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }), ...(op.warm?.length && { warm: op.warm }) } : undefined;
+  // A supplied signature runs as it is, except a Kernel operation's in enable mode (its nonce's first byte 0x01): the
+  // enable data it carries is kept, with stand-ins for the signatures in it (kernelEnableStub), which a dApp's SDK
+  // leaves as dummies until they're signed. It runs as it is only if those can't be made.
+  const enable = supplied && op.nonce >> 248n === 1n && readKernelEnable(supplied.signature) ? (await stubFor({ ...context, signature: supplied.signature }, op.delegate, op.initCode)).filter(s => s.enable) : [];
+  const stubs: Stub[] = supplied ? [...enable, supplied] : await stubFor(context, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1429,7 +1750,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(verifier && { [verifierAt!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code: verifier } }),
       ...Object.fromEntries(Object.entries(stub.code ?? {}).map(([address, code]) => [address, { code }])),
       ...((op.delegate || stub.storage) && { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: stub.storage }) } }) }) }, ep!.version);
-  const standIn = op.signature && op.signature !== '0x' ? 'wallet' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
+  const standIn = stub.wallet ? 'wallet' as const : stub.enable ? 'enable' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
     const ran = await run(first, recover);
     // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one.
@@ -1445,10 +1766,14 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     }
     return ran;
   };
-  // Over the digest the wallet will sign first; if the account checks another form of the hash, over any.
+  // Over the digest the wallet will sign first (or, an enable-mode stand-in's, the digest each key signs); if the
+  // account checks another form of the hash, over any.
   const recoverGas = ecrecoverPrice(op.chainId);
-  let result = op.digest && standIn === 'ecdsa' ? await attempt(ecrecoverAs(signer, op.digest, stub.cosigners, recoverGas)) : null;
-  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(ecrecoverAs(signer, undefined, stub.cosigners, recoverGas));
+  // (An enable-mode stand-in's signatures are all its own, none STUB_SIGNATURE: ecrecover stands in for those alone.)
+  const recover = (cosigners: Cosigner[] | undefined, digest?: Hex) => stub.enable && cosigners?.length ? ecrecoverAsMany(cosigners, recoverGas) : ecrecoverAs(signer, digest, cosigners, recoverGas);
+  const own = stub.cosigners?.some(c => c.digest);
+  let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
+  if (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23')) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
   return result && { ...result, standIn };
   }
 }

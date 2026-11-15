@@ -359,3 +359,100 @@ contract RefusingHook {
     }
     function postCheck(bytes calldata) external pure {}
 }
+/// Kernel v3.1's enable mode, as its ValidationManager runs it for a permission with ZeroDev's ECDSA signer and its
+/// ECDSA validator as the root (the parts src/erc4337-sim.ts's kernelEnableStub relies on): the signature is hook ‖
+/// abi.encode(validatorData, hookData, selectorData, enableSig, userOpSig); enableSig must pass the root's check of
+/// the Enable digest (EIP-712, domain "Kernel" "0.3.1", nonce currentNonce) or validation reverts (EnableNotApproved);
+/// the permission is installed, then userOpSig (policies' parts, 0xff, the signer's) is checked by its signer.
+interface IKernelValidatorMock { function onInstall(bytes calldata) external; function isValidSignatureWithSender(address, bytes32, bytes calldata) external view returns (bytes4); }
+interface IKernelSignerMock { function onInstall(bytes calldata) external; function checkSignature(bytes32 id, bytes calldata sig, bytes32 hash) external view returns (uint256); }
+contract KernelEnable {
+    struct ValidationConfig { uint32 nonce; address hook; }
+    mapping(bytes32 => address) public executionHook;
+    address public entryPoint;
+    bytes21 public rootValidator;
+    uint32 public currentNonce;
+    mapping(bytes21 => ValidationConfig) internal configs;
+    error EnableNotApproved();
+    bytes32 constant ENABLE = keccak256("Enable(bytes21 validationId,uint32 nonce,address hook,bytes validatorData,bytes hookData,bytes selectorData)");
+    function init(address ep, address validator, address owner) external {
+        entryPoint = ep; rootValidator = bytes21(abi.encodePacked(bytes1(0x01), validator)); currentNonce = 1;
+        configs[rootValidator] = ValidationConfig(1, address(1));
+        IKernelValidatorMock(validator).onInstall(abi.encodePacked(owner));
+    }
+    function validationConfig(bytes21 vId) external view returns (ValidationConfig memory) { return configs[vId]; }
+    function from(bytes memory b, uint256 start) internal pure returns (bytes memory out) {
+        out = new bytes(b.length - start);
+        for (uint256 i = 0; i < out.length; i++) out[i] = b[start + i];
+    }
+    function validateUserOp(PackedUserOperation calldata op, bytes32 hash, uint256 missing) external returns (uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        require(op.nonce >> 248 == 1 && uint8(op.nonce >> 240) == 2, "enable mode of a permission only");
+        bytes21 vId = bytes21(bytes5(bytes32(op.nonce << 8)));
+        (address signer, bytes memory userOpSig) = enable(vId, op.signature);
+        // userOpSig: each policy's part (idx, 8-byte length, data), then 0xff and the signer's.
+        uint256 i = 0;
+        while (uint8(userOpSig[i]) != 0xff) i += 9 + uint64(bytes8(from(userOpSig, i + 1)));
+        executionHook[hash] = configs[vId].hook;
+        return IKernelSignerMock(signer).checkSignature(bytes32(bytes4(vId << 8)), from(userOpSig, i + 1), hash);
+    }
+    function enable(bytes21 vId, bytes calldata sig) internal returns (address signer, bytes memory userOpSig) {
+        address hook = address(bytes20(sig[0:20]));
+        bytes memory validatorData; bytes memory hookData; bytes memory selectorData; bytes memory enableSig;
+        (validatorData, hookData, selectorData, enableSig, userOpSig) = abi.decode(sig[20:], (bytes, bytes, bytes, bytes, bytes));
+        bytes32 digest = enableDigest(vId, hook, validatorData, hookData, selectorData);
+        if (IKernelValidatorMock(address(bytes20(rootValidator << 8))).isValidSignatureWithSender(address(this), digest, enableSig) != 0x1626ba7e) revert EnableNotApproved();
+        // The permission: its last entry is the signer (2-byte flag, address, data); policies aren't installed here.
+        bytes[] memory items = abi.decode(validatorData, (bytes[]));
+        bytes memory entry = items[items.length - 1];
+        assembly { signer := shr(96, mload(add(entry, 34))) }
+        IKernelSignerMock(signer).onInstall(abi.encodePacked(bytes32(bytes4(vId << 8)), from(entry, 22)));
+        configs[vId] = ValidationConfig(currentNonce, hook == address(0) ? address(1) : hook);
+    }
+    function enableDigest(bytes21 vId, address hook, bytes memory validatorData, bytes memory hookData, bytes memory selectorData) internal view returns (bytes32) {
+        bytes32 domain = keccak256(abi.encode(keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"), keccak256("Kernel"), keccak256("0.3.1"), block.chainid, address(this)));
+        return keccak256(abi.encodePacked("\x19\x01", domain, keccak256(abi.encode(ENABLE, vId, currentNonce, hook, keccak256(validatorData), keccak256(hookData), keccak256(selectorData)))));
+    }
+    function executeUserOp(PackedUserOperation calldata userOp, bytes32) external payable {
+        require(msg.sender == entryPoint, "entrypoint");
+        (bool ok, ) = address(this).delegatecall(userOp.callData[4:]);
+        require(ok, "execution");
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        require(msg.sender == entryPoint || msg.sender == address(this), "entrypoint");
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
+/// Solady's ECDSA.recover: the precompile recovering no one (an r off the curve) reverts.
+library RecoverMock {
+    function recover(bytes32 h, bytes memory sig) internal view returns (address a) {
+        bytes32 r; bytes32 s; uint8 v;
+        assembly { r := mload(add(sig, 32)) s := mload(add(sig, 64)) v := byte(0, mload(add(sig, 96))) }
+        (bool ok, bytes memory out) = address(1).staticcall(abi.encode(h, v, r, s));
+        require(ok && out.length == 32, "InvalidSignature");
+        a = abi.decode(out, (address));
+    }
+    function eth(bytes32 h) internal pure returns (bytes32) { return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", h)); }
+}
+/// ZeroDev's ECDSA validator: the owner of each account, checked over the hash, then its personal_sign form.
+contract KernelEcdsaValidatorMock {
+    mapping(address => address) public ecdsaValidatorStorage;
+    function onInstall(bytes calldata data) external { ecdsaValidatorStorage[msg.sender] = address(bytes20(data[0:20])); }
+    function isValidSignatureWithSender(address, bytes32 hash, bytes calldata sig) external view returns (bytes4) {
+        address owner = ecdsaValidatorStorage[msg.sender];
+        if (RecoverMock.recover(hash, sig) == owner || RecoverMock.recover(RecoverMock.eth(hash), sig) == owner) return 0x1626ba7e;
+        return 0xffffffff;
+    }
+}
+/// ZeroDev's ECDSA signer: a key per permission and account, checked over the hash, then its personal_sign form.
+contract KernelEcdsaSignerMock {
+    mapping(bytes32 => mapping(address => address)) public signer;
+    function onInstall(bytes calldata data) external { signer[bytes32(data[0:32])][msg.sender] = address(bytes20(data[32:52])); }
+    function checkSignature(bytes32 id, bytes calldata sig, bytes32 hash) external view returns (uint256) {
+        address key = signer[id][msg.sender];
+        return RecoverMock.recover(hash, sig) == key || RecoverMock.recover(RecoverMock.eth(hash), sig) == key ? 0 : 1;
+    }
+}

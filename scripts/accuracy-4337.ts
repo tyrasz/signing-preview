@@ -1,5 +1,6 @@
 // npm run accuracy:4337 -- [--chain 1|42161|8453|10|137|56] [--entrypoint 0.6|0.7|0.8|0.9] [--follow 1200 [--backfill 100] | --blocks 100 | --tx 0x…]
 //   [--max 30] [--concurrency 1] [--no-prefix] [--out report.json] [--summary-md summary.md] [--strict] [--dump preview.json]
+//   [--enable-dummies] (a Kernel operation in enable mode previewed with the SDK's dummy for each signature in it)
 //   [--differing dir/] (the row and preview of each operation whose preview differed, to look at once its state is gone)
 //
 // --concurrency replays that many operations at once (each on its own state; oldest first where the node keeps state
@@ -42,7 +43,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { BULLBIT_IMPLEMENTATION, implementationOf, okxDigest } from '../src/erc4337-sim.ts';
+import { BULLBIT_IMPLEMENTATION, implementationOf, kernelEnableSignature, okxDigest, readKernelEnable, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
@@ -52,7 +53,7 @@ import { compareTokens, movedAlike, TRANSFER, type Compared } from './userop-tok
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
-const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.includes('--strict');
+const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.includes('--strict'), ENABLE_DUMMIES = process.argv.includes('--enable-dummies');
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '1'))), BACKFILL = Number(arg('backfill', '0'));
 // The chain's *_RPC_URL replaces its public RPC (empty counts as unset, as an unset CI secret is; EVM_RPCS).
 const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
@@ -200,6 +201,21 @@ async function permissionOwner(call: (to: string, data: Hex) => Promise<string>,
   } catch { return undefined; }
 }
 
+/**
+ * An enable-mode signature as a dApp's SDK sends it before it is signed: ZeroDev's dummy (STUB_SIGNATURE) in place of
+ * each ECDSA signature in it (one or two after a permission's 0xff; a multi-chain owner's before its Merkle root and
+ * proof), a passkey's left as it is. So is an owner's for a root that keeps signers by id (its id, then the owner's
+ * signature): the preview takes that owner to be the signer it is asked for (src/erc4337-sim.ts, kernelEnableStub),
+ * which a replay doesn't know otherwise. And so is a permission's signature after its policies' parts (only one
+ * starting with 0xff, no parts before it, is read here).
+ */
+function dummied(e: KernelEnable): KernelEnable {
+  const swap = (sig: Hex): Hex => sig.length === 132 ? STUB_SIGNATURE : sig.length === 262 ? `${STUB_SIGNATURE}${STUB_SIGNATURE.slice(2)}` as Hex : sig;
+  const signer = (sig: Hex): Hex => sig.startsWith('0xff') ? `0xff${swap(`0x${sig.slice(4)}`).slice(2)}` as Hex : swap(sig);
+  const merkle = e.enableSig.length > 2 + 97 * 2 && (() => { try { decodeAbiParameters([{ type: 'bytes32[]' }], `0x${e.enableSig.slice(196)}`); return true; } catch { return false; } })();
+  return { ...e, enableSig: merkle ? `${STUB_SIGNATURE}${e.enableSig.slice(132)}` as Hex : signer(e.enableSig), userOpSig: signer(e.userOpSig) };
+}
+
 const ERC1967_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
 /** Alchemy's Modular Account v2: its implementations and its EIP-7702 delegate (as src/erc4337-sim.ts shapes them). */
 const MODULAR_ACCOUNTS_V2 = new Set(['0x000000000000c5a9089039570dd36455b5c07383', '0x00000000000002377b26b1eda7b0bc371c60dd4f', '0x69007702764179f14f51cdce752f4f775d74e139']);
@@ -212,7 +228,7 @@ const rows: Row[] = [];
 const blocks = new Set<number>();
 const skipped: Record<string, number> = {};
 const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
-const STAND_IN_REJECTED = /doesn't accept it as theirs/;
+const STAND_IN_REJECTED = /doesn't accept (it as theirs|as signed)/;
 /** The key Chrome adds to some passkeys' clientDataJSON, as it appears in a signature (hex, no 0x). */
 const CHROME_EXTRA_KEY = Buffer.from('"other_keys_can_be_added_here"').toString('hex');
 
@@ -366,14 +382,26 @@ async function replay(item: string): Promise<void> {
   let code: string;
   try { code = String(await atParent.call(CHAIN, 'eth_getCode', [sender, 'latest'])); } catch { return skip('its state is no longer served by the node'); }
   // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
-  // validator or permission it installs, which signs the operation (a dApp's session key, mostly). No wallet signs
-  // the operation's hash.
+  // validator or permission it installs (the Enable), which signs the operation (a dApp's session key, mostly); its
+  // signature carries what it installs and both signatures, as the dApp's SDK builds it. It is previewed with that
+  // signature as the operation's own (--enable-dummies: with the SDK's dummy in place of the ECDSA signatures in it
+  // that dummied() replaces), which the preview keeps, standing in for the signatures (src/erc4337-sim.ts,
+  // kernelEnableStub).
   // An account the operation deploys through ZeroDev's FactoryStaker is a Kernel v3 too.
-  if (BigInt(op.nonce) >> 248n === 1n && code === '0x' && op.initCode.slice(0, 42).toLowerCase() === '0xd703aae79538628d27099b8c4f621be4ccd142d5') return skip("a Kernel operation in enable mode (signed by the key it installs, which its owner approves as typed data)");
-  if (BigInt(op.nonce) >> 248n === 1n && code.length > 2) {
-    const root = await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']).catch(() => '0x');
-    if (/^0x[0-9a-f]{64}$/i.test(String(root))) return skip("a Kernel operation in enable mode (signed by the key it installs, which its owner approves as typed data)");
+  let supplied: Hex | undefined;
+  if (BigInt(op.nonce) >> 248n === 1n) {
+    // (Or an account delegating to Kernel v3.3 (EIP-7702), which its bundle can delegate first: then it has no code
+    // to answer rootValidator() on the state before.)
+    const kernel = code === '0x' ? op.initCode.slice(0, 42).toLowerCase() === '0xd703aae79538628d27099b8c4f621be4ccd142d5'
+      : code.toLowerCase() === '0xef0100d6cedde84be40893d153be9d467cd6ad37875b28'
+      || /^0x[0-9a-f]{64}$/i.test(String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']).catch(() => '0x')));
+    const enable = kernel ? readKernelEnable(op.signature) : undefined;
+    if (kernel && !enable) return skip('a Kernel operation in enable mode whose signature carries no enable data');
+    if (enable) supplied = ENABLE_DUMMIES ? kernelEnableSignature(dummied(enable)) : op.signature;
   }
+  // (Its stand-in validated, or, where none could be made, the signature it was previewed with, as it is: a real one
+  // validates, so that run is counted apart, not as the stand-in's.)
+  const enabling = (q: Preview) => q.decoding.notes.some(x => /whole operation was simulated.*Kernel's enable mode/.test(x));
   // Modular Account v2's deferred actions (the nonce key's flag 0x02) are the same: the owner signs the action
   // installing a validation, as typed data, and that validation signs the operation.
   if ((BigInt(op.nonce) >> 64n) & 2n) {
@@ -399,7 +427,7 @@ async function replay(item: string): Promise<void> {
     request = signer => ({ method: 'eth_signTypedData_v4', params: [signer, JSON.stringify(typed)] });
   } else if (VERSION === '0.6' || VERSION === '0.7') {
     kind = 'hash';
-    const form = rpcForm(op);
+    const form = { ...rpcForm(op), ...(supplied && { signature: supplied }) };
     digest = userOpHash(readOperation(form, VERSION)!, EP, CHAIN, VERSION);
     ctx = { ...context, userOperation: { entryPoint: EP, operation: form } };
     // The hash as it is (eth_sign) for a signer whose real signature is over the bare hash, else personal_sign:
@@ -617,7 +645,8 @@ async function replay(item: string): Promise<void> {
     if (byReplay) tokenMatch = matchOf();
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }),
     callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
     gas: gasCompared ? { simulated: gasCompared.simulated, actual: gasCompared.actual.toString(), percent: gasPercent, ...(gasCompared.gasless && { gasless: true }) } : undefined,
@@ -748,13 +777,14 @@ console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
+if (count(r => !!r.enableMode)) say(`  Kernel's enable mode (previewed with ${ENABLE_DUMMIES ? "the SDK's dummies for" : 'their own'} signatures): ${count(r => !!r.enableMode)}, the stand-in validated for ${count(r => !!r.enableMode && r.standIn === 'validated')}${count(r => r.standIn === 'as signed') ? `, run with the signatures as they were for ${count(r => r.standIn === 'as signed')} (no stand-in made)` : ''}`);
 say(`  gas paid (for ${count(r => !!(g(r) as { gasless?: boolean } | undefined)?.gasless)} gasless operations, the gas used), of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
 if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's contract (${count(r => !!r.relayedBy)}), gas reported but not judged: of ${count(r => !!bg(r))}, within 0.5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) < 0.5)}, 5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 0.5 && Math.abs(bg(r)!.percent) < 5)}, more ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 5)}`);
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`].filter(Boolean);
+    r.standIn === 'rejected' && 'the account rejected the stand-in (signer unknown)', r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
 
