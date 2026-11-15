@@ -6,6 +6,11 @@
 // (UnrecycledBundle), Solady's SafeTransferLib (TransferFromFailed), Ostium's price upkeep (NotInitiated), and
 // NonAdminSelfCall and a Kernel execution hook's ModuleCallNotAllowed (OpenChain's signature database, from
 // verified contracts), and Rhinestone's Safe7579 reporting a module's revert (ExecutionFailed, verified on Sourcify).
+// Rhinestone's SmartSession (session keys' operations: both deployments, 0x0000…4bda and 0x0000…37de, verified on
+// Sourcify on Arbitrum One and Base): the errors of its ISmartSession and libraries that its deployed code reverts with
+// (each selector found in its code on Arbitrum One and Base, pushed and shifted into place: all in both deployments'
+// but UnsupportedCallType, only in 0x0000…4bda's; declared but never raised: HashIndexOutOfBounds, InvalidCallTarget,
+// InvalidSessionKeySignature, PartlyEnabledActions, PartlyEnabledPolicies).
 import { decodeErrorResult, parseAbiItem, toFunctionSelector, type Abi, type Hex } from 'viem';
 
 export const KNOWN_ERRORS = [
@@ -41,6 +46,12 @@ export const KNOWN_ERRORS = [
   'NotBorrowableInEMode()', 'CallerNotUmbrella()', 'ReserveNotInDeficit()', 'MustNotLeaveDust()',
   'UserCannotHaveDebt()', 'SelfLiquidation()', 'CallerNotPositionManager()', 'InvalidCollateralInEmode(address,uint256)',
   'InvalidDebtInEmode(address,uint256)', 'MustBeEmodeCollateral(address,uint256)',
+  // SmartSession
+  'NoPoliciesSet(bytes32)', 'PolicyViolation(bytes32,address)', 'SignerNotFound(bytes32,address)', 'InvalidSession(bytes32)', 'InvalidPermissionId(bytes32)',
+  'InvalidISessionValidator(address)', 'InvalidUserOpSender(address)', 'InvalidEnableSignature(address,bytes32)', 'UnsupportedPolicy(address)',
+  'UnsupportedSmartSessionMode(uint8)', 'UnsupportedCallType(bytes1)', 'UnsupportedExecutionType()', 'PaymasterValidationNotEnabled(bytes32)',
+  'ForbiddenValidationData()', 'ChainIdMismatch(uint64)', 'HashMismatch(bytes32,bytes32)', 'InvalidActionId()', 'InvalidData()', 'InvalidMode()',
+  'InvalidSelfCall()', 'InvalidTarget()', 'NoExecutionsInBatch()', 'SmartSessionModuleAlreadyInstalled(address)', 'AssociatedArray_OutOfBounds(uint256)',
 ];
 
 /** What the most common ones mean for the person signing. */
@@ -80,7 +91,14 @@ const MEANING: Record<string, string> = {
   NoExplicitAmountToRepayOnBehalf: 'repaying for someone else needs an explicit amount, not "all"',
   UnderlyingBalanceZero: 'you have nothing supplied in this market',
   CallerNotPositionManager: 'the caller is not an approved position manager for that account',
+  NoPoliciesSet: "the session key's session has no policy for this call (or, for an operation with a paymaster, none for the operation), and SmartSession requires one",
+  PolicyViolation: "a policy of the session key's session (the address after its permission ID) refuses this operation",
+  SignerNotFound: "the session named isn't enabled for this account (it has no session validator)",
+  InvalidSession: "the session named isn't one the account has enabled",
+  PaymasterValidationNotEnabled: "the session key's session isn't allowed to use a paymaster",
 };
+/** Errors whose arguments say which (a policy, a session) and are shown with their meaning. */
+const WITH_ARGUMENTS = new Set(['PolicyViolation', 'NoPoliciesSet', 'SignerNotFound', 'InvalidSession', 'PaymasterValidationNotEnabled']);
 
 let selectors: Map<string, string> | null = null;
 /** "Name: meaning" for a known custom error, or null. */
@@ -97,5 +115,5 @@ export function knownError(data: Hex): string | null {
     const r = decodeErrorResult({ abi: [parseAbiItem(`error ${sig}`)] as Abi, data });
     if (r.args?.length) args = `(${r.args.map(a => String(a)).join(', ')})`;
   } catch { /* name only */ }
-  return MEANING[name] ? `${name}: ${MEANING[name]}` : `${name}${args}`;
+  return MEANING[name] ? `${name}${WITH_ARGUMENTS.has(name) ? args : ''}: ${MEANING[name]}` : `${name}${args}`;
 }

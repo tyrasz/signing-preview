@@ -130,6 +130,32 @@ test('HTTP API: the operations of a Biconomy MEE supertransaction, supplied in t
   });
 });
 
+test('HTTP API: operations an app can add to eth_sign that can’t be hashed don’t fail the preview, and a failed preview of eth_sign stays a danger', async () => {
+  const ep = '0x0000000071727de22e5e9d8baf0edac6f37da032', hash = `0x${'ab'.repeat(32)}`;
+  const operation = { sender: '0x5ca1ab1e00000000000000000000000000000007', nonce: '0x1', callData: '0x', callGasLimit: '0x10000', verificationGasLimit: '0x10000', preVerificationGas: '0x5000', maxFeePerGas: '0x3b9aca00', maxPriorityFeePerGas: '0x1' };
+  await withServer(async url => {
+    const post = (context: unknown) => fetch(`${url}/v1/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ request: { method: 'eth_sign', params: [ALICE, hash] }, context }) });
+    // A negative chain ID, a time bound past uint256, a v0.7 gas limit past uint128: each was HTTP 500.
+    for (const meeOperations of [[{ chainId: -1, entryPoint: ep, operation }], [{ chainId: 1, entryPoint: ep, operation, lowerBoundTimestamp: `2${'0'.repeat(77)}`, upperBoundTimestamp: 0 }],
+      [{ chainId: 1, entryPoint: ep, operation: { ...operation, callGasLimit: `0x1${'0'.repeat(32)}` } }]]) {
+      const res = await post({ chainId: 1, meeOperations });
+      assert.equal(res.status, 200, JSON.stringify(meeOperations));
+      const p = await res.json() as { attention: string; warnings: { code: string }[] };
+      assert.equal(p.attention, 'danger');
+      assert.ok(p.warnings.some(w => w.code === 'eth_sign') && p.warnings.some(w => w.code === 'mee_supertransaction_mismatch'), JSON.stringify(p.warnings));
+    }
+    // A UserOperation with a negative chain ID, likewise.
+    assert.equal((await post({ chainId: -1, userOperation: { entryPoint: ep, operation } })).status, 200);
+  });
+  // Whatever makes a preview fail, the interceptor's fallback for eth_sign keeps its danger.
+  const wallet: Eip1193Provider = { async request() { return '0x1'; } };
+  let shown: { attention: string; warnings: { code: string; severity: string }[] } | undefined;
+  const provider = withSigningPreview(wallet, { preview: async () => { throw new Error('offline'); }, confirm: async p => { shown = p as never; return false; } });
+  await assert.rejects(provider.request({ method: 'eth_sign', params: [ALICE, hash] }));
+  assert.equal(shown?.attention, 'danger');
+  assert.deepEqual(shown?.warnings.map(w => [w.code, w.severity]), [['preview_unavailable', 'caution'], ['eth_sign', 'danger']]);
+});
+
 test('HTTP API: the Safe operations behind a multi-chain root, supplied in the context, are checked against it', async () => {
   const { hashTypedData } = await import('viem');
   const MC = '0x22939e839e3c0f479b713eaf95e0df128554aead';

@@ -362,6 +362,31 @@ test('An account that sends its own operations isn’t taken for its bundler: it
   assert.ok(codes(p).includes('userop_execution_reverts'), codes(p).join());
 });
 
+test('A paymaster whose recent operations the account sent itself: the account isn’t taken for the paymaster’s bundler either', async () => {
+  // The account (0.01 HYPE; its calls send 0.5) sends its own operations, and its paymaster takes only bundles it
+  // sends (tx.origin): the paymaster's latest operation came in a transaction the account sent.
+  const self = await chain.deploy('Account4337', 'address,address', [OWNER, EP]);
+  await chain.setBalance(self, E / 100n);
+  const picky = await chain.deploy('BundlerPaymaster', 'address,address', [EP, self]);
+  await chain.exec(EP, call('depositTo', [picky]), '0xde9100000000000000000000000000000000d001', E);
+  const op = operation({ sender: self, callData: call('execute', [BOB, E / 2n, '0x']), ...withPaymaster(picky) });
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  const lookups: any[] = [];
+  const rpc = { has: (c: number) => deps.rpc!.has(c), call: async (c: number, m: string, ps: any[]) => {
+    if (m === 'eth_blockNumber') return '0x100';
+    if (m === 'eth_getLogs') { lookups.push(ps[0]); return ps[0].topics[3] === `0x${'00'.repeat(12)}${picky.slice(2)}` ? [{ transactionHash: `0x${'ae'.repeat(32)}`, data: '0x' }] : []; }
+    if (m === 'eth_getTransactionByHash') return { from: self, input: '0x' };
+    return deps.rpc!.call(c, m, ps);
+  } } as Dependencies['rpc'];
+  const runs = simulatorFailing();
+  const p = await previewRequest({ method: 'personal_sign', params: [hash, OWNER] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP, operation: op } }, { ...deps, rpc, simulator: runs.simulator });
+  // The paymaster's operations were looked up, and the account left out: run as it, it validated and paid on the
+  // bundler's balance (10^24 wei), and the paymaster, seeing its own bundler, took it.
+  assert.ok(lookups.some(l => l.topics[3] === `0x${'00'.repeat(12)}${picky.slice(2)}`), JSON.stringify(lookups));
+  assert.ok(!runs.sent.includes(self), runs.sent.join());
+  assert.match(rejectedOf(p), /AA33/);
+});
+
 test('The operation runs at the price its bundle pays: a contract reading tx.gasprice sees the base fee plus the operation’s priority fee', async () => {
   const tips = await chain.deploy('TipReader', '', []);
   const T = parseAbi(['function requireTip(uint256 atLeast) view']);

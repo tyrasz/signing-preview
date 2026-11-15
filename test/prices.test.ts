@@ -82,6 +82,11 @@ test('A preview’s balance changes carry what they are worth now, and a line su
   // A price source that fails or hangs leaves the preview as it is.
   assert.deepEqual((await addUsdValues(preview(), { prices: { price: async () => { throw new Error('down'); } } })).details, []);
 
+  // A change on another chain than the preview's (one of a supertransaction's operations): priced on its own chain.
+  const elsewhere = await addUsdValues({ ...preview(), assetChanges: [change({ amount: '2', symbol: 'HYPE', asset: 'native', standard: 'native', chainId: 999 }), change({ amount: '1', symbol: 'ETH', asset: 'native', standard: 'native' })] },
+    { prices: new StaticPrices({ '1:native': 2000, '999:native': 25 }, 'a test price') });
+  assert.deepEqual(elsewhere.assetChanges.map(c => [c.symbol, c.usd]), [['HYPE', '50.00'], ['ETH', '2,000.00']]);
+
   // Through previewRequest: a plain send, and each call of a batch.
   const deps = { tokens: new StaticTokenRegistry(), prices };
   const send = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: BOB, value: '0x3782dace9d900000', chainId: '0x1' }] }, { now: NOW }, deps);

@@ -48,6 +48,12 @@ export interface AssetChange {
    */
   usd?: string;
   usdSource?: string;
+  /**
+   * The chain the change is on, where one signature covers operations that can be on several (a Biconomy MEE
+   * supertransaction's, a multi-chain Safe root's): each operation's changes carry its chain, even when all are on one.
+   * Unset elsewhere: the preview's network.
+   */
+  chainId?: number;
 }
 
 /** A price in dollars for one whole unit of an asset. */

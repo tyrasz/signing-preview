@@ -253,9 +253,17 @@ test('A multi-chain Safe root, with the operations the wallet built it from: sho
   const tree: Hex[] = new Array(2 * leaves.length - 1);
   leaves.forEach((l, i) => { tree[tree.length - 1 - i] = l; });
   for (let i = tree.length - 1 - leaves.length; i >= 0; i--) tree[i] = pairHash(tree[2 * i + 1], tree[2 * i + 2]);
-  const sign = (root: Hex, safeOperations?: typeof ops) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNERS[0], JSON.stringify({ domain: { verifyingContract: MC },
-    types: { EIP712Domain: [{ name: 'verifyingContract', type: 'address' }], MerkleTreeRoot: [{ name: 'merkleTreeRoot', type: 'bytes32' }] }, primaryType: 'MerkleTreeRoot', message: { merkleTreeRoot: root } })] }, { now: NOW, ...(safeOperations && { safeOperations }) }, deps);
+  const sign = (root: Hex, safeOperations?: typeof ops, chainId?: number) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNERS[0], JSON.stringify({ domain: { verifyingContract: MC },
+    types: { EIP712Domain: [{ name: 'verifyingContract', type: 'address' }], MerkleTreeRoot: [{ name: 'merkleTreeRoot', type: 'bytes32' }] }, primaryType: 'MerkleTreeRoot', message: { merkleTreeRoot: root } })] }, { now: NOW, ...(chainId && { chainId }), ...(safeOperations && { safeOperations }) }, deps);
   const shown = await sign(tree[0], ops);
+  // Operations of two Safes: what one receives isn't netted against what the other sends, and a caution names both.
+  const other = { chainId: 42161, operation: { ...ops[1].operation, safe: '0x5ca1ab1e00000000000000000000000000000007' } };
+  const two = [ops[0], other];
+  const [l0, l1] = two.map(o => hashTypedData({ domain: { chainId: o.chainId, verifyingContract: MC }, types, primaryType: 'SafeOp', message: o.operation as never }));
+  const both = await sign(pairHash(l0, l1), two, 1);
+  assert.ok(codes(both).includes('safe_multichain_root_verified'), codes(both).join());
+  assert.match(both.warnings.find(w => w.code === 'operations_multiple_accounts')?.message ?? '', /^These operations run from 2 different accounts \(0x33a2…48c0, 0x5ca1…0007\)/);
+  assert.equal(both.attention, 'caution');
   assert.ok(codes(shown).includes('safe_multichain_root_verified') && !codes(shown).includes('safe_multichain_root'), codes(shown).join());
   assert.match(shown.title, /^Sign Safe operations: 3 operations on 2 chains$/);
   assert.ok(String(detail(shown, 'Operation 2 (Arbitrum One)')).endsWith(`from the Safe ${SAFE_OP_V03.message.safe.slice(0, 6).toLowerCase()}…${SAFE_OP_V03.message.safe.slice(-4).toLowerCase()}`), String(detail(shown, 'Operation 2 (Arbitrum One)')));
@@ -265,6 +273,26 @@ test('A multi-chain Safe root, with the operations the wallet built it from: sho
   assert.equal(partial.attention, 'danger');
   // A single operation's root is its own digest.
   assert.ok(codes(await sign(leaves[0], [ops.find(o => hashTypedData({ domain: { chainId: o.chainId, verifyingContract: MC }, types, primaryType: 'SafeOp', message: o.operation as never }) === leaves[0])!])).includes('safe_multichain_root_verified'));
+});
+
+test('Several operations’ balance changes (a multi-chain root’s, a supertransaction’s): each on its chain, and one account’s incoming amounts not netted against another’s outgoing ones', async () => {
+  const { combineChanges } = await import('../src/operation-changes.ts');
+  const { PreviewBuilder } = await import('../src/format.ts');
+  const A = '0x00000000000000000000000000000000000000a1', B = '0x00000000000000000000000000000000000000b2';
+  const change = (account: string, direction: 'in' | 'out', amount: string) => ({ direction, account, amount, symbol: 'TKN', basis: 'simulated_state' as const });
+  // One account: everything, each change with its operation's chain (none left out for being off the request's).
+  const one = new PreviewBuilder();
+  assert.deepEqual(combineChanges([{ label: 'Operation 1 (Ethereum)', chainId: 1, sender: A, changes: [change(A, 'out', '5')] }, { label: 'Operation 2 (Base)', chainId: 8453, sender: A.toUpperCase().replace('0X', '0x'), changes: [change(A, 'in', '5')] }], one)
+    .map(c => [c.direction, c.chainId]), [['out', 1], ['in', 8453]]);
+  assert.deepEqual(one.warnings, []);
+  // Two: B's incoming 100 isn't listed against A's outgoing 100; it's described with its operation, and a caution says why.
+  const two = new PreviewBuilder();
+  const ops = [{ label: 'Operation 1 (Base)', chainId: 8453, sender: A, changes: [change(A, 'out', '100')] }, { label: 'Operation 2 (Base)', chainId: 8453, sender: B, changes: [change(B, 'in', '100'), change(B, 'out', '1')] }];
+  assert.deepEqual(combineChanges(ops, two).map(c => [c.account, c.direction, c.amount]), [[A, 'out', '100'], [B, 'out', '1']]);
+  assert.deepEqual(two.details, [{ label: `Operation 2 (Base): received by 0x0000…00b2 (not in the balance changes)`, value: '+100 TKN' }]);
+  assert.deepEqual(two.warnings.map(w => [w.code, w.severity]), [['operations_multiple_accounts', 'caution']]);
+  // The connected account's incoming amounts are listed.
+  assert.deepEqual(combineChanges(ops, new PreviewBuilder(), B).map(c => [c.account, c.direction, c.amount]), [[A, 'out', '100'], [B, 'in', '100'], [B, 'out', '1']]);
 });
 
 test('A passkey owner’s verifiers stood in for: the precompile where named, the fallback verifier after its real code, or nothing to stand in for', async () => {

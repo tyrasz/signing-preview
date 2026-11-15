@@ -27,11 +27,16 @@ const provider = withSigningPreview(mockWallet, {
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const ATTENTION = { none: 'No warnings', info: 'Note', caution: 'Review', danger: 'Danger' };
+const CHAINS = { 1: 'Ethereum', 10: 'OP Mainnet', 56: 'BNB Chain', 137: 'Polygon', 999: 'HyperEVM', 8453: 'Base', 42161: 'Arbitrum One' };
 
 function renderBody(p) {
   const net = p.network ? `<span class="chip">${esc(p.network.name)}</span>` : '';
   const warnings = p.warnings.map(w => `<div class="warning ${w.severity}" role="${w.severity === 'danger' ? 'alert' : 'note'}"><strong>${esc(w.severity)}:</strong> ${esc(w.message)}</div>`).join('');
-  const changes = p.assetChanges.length ? `<div class="changes">${p.assetChanges.map(c => `<div class="change ${c.direction}"><span>${c.direction === 'out' ? 'You send' : 'You receive'} <small>(${esc(c.basis.replace('_', ' '))})</small></span><span class="amt">${c.direction === 'out' ? '−' : '+'}${esc(c.amount)} ${esc(c.symbol)}${c.usd ? ` <small title="${esc(c.usdSource ?? '')}">≈ $${esc(c.usd)}</small>` : ''}</span></div>`).join('')}</div>` : '';
+  // Changes of several accounts (a supertransaction's operations) name the account; a change on another chain, its chain.
+  const accounts = new Set(p.assetChanges.map(c => c.account.toLowerCase()));
+  const who = c => accounts.size > 1 ? `Account ${esc(c.account.slice(0, 6))}…${esc(c.account.slice(-4))} ${c.direction === 'out' ? 'sends' : 'receives'}` : c.direction === 'out' ? 'You send' : 'You receive';
+  const where = c => c.chainId !== undefined && c.chainId !== p.network?.chainId ? ` on ${esc(CHAINS[c.chainId] ?? `chain ${c.chainId}`)}` : '';
+  const changes = p.assetChanges.length ? `<div class="changes">${p.assetChanges.map(c => `<div class="change ${c.direction}"><span>${who(c)}${where(c)} <small>(${esc(c.basis.replace('_', ' '))})</small></span><span class="amt">${c.direction === 'out' ? '−' : '+'}${esc(c.amount)} ${esc(c.symbol)}${c.usd ? ` <small title="${esc(c.usdSource ?? '')}">≈ $${esc(c.usd)}</small>` : ''}</span></div>`).join('')}</div>` : '';
   const details = p.details.length ? `<dl>${p.details.map(d => `<dt>${esc(d.label)}</dt><dd>${/^0x[0-9a-f]{20,}$/i.test(d.value) ? `<code>${esc(d.value)}</code>` : esc(d.value)}</dd>`).join('')}</dl>` : '';
   const short = a => `${a.slice(0, 6)}…${a.slice(-4)}`;
   const approvals = p.approvals?.length ? `<div class="changes">${p.approvals.map(a => `<div class="change approval${a.revoked ? ' revoked' : ''}"><span>${a.revoked ? 'Permission removed' : 'Permission left in place'} <small>(${a.direct ? 'this call' : 'set along the way'})</small></span><span class="amt">${esc(short(a.spender))} → ${esc(a.allowance === 'unlimited' ? `unlimited ${a.symbol ?? ''}` : a.allowance)}</span></div>`).join('')}</div>` : '';

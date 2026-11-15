@@ -9,7 +9,7 @@ import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf, saf
 import { callerOverrides, decodeTransaction, warnOverridden } from '../evm/transaction.ts';
 import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
-import type { AssetChange } from '../types.ts';
+import { combineChanges, type OperationChanges } from '../operation-changes.ts';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
@@ -311,7 +311,7 @@ const merkleTreeRoot: TypedAdapter = async (data, env) => {
   const chains = [...new Set(supplied.map(o => o.chainId))];
   b.warn('info', 'safe_multichain_root_verified', `The wallet supplied the ${supplied.length} operation${supplied.length === 1 ? '' : 's'} this root covers, on ${chains.map(chainName).join(', ')}, and they make up the root exactly: the signature authorizes these and nothing else. Each runs once its bundler submits it with its proof.`);
   const titles: string[] = [];
-  let assetChanges: AssetChange[] = [];
+  const changes: OperationChanges[] = [];
   for (const [i, o] of supplied.entries()) {
     const r = await safeOp(typedOf(o), { ...env, context: { ...env.context, chainId: o.chainId } });
     const label = `Operation ${i + 1} (${chainName(o.chainId)})`;
@@ -322,10 +322,12 @@ const merkleTreeRoot: TypedAdapter = async (data, env) => {
     // The caution that the run used state set by the caller is the preview's, once and unprefixed (every operation's run used it).
     for (const w of r.b.warnings) b.warn(w.severity, w.code, w.code === 'state_overridden' ? w.message : `${label}: ${w.message}`);
     for (const n of r.b.notes) b.note(`${label}: ${n}`);
-    // Balance changes of the context's chain go in the preview's list; another chain's are described with its operation.
-    if (!network || o.chainId === network.chainId) assetChanges = assetChanges.concat(r.assetChanges ?? []);
-    else if (r.assetChanges?.length) b.detail(`${label}: balance changes`, r.assetChanges.map(c => `${c.direction === 'out' ? '−' : '+'}${c.amount} ${c.symbol}`).join(', '));
+    changes.push({ label, chainId: o.chainId, sender: str(o.operation.safe), changes: r.assetChanges ?? [] });
   }
+  // Every operation's balance changes, each on its chain (the signature names none: the request's is no guide to
+  // where funds move); a Safe's incoming amounts only where it is the only one (or the connected one): an app can add
+  // an operation of a Safe of its own that lists the signer as an owner. See combineChanges.
+  const assetChanges = combineChanges(changes, b, env.context.account);
   const many = titles.length === 1 ? titles[0] : `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}`;
   return { title: `Sign Safe operations: ${many}`, summary: `Authorizes ${supplied.length} Safe operation${supplied.length === 1 ? '' : 's'} with one signature, on ${chains.map(chainName).join(', ')}: ${titles.join('; ')}.`, decoder: 'safe_multichain_root', status: 'partial', b, network, assetChanges };
 };

@@ -307,3 +307,25 @@ test('A supertransaction’s hash covering operations whose accounts take no sig
   // (Asked to sign that operation's own hash, its owner validates as before.)
   assert.doesNotMatch(wholeNote(await preview(mine, KEY)), /doesn't accept/);
 });
+
+test('Rhinestone SmartSession’s errors (verified on Sourcify; each in its deployed code) read by name: a session operation that fails validation says why', async () => {
+  const { decodeRevert } = await import('../src/simulation.ts');
+  const { encodeErrorResult, getAddress, parseAbiItem } = await import('viem');
+  const ID = `0x${'5e'.repeat(32)}` as Hex, POLICY = '0x0000000000000000000000000000000000000b01';
+  const sample: Record<string, unknown> = { bytes32: ID, address: POLICY, uint256: 7n, uint64: 999n, uint8: 2, bytes1: '0xfe' };
+  const errors = ['NoPoliciesSet(bytes32)', 'PolicyViolation(bytes32,address)', 'SignerNotFound(bytes32,address)', 'InvalidSession(bytes32)', 'InvalidPermissionId(bytes32)',
+    'InvalidISessionValidator(address)', 'InvalidUserOpSender(address)', 'InvalidEnableSignature(address,bytes32)', 'UnsupportedPolicy(address)', 'UnsupportedSmartSessionMode(uint8)',
+    'UnsupportedCallType(bytes1)', 'UnsupportedExecutionType()', 'PaymasterValidationNotEnabled(bytes32)', 'ForbiddenValidationData()', 'ChainIdMismatch(uint64)',
+    'HashMismatch(bytes32,bytes32)', 'InvalidActionId()', 'InvalidData()', 'InvalidMode()', 'InvalidSelfCall()', 'InvalidTarget()', 'NoExecutionsInBatch()',
+    'SmartSessionModuleAlreadyInstalled(address)', 'AssociatedArray_OutOfBounds(uint256)'];
+  for (const e of errors) {
+    const item = parseAbiItem(`error ${e}`) as unknown as { name: string; inputs: { type: string }[] };
+    const data = encodeErrorResult({ abi: [item], errorName: item.name, args: item.inputs.map(i => sample[i.type]) } as never) as Hex;
+    const read = decodeRevert(data);
+    assert.ok(read?.startsWith(item.name) && !read.startsWith('custom error'), `${e}: ${read}`);
+  }
+  // The two a session's operation meets most: with what they name, and what they mean.
+  const violation = encodeErrorResult({ abi: [parseAbiItem('error PolicyViolation(bytes32,address)')], errorName: 'PolicyViolation', args: [ID, POLICY] });
+  assert.equal(decodeRevert(violation), `PolicyViolation(${ID}, ${getAddress(POLICY)}): a policy of the session key's session (the address after its permission ID) refuses this operation`);
+  assert.match(decodeRevert(encodeErrorResult({ abi: [parseAbiItem('error NoPoliciesSet(bytes32)')], errorName: 'NoPoliciesSet', args: [ID] }))!, /^NoPoliciesSet\(0x5e5e.*\): the session key's session has no policy for this call/);
+});

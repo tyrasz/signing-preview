@@ -138,7 +138,9 @@ export async function addUsdValues(preview: Preview, deps: Dependencies, when?: 
     if (!c.asset || c.standard === 'erc721' || c.standard === 'erc1155') return;
     const amount = Number(c.amount.replace(/,/g, ''));
     if (!Number.isFinite(amount) || amount <= 0) return;
-    const p = await prices.price(chainId, c.asset, when);
+    // (A change on another chain than the preview's, one of several operations': its chain's price now.)
+    const other = c.chainId !== undefined && c.chainId !== chainId;
+    const p = await prices.price(other ? c.chainId! : chainId, c.asset, other ? undefined : when);
     if (!p || closed) return; // a price that comes after the wait isn't added: the sum below wouldn't count it
     worth.set(c, amount * p.usd);
     c.usd = usdText(amount * p.usd);

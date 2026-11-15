@@ -72,6 +72,8 @@ export interface ExecutionInput {
   stateOverrides?: SimulationRequest['stateOverrides'];
   /** The bundler to deploy the account as (tx.origin), for a factory that only deploys for its own (see simulateOperation). */
   origin?: string;
+  /** Calls run first, for the state the calls start from: earlier operations of the same supertransaction (OperationInput.before). */
+  before?: SimulationRequest[];
 }
 
 /**
@@ -83,7 +85,13 @@ export interface ExecutionInput {
  */
 export const SENDER_FORWARDER = '0x366014900380601460003760006000826000600060003560601c5af13d600060003e6029573d6000fd5b3d6000f3' as Hex;
 
-export interface Execution { result: SimulationResult; deployed: boolean; direct?: boolean; /** The account has no code: calling it runs nothing (it may get an EIP-7702 delegation in the same transaction). */ noCode?: boolean }
+export interface Execution {
+  result: SimulationResult; deployed: boolean; direct?: boolean;
+  /** The account has no code: calling it runs nothing (it may get an EIP-7702 delegation in the same transaction). */
+  noCode?: boolean;
+  /** What was simulated for `result` (the deployment first, for a new account), without `before`: for operations after it. */
+  requests?: SimulationRequest[];
+}
 
 /** Cold-access costs a standalone call pays that the EntryPoint's call doesn't: a few accounts (2,600) and slots (2,100). */
 const COLD_HEADROOM = 25_000n;
@@ -198,6 +206,11 @@ async function kernelExecutionHook(deps: Dependencies, chainId: number, sender: 
 export async function simulateExecution(op: ExecutionInput, deps: Dependencies): Promise<Execution | null> {
   const sim = deps.simulator;
   if (!sim) return null;
+  // The calls, after `before` where there is any (their results left out).
+  const pre = op.before ?? [];
+  const batch = async (reqs: SimulationRequest[]): Promise<(SimulationResult | null)[] | null> => pre.length
+    ? (sim.simulateBatch ? (await sim.simulateBatch([...pre, ...reqs]))?.slice(pre.length) ?? null : null)
+    : reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
   let data = op.callData;
   if (data.toLowerCase().startsWith(EXECUTE_USER_OP) && op.packed) {
@@ -233,20 +246,22 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     const deploy: SimulationRequest = op.origin
       ? { chainId: op.chainId, from: op.origin.toLowerCase(), account: sender, to: creator, data: op.initCode!, value: 0n, stateOverrides: { [creator]: { code: SENDER_FORWARDER } } }
       : { chainId: op.chainId, from: creator, account: sender, to: factory, data: `0x${op.initCode!.slice(42)}` as Hex, value: 0n };
-    const results = await sim.simulateBatch([deploy, exec]);
-    if (!results) return null;
-    if (results[0].status === 'reverted') return { result: { ...results[0], revertReason: `deploying the account failed${results[0].revertReason ? `: ${results[0].revertReason}` : ''}` }, deployed: true };
+    const results = await batch([deploy, exec]);
+    if (!results?.[0] || !results[1]) return null;
+    if (results[0].status === 'reverted') return { result: { ...results[0], revertReason: `deploying the account failed${results[0].revertReason ? `: ${results[0].revertReason}` : ''}` }, deployed: true, requests: [deploy] };
     // A Kernel v3 that ZeroDev's FactoryStaker deploys has no execution hook stored for executeUserOp either (above),
     // and storage can't be set at an address before it's created: its calls as executeUserOp runs them, callData
     // after the selector, from the EntryPoint (which Kernel's execute accepts), without the hook.
     if (results[1].status === 'reverted' && data !== op.callData && factory === KERNEL_FACTORY_STAKER) {
-      const direct = await sim.simulateBatch([deploy, { ...exec, data: `0x${op.callData.slice(10)}` as Hex }]);
-      if (direct && direct[0].status !== 'reverted') return { result: direct[1], deployed: true };
+      const plain = { ...exec, data: `0x${op.callData.slice(10)}` as Hex };
+      const direct = await batch([deploy, plain]);
+      if (direct?.[0] && direct[1] && direct[0].status !== 'reverted') return { result: direct[1], deployed: true, requests: [deploy, plain] };
     }
-    return { result: results[1], deployed: true };
+    return { result: results[1], deployed: true, requests: [deploy, exec] };
   }
-  if (!factory && !op.delegate && (await deployed()) === false) return { result: { status: 'success', source: 'no code at the account', transfers: [], limited: true }, deployed: false, noCode: true };
-  const result = await sim.simulate(exec);
+  // (After earlier operations, one of them may have deployed or delegated the account: the calls are run.)
+  if (!pre.length && !factory && !op.delegate && (await deployed()) === false) return { result: { status: 'success', source: 'no code at the account', transfers: [], limited: true }, deployed: false, noCode: true };
+  const result = (await batch([exec]))?.[0];
   if (!result) return null;
   // An account that only runs calls it validated in the same transaction (a flag in transient storage, set by
   // validateUserOp) can't be run this way before it's signed: its calls are simulated directly from the account.
@@ -255,15 +270,15 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     const calls = code && readsTransientStorage(code) ? callsOf(op.callData) : null;
     if (calls) {
       const reqs: SimulationRequest[] = calls.map(c => ({ chainId: op.chainId, from: sender, to: c.to, data: c.data, value: c.value, ...(op.watch?.length && { watch: op.watch }), ...(op.stateOverrides && { stateOverrides: op.stateOverrides }) }));
-      const results = reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
+      const results = await batch(reqs);
       if (results && results.every(r => r)) {
         const failed = results.find(r => r!.status === 'reverted');
         const merged: SimulationResult = failed ?? { ...results[results.length - 1]!, transfers: results.flatMap(r => r!.transfers), nftTransfers: results.flatMap(r => r!.nftTransfers ?? []), approvals: results.flatMap(r => r!.approvals ?? []) };
-        return { result: merged, deployed: false, direct: true };
+        return { result: merged, deployed: false, direct: true, requests: reqs };
       }
     }
   }
-  return { result, deployed: false };
+  return { result, deployed: false, requests: [exec] };
 }
 
 /** The EntryPoint deposit of an account or paymaster (StakeManager.balanceOf), undefined without an RPC. */
@@ -487,6 +502,11 @@ interface Stub {
    * the preview says so where the account rejects it.
    */
   why?: string;
+  /**
+   * The stand-in's refusal doesn't show the signer can't sign: not every way it might (its sessions, say) was read,
+   * and `why` says which weren't.
+   */
+  unsure?: boolean;
   /** What the preview says where the account accepts it (how the signature it stands in for differs from others). */
   note?: string;
 }
@@ -1583,7 +1603,8 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
     // Newest first (the last enabled), a chunk at a time, until a session of the signer's turns up: MEE enables a
     // session, with a key of its own, for each grant, and an account on Arbitrum One had 105 (105 keys, any of which
     // can sign for it: with only the newest 32 read, the 73rd's key was told it isn't one). Where none is the
-    // signer's, all of them (up to SESSIONS_READ), so that the preview counts them all.
+    // signer's, all of them (up to SESSIONS_READ), so that the preview counts them all. Past that, the older ones
+    // aren't read, and the signer may hold one of them: the preview says so, not that it holds none.
     const newest = [...ids].reverse().slice(0, SESSIONS_READ);
     const sessions: ReturnType<typeof session>[] = [];
     for (let i = 0; i < newest.length; i += SESSIONS_AT_ONCE) {
@@ -1614,7 +1635,9 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
     // session's, whose policies the operation's calls most likely meet. Counted from all of the account's sessions.
     const first = [...sessions].reverse().find(s => s.owners.length) ?? sessions.find(s => s.key) ?? sessions[0];
     const named = sessions.filter(s => s.key).map(s => shortAddr(s.key!));
-    const counted = sessions.length < ids.length ? ` among the newest ${sessions.length} of its ${ids.length}` : '';
+    const unread = ids.length - sessions.length;
+    const counted = unread > 0 ? ` among the newest ${sessions.length} of its ${ids.length}` : '';
+    const notSigner = (them: string) => unread > 0 ? `, and the signer asked holds none of the ${sessions.length} read, but may hold one of the ${unread} older ones, which weren't read` : `, and the signer asked isn't ${them}`;
     const MEE_SIGNS = "which takes the key's signature over the operation's hash, or over a supertransaction's hash with the operation's proof";
     const keys = first.owners.length ? ` (${first.threshold} of ${first.owners.map(shortAddr).join(', ')})`
       : first.key ? (named.length === 1 && !counted ? `'s key (${named[0]}, through Biconomy's K1MeeValidator, ${MEE_SIGNS})`
@@ -1622,11 +1645,11 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
       : ` (through ${SESSION_VALIDATOR_NAMES[first.validator] ?? `session validator ${shortAddr(first.validator)}`}, whose form the stand-in doesn't take)`;
     const one = first.key && named.length === 1 && !counted;
     const why = first.key
-      ? `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by ${one ? 'its session' : 'one of its sessions'}${keys}, not by the account's owners, and the signer asked isn't ${one ? 'it' : 'one of them'}`
-      : `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by its session's keys${keys}, not by the account's owners${first.owners.length ? ', and the signer asked isn\'t one of them' : ''}`;
+      ? `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by ${one ? 'its session' : 'one of its sessions'}${keys}, not by the account's owners${notSigner(one ? 'it' : 'one of them')}`
+      : `it validates through Rhinestone's SmartSession (${shortAddr(module)}), as a session key's operation signed by its session's keys${keys}, not by the account's owners${first.owners.length || unread > 0 ? notSigner('one of them') : ''}`;
     // (Not the signer's: its stand-in, then all but one of the owners, so the session's check runs on as many
     // signatures; for a K1MeeValidator session, its form with the signer's stand-in, which it refuses.)
-    return [{ ...(first.owners.length ? form(first, signer) : first.key ? k1mee(first, signer) : { signature: concatHex(['0x00', first.id, STUB_SIGNATURE]) }), why }];
+    return [{ ...(first.owners.length ? form(first, signer) : first.key ? k1mee(first, signer) : { signature: concatHex(['0x00', first.id, STUB_SIGNATURE]) }), why, ...(unread > 0 && { unsure: true }) }];
   } catch { return [bare]; }
 }
 
@@ -1949,6 +1972,11 @@ export interface OperationInput {
   /** Calls to simulate right after the operation, in the same block (e.g. reading what it changed). */
   after?: SimulationRequest[];
   /**
+   * Calls to simulate before the operation, in the same block, for the state it starts from: earlier operations of
+   * the same supertransaction on its chain (their runs' requests), which it may depend on. Their results aren't its.
+   */
+  before?: SimulationRequest[];
+  /**
    * More state for the simulation: what the caller set (PreviewContext.stateOverrides), and a Safe's approvals
    * standing in for its owners' signatures. The run's own stand-ins go over it (see mergeOverrides).
    */
@@ -1985,6 +2013,8 @@ export interface OperationRun {
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
   /** Why the account may not take the stand-in as the signer's (Stub's `why`): said where it rejects it. */
   why?: string;
+  /** The refusal doesn't show the signer can't sign (Stub's `unsure`). */
+  unsure?: boolean;
   /**
    * Sent by anyone else, the account's deployment (`factory`) or validation (`account`) fails (`rejected`, as the
    * simulation's own bundler): the operation was simulated as `bundler`, which recently sent that factory's
@@ -2046,7 +2076,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const sim = deps.simulator;
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
   const ep = SIMULATIONS[entryPoint];
-  if (!sim || !ep || (op.after?.length && !sim.simulateBatch)) return null;
+  if (!sim || !ep || ((op.after?.length || op.before?.length) && !sim.simulateBatch)) return null;
   const signer = (op.signer ?? sender).toLowerCase();
   const word = (v: bigint) => v.toString(16).padStart(32, '0');
   const fields = (signature: Hex) => ep.version === '0.6'
@@ -2065,7 +2095,10 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // found): a paymaster can check, or work differently for, the bundler sending it (tx.origin). One on Arbitrum One
   // charged 9,130 gas more as its own bundlers than as an address it didn't know, 4% of the operation's gas.
   const paymaster = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData) ? `0x${op.paymasterAndData.slice(2, 42)}` : null;
-  const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData) : Promise.resolve([]);
+  // Not the account itself: one that sends its own operations (an EIP-7702 account, say) is its own "bundler", and a
+  // run as it would hand it the bundler's balance (BUNDLER_BALANCE) to validate and spend (as for originBundlers).
+  const notSender = (found: string[]) => found.filter(b => b !== sender);
+  const bundlers = paymaster ? recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData).then(notSender) : Promise.resolve([]);
   // Kernel v3.2's and v3.3's chain-agnostic hash of the operation (replayableUserOpHash: getUserOpHash's with chain ID 0).
   const replayableHash = () => {
     if (ep.version === '0.6') return undefined;
@@ -2167,7 +2200,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       // An empty list here can be a passing node failure (the lookup is not remembered when so), not "no bundlers":
       // ask once more before falling back to the account's calls alone.
       let found = (await bundlers).filter(b => b !== first);
-      if (!found.length) found = (await recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData)).filter(b => b !== first);
+      if (!found.length) found = notSender(await recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData)).filter(b => b !== first);
       for (const bundler of found) {
         const again = await run(bundler, recover);
         if (again && !again.rejected?.startsWith('AA33')) return again;
@@ -2213,7 +2246,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
-  return result && { ...result, standIn, ...(why && { why }), ...(stub.note && { note: stub.note }), ...(origin && { origin }) };
+  return result && { ...result, standIn, ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(origin && { origin }) };
   }
 }
 
@@ -2221,7 +2254,9 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
   if (op.at) req = { ...req, at: op.at };
   const requests = [req, ...(op.after ?? []).map(a => (op.at ? { ...a, at: op.at } : a))];
-  const results = requests.length > 1 ? await sim.simulateBatch!(requests) : [await sim.simulate(req)];
+  // Earlier operations run first, for their state; the results are the operation's and those after it.
+  const before = (op.before ?? []).map(a => (op.at ? { ...a, at: op.at } : a));
+  const results = before.length ? (await sim.simulateBatch!([...before, ...requests]))?.slice(before.length) : requests.length > 1 ? await sim.simulateBatch!(requests) : [await sim.simulate(req)];
   const r = results?.[0];
   if (!r) return null;
   if (r.status === 'reverted') {

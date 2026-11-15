@@ -102,11 +102,14 @@ async function handleReplay(req: IncomingMessage, res: ServerResponse, deps: Dep
 }
 const REPLAY_STATUS = { INVALID_REQUEST: 400, NOT_FOUND: 404, PENDING: 409, UNSUPPORTED: 422, UNAVAILABLE: 503 } as const;
 
+/** A chain ID: a positive integer (the EntryPoint hashes it as a uint256, which a negative one can't be). */
+const chainIdOf = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
+
 function sanitizeContext(raw: unknown): PreviewContext {
   if (!raw || typeof raw !== 'object') return {};
   const c = raw as Record<string, unknown>;
   const out: PreviewContext = {};
-  if (typeof c.chainId === 'number' && Number.isSafeInteger(c.chainId)) out.chainId = c.chainId;
+  if (chainIdOf(c.chainId)) out.chainId = c.chainId;
   if (typeof c.origin === 'string') out.origin = c.origin.slice(0, 256);
   if (typeof c.account === 'string' && /^0x[0-9a-fA-F]{40}$/.test(c.account)) out.account = c.account;
   if (c.trace === true) out.trace = true;
@@ -129,19 +132,19 @@ function sanitizeContext(raw: unknown): PreviewContext {
   }
   const uo = c.userOperation as Record<string, unknown> | undefined;
   if (uo && typeof uo === 'object' && typeof uo.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(uo.entryPoint) && uo.operation && typeof uo.operation === 'object' && !Array.isArray(uo.operation)) {
-    out.userOperation = { entryPoint: uo.entryPoint, operation: uo.operation as Record<string, unknown>, ...(typeof uo.chainId === 'number' && Number.isSafeInteger(uo.chainId) && { chainId: uo.chainId }) };
+    out.userOperation = { entryPoint: uo.entryPoint, operation: uo.operation as Record<string, unknown>, ...(chainIdOf(uo.chainId) && { chainId: uo.chainId }) };
   }
   // At most 64 operations: a larger tree can't be checked here, so its root stays a danger mismatch.
   if (Array.isArray(c.safeOperations)) {
     out.safeOperations = c.safeOperations.slice(0, 64).filter(o => o && typeof o === 'object').map(o => o as Record<string, unknown>)
-      .filter(o => typeof o.chainId === 'number' && Number.isSafeInteger(o.chainId) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
+      .filter(o => chainIdOf(o.chainId) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
       .map(o => ({ chainId: o.chainId as number, operation: o.operation as Record<string, unknown> }));
   }
   // At most 64 operations, each proof at most 32 hashes (a tree of 2^32 leaves).
   if (Array.isArray(c.meeOperations)) {
     const bound = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) || (typeof v === 'string' && /^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$/.test(v));
     out.meeOperations = c.meeOperations.slice(0, 64).filter(o => o && typeof o === 'object').map(o => o as Record<string, unknown>)
-      .filter(o => typeof o.chainId === 'number' && Number.isSafeInteger(o.chainId) && typeof o.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(o.entryPoint) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
+      .filter(o => chainIdOf(o.chainId) && typeof o.entryPoint === 'string' && /^0x[0-9a-fA-F]{40}$/.test(o.entryPoint) && o.operation && typeof o.operation === 'object' && !Array.isArray(o.operation))
       .map(o => ({ chainId: o.chainId as number, entryPoint: o.entryPoint as string, operation: o.operation as Record<string, unknown>,
         ...(Array.isArray(o.proof) && o.proof.length <= 32 && o.proof.every(h => typeof h === 'string' && /^0x[0-9a-fA-F]{64}$/.test(h)) && { proof: o.proof as string[] }),
         ...(bound(o.lowerBoundTimestamp) && { lowerBoundTimestamp: o.lowerBoundTimestamp as number | string }), ...(bound(o.upperBoundTimestamp) && { upperBoundTimestamp: o.upperBoundTimestamp as number | string }) }));

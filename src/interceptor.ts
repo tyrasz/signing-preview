@@ -69,11 +69,15 @@ async function baseContext(provider: Eip1193Provider): Promise<Partial<PreviewCo
 
 function fallbackPreview(request: SigningRequest, error: unknown): Preview {
   const message = error instanceof Error ? error.message : String(error);
-  const warnings = [{ severity: 'caution' as const, code: 'preview_unavailable', message: `A readable preview could not be produced (${message}). Check the raw request carefully.` }];
+  const warnings: Preview['warnings'] = [{ severity: 'caution', code: 'preview_unavailable', message: `A readable preview could not be produced (${message}). Check the raw request carefully.` }];
+  // eth_sign is a blind signature whatever its preview would have said: a failed preview doesn't make it less of a
+  // danger (context a dApp adds to the request must not be a way to turn that danger into a caution).
+  const blind = request.method === 'eth_sign';
+  if (blind) warnings.push({ severity: 'danger', code: 'eth_sign', message: 'eth_sign signs raw data that can be a transaction or permission. Legitimate dApps no longer need it. Reject unless you know exactly what this is.' });
   return {
     schema: 'signing-preview/1', method: request.method, kind: 'unsupported', network: null,
     title: 'Preview unavailable', summary: 'The signing request could not be decoded.', details: [{ label: 'Raw request', value: JSON.stringify(request.params) }],
-    assetChanges: [], warnings, attention: 'caution', decoding: { status: 'opaque', decoder: 'none', notes: [] },
+    assetChanges: [], warnings, attention: blind ? 'danger' : 'caution', decoding: { status: 'opaque', decoder: 'none', notes: [] },
   };
 }
 

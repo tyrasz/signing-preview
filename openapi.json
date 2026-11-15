@@ -491,7 +491,8 @@
         "properties": {
           "chainId": {
             "type": "integer",
-            "description": "The wallet's active chain, used when the request has no chainId."
+            "description": "The wallet's active chain, used when the request has no chainId.",
+            "minimum": 1
           },
           "origin": {
             "type": "string",
@@ -556,7 +557,8 @@
               },
               "chainId": {
                 "type": "integer",
-                "description": "Defaults to the context's chainId."
+                "description": "Defaults to the context's chainId.",
+                "minimum": 1
               },
               "operation": {
                 "type": "object"
@@ -606,7 +608,8 @@
               "additionalProperties": false,
               "properties": {
                 "chainId": {
-                  "type": "integer"
+                  "type": "integer",
+                  "minimum": 1
                 },
                 "operation": {
                   "type": "object",
@@ -617,7 +620,7 @@
           },
           "meeOperations": {
             "type": "array",
-            "description": "For personal_sign (or eth_sign) of a Biconomy MEE supertransaction's hash (the root of a Merkle tree of its UserOperations' hashes, on any chains, none of which the message shows): the operations, as the wallet's quote holds them, each with its chain, its EntryPoint (v0.6 or v0.7) and the operation as bundlers' RPC carries it (at most 64). The root is rebuilt from their hashes (or, from an operation's proof, shown to be among its leaves); each is then previewed whole on its chain, signed as one of the supertransaction's (K1MeeValidator's simple mode, with the root and its proof: only a K1MeeValidator session's operation, through SmartSession, takes that signature here; any other account's is shown not accepting it). Operations that don't make up the root, or whose proofs don't reach it, are a danger mismatch; operations shown by their proofs alone carry a danger that the root covers others. Takes precedence over userOperation.",
+            "description": "For personal_sign (or eth_sign) of a Biconomy MEE supertransaction's hash (the root of a Merkle tree of its UserOperations' hashes, on any chains, none of which the message shows): the operations, as the wallet's quote holds them, each with its chain, its EntryPoint (v0.6 or v0.7) and the operation as bundlers' RPC carries it (at most 64). The root is rebuilt from their hashes (or, from an operation's proof, shown to be among its leaves); each is then previewed whole on its chain, signed as one of the supertransaction's (K1MeeValidator's simple mode, with the root and its proof: only a K1MeeValidator session's operation, through SmartSession, takes that signature here; any other account's is shown not accepting it). Operations that don't make up the root, or whose proofs don't reach it, are a danger mismatch; operations shown by their proofs alone carry a danger that the root covers others. Operations on one chain are simulated in the order they run (as supplied; an account's operations under one nonce key in their nonce's order), each on the state the ones before it leave (the first 8 of a chain; past them, each alone); one that can also be submitted without the operations before it that it doesn't need (all but its account's under its nonce key) and then sends more carries a danger. Every operation's balance changes are listed, each with its chain (AssetChange.chainId); where the operations run from more than one account, only what each sends (and what the connected account receives) is listed, with a caution naming the accounts; each operation's run is read for the other operations' accounts too (their tokens), as one can take another's tokens with an allowance. An operation that can't be hashed (a chain ID that isn't positive, a field past its type, time bounds past uint48) is a malformed one: the danger mismatch. Takes precedence over userOperation.",
             "maxItems": 64,
             "items": {
               "type": "object",
@@ -629,7 +632,8 @@
               "additionalProperties": false,
               "properties": {
                 "chainId": {
-                  "type": "integer"
+                  "type": "integer",
+                  "minimum": 1
                 },
                 "entryPoint": {
                   "type": "string",
@@ -659,7 +663,7 @@
                       "pattern": "^(0x[0-9a-fA-F]{1,64}|[0-9]{1,78})$"
                     }
                   ],
-                  "description": "With upperBoundTimestamp: the operation's leaf is MEE's hash of its hash and these (an operation its account's own K1MeeValidator checks); without them, its hash (a session key's, through SmartSession)."
+                  "description": "With upperBoundTimestamp: the operation's leaf is MEE's hash of its hash and these (an operation its account's own K1MeeValidator checks); without them, its hash (a session key's, through SmartSession). K1MeeValidator reads both as uint48 seconds (validAfter, and validUntil with 0 for no end): larger values make the operation malformed. The window is shown with the operation, with a caution when it starts later than now or has no end, and an info when it has ended or lasts more than a day."
                 },
                 "upperBoundTimestamp": {
                   "oneOf": [
@@ -964,6 +968,11 @@
           "usdSource": {
             "type": "string",
             "description": "Where the price is from, e.g. \"Chainlink ETH / USD\"."
+          },
+          "chainId": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The chain the change is on, where one signature covers operations that can be on several chains (a Biconomy MEE supertransaction's, a multi-chain Safe root's): every operation's changes are listed, each with its operation's chain (even when all are on one). Absent elsewhere: the preview's network."
           }
         }
       },

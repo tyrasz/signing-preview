@@ -24,6 +24,8 @@ const int = (v: unknown): bigint | null => {
   return v === undefined || v === null ? 0n : null;
 };
 const word = (v: bigint) => v.toString(16).padStart(32, '0');
+/** The largest value a field can hold: uint256, and (v0.7's packed gas limits and fees) uint128. */
+const U256 = (1n << 256n) - 1n, U128 = (1n << 128n) - 1n;
 
 /** The operation's fields in the EntryPoint's own form (v0.7 packed, as the contract hashes it). */
 export interface HashedOperation {
@@ -56,6 +58,11 @@ export function readOperation(raw: Record<string, unknown>, version: '0.6' | '0.
     }
   }
   if (callGasLimit === null || verificationGasLimit === null || maxFeePerGas === null || maxPriorityFeePerGas === null || initCode === null || paymasterAndData === null) return null;
+  // A value its field can't hold is no operation the EntryPoint hashes (and can't be hashed here): v0.7 packs the gas
+  // limits and fees, and the paymaster's two gas limits, into 128 bits each.
+  const gas = version === '0.7' ? U128 : U256;
+  if (nonce > U256 || preVerificationGas > U256 || [callGasLimit, verificationGasLimit, maxFeePerGas, maxPriorityFeePerGas].some(v => v > gas)) return null;
+  if (version === '0.7' && typeof raw.paymaster === 'string' && [raw.paymasterVerificationGasLimit, raw.paymasterPostOpGasLimit].some(v => (int(v) ?? 0n) > U128)) return null;
   return { sender, nonce, initCode, callData, callGasLimit, verificationGasLimit, preVerificationGas, maxFeePerGas, maxPriorityFeePerGas, paymasterAndData };
 }
 
@@ -84,13 +91,16 @@ export async function previewSignedOperation(method: string, params: unknown[], 
   const signer = typeof address === 'string' && ADDRESS.test(address) ? address.toLowerCase() : null;
   const entryPoint = supplied.entryPoint.toLowerCase();
   const ep = HASH_ENTRY_POINTS[entryPoint];
-  const chainId = supplied.chainId ?? context.chainId ?? null;
+  const given = supplied.chainId ?? context.chainId ?? null;
+  // A chain ID is positive (and the EntryPoint hashes it as a uint256): any other is none.
+  const chainId = given !== null && Number.isSafeInteger(given) && given > 0 ? given : null;
   const op = ep ? readOperation(supplied.operation, ep.version) : null;
-  const expected = op && ep && chainId !== null ? userOpHash(op, entryPoint, chainId, ep.version) : null;
+  let expected: Hex | null = null;
+  try { expected = op && ep && chainId !== null ? userOpHash(op, entryPoint, chainId, ep.version) : null; } catch { expected = null; }
   if (!expected || expected !== message.toLowerCase()) {
     const p = previewMessage(method, params, context);
     const why = !ep ? `${shortAddress(entryPoint)} is not EntryPoint v0.6 or v0.7, whose operations are signed as a hash`
-      : !op ? 'the operation supplied with it is malformed' : chainId === null ? 'no chain ID was given to hash the operation with'
+      : !op ? 'the operation supplied with it is malformed' : chainId === null ? (given === null ? 'no chain ID was given to hash the operation with' : `its chain ID (${given}) isn't a chain's`)
       : `it is not the hash of the operation supplied with it (that is ${expected})`;
     const severity = expected ? 'danger' as const : 'caution' as const;
     p.warnings.push({ severity, code: 'userop_hash_mismatch', message: `This message can't be checked as a UserOperation: ${why}. What you would sign may not be what the app shows.` });

@@ -6,8 +6,9 @@ import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../forma
 import { CHAINS, chainName } from '../chains.ts';
 import { callerOverrides, decodeTransaction, simulationNote, warnOverridden } from '../evm/transaction.ts';
 import { netChanges } from '../evm/effects.ts';
-import type { AssetChange } from '../types.ts';
-import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
+import { parseLogs } from '../simulation.ts';
+import type { AssetChange, SimulationRequest, SimulationResult } from '../types.ts';
+import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedDecoded, type TypedEnv } from './common.ts';
 import { entryPointDeposit, simulateExecution, simulateOperation, type ExecutionInput, type OperationRun, type SupertransactionProof } from '../erc4337-sim.ts';
 import { pinLatest } from '../block.ts';
 import { tracePreviews, noTrace, type TraceEnv } from '../evm/trace.ts';
@@ -135,6 +136,22 @@ export interface Operation {
   digest?: Hex;
   /** Signed as one of a supertransaction's operations (src/supertransaction.ts): its root, and this operation's proof in it. */
   supertransaction?: SupertransactionProof;
+  /** Earlier operations of that supertransaction on the same chain, run first for the state this one starts from (DescribedOperation.ran). */
+  before?: SimulationRequest[];
+  /**
+   * Other accounts whose balance changes in this operation's simulated run are listed too, after its own account's:
+   * the other operations' accounts in that supertransaction (an operation can move another account's tokens, with an
+   * allowance an earlier operation granted it).
+   */
+  alsoFor?: string[];
+}
+
+/** What describeOperation found: the preview's parts, and how the operation's simulation went. */
+export interface DescribedOperation extends TypedDecoded {
+  /** What was simulated for the operation's effects (its whole run, or its calls alone), for an operation run after it. */
+  ran?: SimulationRequest[];
+  /** Whether the whole operation ran with the account taking the stand-in for the signer's signature. */
+  accepted?: boolean;
 }
 
 /** What the EntryPoint's rejection codes mean (eth-infinitism's EntryPoint, all versions). */
@@ -216,14 +233,19 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   }
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
-  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : run.standIn === 'enable' ? ` (Kernel's enable mode: installing what the operation's signature names, with stand-ins for the two signatures in it, which don't exist until they're signed: the owner's approval of what it installs, its Enable signature, and the operation's own by the key it installs${run.account?.signatureFailed ? `, but the account doesn't accept it as theirs${run.why ? ` (${run.why})` : ''}, so its own signature check isn't simulated` : ''})` : u.signature ? ` (with the wallet's stand-in signature${run.account?.signatureFailed ? ", which the account doesn't accept as signed, as gas-estimation stubs often aren't" : ''})` : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? `, but the account doesn't accept it as theirs${run.why ? ` (${run.why})` : ''}, so its own signature check isn't simulated` : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
+  // Where the stand-in's refusal doesn't show the signer can't sign (not all of the account's sessions were read),
+  // it isn't said to be the account refusing theirs.
+  const refusal = run.unsure
+    ? `, but the account doesn't take it${run.why ? ` (${run.why})` : ''}, which needn't mean it won't take theirs; its own signature check isn't simulated`
+    : `, but the account doesn't accept it as theirs${run.why ? ` (${run.why})` : ''}, so its own signature check isn't simulated`;
+  b.note(`The whole operation was simulated as ${u.entryPointName ?? 'the EntryPoint'} runs it: ${how.deploys ? 'deploying the account through its factory, ' : ''}validation${how.validation ? ` (${how.validation})` : run.standIn === 'enable' ? ` (Kernel's enable mode: installing what the operation's signature names, with stand-ins for the two signatures in it, which don't exist until they're signed: the owner's approval of what it installs, its Enable signature, and the operation's own by the key it installs${run.account?.signatureFailed ? refusal : ''})` : u.signature ? ` (with the wallet's stand-in signature${run.account?.signatureFailed ? ", which the account doesn't accept as signed, as gas-estimation stubs often aren't" : ''})` : ` (with a stand-in for the signature, which doesn't exist until it's signed: ${run.standIn === 'passkey' ? "a passkey's assertion over the operation's hash, which the P256 verifier accepts" : `ecrecover attributes it to ${env.signer ? 'the signer' : 'the account'}`}${run.account?.signatureFailed ? refusal : ''})`}, its calls${how.delegate ? ' (with the account delegating as the operation expects)' : ''}, and the gas payment${pm ? ", with the paymaster's own validation and charge" : ''}. ${simulationNote(sim)}`);
   // What the stand-in's form leaves out, where the account took it (a K1MeeValidator session's plain form).
   if (run.note && !run.account?.signatureFailed) b.note(run.note);
   return changes;
 }
 
 /** What a UserOperation does: its account, setup, gas, and its callData decoded and simulated as the account's own calls. */
-export async function describeOperation(u: Operation, env: TypedEnv, b = new PreviewBuilder()): Promise<NonNullable<Awaited<ReturnType<TypedAdapter>>>> {
+export async function describeOperation(u: Operation, env: TypedEnv, b = new PreviewBuilder()): Promise<DescribedOperation> {
   const { chainId, entryPoint, sender, nonce, initCode, callData } = u;
   const network = chainId !== null ? { kind: 'evm' as const, chainId, name: chainName(chainId) } : null;
   const mine = env.signer !== null && sameAddress(sender, env.signer);
@@ -276,7 +298,20 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   // With the state the caller set for it (context.stateOverrides), beneath the stand-ins the run needs.
   const overrides = callerOverrides(env.context);
   let assetChanges: AssetChange[] = inner.assetChanges;
+  // Other accounts' balance changes in the simulated run (Operation.alsoFor), listed after the account's own: from
+  // its events (a simulator that reads balances reports only the account's own), so tokens, not the native coin,
+  // which no other account can take from them.
+  let others: AssetChange[] = [];
+  const alsoFor = async (sim: SimulationResult) => {
+    const accounts = [...new Set((u.alsoFor ?? []).map(a => a.toLowerCase()))].filter(a => !sameAddress(a, sender));
+    if (!accounts.length) return;
+    const moved = sim.logs ? parseLogs(sim.logs).transfers : sim.transfers.filter(t => t.asset !== 'native');
+    try { others = (await Promise.all(accounts.map(a => netChanges(moved, { chainId: chainId!, from: a }, env.deps, b, 'simulated_events')))).flat(); } catch { others = []; }
+  };
   let whole: AssetChange[] | null = null;
+  // What ran, for operations after this one (DescribedOperation), and whether the account took the stand-in.
+  let ran: SimulationRequest[] | undefined, accepted: boolean | undefined;
+  const before = u.before?.length ? u.before : undefined;
   // The bundler the account deploys for, where its factory takes only its own (OperationRun's origin).
   let deployer: string | undefined;
   if (env.deps.simulator && chainId !== null && u.gas && nonce !== null && u.paymasterAndData !== undefined) {
@@ -287,15 +322,20 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
       // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
       const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
       const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData, callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
-        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(u.supertransaction && { supertransaction: u.supertransaction }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(before && { before }), ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(u.supertransaction && { supertransaction: u.supertransaction }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
       if (run) warnOverridden(b, overrides);
       if (run?.origin?.by === 'factory') deployer = run.origin.bundler;
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });
-      // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment.
+      if (whole && run?.requests) { ran = run.requests.slice(0, 1); accepted = !run.account?.signatureFailed; }
+      else if (run?.rejected?.startsWith('AA23')) accepted = false;
+      if (whole && run) await alsoFor(run.result);
+      // The whole operation's trace: the EntryPoint's simulation call, validation, the calls and the gas payment
+      // (after the operations before it, whose traces aren't shown).
       if (whole && env.context.trace && run?.requests) {
         const traceEnv: TraceEnv = { chainId, account: sender, accountLabel: mine ? 'you' : 'the account', deps: env.deps };
-        const traces = await tracePreviews(run.requests, [run.result], traceEnv);
-        if (traces?.[0]) b.trace = traces[0];
+        const traces = await tracePreviews([...before ?? [], ...run.requests], [...(before ?? []).map(() => undefined), run.result], traceEnv);
+        const own = traces?.[before?.length ?? 0];
+        if (own) b.trace = own;
         else b.note(noTrace(traceEnv));
       }
     } catch { whole = null; }
@@ -304,9 +344,10 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   // Otherwise its calls alone, as the EntryPoint makes them: the account deployed first if it's new, then called.
   if (whole === null && env.deps.simulator && chainId !== null) {
     try {
-      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(deploys && { initCode }), ...(deploys && deployer && { origin: deployer }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+      const run = await simulateExecution({ chainId, entryPoint, sender, callData, ...(before && { before }), ...(deploys && { initCode }), ...(deploys && deployer && { origin: deployer }), ...(delegate && { delegate }), ...(u.packed && { packed: u.packed }), ...(u.userOpHash && { userOpHash: u.userOpHash }), ...(u.gas && { callGasLimit: u.gas.call }), ...(inner.watch?.length && { watch: inner.watch }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
       const sim = run?.result;
       if (sim && !run.noCode) warnOverridden(b, overrides);
+      if (run?.requests) ran = run.requests;
       const how = run?.direct ? "directly from the account: this account only runs calls it validated in the same transaction (a flag kept in transient storage), which can't be done before it's signed"
         : `as the EntryPoint runs it${run?.deployed ? ', after deploying the account through its factory' : ''}${delegate ? ', with the account delegating as the operation expects' : ''}`;
       if (run?.noCode) b.warn('info', 'userop_account_no_code', `The account ${shortAddress(sender)} has no code, so the EntryPoint calling it would run nothing. The operation only does something if the account is delegated (EIP-7702) in the same transaction, and the preview can't simulate that.`);
@@ -315,6 +356,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
         const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
         const simulated = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
         if (simulated.length || !assetChanges.length) assetChanges = simulated;
+        await alsoFor(sim);
         b.note(`The operation's calls were simulated ${how}. Its signature check, gas payment and any paymaster charge aren't part of the simulation. ${simulationNote(sim)}`);
       } else if (sim?.status === 'success') {
         b.note(`The operation's calls were checked ${how}: they succeed. Balance changes are from the decoded calls.`);
@@ -326,6 +368,6 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   return {
     title: `Sign a UserOperation: ${inner.title}`,
     summary: `Authorizes an ERC-4337 UserOperation from ${mine ? 'your account' : `account ${shortAddress(sender)}`}. ${inner.summary}`,
-    decoder: 'erc4337_user_operation', status: inner.status, b, network, assetChanges,
+    decoder: 'erc4337_user_operation', status: inner.status, b, network, assetChanges: [...assetChanges, ...others], ...(ran && { ran }), ...(accepted !== undefined && { accepted }),
   };
 }

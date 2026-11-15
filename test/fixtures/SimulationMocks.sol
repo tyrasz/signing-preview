@@ -37,6 +37,11 @@ contract Vault is Token {
     function deposit(uint256 amount) external { asset.transferFrom(msg.sender, address(this), amount); balanceOf[msg.sender] += amount; emit Transfer(address(0), msg.sender, amount); }
 }
 
+/// Moves all of the caller's balance of a token to `to` (from an allowance it gave), whatever that is when it runs.
+contract Sweeper {
+    function sweep(Token token, address to) external { token.transferFrom(msg.sender, to, token.balanceOf(msg.sender)); }
+}
+
 /// Aave-like: supply mints a receipt token the calldata doesn't mention.
 contract Pool {
     Token public immutable asset;
