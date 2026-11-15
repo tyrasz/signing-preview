@@ -827,6 +827,86 @@ test('Base’s policy registry: a composite’s children and a bool word, read a
   assert.deepEqual([upper.status, upper.returnData, upper.trace!.gasUsed], ['reverted', allow.slice(0, 10), 36n]);
 });
 
+test('Base’s NonceManager and TxContext (EIP-8130’s) run from its upgrade of 2026-11-05 on, as its node answers and charges them', async () => {
+  // What each is given and what it answers, gas included, as measured on Base's node on 2026-11-15.
+  const NM = '0x813000000000000000000000000000000000aa01', TC = '0x813000000000000000000000000000000000aa02';
+  const base = new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl, profiles: { 8453: CHAIN_PROFILES[8453] } });
+  const header = (timestamp: bigint) => ({ number: 17n, timestamp, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex });
+  const at = { block: 'latest', header: header(1_800_000_000n) };
+  const abi = parseAbi(['function getNonce(address account, uint256 nonceKey) view returns (uint64)', 'function getTransactionSender() view returns (address)',
+    'function getTransactionPayer() view returns (address)', 'function getTransactionSenderActorId() view returns (bytes32)']);
+  const getNonce = (account: string, key: bigint) => encodeFunctionData({ abi, functionName: 'getNonce', args: [account as Hex, key] });
+  const sender = encodeFunctionData({ abi, functionName: 'getTransactionSender' });
+  const trace = async (to: string, data: Hex, value = 0n) => (await base.trace([{ chainId: 8453, from: USER, to, data, value, at }]))![0];
+  const word = (n: bigint) => setLengthLeft(hexToBytes(toHex(n)), 32);
+  // nonces[account][key] in NonceManager's own storage, at ERC-7201's base.nonce_manager.
+  const LOCATION = 0x9d3ea32ad25774a46482ebbae019e8da4242109d164d324a59aa787515b9fe00n;
+  const slot = (account: string, key: bigint) => keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'bytes32' }], [key, keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [account as Hex, LOCATION]))]));
+
+  // A key never used: 0, for 6 gas a word of its input and the slot's cold read.
+  const unused = await trace(NM, getNonce(BOB, 1n));
+  assert.deepEqual([unused.status, BigInt(unused.returnData!), unused.trace!.gasUsed], ['success', 0n, 18n + 2_100n]);
+  // One used: what the chain's slot holds.
+  await chain.evm.stateManager.putStorage(createAddressFromString(NM), hexToBytes(slot(BOB, 5n)), word(42n));
+  const used = await trace(NM, getNonce(BOB, 5n));
+  assert.deepEqual([used.status, BigInt(used.returnData!)], ['success', 42n]);
+  // The account has no code, nonce or balance: once a transaction has called it, it is removed as empty (EIP-161)
+  // with its storage, and a later transaction reads 0, as Base's node has it (measured with a state override).
+  const [first, after] = (await base.simulateBatch([{ chainId: 8453, from: USER, to: NM, data: getNonce(BOB, 5n), value: 0n, at }, { chainId: 8453, from: USER, to: NM, data: getNonce(BOB, 5n), value: 0n, at }]))!;
+  assert.deepEqual([BigInt(first.returnData!), BigInt(after.returnData!)], [42n, 0n]);
+  // A value there too large for a uint64 (only a state override puts one there): Panic(0x11).
+  await chain.evm.stateManager.putStorage(createAddressFromString(NM), hexToBytes(slot(BOB, 6n)), word(1n << 64n));
+  assert.equal((await trace(NM, getNonce(BOB, 6n))).returnData, '0x4e487b710000000000000000000000000000000000000000000000000000000000000011');
+  // Key 0 is the account's own nonce: ProtocolNonceNotSupported(), charged its input alone.
+  const protocol = await trace(NM, getNonce(BOB, 0n));
+  assert.deepEqual([protocol.status, protocol.returnData, protocol.trace!.gasUsed], ['reverted', '0x1bc81ca9', 18n]);
+  // Calldata it can't decode reverts with its selector (zeros short of one), at 6 a word.
+  const shortOf = await trace(NM, getNonce(BOB, 1n).slice(0, 74) as Hex);
+  const dirty = await trace(NM, `${getNonce(BOB, 1n).slice(0, 10)}ff${getNonce(BOB, 1n).slice(12)}` as Hex);
+  const lacks = await trace(NM, `0xdeadbeef${'00'.repeat(96)}`);
+  assert.deepEqual([shortOf, dirty, lacks].map(r => [r.status, r.returnData, r.trace!.gasUsed]), [['reverted', '0x89535803', 12n], ['reverted', '0x89535803', 18n], ['reverted', '0xdeadbeef', 24n]]);
+  assert.deepEqual([(await trace(NM, '0x895358')).returnData, (await trace(NM, '0x')).trace!.gasUsed], ['0x00000000', 0n]);
+  // Read twice in a transaction (a contract asking for it twice), the second read is warm: 118.
+  const TWICE = '0x00000000000000000000000000000000000aa0a1', call = (to: string, op = 'fa') => `5f5f365f73${to.slice(2)}5a${op}`;
+  await chain.putCode(TWICE, `0x365f5f37${call(NM)}50${call(NM)}503d5f5f3e3d5ff3`);
+  const twice = await trace(TWICE, getNonce(BOB, 1n));
+  assert.deepEqual(twice.trace!.calls!.map(c => c.gasUsed), [2_118n, 118n]);
+
+  // TxContext: from a contract, the transaction's sender (not the contract that asks), for 3 gas; so for the
+  // payer, and the sender's own actor id. Another function, or none: its selector back, for nothing.
+  const RELAY = '0x00000000000000000000000000000000000aa0a2';
+  await chain.putCode(RELAY, `0x365f5f37${call(TC)}3d5f5f3e6029573d5ffd5b3d5ff3`);
+  const asked = await trace(RELAY, sender);
+  assert.deepEqual([asked.status, asked.returnData, asked.trace!.calls![0].gasUsed], ['success', `0x${USER.slice(2).padStart(64, '0')}`, 3n]);
+  for (const f of ['getTransactionPayer', 'getTransactionSenderActorId'] as const) assert.equal((await trace(TC, encodeFunctionData({ abi, functionName: f }))).returnData, `0x${USER.slice(2).padStart(64, '0')}`);
+  const calls = await trace(TC, '0xdf66b5cb');
+  assert.deepEqual([calls.status, calls.returnData, calls.trace!.gasUsed], ['reverted', '0xdf66b5cb', 0n]);
+  // Run as another's code, either refuses: DelegateCallNotAllowed(). Sent value: NonPayable(), charging nothing.
+  const DELEGATOR = '0x00000000000000000000000000000000000aa0a3';
+  for (const to of [NM, TC]) {
+    await chain.putCode(DELEGATOR, `0x365f5f37${call(to, 'f4')}3d5f5f3e6029573d5ffd5b3d5ff3`);
+    const delegated = await trace(DELEGATOR, to === NM ? getNonce(BOB, 1n) : sender);
+    assert.deepEqual([delegated.status, delegated.returnData], ['reverted', '0x0d89438e']);
+    const paid = await trace(to, to === NM ? getNonce(BOB, 1n) : sender, 1n);
+    assert.deepEqual([paid.status, paid.returnData, paid.trace!.gasUsed], ['reverted', '0x6fb1b0e9', 0n]);
+  }
+  // Moved elsewhere for a simulation: refused (the local EVM has them at their own addresses only).
+  await assert.rejects(base.simulateBatch([{ chainId: 8453, from: USER, to: NM, data: getNonce(BOB, 1n), value: 0n, at, stateOverrides: { [NM]: { movePrecompileToAddress: BOB } } }]),
+    (e: Error) => e instanceof ForkUnsupported && /NonceManager, which the local EVM has at its own address only/.test(e.message));
+  // Nor another precompile moved onto one of them: Base's node runs the one moved there (sha256 onto NonceManager
+  // returns the input's hash), which the local EVM wouldn't.
+  for (const onto of [NM, TC]) await assert.rejects(base.simulateBatch([{ chainId: 8453, from: USER, to: onto, data: getNonce(BOB, 1n), value: 0n, at, stateOverrides: { '0x0000000000000000000000000000000000000002': { movePrecompileToAddress: onto } } }]),
+    (e: Error) => e instanceof ForkUnsupported && /a precompile moved onto it isn't run by the local EVM/.test(e.message));
+  // Before Base's upgrade, where the node lists them, a call reaching one is refused, not run as an empty account.
+  chain.config = { current: { forkId: '0x169d85a3', activationTime: 1_793_901_600, precompiles: { NonceManager: NM, TxContext: TC } } };
+  try {
+    await assert.rejects(new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId: 8453, from: USER, to: NM, data: getNonce(BOB, 1n), value: 0n, at: { block: 'latest', header: header(1_793_901_599n) } }]),
+      (e: Error) => e instanceof ForkUnsupported && /is NonceManager, a precompile this chain's node has/.test(e.message));
+    const [now] = (await new ForkSimulator({ 8453: URL_ }, { fetchImpl: chain.fetchImpl }).simulateBatch([{ chainId: 8453, from: USER, to: TC, data: sender, value: 0n, at }]))!;
+    assert.deepEqual([now.status, now.returnData], ['success', `0x${USER.slice(2).padStart(64, '0')}`]);
+  } finally { chain.config = undefined; }
+});
+
 test('A rate limit on state reads: the node’s wait is kept to, and a trace it denies says why', async () => {
   // A public node refusing reads for a while (HTTP 429), asking for a short wait: kept to, not the usual backoff.
   let refused = 0;

@@ -12,7 +12,7 @@
 // Approvals come from Approval logs and are read back from the token after each call.
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createEVM, EVMError, getActivePrecompiles, paramsEVM, type EVM } from '@ethereumjs/evm';
+import { createEVM, EVMError, getActivePrecompiles, paramsEVM, type EVM, type PrecompileInput } from '@ethereumjs/evm';
 import { Common, createCustomCommon, Hardfork, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
@@ -830,6 +830,20 @@ class LazyState extends SimpleStateManager {
     await super.clearStorage(address);
     this.cleared.add(address.toString());
   }
+
+  /**
+   * An account removed as empty (EIP-161: touched by a transaction and left with no code, nonce or balance, which the
+   * run's journal cleanup does before each call) goes with its storage, as the chain's node removes it. Only an
+   * account a state override gives storage, or one a precompile keeps storage in, can hold any: Base's NonceManager
+   * has none of the three, and its node reads a nonce an override gave it as 0 in a transaction after one that
+   * called it (measured in a simulated block: a nonce of 7 given, read as 7 by the first transaction to call it and
+   * as 0 by one after another had called it; with a balance or nonce of 1 given as well, 7).
+   * (In a speculative run an account not read yet may only look empty: its storage is left to the run that knows.)
+   */
+  override async deleteAccount(address: Address): Promise<void> {
+    await super.deleteAccount(address);
+    if (!this.misses || this.source.accounts.has(address.toString())) await this.clearStorage(address);
+  }
 }
 
 
@@ -1127,6 +1141,93 @@ const isNative = (code: Uint8Array) => code.length > 0 && code[0] === 0xef && !i
 const BASE = 8453;
 /** When Base's upgrade of 2026-11-05 (Denim) took effect: the B20 rules base-std's `main` has (its eth_config activationTime). */
 const BASE_DENIM = 1_793_901_600n;
+/**
+ * Base's precompiles for EIP-8130's account-abstraction transactions, from its upgrade of 2026-11-05 on (its
+ * eth_config lists them, by these names, with the fork of that time), which the local EVM runs as the node does.
+ * Measured on Base's node (2026-11-15), each call from a contract that reports the gas it spent. They have no code,
+ * are warm from the start, and answer:
+ * - NonceManager's getNonce(address account, uint256 nonceKey): the account's nonce on that key, a uint64, kept in
+ *   its own storage at nonces[account][nonceKey] in ERC-7201's namespace `base.nonce_manager` (NONCES_LOCATION: a
+ *   state override of that slot is what it answers; of no other candidate). Key 0, the account's own nonce, reverts
+ *   with ProtocolNonceNotSupported(). It costs 6 gas a word of its input and the slot's read, cold or warm as an
+ *   SLOAD (2,100 or 100: getNonce 2,118, then 118 for the same key, 2,118 for another); given a gas less, it runs
+ *   out. A value over 64 bits in the slot (which only an override can put there) reverts with Panic(0x11).
+ * - TxContext's getTransactionSender(), getTransactionPayer() and getTransactionSenderActorId(): in a transaction
+ *   of any type but EIP-8130's (none mined in the blocks scanned; the local EVM runs no other kind), the
+ *   transaction's sender (tx.origin, not the calling contract), as a word; its actor id is the sender's own,
+ *   the address as a bytes32. 3 gas each, its input whatever its length; EIP-8130's other functions
+ *   (getTransactionCalls(), getTransactionGasLimit()) aren't on the node and revert as any it lacks.
+ * Calldata either can't decode (a selector it lacks, arguments short, an address with upper bytes set) reverts
+ * with its selector, or 4 zero bytes short of one, at the price above (NonceManager 6 a word, TxContext nothing).
+ * Run as another's code (DELEGATECALL, CALLCODE) they revert with DelegateCallNotAllowed(), sent value with
+ * NonPayable(), charging nothing (BASE_AA_REFUSED). Nonces only an EIP-8130 transaction writes; a call that reaches
+ * NonceManager leaves its account (empty) to be removed after the transaction, as LazyState.deleteAccount has it.
+ * At a block before the upgrade they aren't run: where the node lists them, a call reaching one is refused (what
+ * was there then couldn't be measured: the public node keeps no state that old).
+ */
+const NONCE_MANAGER = '0x813000000000000000000000000000000000aa01', TX_CONTEXT = '0x813000000000000000000000000000000000aa02';
+const BASE_AA_PRECOMPILES: Record<string, string> = { [NONCE_MANAGER]: 'NonceManager', [TX_CONTEXT]: 'TxContext' };
+/** keccak256(abi.encode(uint256(keccak256("base.nonce_manager")) - 1)) & ~bytes32(uint256(0xff)): NonceManager's nonces mapping. */
+const NONCES_LOCATION = hexToBytes('0x9d3ea32ad25774a46482ebbae019e8da4242109d164d324a59aa787515b9fe00');
+const GET_NONCE = '0x89535803', PROTOCOL_NONCE_NOT_SUPPORTED = hexToBytes('0x1bc81ca9');
+/** getTransactionSender(), getTransactionPayer(), getTransactionSenderActorId(): each the transaction's sender. */
+const TX_SENDER = new Set(['0xbead3f50', '0x690b3a9d', '0xe14fe3f3']);
+const PANIC_OVERFLOW = hexToBytes('0x4e487b710000000000000000000000000000000000000000000000000000000000000011');
+/** The precompiles Base's node runs that the local EVM has at a block of this time (BASE_AA_PRECOMPILES), by address. */
+export const chainPrecompilesAt = (chainId: number, time: bigint): string[] => (chainId === BASE && time >= BASE_DENIM ? Object.keys(BASE_AA_PRECOMPILES) : []);
+const aaOutOfGas = (gasLimit: bigint) => ({ executionGasUsed: gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) });
+/** An answer at `gas`, or out of gas where the call was given less. */
+const aaAnswer = (gas: bigint, gasLimit: bigint, returnValue: Uint8Array, reverts = false) => (gas > gasLimit ? aaOutOfGas(gasLimit)
+  : { executionGasUsed: gas, returnValue, ...(reverts && { exceptionError: new EVMError(EVMError.errorMessages.REVERT) }) });
+/** What calldata a precompile can't decode reverts with: its selector, or 4 zero bytes short of one. */
+const echoSelector = (data: Uint8Array) => (data.length >= 4 ? data.slice(0, 4) : new Uint8Array(4));
+/** How Base's AA precompiles refuse a call by the way it is made, charging nothing: run as another's code, or sent value. */
+const BASE_AA_REFUSED = { delegated: hexToBytes('0x0d89438e'), value: hexToBytes('0x6fb1b0e9') };
+
+/**
+ * NonceManager and TxContext as functions the EVM runs at their addresses (BASE_AA_PRECOMPILES). `originOf` gives
+ * the sender of the transaction an EVM is running (see the run's hook): what TxContext answers.
+ */
+function baseAaPrecompiles(originOf: (evm: unknown) => Address | undefined) {
+  const nonceManager = async (input: PrecompileInput) => {
+    const { data, gasLimit } = input, gas = 6n * BigInt(Math.ceil(data.length / 32));
+    // getNonce(address, uint256): two words, the first an address.
+    if (data.length < 68 || bytesToHex(data.subarray(0, 4)) !== GET_NONCE || data.subarray(4, 16).some(b => b !== 0)) return aaAnswer(gas, gasLimit, echoSelector(data), true);
+    if (data.subarray(36, 68).every(b => b === 0)) return aaAnswer(gas, gasLimit, PROTOCOL_NONCE_NOT_SUPPORTED, true);
+    // nonces[account][nonceKey]: keccak256(nonceKey ‖ keccak256(account ‖ NONCES_LOCATION)).
+    const slot = hexToBytes(keccak256(new Uint8Array([...data.subarray(36, 68), ...hexToBytes(keccak256(new Uint8Array([...data.subarray(4, 36), ...NONCES_LOCATION])))])));
+    const evm = input._EVM as unknown as EVM, at = hexToBytes(NONCE_MANAGER);
+    const cost = gas + (evm.journal.isWarmedStorage(at, slot) ? 100n : 2_100n);
+    if (cost > gasLimit) return aaOutOfGas(gasLimit);
+    evm.journal.addWarmedStorage(at, slot);
+    const value = setLengthLeft(await evm.stateManager.getStorage(createAddressFromString(NONCE_MANAGER), slot), 32);
+    return value.subarray(0, 24).some(b => b !== 0) ? aaAnswer(cost, gasLimit, PANIC_OVERFLOW, true) : aaAnswer(cost, gasLimit, value);
+  };
+  const txContext = (input: PrecompileInput) => {
+    const { data, gasLimit } = input;
+    if (data.length < 4 || !TX_SENDER.has(bytesToHex(data.subarray(0, 4)))) return aaAnswer(0n, gasLimit, echoSelector(data), true);
+    return aaAnswer(3n, gasLimit, setLengthLeft((originOf(input._EVM) ?? createAddressFromString(ZERO)).bytes, 32));
+  };
+  return [{ address: NONCE_MANAGER as Hex, function: nonceManager }, { address: TX_CONTEXT as Hex, function: txContext }];
+}
+
+/**
+ * A message hook for an EVM with Base's AA precompiles: notes each transaction's sender (a message at depth 0 is
+ * sent by it) for TxContext, and gives a call that NonceManager or TxContext refuses for the way it is made
+ * (BASE_AA_REFUSED) the refusal to run in their place.
+ */
+function baseAaHook(origins: WeakMap<object, Address>, evm: object) {
+  return (m: { to?: Address; _codeAddress?: Address; caller: Address; value: bigint; depth: number; code?: unknown; isCompiled: boolean }, next?: () => void) => {
+    if (m.depth === 0) origins.set(evm, m.caller);
+    const code = (m._codeAddress ?? m.to)?.toString();
+    if (code && code in BASE_AA_PRECOMPILES) {
+      // (Run as another's code is refused first: CALLCODE with value is DelegateCallNotAllowed().)
+      const refusal = m.to?.toString() !== code ? BASE_AA_REFUSED.delegated : m.value > 0n ? BASE_AA_REFUSED.value : undefined;
+      if (refusal) { m.code = () => ({ executionGasUsed: 0n, returnValue: refusal, exceptionError: new EVMError(EVMError.errorMessages.REVERT) }); m.isCompiled = true; }
+    }
+    next?.();
+  };
+}
 /** Base's registries a B20 token asks on its transfers: who may send and receive (policies), and what is switched on. */
 const BASE_REGISTRIES: Record<string, string> = { '0x8453000000000000000000000000000000000001': ACTIVATION_REGISTRY_CODE, '0x8453000000000000000000000000000000000002': POLICY_REGISTRY_CODE };
 /**
@@ -1430,6 +1531,8 @@ export class ForkSimulator implements Simulator {
     // (The chain's own precompiles a fork adds the local EVM has on both sides of it, an empty account before: none
     // is refused, whatever the node's current fork lists.)
     for (const p of profile.timedPrecompiles ?? []) forwards.add(p.address);
+    // (Base's NonceManager and TxContext the local EVM runs from Base's upgrade of 2026-11-05 on: BASE_AA_PRECOMPILES.)
+    for (const a of chainPrecompilesAt(chainId, block.header.timestamp)) forwards.add(a);
     for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !hasReference(chainId, address)) source.nodeOnly.set(address, name);
     const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
@@ -1561,6 +1664,13 @@ export class ForkSimulator implements Simulator {
     // token moved away is ignored, as on the node: it isn't one of the chain's precompiles there.)
     const away = chainId === BASE ? reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).find(([a, o]) => o.movePrecompileToAddress && (hexOf(a) === B20_FACTORY || hexOf(a) in BASE_REGISTRIES)) : undefined;
     if (away) throw new ForkUnsupported(`${hexOf(away[0])} is one of Base's own contracts, which the local EVM runs from its Solidity reference at its own address only: it can't be moved for the simulation`);
+    // (Nor NonceManager or TxContext, which the local EVM has at their own addresses only.)
+    const aa = chainPrecompilesAt(chainId, block.header.timestamp);
+    const aaAway = reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).find(([a, o]) => o.movePrecompileToAddress && aa.includes(hexOf(a)));
+    if (aaAway) throw new ForkUnsupported(`${hexOf(aaAway[0])} is Base's ${BASE_AA_PRECOMPILES[hexOf(aaAway[0])]}, which the local EVM has at its own address only: it can't be moved for the simulation`);
+    // (Nor another precompile moved onto theirs: Base's node then runs the one moved there.)
+    const aaOnto = reqs.flatMap(r => Object.values(r.stateOverrides ?? {})).find(o => o.movePrecompileToAddress && aa.includes(hexOf(o.movePrecompileToAddress)));
+    if (aaOnto) throw new ForkUnsupported(`${hexOf(aaOnto.movePrecompileToAddress!)} is Base's ${BASE_AA_PRECOMPILES[hexOf(aaOnto.movePrecompileToAddress!)]}: a precompile moved onto it isn't run by the local EVM`);
     const moved = reqs.flatMap(r => Object.entries(r.stateOverrides ?? {})).flatMap(([a, o]) => {
       const fn = o.movePrecompileToAddress ? active.get(hexOf(a).slice(2)) : undefined;
       return fn ? [{ address: hexOf(a) as Hex }, { address: hexOf(o.movePrecompileToAddress!) as Hex, function: fn }] : [];
@@ -1582,8 +1692,12 @@ export class ForkSimulator implements Simulator {
     const timed = timedPrecompilesAt(profile, block.header.timestamp).map(p => ({ address: p.address as Hex, function: async (input: { gasLimit: bigint }) =>
       p.gas > input.gasLimit ? { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) }
         : { executionGasUsed: p.gas, returnValue: p.answer({ timestamp: block.header.timestamp, milliseconds: block.header.milliseconds ?? 0n }) } }));
-    const precompiles = [...scaled, ...timed, ...forwarded, ...moved, ...absent];
+    // Base's NonceManager and TxContext (BASE_AA_PRECOMPILES), given the sender of the transaction each EVM runs.
+    const origins = new WeakMap<object, Address>();
+    const ownAa = aa.length ? baseAaPrecompiles(on => origins.get(on as object)) : [];
+    const precompiles = [...scaled, ...timed, ...forwarded, ...moved, ...absent, ...ownAa];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
+    if (ownAa.length) evm.events!.on('beforeMessage', baseAaHook(origins, evm));
     // What a cleared slot gives back reaches the caller that paid for it, as on the chain (see repayCallers).
     const gasBack = profile.hardfork === 'amsterdam' ? repayCallers(evm) : undefined;
     // Only the calls themselves are traced, not the balance and approval reads around them.
@@ -1939,6 +2053,7 @@ export class ForkSimulator implements Simulator {
       if (!pre) {
         const preState = new LazyState(source, misses, { common });
         pre = await createEVM({ common, stateManager: preState, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
+        if (ownAa.length) pre.events!.on('beforeMessage', baseAaHook(origins, pre));
         // (Base's tokens run their references here too: see standInFor.)
         if (chainId === BASE) pre.events!.on('beforeMessage', async (m: { to?: Address; _codeAddress?: Address; code?: unknown }, next?: () => void) => {
           const code = (m._codeAddress ?? m.to)?.toString();

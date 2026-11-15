@@ -24,8 +24,8 @@ import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
 import { getActivePrecompiles } from '@ethereumjs/evm';
 import { createCustomCommon, Mainnet } from '@ethereumjs/common';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { hashMessage, toFunctionSelector, type Hex } from 'viem';
-import { CHAIN_PROFILES, ForkSimulator, hasReference, nodeRulesOf, timedPrecompilesAt } from '../src/fork-simulator.ts';
+import { hashMessage, keccak256, toFunctionSelector, type Hex } from 'viem';
+import { CHAIN_PROFILES, chainPrecompilesAt, ForkSimulator, hasReference, nodeRulesOf, timedPrecompilesAt } from '../src/fork-simulator.ts';
 import { headerOf, nodeOverrides, pinLatest, type BlockAt, type RpcHeader, type StateChanges } from '../src/block.ts';
 import { chainsOwnLog } from '../src/evm/trace.ts';
 import { authorizationsForNode } from '../src/simulation.ts';
@@ -60,7 +60,7 @@ const OPS: Record<string, string> = {
   STOP: '00', SUB: '03', EXP: '0a', SHL: '1b', KECCAK256: '20', BALANCE: '31', CALLER: '33', CALLDATASIZE: '36', CALLDATACOPY: '37', RETURNDATASIZE: '3d', RETURNDATACOPY: '3e',
   EXTCODESIZE: '3b', EXTCODEHASH: '3f', BLOCKHASH: '40', NUMBER: '43', POP: '50', MLOAD: '51', SWAP1: '90',
   MSTORE: '52', SLOAD: '54', SSTORE: '55', GAS: '5a', TLOAD: '5c', TSTORE: '5d', MCOPY: '5e', LOG2: 'a2', CREATE: 'f0', CALL: 'f1', RETURN: 'f3', DELEGATECALL: 'f4', CREATE2: 'f5',
-  STATICCALL: 'fa', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47', GASPRICE: '3a', COINBASE: '41', BASEFEE: '48',
+  STATICCALL: 'fa', CALLCODE: 'f2', MSTORE8: '53', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47', GASPRICE: '3a', COINBASE: '41', BASEFEE: '48',
 };
 const asm = (source: string): Hex => `0x${source.trim().split(/\s+/).map(t => {
   if (OPS[t]) return OPS[t];
@@ -318,6 +318,70 @@ function b20Programs(): Program[] {
     { label: 'B20 factory creating a stablecoin', code: callOf(FACTORY), data: create(1, stablecoin('Rules Dollar', 'RUSD', 'USD'), []) },
     { label: 'B20 factory, decimals out of range', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 5), []) },
     { label: 'B20 factory, an init call the token lacks', code: callOf(FACTORY), data: create(0, asset('Rules Check', 'RULES', 18), ['deadbeef']) },
+  ];
+}
+
+/**
+ * Base's NonceManager and TxContext (EIP-8130's, from its upgrade of 2026-11-05), which its node runs in Rust and
+ * the local EVM as measured (src/fork-simulator.ts, BASE_AA_PRECOMPILES), each from a contract that reports the gas
+ * the call spent: a nonce read cold, warm and on another key, one stored and one too large for a uint64 (the slots
+ * given on both sides), one read after another transaction called it, key 0, calldata it can't decode each way, a
+ * gas short, value sent, run as another's code, and each TxContext function, with a transaction straight to each.
+ * So a change Base makes to them shows the next day.
+ */
+function baseAaPrograms(): Program[] {
+  const NONCE_MANAGER = '813000000000000000000000000000000000aa01', TX_CONTEXT = '813000000000000000000000000000000000aa02';
+  const callOf = (to: string, { kind = 'STATICCALL', value = '00', gas = 'GAS', twice = false }: { kind?: 'STATICCALL' | 'CALL' | 'DELEGATECALL' | 'CALLCODE'; value?: string; gas?: string; twice?: boolean } = {}) => {
+    const call = kind === 'STATICCALL' || kind === 'DELEGATECALL' ? `00 00 CALLDATASIZE 00 ${to} ${gas} ${kind}` : `00 00 CALLDATASIZE 00 ${value} ${to} ${gas} ${kind}`;
+    return asm(`CALLDATASIZE 00 00 CALLDATACOPY ${twice ? `${call} POP ` : ''}GAS ${call} GAS
+      SWAP1 00 MSTORE SWAP1 SUB 20 MSTORE RETURNDATASIZE 40 MSTORE RETURNDATASIZE 00 80 RETURNDATACOPY RETURNDATASIZE 80 KECCAK256 60 MSTORE 80 00 RETURN`);
+  };
+  const sel = (signature: string) => toFunctionSelector(`function ${signature}`);
+  const someone = word(BigInt(FROM));
+  const getNonce = (key: bigint, account = someone) => `${sel('getNonce(address,uint256)')}${account}${word(key)}` as Hex;
+  // nonces[account][key] in NonceManager's storage (ERC-7201's base.nonce_manager): a nonce of 7 on key 7, and a
+  // value over 64 bits on key 8. One state for the programs that read them (a batch's states are merged account by
+  // account), each first in its block: the account has no code, nonce or balance, so once a transaction has called
+  // it the node removes it as empty, storage and all, and a later one reads 0 (the third program shows it).
+  const LOCATION = '9d3ea32ad25774a46482ebbae019e8da4242109d164d324a59aa787515b9fe00';
+  const slot = (key: bigint) => keccak256(`0x${word(key)}${keccak256(`0x${someone}${LOCATION}`).slice(2)}`);
+  const stored: StateChanges = { [`0x${NONCE_MANAGER}`]: { stateDiff: { [slot(7n)]: `0x${word(7)}`, [slot(8n)]: `0x${word(1n << 64n)}` } } };
+  const nonces = (label: string, data: Hex, how?: Parameters<typeof callOf>[1], more?: Partial<Program>): Program => ({ precompile: true, label: `Base NonceManager ${label}`, code: callOf(NONCE_MANAGER, how), data, ...more });
+  const context = (label: string, data: Hex, how?: Parameters<typeof callOf>[1], more?: Partial<Program>): Program => ({ precompile: true, label: `Base TxContext ${label}`, code: callOf(TX_CONTEXT, how), data, ...more });
+  return [
+    nonces('getNonce(someone, 1), a key never used (read cold)', getNonce(1n)),
+    nonces('getNonce twice, the second read warm', getNonce(2n), { twice: true }),
+    nonces('getNonce of another key after one (cold again)', getNonce(3n), undefined, { code: asm(`CALLDATASIZE 00 00 CALLDATACOPY 01 43 MSTORE8 00 00 44 00 ${NONCE_MANAGER} GAS STATICCALL POP 03 43 MSTORE8 GAS 00 00 44 00 ${NONCE_MANAGER} GAS STATICCALL GAS
+      SWAP1 00 MSTORE SWAP1 SUB 20 MSTORE RETURNDATASIZE 40 MSTORE RETURNDATASIZE 00 80 RETURNDATACOPY RETURNDATASIZE 80 KECCAK256 60 MSTORE 80 00 RETURN`) }),
+    nonces('getNonce(someone, 0): the protocol nonce', getNonce(0n)),
+    nonces('getNonce of a nonce stored (7)', getNonce(7n), undefined, { state: stored, first: true }),
+    nonces('getNonce of the nonce stored, after a transaction that called it (the empty account removed)', getNonce(7n), undefined, { state: stored }),
+    nonces('getNonce of a value over 64 bits stored', getNonce(8n), undefined, { state: stored, first: true }),
+    nonces('getNonce, a key of all ones', getNonce((1n << 256n) - 1n)),
+    nonces('getNonce with 64 bytes more', `${getNonce(1n)}${word(0)}${word(5)}` as Hex),
+    nonces('getNonce short of its arguments', `${sel('getNonce(address,uint256)')}${someone}` as Hex),
+    nonces("getNonce with an address's upper bytes set", getNonce(1n, `${'ff'.repeat(12)}${someone.slice(24)}`)),
+    nonces('a function it lacks, 100 bytes', `0xdeadbeef${'00'.repeat(96)}`),
+    nonces('calldata too short for a selector', '0x895358'),
+    nonces('no calldata', '0x'),
+    nonces('getNonce given 2,117 gas (runs out)', getNonce(1n), { gas: '0845' }),
+    nonces('getNonce given 2,118 gas', getNonce(1n), { gas: '0846' }),
+    nonces('getNonce(someone, 0) given 17 gas (runs out)', getNonce(0n), { gas: '11' }),
+    nonces('getNonce sent value', getNonce(1n), { kind: 'CALL', value: '01' }, { balance: 1n }),
+    nonces("getNonce run as the caller's code (DELEGATECALL)", getNonce(1n), { kind: 'DELEGATECALL' }),
+    nonces("getNonce run as the caller's code with value (CALLCODE)", getNonce(1n), { kind: 'CALLCODE', value: '01' }, { balance: 1n }),
+    nonces('getNonce through CALL', getNonce(1n), { kind: 'CALL' }),
+    { label: 'Base NonceManager getNonce, a transaction straight to it', to: `0x${NONCE_MANAGER}`, data: getNonce(1n) },
+    ...(['getTransactionSender()', 'getTransactionPayer()', 'getTransactionSenderActorId()'] as const).map(f => context(f, sel(f))),
+    context('getTransactionSender() with 64 bytes more', `${sel('getTransactionSender()')}${word(1)}${word(2)}` as Hex),
+    // (EIP-8130's other two functions, which Base's node hasn't.)
+    context('getTransactionCalls()', sel('getTransactionCalls()')), context('getTransactionGasLimit()', sel('getTransactionGasLimit()')),
+    context('calldata too short for a selector', '0xbead3f'), context('no calldata', '0x'),
+    context('getTransactionSender() given 2 gas (runs out)', sel('getTransactionSender()'), { gas: '02' }),
+    context('getTransactionSender() given 3 gas', sel('getTransactionSender()'), { gas: '03' }),
+    context('getTransactionSender() sent value', sel('getTransactionSender()'), { kind: 'CALL', value: '01' }, { balance: 1n }),
+    context("getTransactionSender() run as the caller's code (DELEGATECALL)", sel('getTransactionSender()'), { kind: 'DELEGATECALL' }),
+    { label: 'Base TxContext getTransactionSender(), a transaction straight to it', to: `0x${TX_CONTEXT}`, data: sel('getTransactionSender()') },
   ];
 }
 
@@ -594,6 +658,7 @@ async function check(chainId: number): Promise<Report> {
     const common = createCustomCommon({ chainId }, Mainnet, { hardfork: (amsterdam ? 'amsterdam' : profile.hardfork) as never });
     const own = new Set([...getActivePrecompiles(common).keys()].map(k => `0x${k}`)), forwards = new Set((profile.forwardedPrecompiles ?? []).map(a => a.toLowerCase()));
     for (const p of timedPrecompilesAt(profile, BigInt(head.timestamp))) own.add(p.address);
+    for (const a of chainPrecompilesAt(chainId, BigInt(head.timestamp))) own.add(a);
     // (Base's registries run from their Solidity references: said apart.)
     for (const [address, name] of rules.precompiles) if (!own.has(address) && !forwards.has(address)) (hasReference(chainId, address) ? report.referenced : report.nodeOnly).push(`${name} ${address}`);
     const next = config?.next;
@@ -632,6 +697,7 @@ async function check(chainId: number): Promise<Report> {
     ...(profile.hardfork === 'cancun' ? [] : await authorizationPrograms(chainId)),
     ...(profile.arbitrum ? arbosPrograms() : []),
     ...(chainId === 8453 ? b20Programs() : []),
+    ...(chainId === 8453 ? baseAaPrograms() : []),
   ];
   if (!ONLY_FUZZ) await compare(chain, chainId, programs, report);
   // --fuzz N: as many random programs again (see fuzzPrograms), from --seed.
