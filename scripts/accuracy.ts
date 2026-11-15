@@ -30,7 +30,7 @@
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { millisecondsOf } from '../src/block.ts';
-import { parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { NATIVE_LOG_ADDRESS, parseLogs, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import type { SimulationRequest, SimulationResult, Simulator } from '../src/types.ts';
 import { recoverAuthorizationAddress } from 'viem/utils';
@@ -172,7 +172,12 @@ async function replay(b: B, seen?: Set<string>) {
     // what other transactions of the block paid it directly (a bot funded just before it acts, say).
     const bal = async (tag: string) => BigInt(String(await rpc.call(CHAIN, 'eth_getBalance', [from, tag])));
     const paidIn = b.transactions.filter(x => x.hash !== t.hash && x.to?.toLowerCase() === from && receipts.find(y => y.transactionHash === x.hash)?.status === '0x1').reduce((sum, x) => sum + BigInt(x.value), 0n);
-    const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice) + extraFee(r) - paidIn;
+    // A chain that logs its native transfers itself (EIP-7708: Sepolia, from Glamsterdam on) has every one the block's
+    // other transactions made to or from the sender in their receipts, a contract's as well as a transaction's own
+    // value: those are left out instead (a smart account handing back the wei the sender had just sent it, from a
+    // bundle later in the block: Sepolia, 2026-11-13), and the simulated reruns below aren't needed.
+    const nativeLogged = receipts.some(x => x.logs.some(l => l.address.toLowerCase() === NATIVE_LOG_ADDRESS));
+    const nativeActual = (await bal(b.number)) - (await bal(parent)) + BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice) + extraFee(r) - (nativeLogged ? others.get('native') ?? 0n : paidIn);
     const approvals = logs.approvals.filter(a => a.owner === from && !(a.kind === 'erc721' && /^0x0{40}$/.test(a.spender))).map(a => `${a.kind}:${a.token}:${a.spender}`);
     const row: Record<string, unknown> = { hash: t.hash, block: n, index, to: t.to, selector: t.input.slice(0, 10), receipt: r.status === '0x1' ? 'success' : 'reverted', receiptGas: (BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0)).toString(), receiptTotal: BigInt(r.gasUsed).toString(), receiptL1: BigInt(r.gasUsedForL1 ?? 0).toString() };
     // The block's earlier transactions, the chain's own left out, except an OP Stack block's L1 info deposit (its
@@ -230,7 +235,8 @@ async function replay(b: B, seen?: Set<string>) {
           ...(res.stateReadError && { unread: res.stateReadError }),
         };
         // A native change that differs: what the block's other transactions sent the sender through a contract (a
-        // builder's rebate, a contract paying it out) moves its balance too, with no log to show it. The block's
+        // builder's rebate, a contract paying it out) moves its balance too, with no log to show it (on a chain that
+        // doesn't log native transfers: nativeLogged above has them from the receipts). The block's
         // earlier transactions were simulated with it, and the rest of the block is simulated after it; what those
         // calls moved for the sender (traceTransfers, their own values included, so not paidIn as well) is left out of
         // the actual change.
@@ -239,11 +245,11 @@ async function replay(b: B, seen?: Set<string>) {
         // on Base, 2026-11-10: the balance moved by the payout less the L2 gas, to the wei). The simulation is then
         // right, and the harness's adding of the fee back is what's off.
         if (!cell.native && OP_STACK.has(CHAIN) && r.l1Fee && res.status === 'success' && nativeGot === nativeActual - BigInt(r.l1Fee)) { cell.native = true; cell.l1FeeNotCharged = true; }
-        if (!cell.native && name === 'eth_simulateV1' && res.status === 'success') {
+        if (!cell.native && name === 'eth_simulateV1' && res.status === 'success' && !nativeLogged) {
           const earlier = out.slice(0, -1).reduce((sum, x) => sum + (net(x.transfers, from).get('native') ?? 0n), 0n);
           if (earlier !== 0n) { cell.nativeEarlier = earlier.toString(); cell.native = nativeGot === nativeActual + paidIn - earlier; }
         }
-        if (!cell.native && name === 'eth_simulateV1' && res.status === 'success') {
+        if (!cell.native && name === 'eth_simulateV1' && res.status === 'success' && !nativeLogged) {
           try {
             // Without their gas limits (together they can exceed the block's) or prices (unlimited gas at a price is
             // more than a sender has): only what they send the sender matters here, not their fees.

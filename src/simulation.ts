@@ -526,9 +526,9 @@ export class RpcSimulator implements Simulator {
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
     // The native coin: what the balance moved beyond the logged transfers (and the gas a priced run's sender paid,
-    // exactly its gas used at its price on every node, 2026-11-12) is added as a transfer of its own, the logged
-    // ones kept for whom they name. Not for a blob call (its blob gas is paid too), nor the block's fee recipient
-    // (paid the tips).
+    // exactly its gas used at its price on every node, 2026-11-12, an EIP-7702 call's too as priceFields prices it,
+    // 2026-11-15) is added as a transfer of its own, the logged ones kept for whom they name. Not for a blob call
+    // (its blob gas is paid too), nor the block's fee recipient (paid the tips).
     const recipient = blockOverrides?.feeRecipient?.toLowerCase();
     const unloggedNative = (p: SimulationResult, i: number, owner: string, x: bigint, y: bigint, gasUsed = p.gasUsed) => {
       if (reqs[i].blobVersionedHashes?.length || owner === recipient) return;

@@ -137,3 +137,34 @@ test('Signed authorizations go to eth_simulateV1 as they are, and their authorit
     { now: NOW, stateOverrides: { [me.address]: { balance: '0x5' } } }, { ...deps, simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
   assert.deepEqual(sent!.params[0].blockStateCalls[0].stateOverrides?.[me.address.toLowerCase()], { balance: '0x5' });
 });
+
+test('A priced EIP-7702 call goes to the node with a fee cap and tip, which reth-based nodes charge (a gasPrice they leave out)', async () => {
+  // As Ethereum's, Base's, OP Mainnet's, BNB Chain's and Sepolia's public nodes do (2026-11-15): a call with an
+  // authorization list is built as a type-4 transaction, which has no gasPrice, so one priced with gasPrice alone ran
+  // at no price. The sender's balance read after it then showed the fee it should have paid as coin received.
+  const me = privateKeyToAccount('0x7777777777777777777777777777777777777777777777777777777777777777');
+  const a = await me.signAuthorization({ address: DELEGATE as Hex, chainId: 1, nonce: 3 });
+  const auth = { address: a.address, chainId: toHex(a.chainId), nonce: toHex(a.nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) };
+  type Call = { from: string; to?: string; data: string; gasPrice?: string; maxFeePerGas?: string; maxPriorityFeePerGas?: string; authorizationList?: unknown[] };
+  const priced: Call[] = [];
+  const fetchImpl = (async (_u: string, init: RequestInit) => {
+    const { params } = JSON.parse(String(init.body)) as { params: [{ blockStateCalls: { calls: Call[] }[] }] };
+    let balance = 10n ** 18n;
+    const calls = params[0].blockStateCalls[0].calls.map(c => {
+      // Multicall3's getEthBalance: the sender's balance as it stands.
+      if (c.data.startsWith('0x4d2301cc')) return { status: '0x1', gasUsed: '0x0', returnData: toHex(balance, { size: 32 }), logs: [] };
+      if (c.from.toLowerCase() !== me.address.toLowerCase()) return { status: '0x1', gasUsed: '0x0', returnData: toHex(0n, { size: 32 }), logs: [] };
+      priced.push(c);
+      const price = c.authorizationList?.length && c.maxFeePerGas === undefined ? 0n : BigInt(c.gasPrice ?? c.maxFeePerGas ?? '0x0');
+      balance -= 46_000n * price;
+      return { status: '0x1', gasUsed: toHex(46_000n), returnData: '0x', logs: [] };
+    });
+    return new Response(JSON.stringify({ result: [{ calls }] }));
+  }) as typeof fetch;
+  const { RpcSimulator } = await import('../src/simulation.ts');
+  const res = await new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }).simulate({ chainId: 1, from: me.address.toLowerCase(), to: me.address, data: '0x', value: 0n, gas: 100_000n, gasPrice: 3n * 10n ** 9n, authorizationList: [auth] });
+  assert.equal(res?.balancesRead, true);
+  assert.deepEqual(res?.transfers.filter(t => t.asset === 'native'), [], 'the gas paid is no coin moved');
+  for (const c of priced) assert.deepEqual([c.gasPrice, c.maxFeePerGas, c.maxPriorityFeePerGas], [undefined, '0xb2d05e00', '0xb2d05e00']);
+  assert.equal(priced.length, 2, 'the run, and the run with the reads around it');
+});

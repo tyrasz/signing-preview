@@ -340,6 +340,12 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   assert.deepEqual(priceFields({ gasPrice: 7n }), { gasPrice: '0x7' });
   assert.deepEqual(priceFields({}), {});
   assert.deepEqual(priceFields({ gasPrice: 7n, blobVersionedHashes: [H(1)], maxFeePerBlobGas: 9n }), { blobVersionedHashes: [H(1)], maxFeePerBlobGas: '0x9', maxFeePerGas: '0x7', maxPriorityFeePerGas: '0x7' });
+  // So does an EIP-7702 transaction's price, signed or yet to be: reth-based nodes build such a call as a type-4
+  // transaction and leave a gasPrice out (it ran at no price, its sender paying nothing).
+  assert.deepEqual(priceFields({ gasPrice: 7n, authorizationList: [{}] }), { maxFeePerGas: '0x7', maxPriorityFeePerGas: '0x7' });
+  assert.deepEqual(priceFields({ gasPrice: 7n, unsignedAuthorizations: [{}] }), { maxFeePerGas: '0x7', maxPriorityFeePerGas: '0x7' });
+  assert.deepEqual(priceFields({ gasPrice: 7n, authorizationList: [] }), { gasPrice: '0x7' });
+  assert.deepEqual(priceFields({ authorizationList: [{}] }), {});
   // Arbitrum keeps the ArbOS version in the header field other chains use for randomness: it isn't overridden.
   const header = { number: 100n, timestamp: 5n, coinbase: BOB, gasLimit: 1n, baseFeePerGas: 2n, prevRandao: H(1) as `0x${string}` };
   assert.deepEqual(nodeOverrides(header), { time: '0x5', feeRecipient: BOB, prevRandao: H(1), baseFeePerGas: '0x2' });

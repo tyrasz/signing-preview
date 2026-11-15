@@ -339,13 +339,21 @@ export function blockText(number: bigint, time: number): string {
 }
 
 /**
- * A request's price as eth_simulateV1 call fields: its gas price, or for a blob transaction (whose blob hashes nodes
- * take only with EIP-1559 fees and a blob fee cap) that price as both fee cap and tip, which comes to the same.
+ * A request's price as eth_simulateV1 call fields: its gas price, or that price as both fee cap and tip, which comes
+ * to the same (the price paid is the lesser of the cap and the base fee plus the tip), for
+ * - a blob transaction, whose blob hashes nodes take only with EIP-1559 fees and a blob fee cap;
+ * - an EIP-7702 transaction (authorizations signed or yet to be): reth nodes (Ethereum's, Base's, OP Mainnet's and
+ *   BNB Chain's public ones, and Sepolia's public endpoint when a reth backend answers: it is part reth, part Geth;
+ *   2026-11-15) build a call with an authorization list as a type-4 transaction, which has no gasPrice field, and
+ *   leave that out: the call ran at no price, its sender paid no gas and GASPRICE read 0 (Arbitrum's, Polygon's and
+ *   Geth nodes charged it). Priced so, every one of them charges the price.
  */
-export function priceFields(req: { gasPrice?: bigint; blobVersionedHashes?: string[]; maxFeePerBlobGas?: bigint }): Record<string, unknown> {
+export function priceFields(req: { gasPrice?: bigint; blobVersionedHashes?: string[]; maxFeePerBlobGas?: bigint; authorizationList?: unknown[]; unsignedAuthorizations?: unknown[] }): Record<string, unknown> {
   const hex = (v: bigint) => `0x${v.toString(16)}`;
-  if (!req.blobVersionedHashes?.length) return req.gasPrice !== undefined ? { gasPrice: hex(req.gasPrice) } : {};
-  return { blobVersionedHashes: req.blobVersionedHashes, maxFeePerBlobGas: hex(req.maxFeePerBlobGas ?? 1n), ...(req.gasPrice !== undefined && { maxFeePerGas: hex(req.gasPrice), maxPriorityFeePerGas: hex(req.gasPrice) }) };
+  const capAndTip = req.gasPrice !== undefined ? { maxFeePerGas: hex(req.gasPrice), maxPriorityFeePerGas: hex(req.gasPrice) } : {};
+  if (req.blobVersionedHashes?.length) return { blobVersionedHashes: req.blobVersionedHashes, maxFeePerBlobGas: hex(req.maxFeePerBlobGas ?? 1n), ...capAndTip };
+  if (req.authorizationList?.length || req.unsignedAuthorizations?.length) return capAndTip;
+  return req.gasPrice !== undefined ? { gasPrice: hex(req.gasPrice) } : {};
 }
 
 /**
