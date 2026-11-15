@@ -39,6 +39,12 @@
 //     token hasn't. The factory writes no flag, and answers isB20Initialized by whether the token exists, as the
 //     chain does (measured: true for a created token, false for an address with none). It etches the chain's
 //     marker, not the reference's code.
+//   - in that window the reference let the factory skip every role check, where the chain's burn, burnWithMemo
+//     and seizeWithMemo check theirs (measured: a creation whose init call burns or seizes fails
+//     AccessControlUnauthorizedAccount of the factory and BURN_ROLE or SEIZE_ROLE, after the pause check and
+//     before the function's own checks, charged the role's read, unless an earlier init call granted the factory
+//     the role): they check it here too (onlyRoleHeld), and the window's other role-gated functions (mint,
+//     burnBlocked, the grants, pause, the setters, the multiplier's functions, announce) skip it, as on the chain;
 //   - permit to spender 0 (after the nonce is written, as the chain writes it once the signature verifies): the
 //     chain refuses it (InvalidSpender), the reference didn't;
 //   - MAX_SUPPLY_CAP() and the policy registry's ALWAYS_ALLOW_ID() and ALWAYS_BLOCK_ID() are the references' own:
@@ -163,6 +169,22 @@ const PATCHES: Record<string, [string, string][]> = {
         if (account != address(0)) _grantRole(DEFAULT_ADMIN_ROLE, account);
     }
 `],
+    // burn, burnWithMemo and seizeWithMemo check the caller's role in the bootstrap window too, as the chain's do
+    // (measured on Base's node: a creation whose init call burns or seizes fails AccessControlUnauthorizedAccount
+    // of the factory and BURN_ROLE or SEIZE_ROLE, after the pause check and before the function's own checks, the
+    // role's flag read; it goes through once an init call has granted the factory the role, and is refused again
+    // once one has revoked it). The window's other role-gated functions (mint, mintWithMemo, batchMint, burnBlocked,
+    // the grants, pause and unpause, the setters, the multiplier's, announce) skip the check, as the chain's do.
+    ['    modifier onlyRoleAdmin(bytes32 role) {\n', `    modifier onlyRoleHeld(bytes32 role) {
+        if (!hasRole(role, msg.sender)) revert AccessControlUnauthorizedAccount(msg.sender, role);
+        _;
+    }
+
+    modifier onlyRoleAdmin(bytes32 role) {
+`],
+    ['    function burn(uint256 amount) external whenNotPaused(PausableFeature.BURN) onlyRole(BURN_ROLE) {\n', '    function burn(uint256 amount) external whenNotPaused(PausableFeature.BURN) onlyRoleHeld(BURN_ROLE) {\n'],
+    ['        whenNotPaused(PausableFeature.BURN)\n        onlyRole(BURN_ROLE)\n', '        whenNotPaused(PausableFeature.BURN)\n        onlyRoleHeld(BURN_ROLE)\n'],
+    ['        whenNotPaused(PausableFeature.SEIZE)\n        onlyRole(SEIZE_ROLE)\n', '        whenNotPaused(PausableFeature.SEIZE)\n        onlyRoleHeld(SEIZE_ROLE)\n'],
     ['    uint256 public constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;', '    uint256 internal constant MAX_SUPPLY_CAP = B20Constants.MAX_SUPPLY_CAP;'],
     // transferFrom and transferFromWithMemo: the chain checks the allowance first, and writes it after the transfer
     // and its Transfer event (before transferFromWithMemo's Memo), where the reference wrote it before the transfer

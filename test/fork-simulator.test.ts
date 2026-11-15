@@ -655,6 +655,41 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   const [, symbol, held, again] = (await base.simulateBatch([create, { ...create, to: NEW, data: encodeFunctionData({ abi: readNew, functionName: 'symbol' }) }, { ...create, to: NEW, data: encodeFunctionData({ abi: readNew, functionName: 'balanceOf', args: [USER as Hex] }) }, create]))!;
   assert.deepEqual([decodeFunctionResult({ abi: readNew, functionName: 'symbol', data: symbol.returnData! as Hex }), BigInt(held.returnData!)], ['NEW', 1_000n]);
   assert.deepEqual([again.status, again.returnData?.slice(0, 10)], ['reverted', '0x15ef3a57']);
+  // In the bootstrap window an init call skips its role's check, as the mint above did, but for burn, burnWithMemo
+  // and seizeWithMemo, which check it as the chain's do: such a creation fails AccessControlUnauthorizedAccount of
+  // the factory and BURN_ROLE or SEIZE_ROLE (measured on Base's node), after the pause check and before the
+  // function's own checks (a burn with no balance, a seize to the zero address: refused for the role too), the
+  // role's flag read (2,100 cold); granted the role by an earlier init call, the burn goes through, or fails for its
+  // own reasons (more than the balance: InsufficientBalance). burnBlocked keeps the window's bypass, as on the chain:
+  // it fails for the account, which no policy blocks (AccountNotBlocked).
+  const token = parseAbi(['function burn(uint256)', 'function burnWithMemo(uint256,bytes32)', 'function seizeWithMemo(address,address,uint256,bytes32)', 'function burnBlocked(address,uint256)', 'function grantRole(bytes32,address)', 'function pause(uint8[])']);
+  const tokenCall = (functionName: string, args: unknown[]) => encodeFunctionData({ abi: token, functionName: functionName as never, args: args as never });
+  const mintTo = (to: string) => encodeFunctionData({ abi: parseAbi(['function mint(address,uint256)']), functionName: 'mint', args: [to as Hex, 5n] });
+  // (Each its own salt: a trace's requests run one after another, and a token made can't be made again.)
+  let salts = 0;
+  const creating = (inits: Hex[]): SimulationRequest => ({ ...create, data: encodeFunctionData({ abi: factory, functionName: 'createB20', args: [0, `0x${(++salts).toString(16).padStart(64, '2')}`, params, inits] }) });
+  const refused = (role: string) => `0xe2517d3f${FACTORY.slice(2).padStart(64, '0')}${keccak256(toHex(role)).slice(2)}`;
+  const memo = `0x${'4d'.repeat(32)}` as Hex;
+  const [burnt, burntWithMemo, seized, unfunded, paused, burnGranted, blocked, burntRead, seizedToNobody, overBurnt] = (await base.trace([
+    creating([mintTo(FACTORY), tokenCall('burn', [1n])]),
+    creating([mintTo(FACTORY), tokenCall('burnWithMemo', [1n, memo])]),
+    creating([mintTo(BOB), tokenCall('seizeWithMemo', [BOB, USER, 1n, memo])]),
+    creating([tokenCall('burn', [1n])]),
+    creating([tokenCall('pause', [[2]]), tokenCall('burn', [1n])]),
+    creating([mintTo(FACTORY), tokenCall('grantRole', [keccak256(toHex('BURN_ROLE')), FACTORY]), tokenCall('burn', [1n])]),
+    creating([mintTo(BOB), tokenCall('burnBlocked', [BOB, 1n])]),
+    creating([mintTo(FACTORY)]),
+    creating([tokenCall('seizeWithMemo', [BOB, '0x0000000000000000000000000000000000000000', 1n, memo])]),
+    creating([mintTo(FACTORY), tokenCall('grantRole', [keccak256(toHex('BURN_ROLE')), FACTORY]), tokenCall('burn', [6n])]),
+  ]))!;
+  assert.deepEqual([burnt, burntWithMemo, unfunded].map(r => [r.status, r.returnData]), Array(3).fill(['reverted', refused('BURN_ROLE')]));
+  assert.deepEqual([seized, seizedToNobody].map(r => [r.status, r.returnData]), Array(2).fill(['reverted', refused('SEIZE_ROLE')]));
+  assert.deepEqual([paused.status, paused.returnData], ['reverted', `0xfd8c4245${'2'.padStart(64, '0')}`]);
+  assert.deepEqual([burnGranted.status, blocked.status, blocked.returnData?.slice(0, 10)], ['success', 'reverted', '0x64a5cb46']);
+  assert.deepEqual([overBurnt.status, overBurnt.returnData?.slice(0, 10)], ['reverted', '0xdb42144d']);
+  // Refused, the burn is charged its init call (124) and the role's cold read (2,100) over the mint's creation alone,
+  // nothing of its balance; burnWithMemo 6 more, its memo's word.
+  assert.deepEqual([burnt.trace!.gasUsed - burntRead.trace!.gasUsed, burntWithMemo.trace!.gasUsed - burnt.trace!.gasUsed], [2_224n, 6n]);
   // A transaction sent from the factory's own address, which only a simulation can send, is any caller's, as on
   // Base's node, whose factory is native code: the token's bootstrap window is open to the factory only as it
   // creates the token (above, its init call's mint). A mint is refused for the role (AccessControlUnauthorizedAccount
