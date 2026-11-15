@@ -64,7 +64,7 @@ const OPS: Record<string, string> = {
   STOP: '00', SUB: '03', EXP: '0a', SHL: '1b', KECCAK256: '20', BALANCE: '31', CALLER: '33', CALLDATASIZE: '36', CALLDATACOPY: '37', RETURNDATASIZE: '3d', RETURNDATACOPY: '3e',
   EXTCODESIZE: '3b', EXTCODEHASH: '3f', BLOCKHASH: '40', NUMBER: '43', POP: '50', MLOAD: '51', SWAP1: '90',
   MSTORE: '52', SLOAD: '54', SSTORE: '55', GAS: '5a', TLOAD: '5c', TSTORE: '5d', MCOPY: '5e', LOG2: 'a2', CREATE: 'f0', CALL: 'f1', RETURN: 'f3', DELEGATECALL: 'f4', CREATE2: 'f5',
-  STATICCALL: 'fa', CALLCODE: 'f2', MSTORE8: '53', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47', GASPRICE: '3a', COINBASE: '41', BASEFEE: '48',
+  STATICCALL: 'fa', CALLCODE: 'f2', MSTORE8: '53', REVERT: 'fd', INVALID: 'fe', SELFDESTRUCT: 'ff', LOG1: 'a1', ADDRESS: '30', SELFBALANCE: '47', GASPRICE: '3a', COINBASE: '41', BASEFEE: '48', CALLVALUE: '34',
 };
 const asm = (source: string): Hex => `0x${source.trim().split(/\s+/).map(t => {
   if (OPS[t]) return OPS[t];
@@ -162,9 +162,10 @@ function crafted(amsterdam: boolean): Program[] {
 /**
  * A contract that passes its calldata to a precompile and returns four words: whether the call succeeded, the gas
  * it spent, how many bytes came back, and their hash. Called directly, a cheap precompile's price hides under the
- * calldata floor every transaction pays; measured from inside, it doesn't.
+ * calldata floor every transaction pays; measured from inside, it doesn't. `gas`: what the call is given (a hex
+ * number), where not all it can be.
  */
-const caller = (target: number): Hex => asm(`CALLDATASIZE 00 00 CALLDATACOPY GAS 00 00 CALLDATASIZE 00 ${target.toString(16).padStart(target > 0xff ? 4 : 2, '0')} GAS STATICCALL GAS
+const caller = (target: number, op: 'STATICCALL' | 'CALL' | 'DELEGATECALL' | 'CALLCODE' = 'STATICCALL', gas = 'GAS'): Hex => asm(`CALLDATASIZE 00 00 CALLDATACOPY GAS 00 00 CALLDATASIZE 00 ${op === 'CALL' || op === 'CALLCODE' ? 'CALLVALUE ' : ''}${target.toString(16).padStart(target > 0xffff ? 6 : target > 0xff ? 4 : 2, '0')} ${gas} ${op} GAS
   SWAP1 00 MSTORE SWAP1 SUB 20 MSTORE RETURNDATASIZE 40 MSTORE RETURNDATASIZE 00 80 RETURNDATACOPY RETURNDATASIZE 80 KECCAK256 60 MSTORE 80 00 RETURN`);
 
 /** The precompiles, each with an input it accepts. Where an input is wrong for a chain, the node and the local EVM should refuse it alike. */
@@ -267,10 +268,71 @@ function fuzzPrograms(count: number, seed: number): Program[] {
  */
 function arbosPrograms(): Program[] {
   const of = (name: string, address: number, methods: string[]): Program[] => methods.map(m => ({ precompile: true, label: `${name}.${m}`, code: caller(address), data: toFunctionSelector(`function ${m}`) }));
+  // ArbSys's sends to L1, which the local EVM runs itself: each from a contract that passes on the value it is sent
+  // (or calls in a static or delegate call), reporting the gas the call spent and what it returned; their events
+  // (L2ToL1Tx, and a SendMerkleUpdate for each level of the tree merged) are compared too. The programs of a block
+  // run in turn on one tree, so they merge different numbers of levels from one run to the next.
+  const word = (n: bigint | number) => BigInt(n).toString(16).padStart(64, '0'), DESTINATION = '00000000000000000000000000000000000000d5';
+  const withdraw = `${toFunctionSelector('function withdrawEth(address)')}${word(BigInt(`0x${DESTINATION}`))}` as Hex;
+  const send = (bytes: number) => `${toFunctionSelector('function sendTxToL1(address,bytes)')}${word(BigInt(`0x${DESTINATION}`))}${word(64)}${word(bytes)}${'5e'.repeat(bytes).padEnd(Math.ceil(bytes / 32) * 64, '0')}` as Hex;
+  const sending = (label: string, data: Hex, value: bigint, op: 'CALL' | 'STATICCALL' | 'DELEGATECALL' | 'CALLCODE' = 'CALL'): Program => ({ precompile: true, label: `ArbSys.${label}`, code: caller(0x64, op), data, value });
+  const ticket = word(0xdeadn);
+  // What ArbOS checks before a method runs, which the chain's answer to a plain eth_call can't show: a method that
+  // writes in a static call (or in a call made inside one), one that isn't pure in a delegate call or callcode,
+  // value to one that isn't payable. The node's call fails with nothing and burns all it was given (a revert at
+  // 1,600 for ArbFilteredTransactionsManager); a pure method runs in a delegate call.
+  const called = (label: string, address: number, method: string, args: string, op: 'CALL' | 'STATICCALL' | 'DELEGATECALL' | 'CALLCODE', value?: bigint): Program =>
+    ({ precompile: true, label, code: caller(address, op), data: `${toFunctionSelector(`function ${method}`)}${args}` as Hex, ...(value && { value }) });
+  // A contract that STATICCALLs the one placed at INNER with its calldata and returns what it returned.
+  const INNER = '00000000000000000000000000000000c0de7a11';
+  const throughStatic = asm(`CALLDATASIZE 00 00 CALLDATACOPY 00 00 CALLDATASIZE 00 ${INNER} GAS STATICCALL POP RETURNDATASIZE 00 00 RETURNDATACOPY RETURNDATASIZE 00 RETURN`);
   return [
     ...of('ArbSys', 0x64, ['arbBlockNumber()', 'arbChainID()', 'arbOSVersion()', 'isTopLevelCall()', 'getStorageGasAvailable()']),
     // (Not getCurrentTxL1GasFees(): what it returns is the call's own, which differs between the two runs.)
     ...of('ArbGasInfo', 0x6c, ['getPricesInWei()', 'getL1BaseFeeEstimate()', 'getMinimumGasPrice()', 'getPricesInArbGas()', 'getGasAccountingParams()', 'getL1GasPriceEstimate()']),
+    sending('withdrawEth, 1 wei', withdraw, 1n), sending('withdrawEth, nothing sent', withdraw, 0n), sending('sendTxToL1, no data', send(0), 0n),
+    sending('sendTxToL1, 33 bytes and 7 wei', send(33), 7n), sending('sendTxToL1, 300 bytes', send(300), 0n),
+    sending('withdrawEth in a static call', withdraw, 0n, 'STATICCALL'), sending('withdrawEth in a delegate call', withdraw, 0n, 'DELEGATECALL'), sending('withdrawEth with no argument', withdraw.slice(0, 10) as Hex, 0n),
+    // ArbRetryableTx's writes of a ticket that doesn't exist (the node's NoTicketWithID(), at its price; one that
+    // exists is refused locally); ArbFilteredTransactionsManager (0x74), ArbNativeTokenManager (0x73) and ArbosActs.
+    ...['redeem(bytes32)', 'keepalive(bytes32)', 'cancel(bytes32)', 'getTimeout(bytes32)'].map(m => ({ precompile: true, label: `ArbRetryableTx.${m} of no ticket`, code: caller(0x6e, 'CALL'), data: `${toFunctionSelector(`function ${m}`)}${ticket}` as Hex })),
+    { precompile: true, label: 'ArbFilteredTransactionsManager.isTransactionFiltered', code: caller(0x74), data: `${toFunctionSelector('function isTransactionFiltered(bytes32)')}${ticket}` as Hex },
+    { precompile: true, label: 'ArbFilteredTransactionsManager.addFilteredTransaction (not a filterer)', code: caller(0x74, 'CALL'), data: `${toFunctionSelector('function addFilteredTransaction(bytes32)')}${ticket}` as Hex },
+    { precompile: true, label: 'ArbNativeTokenManager.mintNativeToken', code: caller(0x73, 'CALL'), data: `${toFunctionSelector('function mintNativeToken(uint256)')}${word(1)}` as Hex },
+    { precompile: true, label: 'ArbosActs.startBlock (not ArbOS)', code: caller(0xa4b05, 'CALL'), data: `${toFunctionSelector('function startBlock(uint256,uint64,uint64,uint64)')}${word(1)}${word(2)}${word(3)}${word(4)}` as Hex },
+    called('ArbRetryableTx.redeem of no ticket in a static call', 0x6e, 'redeem(bytes32)', ticket, 'STATICCALL'),
+    called('ArbRetryableTx.cancel of no ticket in a static call', 0x6e, 'cancel(bytes32)', ticket, 'STATICCALL'),
+    { precompile: true, label: 'ArbRetryableTx.redeem of no ticket, by a call made inside a static call', code: throughStatic, data: `${toFunctionSelector('function redeem(bytes32)')}${ticket}` as Hex, state: { [`0x${INNER}`]: { code: caller(0x6e, 'CALL') } } },
+    called('ArbRetryableTx.keepalive of no ticket in a delegate call', 0x6e, 'keepalive(bytes32)', ticket, 'DELEGATECALL'),
+    called('ArbRetryableTx.getTimeout of no ticket in a delegate call', 0x6e, 'getTimeout(bytes32)', ticket, 'DELEGATECALL'),
+    called('ArbRetryableTx.redeem of no ticket, 1 wei', 0x6e, 'redeem(bytes32)', ticket, 'CALL', 1n),
+    called('ArbRetryableTx.getBeneficiary of no ticket, 1 wei', 0x6e, 'getBeneficiary(bytes32)', ticket, 'CALL', 1n),
+    called('ArbSys.arbBlockHash of a future block, 1 wei', 0x64, 'arbBlockHash(uint256)', word(1n << 40n), 'CALL', 1n),
+    called('ArbSys.arbBlockHash of a future block in a delegate call', 0x64, 'arbBlockHash(uint256)', word(1n << 40n), 'DELEGATECALL'),
+    called('ArbSys.arbBlockNumber in a delegate call', 0x64, 'arbBlockNumber()', '', 'DELEGATECALL'),
+    called('ArbSys.mapL1SenderContractAddressToL2Alias (pure) in a delegate call', 0x64, 'mapL1SenderContractAddressToL2Alias(address,address)', `${word(0xd5n)}${word(0xd5n)}`, 'DELEGATECALL'),
+    called('ArbAddressTable.register in a static call', 0x66, 'register(address)', word(0xd5n), 'STATICCALL'),
+    called('ArbFilteredTransactionsManager.isTransactionFiltered, 1 wei', 0x74, 'isTransactionFiltered(bytes32)', ticket, 'CALL', 1n),
+    called('ArbFilteredTransactionsManager.isTransactionFiltered in a delegate call', 0x74, 'isTransactionFiltered(bytes32)', ticket, 'DELEGATECALL'),
+    sending('withdrawEth by callcode', withdraw, 0n, 'CALLCODE'),
+    // Errors a method raises keep what it wasn't charged, with no data as with data to decode (the node is asked
+    // what each was charged): an address ArbAddressTable hasn't (1,603), an index too large for it (803), an
+    // account that isn't a batch poster (1,603), a contract that isn't a Stylus program (ProgramNotActivated(), 4,306).
+    called('ArbAddressTable.lookup of an address it hasn\'t', 0x66, 'lookup(address)', word(0xd5n), 'CALL'),
+    called('ArbAddressTable.lookupIndex of 2^200', 0x66, 'lookupIndex(uint256)', word(1n << 200n), 'CALL'),
+    called('ArbAggregator.getFeeCollector of an account that isn\'t a batch poster', 0x6d, 'getFeeCollector(address)', word(0xd5n), 'STATICCALL'),
+    called('ArbWasm.programVersion of an account that isn\'t a program', 0x71, 'programVersion(address)', word(0xd5n), 'STATICCALL'),
+    // Calldata to ArbRetryableTx's writes short of a ticket id, which ArbOS can't decode: the node's call burns all it
+    // was given (refused locally as a ticket that exists, until 2026-11-15). 0x6a, where Arbitrum One lists no
+    // precompile: an empty account, called with value, in a delegate call and by callcode (forwarded as ArbOS's, and
+    // turned away, before). ArbosTest.burnArbGas of more than the call is given (10,000): all of it, and it succeeds.
+    called('ArbRetryableTx.redeem with no argument', 0x6e, 'redeem(bytes32)', '', 'CALL'),
+    called('ArbRetryableTx.cancel with 31 bytes of argument', 0x6e, 'cancel(bytes32)', ticket.slice(0, 62), 'CALL'),
+    called('0x6a (no precompile) with 1 wei', 0x6a, 'foo()', '', 'CALL', 1n),
+    called('0x6a (no precompile) in a delegate call', 0x6a, 'foo()', '', 'DELEGATECALL'),
+    called('0x6a (no precompile) by callcode', 0x6a, 'foo()', '', 'CALLCODE'),
+    { precompile: true, label: 'ArbosTest.burnArbGas of 20,000 on 10,000', code: caller(0x69, 'CALL', '2710'), data: `${toFunctionSelector('function burnArbGas(uint256)')}${word(20_000)}` as Hex },
+    { precompile: true, label: 'ArbosTest.burnArbGas of 2^64 - 1 on 10,000, in a static call', code: caller(0x69, 'STATICCALL', '2710'), data: `${toFunctionSelector('function burnArbGas(uint256)')}${word((1n << 64n) - 1n)}` as Hex },
   ];
 }
 
@@ -643,11 +705,13 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
         : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && !batch[j].priced && node.kind === 'runs' && local.kind === 'runs' && beyond(node.gas - local.gas - l1Charge, batch[j].random ? l1Charge : 0n) && !EXPECTED[chainId]?.[batch[j].label]);
       // Events are compared where the node reports them (not through eth_call).
       const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
-      // A precompile's caller returns four words. Where the precompile's call failed it burnt all the gas it was
-      // given, which on Arbitrum follows from what the node charged before it: that word is left out there.
+      // A precompile's caller returns four words. Where the precompile's call failed burning all the gas it was
+      // given, which on Arbitrum follows from what the node charged before it, that word is left out there: where
+      // both burnt all (more than half the program's gas). One that failed keeping the rest (ArbOS's errors) is
+      // compared to the unit.
       const words = (o: Outcome) => (batch[j].precompile && o.kind === 'runs' && o.returns.length === 2 + 4 * 64 ? [0, 1, 2, 3].map(k => BigInt(`0x${o.returns.slice(2 + 64 * k, 66 + 64 * k)}`)) : undefined);
-      const nodeWords = words(node), localWords = words(local);
-      if (!compareGas && nodeWords && localWords && nodeWords[0] === 0n && localWords[0] === 0n) { node.returns = local.returns = `0x${[nodeWords[0], 0n, nodeWords[2], nodeWords[3]].map(w => w.toString(16).padStart(64, '0')).join('')}`; if (nodeWords[2] !== localWords[2] || nodeWords[3] !== localWords[3]) local.returns += '00'; }
+      const nodeWords = words(node), localWords = words(local), burntAll = (w: bigint[]) => w[0] === 0n && w[1] * 2n > (batch[j].gas ?? GAS);
+      if (!compareGas && nodeWords && localWords && burntAll(nodeWords) && burntAll(localWords)) { node.returns = local.returns = `0x${[nodeWords[0], 0n, nodeWords[2], nodeWords[3]].map(w => w.toString(16).padStart(64, '0')).join('')}`; if (nodeWords[2] !== localWords[2] || nodeWords[3] !== localWords[3]) local.returns += '00'; }
       const said = (o: Outcome, w: bigint[] | undefined) => (w ? `, the precompile ${w[0] ? 'succeeds' : 'fails'} spending ${w[1]} gas and returning ${w[2]} bytes (hash ${w[3].toString(16).slice(0, 10)}…)` : `, returns ${o.returns.slice(0, 74)}`);
       const returns = node.kind === local.kind && node.kind !== 'invalid' && node.returns !== local.returns;
       if (node.kind !== local.kind || returns || gas || logs) {

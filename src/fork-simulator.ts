@@ -16,7 +16,7 @@ import { createEVM, EVMError, getActivePrecompiles, paramsEVM, type EVM, type Pr
 import { Common, createCustomCommon, Hardfork, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
 import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
-import { keccak256 } from 'viem';
+import { decodeAbiParameters, keccak256 } from 'viem';
 import { createHash } from 'node:crypto';
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { recoverAuthorizationAddress } from 'viem/utils';
@@ -25,6 +25,7 @@ import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges 
 import { calldataCandidates } from './simulation-probe.ts';
 import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_BOOTSTRAP_SLOT, B20_FACTORY_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
 import { formatUnits } from './format.ts';
+import { ARBOS_STATE, ARBSYS, l1Send, SEND_TX_TO_L1, WITHDRAW_ETH } from './evm/arbos.ts';
 import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
@@ -54,8 +55,21 @@ export interface ChainProfile {
    * runs what it can compute itself and has the chain answer the rest (BNB Chain's: BSC_OWN).
    */
   ownPrecompiles?: Record<string, OwnPrecompile>;
-  /** Gas a forwarded precompile call costs. */
-  precompileGas?: (inputBytes: number, outputBytes: number, selector?: string) => bigint;
+  /** Gas a forwarded precompile call costs (`address`: which precompile, where they are priced apart). */
+  precompileGas?: (inputBytes: number, outputBytes: number, selector?: string, address?: string) => bigint;
+  /**
+   * Of the forwarded precompiles, those whose reverts can keep the gas they weren't charged (ArbOS's). The chain's
+   * answer to the forwarded eth_call doesn't say what the call cost, so where it is a revert the node is asked again,
+   * from a contract that reports the gas the call spent (REVERT_METER), and the local call is charged that: it keeps
+   * the rest where the node's call did (an error raised by the method, with data to decode, as ArbRetryableTx's
+   * NoTicketWithID(), or with none, as ArbAddressTable.lookup of an address it hasn't), and burns all it was given
+   * where the node's burnt all (ArbOS turned the call away before its method ran: a method it hasn't, arguments it
+   * can't decode) or where the charge is more than it was given. Where the node can't be asked, an error to decode
+   * keeps the rest at `precompileGas` and a revert with nothing burns all. What ArbOS checks of how it is called (a
+   * write in a static call, a delegate call or callcode, value) the forwarded eth_call can't show: the local EVM
+   * checks those itself (ARBOS_METHODS).
+   */
+  revertsKeepGas?: string[];
   /**
    * What the chain's opcode 0x44 returns: the block's mixHash (PREVRANDAO, the default), its difficulty (BNB Chain
    * and Polygon, whose blocks still carry one), or 1 (Arbitrum).
@@ -159,6 +173,7 @@ const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).to
  * call that fails (missing input, an unknown asset) uses all the gas it is given and returns nothing, also measured.
  */
 const hyperCoreReadGas = (input: number, output: number) => 1000n + 33n * BigInt(input + output);
+const low = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
 /**
  * What ArbOS's precompiles charge, measured on Arbitrum One's node (2026-11-11) by the gas a STATICCALL to each
  * spends: 800 to open the chain's own state, 800 for each storage slot the method reads, and 3 for each word it is
@@ -172,15 +187,82 @@ const ARBOS_READS: Record<string, number> = {
   '0xa3b1b31d': 0, '0xd127f54a': 0, '0x051038f2': 0, '0x08bd624c': 0, '0xa94597ff': 0, '0xc6f7de0e': 0,
   '0xf5d6ded7': 1, '0xf918379a': 1, '0x055f362f': 1, '0x02199f34': 1, // getL1BaseFeeEstimate, getMinimumGasPrice, getL1GasPriceEstimate, getPricesInArbGas
   '0x612af178': 2, '0x41b247a8': 2, // getGasAccountingParams, getPricesInWei
+  // ArbRetryableTx.redeem of a ticket that doesn't exist reads it twice before NoTicketWithID() (2,406, measured);
+  // keepalive, cancel and getTimeout once (1,606). Redeeming or keeping alive one that exists is refused (ARBOS_WRITES).
+  '0xeda1122c': 2,
 };
-const arbosGas = (input: number, output: number, selector?: string) => 800n + 800n * BigInt(ARBOS_READS[selector ?? ''] ?? 1) + 3n * BigInt(Math.ceil(Math.max(0, input - 4) / 32) + Math.ceil(output / 32));
-
-const low = (n: number) => `0x${n.toString(16).padStart(40, '0')}`;
 /**
- * ArbOS's precompiles (ArbSys at 0x64 to ArbWasmCache at 0x72, and ArbDebug at 0xff): the chain answers them, as it
- * does HyperCore's reads. What one of them would change (ArbSys sending a message to L1) isn't kept.
+ * ArbFilteredTransactionsManager (0x74, as eth_config names it): 1,600 gas whatever it is given
+ * (none, a byte, 36 or 1,036 bytes), and when it refuses a call (addFilteredTransaction from an account that isn't
+ * a filterer, a method it hasn't) it reverts with nothing and keeps the rest; isTransactionFiltered answers false.
+ * ArbosActs (0xa4b05) refuses every method with CallerNotArbOS() before it reads anything: 800 and 3 a word.
  */
-const ARBOS = [...Array.from({ length: 15 }, (_, i) => low(0x64 + i)), low(0xff)];
+const ARB_FILTERED_TRANSACTIONS = low(0x74), ARBOS_ACTS = low(0xa4b05);
+const arbosGas = (input: number, output: number, selector?: string, address?: string) => {
+  const words = 3n * BigInt(Math.ceil(Math.max(0, input - 4) / 32) + Math.ceil(output / 32));
+  if (address === ARB_FILTERED_TRANSACTIONS) return 1_600n;
+  // A pure method doesn't open ArbOS's state: 3 a word (mapL1SenderContractAddressToL2Alias 9, measured).
+  if (address && selector && ARBOS_METHODS[address]?.pure?.includes(selector)) return words;
+  return 800n + 800n * BigInt(address === ARBOS_ACTS ? 0 : ARBOS_READS[selector ?? ''] ?? 1) + words;
+};
+
+/**
+ * What ArbOS checks before a method runs (Nitro's precompiles/precompile.go), each failing the call with nothing
+ * and burning all it was given: an unknown method, a method that writes (any but view and pure) in a static call or
+ * a call made inside one, a method that isn't pure in a delegate call or callcode (run as another account), value
+ * to a method that isn't payable, and arguments it can't decode. The first and last show in the forwarded eth_call's
+ * answer (REVERT_METER); how the call is made doesn't (it is a plain call, sent nothing), so the local EVM checks the
+ * call it is in, by precompile, against the methods that write, from Nitro's interfaces (nitro-precompile-interfaces,
+ * 2026-11-15), those of them that are payable, and the pure ones. Not listed: ArbOwner (0x70), which refuses every
+ * call from an account that isn't a chain owner, burning all; ArbNativeTokenManager (0x73), which refuses every call
+ * on Arbitrum One; and ArbDebug (0xff), off there. ArbFilteredTransactionsManager (0x74) charges its 1,600 before its
+ * checks: a call it turns away reverts at 1,600 and keeps the rest (measured: in a static call, a delegate call, a
+ * callcode, and with 1 wei).
+ */
+const ARBOS_TEST = low(0x69), BURN_ARB_GAS = '0xbb3480f9';
+const ARBOS_METHODS: Record<string, { writes: string[]; payable?: string[]; pure?: string[] }> = {
+  [low(0x64)]: { writes: ['0x928c169a', '0x25e16063'], payable: ['0x928c169a', '0x25e16063'], pure: ['0x4dbbd506'] }, // ArbSys: sendTxToL1, withdrawEth; mapL1SenderContractAddressToL2Alias
+  [low(0x66)]: { writes: ['0xf6a455a2', '0x4420e486'] }, // ArbAddressTable: compress, register
+  [low(0x68)]: { writes: ['0xce2ae159'] }, // ArbFunctionTable: upload
+  [ARBOS_TEST]: { writes: [], pure: [BURN_ARB_GAS] }, // ArbosTest: burnArbGas
+  [low(0x6b)]: { writes: ['0x6fe86373'] }, // ArbOwnerPublic: rectifyChainOwner
+  [low(0x6d)]: { writes: ['0xdf41e1e2', '0x29149799', '0x5be6888b'] }, // ArbAggregator: addBatchPoster, setFeeCollector, setTxBaseFee
+  [low(0x6e)]: { writes: ['0xeda1122c', '0xf0b21a41', '0xc4d252f5', '0xc9f95d32'] }, // ArbRetryableTx: redeem, keepalive, cancel, submitRetryable
+  [low(0x71)]: { writes: ['0x58c780c2', '0xc689bad5', '0x2dfc5bcd'], payable: ['0x58c780c2', '0xc689bad5'] }, // ArbWasm: activateProgram, codehashKeepalive; deactivateCodehash
+  [low(0x72)]: { writes: ['0x4ceac817', '0xe73ac9f2', '0xce972013'] }, // ArbWasmCache: cacheCodehash, cacheProgram, evictCodehash
+  [low(0x74)]: { writes: ['0xcb470491', '0xd26374b1'] }, // ArbFilteredTransactionsManager: addFilteredTransaction, deleteFilteredTransaction
+  [low(0xa4b05)]: { writes: ['0xb6693771', '0x9998269e', '0x6bf6a42d'] }, // ArbosActs: batchPostingReport, batchPostingReportV2, startBlock
+};
+/** How ArbOS's precompiles are called: the last message to each, as it is about to run (see ARBOS_METHODS). */
+interface ArbOsCall { caller: string; value: bigint; isStatic: boolean; /** A delegate call or callcode: run as the calling account. */ foreign: boolean }
+/** Whether ArbOS turns the call away before its method runs (ARBOS_METHODS). */
+const turnedAway = (address: string, selector: string, m: ArbOsCall) => {
+  const methods = ARBOS_METHODS[address];
+  return (m.foreign && !methods?.pure?.includes(selector)) || (m.value > 0n && !methods?.payable?.includes(selector)) || (m.isStatic && !!methods?.writes.includes(selector));
+};
+
+/**
+ * ArbOS's precompiles (ArbSys at 0x64 to ArbFilteredTransactionsManager at 0x74, ArbDebug at 0xff and ArbosActs at
+ * 0xa4b05): the chain answers them, as it does HyperCore's reads, but for ArbSys's sends to L1, which run here
+ * (src/evm/arbos.ts), the writes in ARBOS_WRITES, refused, and the calls ArbOS turns away for how they are made
+ * (ARBOS_METHODS). 0x73 is ArbNativeTokenManager and 0x74 ArbFilteredTransactionsManager, as eth_config names them:
+ * on Arbitrum One every call to 0x73 (mintNativeToken, burnNativeToken, none) reverts with nothing and burns all it
+ * was given, as does a call to ArbosActs with no method (measured 2026-11-15). Not 0x6a: Arbitrum One's eth_config
+ * lists no precompile there, and its node runs a call to it as one to an empty account, cold (2,600; measured
+ * 2026-11-15 with and without value, in a static and a delegate call and by callcode), as the local EVM does. It had
+ * been forwarded with the rest, at ArbOS's price (1,600), and turned away with value, in a delegate call or by
+ * callcode, where the node's call succeeds.
+ */
+const ARBOS = [...Array.from({ length: 17 }, (_, i) => low(0x64 + i)).filter(a => a !== low(0x6a)), low(0xff), ARBOS_ACTS];
+/**
+ * ArbOS's writes whose effect the chain's answer to an eth_call can't stand for, refused when they would do
+ * something: ArbRetryableTx's redeem (which gives the ticket's retry all the gas the call has left, and the chain
+ * runs the retry as a transaction of its own after this one), keepalive and cancel, of a ticket that exists. Of one
+ * that doesn't they revert with NoTicketWithID(), as the node does, at its price. 3 manual redeems on Arbitrum One
+ * in the week to 2026-11-15 (its logs: RedeemScheduled without TicketCreated), none of them keepalive or cancel.
+ */
+const ARB_RETRYABLE_TX = low(0x6e), NO_TICKET_WITH_ID = '0x80698456';
+const ARBOS_WRITES: Record<string, string> = { '0xeda1122c': 'redeem', '0xf0b21a41': 'keepalive', '0xc4d252f5': 'cancel' };
 /**
  * BNB Chain's SECP256K1_SIGNATURE_RECOVER (0x69) as its node runs it: exactly 129 bytes, a compressed public key
  * (33), a signature's r and s (64, s in the lower half of the order) and the 32-byte digest it signs. It answers the
@@ -241,7 +323,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   1: { hardfork: 'osaka', checked: { forkId: '0x07c9462e', on: '2026-11-10' }, ...NEXT_BLOCK[1] },
   // Sepolia runs Amsterdam (Glamsterdam) since 2026-10-06: its blocks say so, and run under those rules (see ETHEREUM_RULES).
   11155111: { hardfork: 'osaka', checked: { forkId: '0x6c1d9423', on: '2026-11-11' }, ...NEXT_BLOCK[11155111] },
-  42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, precompileGas: arbosGas, missingOpcodes: [0x4a] },
+  42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, precompileGas: arbosGas, revertsKeepGas: ARBOS, missingOpcodes: [0x4a] },
   8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453] },
   10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10] },
   // Polygon prices storage its own way. Measured on its node with code overrides (2026-11-10): a cold SLOAD costs
@@ -429,6 +511,19 @@ const BALANCE_READER = '0x00000000000000000000000000000000ba1a9ce5', CODE_READER
 const BALANCE_READER_CODE = '0x60005b8036111560155780353181526020016002565b366000f3', SLOT_READER_CODE = '0x60005b8036111560155780355481526020016002565b366000f3';
 const CODE_READER_CODE = '0x600035803b8060006000843c6000f3';
 
+/**
+ * What a forwarded call that reverts was charged (ChainProfile.revertsKeepGas): the node is asked with an eth_call
+ * to a contract placed for it, which calls the precompile with the calldata on METERED_GAS and returns the
+ * difference of two GAS readings around the call and whether it succeeded:
+ *   CALLDATASIZE PUSH1 0 PUSH1 0 CALLDATACOPY GAS PUSH1 0 PUSH1 0 CALLDATASIZE PUSH1 0 PUSH1 0 PUSH20 <precompile>
+ *   PUSH3 <METERED_GAS> CALL GAS SWAP1 PUSH1 0x20 MSTORE SWAP1 SUB PUSH1 0 MSTORE PUSH1 0x40 PUSH1 0 RETURN
+ * The readings differ by what the call spent, its warm access (100) and the 22 of the code between them; a call
+ * that burnt all it was given spent METERED_GAS. (Checked on Arbitrum One: ArbAddressTable.lookup of an address it
+ * hasn't, 1,603, as a contract measured; ArbRetryableTx.redeem of no ticket, 2,406.)
+ */
+const REVERT_METER = '0x00000000000000000000000000000000a4b0ca11', METERED_GAS = 1_000_000n, METER_OVERHEAD = 122n;
+const revertMeterCode = (precompile: string): Hex => `0x3660006000375a60006000366000600073${precompile.slice(2)}62${METERED_GAS.toString(16).padStart(6, '0')}f15a90602052900360005260406000f3`;
+
 /** Fetches accounts, storage and forwarded calls from the RPC, in batches, and keeps them for the simulation. */
 class StateSource {
   accounts = new Map<string, AccountData>();
@@ -457,6 +552,8 @@ class StateSource {
   time?: bigint;
   /** What the chain charges for a cold storage read (ChainProfile.storageGas): what a storage reader is given for each. */
   coldRead = 2_100;
+  /** Forwarded precompiles whose reverts are metered (ChainProfile.revertsKeepGas): what each was charged is asked with the answer. */
+  metered = new Set<string>();
 
   /**
    * What the node says a call will touch (eth_createAccessList, on the block the reads are of): the accounts and
@@ -728,15 +825,25 @@ class StateSource {
         if (r) BLOCK_HASHES.set(`${this.chainId}:${n}`, h);
       } });
     }
+    const answer = (k: string, v: { ok: boolean; data: Uint8Array }) => { this.calls.set(k, v); GUESS_CALLS.set(`${this.chainId}:${k}`, v); };
+    // What a forwarded call that reverted was charged (`<call>_gas`, REVERT_METER): the meter's two words, or nothing.
+    const meter = (k: string): Job => {
+      const [to, data] = k.split('_');
+      return { method: 'eth_call', params: [{ to: REVERT_METER, data }, this.block, { [REVERT_METER]: { code: revertMeterCode(to) } }], done: (r, e) => {
+        answer(k, { ok: !e && typeof r === 'string' && r.length === 130, data: !e && typeof r === 'string' && r.length === 130 ? hexToBytes(r as Hex) : new Uint8Array(0) });
+      } };
+    };
     for (const k of m.calls) {
+      if (k.endsWith('_gas')) { jobs.push(meter(k)); continue; }
       const [to, data] = k.split('_');
       jobs.push({ method: 'eth_call', params: [{ to, data }, this.block], done: (r, e) => {
-        const v = e ? { ok: false, data: e.data ? hexToBytes(e.data) : new Uint8Array(0) } : { ok: true, data: hexToBytes(r as Hex) };
-        this.calls.set(k, v);
-        GUESS_CALLS.set(`${this.chainId}:${k}`, v);
+        answer(k, e ? { ok: false, data: e.data ? hexToBytes(e.data) : new Uint8Array(0) } : { ok: true, data: hexToBytes(r as Hex) });
       } });
     }
     await this.sendAll(jobs);
+    // A metered precompile's revert: what it was charged is asked right away, not in a round of its own.
+    const reverted = [...m.calls].filter(k => !k.endsWith('_gas') && this.metered.has(k.split('_')[0]) && this.calls.get(k)?.ok === false && !this.calls.has(`${k}_gas`) && !m.calls.has(`${k}_gas`));
+    if (reverted.length) await this.sendAll(reverted.map(k => meter(`${k}_gas`)));
     for (const [a, acc] of pending) {
       this.accounts.set(a, acc);
       if (!this.historic) GUESS_ACCOUNTS.set(`${this.chainId}:${a}`, { balance: acc.balance, nonce: acc.nonce, hasCode: acc.code.length > 0 });
@@ -1553,6 +1660,7 @@ export class ForkSimulator implements Simulator {
     const source = new StateSource(chainId, url, tag, this.opts.fetchImpl, this.opts.batchSize, this.opts.concurrency, deadline);
     source.historic = !!at?.required;
     source.coldRead = profile.storageGas?.coldRead ?? 2_100;
+    source.metered = new Set(profile.revertsKeepGas ?? []);
     if (options?.after?.length && at) {
       const hex = (v: bigint) => `0x${v.toString(16)}`, bumps = new Map<string, (bigint | 'sent')[]>();
       const bump = (a: string, by: bigint | 'sent') => { const l = bumps.get(a) ?? []; l.push(by); bumps.set(a, l); };
@@ -1737,15 +1845,102 @@ export class ForkSimulator implements Simulator {
       }
       return c;
     };
-    const forwarded = [...(profile.forwardedPrecompiles ?? []), ...pointEvaluation].map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
+    // ArbOS's precompiles need the call they are in (who calls, what value, a static call, a delegate call or
+    // callcode), which a precompile isn't given: the last message to each, as it is about to run.
+    const toArbOs = new Map<string, ArbOsCall>();
+    const burnt = (gasLimit: bigint, error = EVMError.errorMessages.OUT_OF_GAS) => ({ executionGasUsed: gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(error) });
+    /**
+     * ArbSys.sendTxToL1 and withdrawEth, as the node runs them (src/evm/arbos.ts): the value sent leaves ArbSys's
+     * balance (burned), the send joins ArbOS's send-merkle accumulator (its storage, read and written here), and
+     * ArbSys's events are the call's. With arguments it can't decode the node's call fails and burns all it was
+     * given; in a static call, a delegate call or callcode too, which are turned away before this (ARBOS_METHODS).
+     */
+    const arbSysSend = async (input: { data: Uint8Array; gasLimit: bigint }) => {
+      const m = toArbOs.get(ARBSYS);
+      if (!m || m.isStatic || m.foreign) return undefined;
+      const withdraw = bytesToHex(input.data.subarray(0, 4)) === WITHDRAW_ETH;
+      let destination: string, data: Hex;
+      try {
+        [destination, data] = withdraw ? [decodeAbiParameters([{ type: 'address' }], bytesToHex(input.data.subarray(4)))[0], '0x']
+          : decodeAbiParameters([{ type: 'address' }, { type: 'bytes' }], bytesToHex(input.data.subarray(4))) as [string, Hex];
+      } catch { return burnt(input.gasLimit, EVMError.errorMessages.REVERT); }
+      const at = createAddressFromString(ARBOS_STATE);
+      const send = await l1Send({ caller: m.caller, destination: destination.toLowerCase(), value: m.value, data, arbBlockNumber: block.arbBlockNumber, l1BlockNumber: block.header.number, timestamp: block.header.timestamp }, input.data.length, {
+        get: async slot => { const v = await state.getStorage(at, hexToBytes(slot)); return v.length ? BigInt(bytesToHex(v)) : 0n; },
+        set: async (slot, v) => state.putStorage(at, hexToBytes(slot), v === 0n ? new Uint8Array(0) : unpadBytes(hexToBytes(`0x${v.toString(16).padStart(64, '0')}`))),
+      });
+      if (send.gas > input.gasLimit) return burnt(input.gasLimit);
+      await send.apply();
+      if (m.value > 0n) {
+        const arbSys = createAddressFromString(ARBSYS), account = (await state.getAccount(arbSys)) ?? new Account();
+        account.balance = account.balance > m.value ? account.balance - m.value : 0n;
+        await state.putAccount(arbSys, account);
+      }
+      return { executionGasUsed: send.gas, returnValue: hexToBytes(`0x${send.position.toString(16).padStart(64, '0')}`),
+        logs: send.logs.map(l => [hexToBytes(l.address), l.topics.map(t => hexToBytes(t)), hexToBytes(l.data)] as [Uint8Array, Uint8Array[], Uint8Array]) };
+    };
+    const forwarded = [...(profile.forwardedPrecompiles ?? []), ...pointEvaluation].map(address => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint; _EVM?: unknown }) => {
+      const selector = bytesToHex(input.data.subarray(0, 4));
+      // What ArbOS turns away before a method runs, by how it is called here (ARBOS_METHODS): it burns all the call
+      // was given, but ArbFilteredTransactionsManager's, which reverts at its 1,600 and keeps the rest.
+      const made = profile.arbitrum && input._EVM === evm ? toArbOs.get(address) : undefined;
+      if (made && turnedAway(address, selector, made)) {
+        return address === ARB_FILTERED_TRANSACTIONS && input.gasLimit >= 1_600n ? { executionGasUsed: 1_600n, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.REVERT) } : burnt(input.gasLimit, EVMError.errorMessages.REVERT);
+      }
       // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
-      if (profile.arbitrum && address === ARBOS[0] && bytesToHex(input.data.subarray(0, 4)) === '0xa3b1b31d') return { executionGasUsed: profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      if (profile.arbitrum && address === ARBSYS && selector === '0xa3b1b31d') return { executionGasUsed: profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      // (Run here only in the transaction's own EVM, whose messages are followed; the views read around it never send.)
+      if (profile.arbitrum && address === ARBSYS && (selector === SEND_TX_TO_L1 || selector === WITHDRAW_ETH) && input._EVM === evm) {
+        const sent = await arbSysSend(input);
+        if (sent) return sent;
+      }
+      const key = `${address}_${bytesToHex(input.data)}`;
       const c = await ask(address, input.data);
       if (!c) return { executionGasUsed: 2000n, returnValue: new Uint8Array(0) };
-      const gas = address === POINT_EVALUATION ? profile.pointEvaluationGas ?? 50_000n : profile.precompileGas?.(input.data.length, c.data.length, bytesToHex(input.data.subarray(0, 4))) ?? 2000n;
+      // A retryable's redeem, keepalive or cancel that would do something (its ticket exists: the chain's answer is no
+      // NoTicketWithID()) is refused: what it changes isn't in an eth_call's answer (ARBOS_WRITES). Only on an answer
+      // fetched for this run, not a guess, and only with a ticket id to read (36 bytes): ArbOS can't decode shorter
+      // calldata, and the node's call fails burning all it was given (as the meter below finds), the rest of the
+      // transaction going on (measured 2026-11-15: the selector alone, 35 bytes, 20 bytes of argument).
+      if (profile.arbitrum && address === ARB_RETRYABLE_TX && ARBOS_WRITES[selector] && input.data.length >= 36 && source.calls.has(key) && !(!c.ok && bytesToHex(c.data) === NO_TICKET_WITH_ID)) {
+        throw new ForkUnsupported(`the call reaches ArbRetryableTx.${ARBOS_WRITES[selector]} (Arbitrum's 0x6e) for a ticket that exists, whose effect the local EVM doesn't run${ARBOS_WRITES[selector] === 'redeem' ? ' (the chain runs the retry as a transaction of its own, after this one, on all the gas this call has left)' : ''}`);
+      }
+      // A revert of ArbOS's: charged what the node's own call of it was (REVERT_METER), keeping the rest, or burning
+      // all it was given where the node's burnt all or the charge is more than this call was given.
+      if (!c.ok && profile.revertsKeepGas?.includes(address)) {
+        const meterKey = `${key}_gas`;
+        let m = source.calls.get(meterKey);
+        if (!m && misses) {
+          // (Fetched with the answer it follows; asked for here only where that answer is fresh.)
+          if (source.calls.has(key)) misses.calls.add(meterKey);
+          m = source.guessCall(meterKey);
+        } else if (!m) {
+          await source.fetch({ ...newMisses(), calls: new Set([meterKey]) });
+          m = source.calls.get(meterKey);
+        }
+        // (Where the meter's call succeeded, the two calls' answers differ, as for a method that asks who calls: not used.)
+        if (m?.ok && m.data.length === 64 && m.data[63] === 0) {
+          const spent = BigInt(bytesToHex(m.data.subarray(0, 32))) - METER_OVERHEAD;
+          return spent < METERED_GAS && spent <= input.gasLimit ? { executionGasUsed: spent, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) } : burnt(input.gasLimit, EVMError.errorMessages.REVERT);
+        }
+      }
+      let gas = address === POINT_EVALUATION ? profile.pointEvaluationGas ?? 50_000n : profile.precompileGas?.(input.data.length, c.data.length, selector, address) ?? 2000n;
+      // ArbosTest.burnArbGas burns what it is asked to, on top (1,003 for 1,000, measured). Asked for more than the call
+      // has left after its argument's 3 a word, it burns all of that and succeeds: ArbOS ignores its running out there
+      // (measured 2026-11-15, on 10,000 gas: 9,997 spends 10,000; 9,998, 20,000 and 2^64 - 1 spend 10,000 too and
+      // succeed, by a call, a static call or a delegate call; 5,000,000 on all a call can be given likewise).
+      if (profile.arbitrum && address === ARBOS_TEST && selector === BURN_ARB_GAS && input.data.length >= 36) {
+        const burn = BigInt(bytesToHex(input.data.subarray(4, 36)));
+        if (c.ok && gas <= input.gasLimit && gas + burn > input.gasLimit) return { executionGasUsed: input.gasLimit, returnValue: c.data };
+        gas += burn;
+      }
       // (Given less than it costs, it runs out, as the node's does.)
       if (gas > input.gasLimit) return { executionGasUsed: input.gasLimit, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS) };
-      return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
+      // A revert burns all the call was given, but ArbOS's where the node couldn't be asked what it was charged:
+      // with an error to decode (and every one of ArbFilteredTransactionsManager's), they keep what they weren't
+      // charged (ChainProfile.revertsKeepGas).
+      const keeps = !c.ok && !!profile.revertsKeepGas?.includes(address) && (c.data.length > 0 || address === ARB_FILTERED_TRANSACTIONS);
+      return c.ok ? { executionGasUsed: gas, returnValue: c.data } : { executionGasUsed: keeps ? gas : input.gasLimit, returnValue: c.data, exceptionError: new EVMError(EVMError.errorMessages.REVERT) };
     } }));
     // The chain's own precompiles at their own prices (ChainProfile.ownPrecompiles): run here, or answered by the chain.
     const chainOwn = Object.entries(profile.ownPrecompiles ?? {}).map(([address, p]) => ({ address: address as Hex, function: async (input: { data: Uint8Array; gasLimit: bigint }) => {
@@ -1810,6 +2005,12 @@ export class ForkSimulator implements Simulator {
     const precompiles = [...scaled, ...timed, ...forwarded, ...chainOwn, ...moved, ...absent, ...ownAa];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
     if (ownAa.length) evm.events!.on('beforeMessage', baseAaHook(origins, evm));
+    if (profile.arbitrum) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; caller: Address; value: bigint; isStatic: boolean; delegatecall: boolean }, next?: () => void) => {
+      // (A delegate call or callcode runs the precompile's code as the calling account: `to` isn't the precompile.)
+      const code = (m._codeAddress ?? m.to)?.toString();
+      if (code && ARBOS.includes(code)) toArbOs.set(code, { caller: m.caller.toString(), value: m.value, isStatic: m.isStatic, foreign: m.delegatecall || m.to?.toString() !== code });
+      next?.();
+    });
     // What a cleared slot gives back reaches the caller that paid for it, as on the chain (see repayCallers).
     const gasBack = profile.hardfork === 'amsterdam' ? repayCallers(evm) : undefined;
     // Only the calls themselves are traced, not the balance and approval reads around them.
