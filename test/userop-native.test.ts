@@ -240,6 +240,22 @@ test('withoutGas: a stake withdrawn to another address is listed as sent, from t
   assert.deepEqual(withoutGas(home, a, EP, GAS).filter(t => t.from === a || t.to === a), []);
 });
 
+test('withoutGas: a deposit withdrawn to another address is listed as sent from the EntryPoint’s event where the balances weren’t read, and from the reads where they were', () => {
+  // Before, with the amounts the events' alone: nothing listed (the EntryPoint pays the attacker, not the account).
+  const a = '0xacc0000000000000000000000000000000000001', PREFUND = 3n * 10n ** 14n, GAS = 10n ** 14n;
+  const [topic, account] = encodeEventTopics({ abi: parseAbi(['event Withdrawn(address indexed account, address withdrawAddress, uint256 amount)']), eventName: 'Withdrawn', args: { account: a as Hex } }) as Hex[];
+  const logs = [{ address: EP, topics: [topic, account], data: encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [ATTACKER, E / 2n]) }];
+  const frames = [{ asset: 'native', from: a, to: EP, raw: PREFUND }, { asset: 'native', from: EP, to: ATTACKER, raw: E / 2n }];
+  const events: SimulationResult = { status: 'success', source: 'test', transfers: frames, logs };
+  assert.deepEqual(withoutGas(events, a, EP, GAS).filter(t => t.from === a || t.to === a), [{ asset: 'native', from: a, to: ATTACKER, raw: E / 2n }]);
+  // Read: the deposit down by the half withdrawn, up by what's left of the prefund. Listed once, from the reads.
+  const read: SimulationResult = { ...events, readAssets: ['native', EP], transfers: [...frames, { asset: EP, from: a, to: EP, raw: E / 2n - (PREFUND - GAS) }] };
+  assert.deepEqual(withoutGas(read, a, EP, GAS).filter(t => t.from === a || t.to === a), [{ asset: 'native', from: a, to: EP, raw: E / 2n }]);
+  // Withdrawn to the account itself, it is in its balance: not listed from the event.
+  const home: SimulationResult = { ...events, logs: [{ ...logs[0], data: encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [a as Hex, E / 2n]) }] };
+  assert.deepEqual(withoutGas(home, a, EP, GAS).filter(t => t.from === a || t.to === a), []);
+});
+
 test('An operation run by its calls alone: its EntryPoint deposit is its own coin, not a token', async () => {
   const a = await chain.deploy('RevertingAccount', 'address', [EP]);
   await chain.setBalance(a, 2n * E);
@@ -277,9 +293,12 @@ test('eth_simulateV1’s lean pass reads the account’s deposit: the prefund is
     assert.deepEqual(of(sent, 'native'), [['out', '0.5', 'simulated_state']], `logged ${logged}`);
     const moved = await preview(operation(a, call('execute', [wrap, 0n, call('transfer', [BOB, E / 4n])])), deps);
     assert.deepEqual([of(moved, 'native'), of(moved, wrap)], [[], [['out', '0.25', 'simulated_state']]], `logged ${logged}`);
-    // Before: nothing listed, the deposit unread. (Its call gas limit near what it uses: the lean pass gives the run
-    // half as much gas again as it used and 100,000, short of what the EntryPoint asks for a higher limit, AA95.)
-    const drained = await preview(operation(funded, call('execute', [EP, 0n, call('withdrawTo', [ATTACKER, E / 2n])]), { callGasLimit: '0x186a0' }), deps);
-    assert.deepEqual(of(drained, 'native'), [['out', '0.5', 'simulated_state']], `logged ${logged}`);
+    // Before: nothing listed, the deposit unread. With a call gas limit far over what it uses (200,000), too: the lean
+    // pass gave the run half as much gas again as it used and 100,000, short of what the EntryPoint asks of it for
+    // that limit (AA95), and the deposit went unread. It now gives at least the operation's limits (gasFloor).
+    for (const callGasLimit of ['0x186a0', '0x30d40', '0x2dc6c0']) {
+      const drained = await preview(operation(funded, call('execute', [EP, 0n, call('withdrawTo', [ATTACKER, E / 2n])]), { callGasLimit }), deps);
+      assert.deepEqual(of(drained, 'native'), [['out', '0.5', 'simulated_state']], `logged ${logged}, call gas limit ${callGasLimit}`);
+    }
   }
 });

@@ -341,6 +341,7 @@ const USER_OPERATION_EVENT = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344
 const USER_OPERATION_REVERT_REASON = '0x1c4fada7374c0a9ee8841fc38afe82932dc0f8e69012e927f061a8bae611a201';
 const POST_OP_REVERT_REASON = '0xf62676f440ff169a3a9afdbf812e89e7f95975ee8e5c31214ffdef631c5f4792';
 const STAKE_WITHDRAWN = '0xb7c918e0e249f999e965cafeb6c664271b3f4317d296461500e71da39f0cbda3'; // StakeWithdrawn(address indexed account, address withdrawAddress, uint256 amount), v0.6 to v0.9
+const WITHDRAWN = '0xd1c19fbcd4551a5edfb66d43d2e337c04837afda3482b42bdf569a8fccdae5fb'; // Withdrawn(address indexed account, address withdrawAddress, uint256 amount), v0.6 to v0.9
 const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
 /** The simulated bundler when no other is known (simulateHandleOp doesn't check its caller; paymasters can check tx.origin, see recentBundlers). */
 const BUNDLER = '0x0000000000000000000000000000000000004337';
@@ -2818,6 +2819,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // (The EntryPoint is watched too: its balanceOf is the account's deposit, which is read around the run with the
   // account's balance, for the coin its calls move: withoutGas.)
   const run = (bundler: string, recover: Hex) => patiently(() => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(price !== undefined && price > 0n && { gasPrice: price }), watch: [entryPoint, ...(op.watch ?? []).filter(t => t.toLowerCase() !== entryPoint)],
+    gasFloor: entryPointGasFloor(op, ep!.version),
     // The moved precompile is warm, as precompiles are (EIP-2929), so validation costs what it will.
     // An account the bundle delegates (EIP-7702) is warm from its authorization on, as the chain has it.
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] },
@@ -2947,7 +2949,10 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
  * else (depositTo another account, withdrawTo another address) included, and none they kept in it. It is listed as
  * the simulator's own transfers between the account and others, and the rest as one between the account and the
  * EntryPoint. Where it didn't read both (the amounts are the events'), the coin moving between the account and the
- * EntryPoint is left out, as its deposit's. The deposit itself is no token: never listed as one.
+ * EntryPoint is left out, as its deposit's, but its deposit withdrawn to any other address (withdrawTo) is listed
+ * from the EntryPoint's Withdrawn event, as coin the account sends: no transfer of the account's shows it (the
+ * EntryPoint pays it), and it was missing. (Its deposit given to another account, depositTo, no event tells apart
+ * from the prefund: it is still left out there.) The deposit itself is no token: never listed as one.
  *
  * The account's stake (addStake) is not its deposit: it stays locked until unlockStake and a delay after it, so
  * staking shows as the coin leaving its balance, and taking the stake back as the coin coming in. A stake withdrawn
@@ -2959,20 +2964,38 @@ export function withoutGas(r: SimulationResult, account: string, entryPoint: str
   const withEntryPoint = (t: SimulationResult['transfers'][number]) => t.asset === 'native' && t.from !== t.to
     && ((t.from === account && t.to === entryPoint) || (t.from === entryPoint && t.to === account));
   const out = r.transfers.filter(t => t.asset !== entryPoint && !withEntryPoint(t));
-  const stake: SimulationResult['transfers'] = [];
-  for (const l of r.logs ?? []) {
-    if (l.address.toLowerCase() !== entryPoint || l.topics[0]?.toLowerCase() !== STAKE_WITHDRAWN || !l.topics[1] || `0x${l.topics[1].slice(26)}`.toLowerCase() !== account) continue;
-    try {
-      const [to, raw] = decodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], l.data as Hex);
-      if (to.toLowerCase() !== account && raw > 0n) stake.push({ asset: 'native', from: account, to: to.toLowerCase(), raw });
-    } catch { /* not the EntryPoint's event */ }
-  }
-  if (!r.readAssets?.includes('native') || !r.readAssets.includes(entryPoint)) return [...out, ...stake];
+  /** What the EntryPoint's `topic` events (StakeWithdrawn, Withdrawn) say it paid from the account to other addresses. */
+  const paidOut = (topic: string) => {
+    const paid: SimulationResult['transfers'] = [];
+    for (const l of r.logs ?? []) {
+      if (l.address.toLowerCase() !== entryPoint || l.topics[0]?.toLowerCase() !== topic || !l.topics[1] || `0x${l.topics[1].slice(26)}`.toLowerCase() !== account) continue;
+      try {
+        const [to, raw] = decodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], l.data as Hex);
+        if (to.toLowerCase() !== account && raw > 0n) paid.push({ asset: 'native', from: account, to: to.toLowerCase(), raw });
+      } catch { /* not the EntryPoint's event */ }
+    }
+    return paid;
+  };
+  const stake = paidOut(STAKE_WITHDRAWN);
+  if (!r.readAssets?.includes('native') || !r.readAssets.includes(entryPoint)) return [...out, ...paidOut(WITHDRAWN), ...stake];
   const net = (ts: SimulationResult['transfers'], asset: string) => ts.reduce((sum, t) => t.asset !== asset ? sum : sum + (t.to === account ? t.raw : 0n) - (t.from === account ? t.raw : 0n), 0n);
   const rest = net(r.transfers, 'native') + net(r.transfers, entryPoint) + gas - net(out, 'native');
   if (rest < 0n) out.push({ asset: 'native', from: account, to: entryPoint, raw: -rest });
   else if (rest > 0n) out.push({ asset: 'native', from: entryPoint, to: account, raw: rest });
   return [...out, ...stake];
+}
+
+/**
+ * The least gas an EntryPoint run of the operation is given where a pass sets it (SimulationRequest.gasFloor): all of
+ * its limits (v0.6's verification limit three times over with a paymaster, which its postOp runs on too), a 64th more,
+ * and 100,000. The EntryPoint refuses a run whose gas left falls under them (AA95), whatever the operation then uses:
+ * BNB Chain's lean pass, which gives a run half as much gas again as it used and 100,000, was refused so for an
+ * operation whose call gas limit was 200,000 and used far less, and its deposit went unread.
+ */
+export function entryPointGasFloor(op: Pick<OperationInput, 'callGasLimit' | 'verificationGasLimit' | 'preVerificationGas' | 'paymasterAndData'>, version: '0.6' | '0.7' | '0.8' | '0.9'): bigint {
+  const pm = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData);
+  const pmGas = version !== '0.6' && op.paymasterAndData.length >= 2 + 2 * 52 ? BigInt(`0x${op.paymasterAndData.slice(42, 74)}`) + BigInt(`0x${op.paymasterAndData.slice(74, 106)}`) : 0n;
+  return ((pm && version === '0.6' ? 3n : 1n) * op.verificationGasLimit + op.callGasLimit + pmGas + op.preVerificationGas) * 65n / 64n + 100_000n;
 }
 
 async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, req: SimulationRequest, version: '0.6' | '0.7' | '0.8' | '0.9'): Promise<OperationRun | null> {

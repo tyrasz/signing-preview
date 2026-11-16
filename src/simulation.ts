@@ -645,11 +645,12 @@ export class RpcSimulator implements Simulator {
   /**
    * Balance reads asked again on their own (readState): the calls as before, with the given owners' balances of the
    * given tokens read before the first and after each, and nothing else. Each call is given its own gas (what it set,
-   * else what it used and half as much again and 100,000), so a node that splits the block's gas among the calls that
+   * else what it used and half as much again and 100,000, or its gasFloor if more), so a node that splits the block's gas among the calls that
    * set none (BNB Chain's) gives the few reads a large share. Every call must come out as it did the first time: the same
    * outcome and the same gas used, or nothing is read. The values by `${callsBefore}:${owner}:${token}`.
    */
   private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[], tag: string): Promise<Map<string, bigint> | undefined> {
+    const max = (a: bigint, b: bigint) => (a > b ? a : b);
     const calls: SimCall[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
     const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push(token === 'native' ? { from: READER, to: MULTICALL3, data: `0x4d2301cc${owner.slice(2).padStart(64, '0')}` } : { from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
     const fields = await Promise.all(this.warmed(reqs).map(simulationFields));
@@ -658,7 +659,7 @@ export class RpcSimulator implements Simulator {
       const used = parsed[i].gasUsed;
       if (req.gas === undefined && used === undefined) throw new Error('no gas to give the call');
       callIndex.push(calls.length);
-      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...fields[i], ...(req.gas === undefined && { gas: `0x${(used! * 3n / 2n + 100_000n).toString(16)}` }) });
+      calls.push({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...fields[i], ...(req.gas === undefined && { gas: `0x${max(used! * 3n / 2n + 100_000n, req.gasFloor ?? 0n).toString(16)}` }) });
       reads(i + 1);
     });
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));

@@ -394,6 +394,12 @@ export interface SimulationRequest {
   /** The transaction's gas limit, gas price and EIP-2930 access list, when the request sets them (contracts can read gasleft() and tx.gasprice). */
   gas?: bigint;
   /**
+   * With no `gas`: the least a pass that sets the call's gas itself must give it (RpcSimulator's lean pass gives a call
+   * half as much again as it used): a UserOperation's run, whose EntryPoint refuses one whose gas left falls under the
+   * operation's own limits (AA95), whatever the operation goes on to use.
+   */
+  gasFloor?: bigint;
+  /**
    * Arbitrum: the gas the chain took out of `gas` for the transaction's L1 data before running it (a replay's, from
    * its receipt's gasUsedForL1). The chain's node works it out itself; the local EVM runs on the rest.
    */
