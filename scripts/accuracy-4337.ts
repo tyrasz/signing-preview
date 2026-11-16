@@ -3,6 +3,8 @@
 //   [--enable-dummies] (a Kernel operation in enable mode previewed with the SDK's dummy for each signature in it)
 //   [--differing dir/] (the row and preview of each operation whose preview differed, to look at once its state is gone)
 //   [--sessions] (only bundles carrying a session key's operation, through Rhinestone's SmartSession: a few of many)
+//   [--mee-owners] (only bundles carrying an operation whose nonce key is laid out as a Biconomy Nexus account's for its
+//   own default validator through MEE: three bytes of MEE's, then mode 0x00 and validator 0)
 //
 // --concurrency replays that many operations at once (each on its own state; oldest first where the node keeps state
 // longer, newest first on Arbitrum, OP Mainnet and Polygon, whose public nodes keep the least), while --follow keeps
@@ -21,7 +23,9 @@
 //   - a SafeOp, for a Safe whose fallback handler is one of the known 4337 modules (src/typed-data/safe.ts);
 //   - a session key's operation through Biconomy's K1MeeValidator in simple mode (src/erc4337-sim.ts), as its key
 //     signed it: personal_sign (or eth_sign) of the supertransaction's hash in its signature, with the operation and
-//     its proof as context.meeOperations (src/supertransaction.ts; the root's other leaves only hashes here);
+//     its proof as context.meeOperations (src/supertransaction.ts; the root's other leaves only hashes here); and so
+//     an operation an account's own K1MeeValidator validates in simple mode (a Biconomy Nexus account's default
+//     validator), as its owner signed it, with the operation's time bounds too;
 //   - otherwise, for v0.6 and v0.7, personal_sign of the operation's hash with the operation as context.userOperation;
 //   - for v0.8 and v0.9, the PackedUserOperation typed data (an EIP-7702 account's delegate where its marker is).
 // Each is previewed on the state the operation met: the parent block, with the block's own header (base fee
@@ -39,7 +43,7 @@
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeFunctionData, hashMessage, hashTypedData, keccak256, parseAbi, recoverAddress, type Hex } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, encodeFunctionData, hashMessage, hashTypedData, keccak256, parseAbi, parseAbiParameters, recoverAddress, type Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
@@ -62,6 +66,13 @@ const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.incl
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '1'))), BACKFILL = Number(arg('backfill', '0'));
 /** --sessions: only bundles with an operation whose nonce names SmartSession (smartSessionOf), read from its UserOperationEvent. */
 const SESSIONS = process.argv.includes('--sessions');
+/**
+ * --mee-owners: only bundles with an operation whose nonce key (from its UserOperationEvent) is a Nexus account's
+ * through MEE for its default validator, K1MeeValidator: three bytes of MEE's (not all zero), then zeros (mode 0x00,
+ * validator 0). Other accounts' keys mostly aren't (random, or 0); the replay itself goes by the signature.
+ */
+const MEE_OWNERS = process.argv.includes('--mee-owners');
+const meeOwnerKey = (nonce: bigint) => { const key = nonce >> 64n; return key >> 168n !== 0n && (key & ((1n << 168n) - 1n)) === 0n; };
 // The chain's *_RPC_URL replaces its public RPC (empty counts as unset, as an unset CI secret is; EVM_RPCS).
 const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
 /**
@@ -245,12 +256,37 @@ async function k1meeSimple(sig: Hex): Promise<{ root: Hex; proof: Hex[]; message
   } catch { return undefined; }
 }
 
+/**
+ * An operation its account's own K1MeeValidator validates in simple mode (a Biconomy Nexus account's default validator,
+ * src/erc4337-sim.ts, nexusStub), signed by its owner: 0x177eee00, then abi.encode(the supertransaction's hash, the
+ * operation's lower and upper time bounds, the proof of its leaf, MEE's hash of its hash and the bounds, and the owner's
+ * signature over the root). The root, the bounds, the proof, and whom the signature recovers to over the root as a
+ * message and as it is; only for that encoding exactly (decoded and encoded again, the same bytes).
+ */
+const K1MEE_OWN = parseAbiParameters('bytes32, uint256, uint256, bytes32[], bytes');
+async function k1meeOwnSimple(sig: Hex): Promise<{ root: Hex; proof: Hex[]; bounds: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint }; message?: string; bare?: string } | undefined> {
+  if (!sig.toLowerCase().startsWith('0x177eee00')) return undefined;
+  const body = `0x${sig.slice(10)}`.toLowerCase() as Hex;
+  try {
+    const [root, lowerBoundTimestamp, upperBoundTimestamp, proof, signature] = decodeAbiParameters(K1MEE_OWN, body);
+    if (signature.length !== 2 + 65 * 2 || encodeAbiParameters(K1MEE_OWN, [root, lowerBoundTimestamp, upperBoundTimestamp, proof, signature]) !== body) return undefined;
+    const recovered = (hash: Hex) => recoverAddress({ hash, signature }).then(a => a.toLowerCase(), () => undefined);
+    return { root, proof: [...proof], bounds: { lowerBoundTimestamp, upperBoundTimestamp }, message: await recovered(hashMessage({ raw: root })), bare: await recovered(root) };
+  } catch { return undefined; }
+}
+const K1MEE_OWNER = parseAbi(['function getOwner(address smartAccount) view returns (address)']);
+
 type Row = Record<string, unknown>;
 const rows: Row[] = [];
 const blocks = new Set<number>();
 const skipped: Record<string, number> = {};
 const skip = (why: string) => { skipped[why] = (skipped[why] ?? 0) + 1; };
 const STAND_IN_REJECTED = /doesn't accept (it as theirs|as signed)/;
+/**
+ * The node's failure of the whole operation's simulation, where the preview says so (src/erc4337-sim.ts, NodeFailure):
+ * counted apart, not as a shape the stand-in doesn't take or anything the account does.
+ */
+const nodeFailure = (p: Preview) => p.warnings.find(w => w.code === 'userop_simulation_failed')?.message;
 /** A supertransaction's preview of one operation (src/supertransaction.ts), its details, warnings and notes as the operation's own. */
 function asOperation(p: Preview): Preview {
   const own = (x: string) => x.replace(/^Operation 1 \([^)]*\): /, '');
@@ -419,7 +455,7 @@ async function replay(item: string): Promise<void> {
   // as it is), with the operation and its proof (the root's other leaves, operations the harness doesn't have, as
   // hashes) as context.meeOperations (src/supertransaction.ts); otherwise the operation's hash. Another session
   // validator's form, or a session the operation enables, nothing a wallet signs takes: skipped.
-  let sessionValidator: string | undefined, sessionKey: string | undefined, supertransaction: { root: Hex; proof: Hex[]; bare: boolean } | undefined;
+  let sessionValidator: string | undefined, sessionKey: string | undefined, supertransaction: { root: Hex; proof: Hex[]; bare: boolean; bounds?: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint } } | undefined;
   if (session) {
     const enabled = op.signature.startsWith('0x00') && op.signature.length >= 2 + 33 * 2;
     let validator: string | undefined, config: Hex = '0x';
@@ -440,6 +476,19 @@ async function replay(item: string): Promise<void> {
       sessionKey = bare ? configured : simple?.message ?? configured;
       if (simple) supertransaction = { root: simple.root, proof: simple.proof, bare };
     }
+  }
+  // An operation an account's own K1MeeValidator validates in simple mode (a Biconomy Nexus account's default
+  // validator), signed by its owner: replayed the same way, as what the owner signed (personal_sign of the root, eth_sign
+  // where the owner K1MeeValidator keeps for the account signed it as it is), with the operation's time bounds too, its
+  // leaf MEE's hash of its hash and them. The owner: the one its signature recovers to, then K1MeeValidator's for it.
+  let meeOwner: string | undefined, meeKept: string | undefined;
+  const ownSimple = !session ? await k1meeOwnSimple(op.signature) : undefined;
+  if (ownSimple) {
+    const kept = String(await atParent.call(CHAIN, 'eth_call', [{ to: K1MEE_VALIDATOR, data: encodeFunctionData({ abi: K1MEE_OWNER, functionName: 'getOwner', args: [sender as Hex] }) }, 'latest']).catch(() => '0x'));
+    meeKept = /^0x0{24}[0-9a-f]{40}$/i.test(kept) ? `0x${kept.slice(26)}`.toLowerCase() : undefined;
+    const bare = !!ownSimple.bare && ownSimple.bare === meeKept;
+    meeOwner = bare ? meeKept : ownSimple.message ?? meeKept;
+    supertransaction = { root: ownSimple.root, proof: ownSimple.proof, bare, bounds: ownSimple.bounds };
   }
   // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
   // validator or permission it installs (the Enable), which signs the operation (a dApp's session key, mostly); its
@@ -486,12 +535,13 @@ async function replay(item: string): Promise<void> {
     digest = hashTypedData(typed as never);
     request = signer => ({ method: 'eth_signTypedData_v4', params: [signer, JSON.stringify(typed)] });
   } else if (supertransaction && (VERSION === '0.6' || VERSION === '0.7')) {
-    // A K1MeeValidator session's operation in simple mode: the supertransaction's hash its key signed (above).
+    // A K1MeeValidator session's operation in simple mode, or an account's own: the supertransaction's hash its key
+    // (its owner) signed (above), with the operation's time bounds where its leaf is MEE's hash of them.
     kind = 'supertransaction';
     digest = supertransaction.root;
-    ctx = { ...context, meeOperations: [{ chainId: CHAIN, entryPoint: EP, operation: rpcForm(op), proof: supertransaction.proof }] };
-    const { root, bare: asIs } = supertransaction;
-    request = signer => asIs && signer === sessionKey ? { method: 'eth_sign', params: [signer, root] } : { method: 'personal_sign', params: [root, signer] };
+    const { root, bare: asIs, bounds } = supertransaction;
+    ctx = { ...context, meeOperations: [{ chainId: CHAIN, entryPoint: EP, operation: rpcForm(op), proof: supertransaction.proof, ...(bounds && { lowerBoundTimestamp: bounds.lowerBoundTimestamp.toString(), upperBoundTimestamp: bounds.upperBoundTimestamp.toString() }) }] };
+    request = signer => asIs && signer === (sessionKey ?? meeOwner) ? { method: 'eth_sign', params: [signer, root] } : { method: 'personal_sign', params: [root, signer] };
   } else if (VERSION === '0.6' || VERSION === '0.7') {
     kind = 'hash';
     const form = { ...rpcForm(op), ...(supplied && { signature: supplied }) };
@@ -547,8 +597,8 @@ async function replay(item: string): Promise<void> {
   // First, a Kernel permission's recorded owner (whose signature recovers to someone else).
   const recorded = code.length > 2 && !module ? await permissionOwner((to, data) => atParent.call(CHAIN, 'eth_call', [{ to, data }, 'latest']) as Promise<string>, sender, BigInt(op.nonce)) : undefined;
   if (recorded) { const i = signers.indexOf(recorded); if (i >= 0) signers.splice(i, 1); signers.unshift(recorded); }
-  // First of all, a K1MeeValidator session's key (above).
-  if (sessionKey) { const i = signers.indexOf(sessionKey); if (i >= 0) signers.splice(i, 1); signers.unshift(sessionKey); }
+  // First of all, a K1MeeValidator session's key, or the owner whose own K1MeeValidator checks it (above).
+  for (const key of [sessionKey, meeKept, meeOwner]) if (key) { const i = signers.indexOf(key); if (i >= 0) signers.splice(i, 1); signers.unshift(key); }
   add(sender);
   let p!: Preview, tried = 0;
   // A supertransaction's preview shows its operation as "Operation 1 (chain): …": read as the operation's own.
@@ -576,8 +626,13 @@ async function replay(item: string): Promise<void> {
     if (outOfGas(p) && prefix.length > essential.length) await narrow("they left too little of the node's gas cap for the operation");
     // The whole operation didn't run and nothing says why (no rejection, no validation revert): the node failed the
     // simulation, which a heavy block refused under load does (alone, the same operations ran whole). Once more.
+    // (Or the preview says the node failed it, userop_simulation_failed: a rate limit or a timeout the preview's own
+    // second ask didn't get past.)
     const unexplained = (q: Preview) => ran(q) && !q.decoding.notes.some(x => /whole operation was simulated|validation reverts on a stand-in/.test(x)) && !q.warnings.some(w => w.code === 'userop_rejected');
     if (unexplained(p)) { await new Promise(r => setTimeout(r, 1500)); p = await previewOf(request(signer)); }
+    // A passing node failure still there (a rate limit, a timeout: the preview asked twice): once more, ten seconds on
+    // (as for a read refused for the rate), while the node still keeps the block's state.
+    if (/asked twice/.test(nodeFailure(p) ?? '') && (ONE || !STATE_SECONDS[CHAIN] || Date.now() / 1000 - Number(block.timestamp) + 15 < STATE_SECONDS[CHAIN])) { await new Promise(r => setTimeout(r, 10_000)); p = await previewOf(request(signer)); }
     // A wrong guess shows as the account rejecting the stand-in, or as its validation reverting on a shape for
     // another key (a passkey account given an ECDSA stand-in for a non-owner): either way, the next candidate.
     if (!p.decoding.notes.some(x => STAND_IN_REJECTED.test(x) || /validation reverts on a stand-in/.test(x))) break;
@@ -596,6 +651,7 @@ async function replay(item: string): Promise<void> {
   const reverts = p.warnings.some(w => ['userop_execution_reverts', 'userop_postop_reverts', 'safe_tx_reverts'].includes(w.code));
   const rejected = p.warnings.find(w => w.code === 'userop_rejected')?.message;
   const fallbackNote = p.decoding.notes.find(x => /validation reverts on a stand-in/.test(x));
+  const nodeFailed = whole ? undefined : nodeFailure(p);
   const simCost = p.details.find(d => d.label === 'Gas cost (simulated)')?.raw;
   const fees = new Map<string, bigint>();
   const paymaster = op.paymasterAndData.length >= 42 ? `0x${op.paymasterAndData.slice(2, 42)}`.toLowerCase() : null;
@@ -748,10 +804,11 @@ async function replay(item: string): Promise<void> {
   }
   rows.push({
     hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
-    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session, sessionValidator }),
+    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
-    callsOnlyBecause: whole ? undefined : rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
+    ...(nodeFailed && { nodeFailed: true }),
+    callsOnlyBecause: whole ? undefined : nodeFailed ?? rejected ?? fallbackNote ?? (p.warnings.some(w => w.code === 'userop_account_no_code') ? 'no code at the account before the bundle (delegated in it)'
       : p.decoding.notes.find(x => /simulat/.test(x)) ?? "the simulation didn't run (the node refused or failed it)"),
     gas: gasCompared ? { simulated: gasCompared.simulated, actual: gasCompared.actual.toString(), percent: gasPercent, ...(gasCompared.gasless && { gasless: true }) } : undefined,
     // Without any simulation (the node refused it) there are no simulated movements to compare.
@@ -826,7 +883,7 @@ async function replay(item: string): Promise<void> {
 
 const head = Number(await call<string>('eth_blockNumber', []));
 const pending = async (from: number, to: number) => [...new Set((await call<{ transactionHash: string; data: Hex }[]>('eth_getLogs', [{ address: EP, topics: [UOE], fromBlock: hex(BigInt(from)), toBlock: hex(BigInt(to)) }]))
-  .filter(l => !SESSIONS || smartSessionOf(BigInt(l.data.slice(0, 66)))).map(l => l.transactionHash))];
+  .filter(l => (!SESSIONS || smartSessionOf(BigInt(l.data.slice(0, 66)))) && (!MEE_OWNERS || meeOwnerKey(BigInt(l.data.slice(0, 66))))).map(l => l.transactionHash))];
 // Replays, CONCURRENCY at a time. On Ethereum, oldest first: a backfill's oldest blocks are the first whose state
 // the node stops serving (about 128 blocks, 25 minutes), and the newest still have time. On Arbitrum, newest first:
 // its 30 seconds of state are gone for anything queued behind.
@@ -882,8 +939,9 @@ const range = [...blocks].sort((a, b) => a - b);
 console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
-say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
+say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | not whole, the node failed it ${count(r => !!r.nodeFailed)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 if (count(r => !!r.session)) say(`  session keys' operations (SmartSession): ${count(r => !!r.session)} (${['OwnableValidator', 'K1MeeValidator'].map(v => `through ${v} ${count(r => r.sessionValidator === v)}`).join(', ')}), the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
+if (count(r => !!r.meeOwner)) say(`  owners' operations through their own K1MeeValidator in simple mode (Biconomy Nexus): ${count(r => !!r.meeOwner)}, the stand-in validated for ${count(r => !!r.meeOwner && r.standIn === 'validated')}`);
 if (count(r => !!r.enableMode)) say(`  Kernel's enable mode (previewed with ${ENABLE_DUMMIES ? "the SDK's dummies for" : 'their own'} signatures): ${count(r => !!r.enableMode)}, the stand-in validated for ${count(r => !!r.enableMode && r.standIn === 'validated')}${count(r => r.standIn === 'as signed') ? `, run with the signatures as they were for ${count(r => r.standIn === 'as signed')} (no stand-in made)` : ''}`);
 say(`  gas paid (for ${count(r => !!(g(r) as { gasless?: boolean } | undefined)?.gasless)} gasless operations, the gas used), of ${count(r => !!g(r))} compared: exact ${count(r => g(r)?.percent === 0)}, within 0.05% ${count(r => !!g(r) && g(r)!.percent !== 0 && Math.abs(g(r)!.percent) < 0.05)}, 0.5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.05 && Math.abs(g(r)!.percent) < 0.5)}, 5% ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 0.5 && Math.abs(g(r)!.percent) < 5)}, more ${count(r => !!g(r) && Math.abs(g(r)!.percent) >= 5)}`);
 say(`  token movements, of ${count(r => !!r.tokens)}: exact ${count(r => r.tokens === 'exact')}, within a gas-priced fee's rounding ${count(r => r.tokens === 'fee')}, within 2 base units (a share token's rounding) ${count(r => r.tokens === 'units')}, other ${count(r => r.tokens === 'other')}`);
@@ -892,7 +950,7 @@ say(`  the native coin its calls move (reported, not judged), of ${count(r => !!
 if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's contract (${count(r => !!r.relayedBy)}), gas reported but not judged: of ${count(r => !!bg(r))}, within 0.5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) < 0.5)}, 5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 0.5 && Math.abs(bg(r)!.percent) < 5)}, more ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 5)}`);
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
-  const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `calls only: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
+  const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `${r.nodeFailed ? 'not whole, the node failed it' : 'calls only'}: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
     r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`,
     nat(r)?.match === 'other' && `native coin: simulated ${nat(r)!.simulated}, actual ${nat(r)!.actual}${nat(r)!.mixed ? ` (${nat(r)!.mixed})` : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);

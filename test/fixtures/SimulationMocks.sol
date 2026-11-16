@@ -280,6 +280,31 @@ contract BundlerPaymaster {
     }
     function postOp(uint8, bytes calldata, uint256, uint256) external {}
 }
+/// A paymaster that pays for any bundler in its validation and refuses the others in its charge after the calls
+/// (postOp), as Coinbase's VerifyingPaymaster does where its data doesn't allow any bundler (BundlerNotAllowed).
+contract PostOpBundlerPaymaster {
+    error BundlerNotAllowed(address bundler);
+    address public entryPoint;
+    address public bundler;
+    constructor(address ep, address b) { entryPoint = ep; bundler = b; }
+    function validatePaymasterUserOp(PackedUserOperation calldata op, bytes32, uint256) external view returns (bytes memory, uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        return (abi.encode(op.sender), 0);
+    }
+    function postOp(uint8, bytes calldata, uint256, uint256) external view {
+        require(msg.sender == entryPoint, "entrypoint");
+        if (tx.origin != bundler) revert BundlerNotAllowed(tx.origin);
+    }
+}
+/// An Account4337 that installs ERC-7579 modules (logging ModuleInstalled), as modular accounts do.
+contract ModularAccount4337 is Account4337 {
+    event ModuleInstalled(uint256 moduleTypeId, address module);
+    constructor(address o, address ep) Account4337(o, ep) {}
+    function installModule(uint256 moduleTypeId, address module, bytes calldata) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        emit ModuleInstalled(moduleTypeId, module);
+    }
+}
 /// A factory whose accounts only deploy when its own bundler sends the operation (tx.origin), as those of an OKX
 /// Wallet factory on Ethereum do (their initialization asks OKX's list of bundlers, and reverts InvalidBundler()).
 contract BundlerFactory {
@@ -621,4 +646,31 @@ contract Account7579 {
 contract NexusLike is Account7579 {
     constructor(address ep) Account7579(ep) {}
     function validatorOf(uint256 nonce) internal pure override returns (address) { return address(uint160(nonce >> 64)); }
+}
+
+/// An account that takes any signature (validateUserOp checks none), and a factory that names another implementation
+/// (implementation(), as Coinbase Smart Wallet's factories name theirs) but deploys this one, with createAccount's
+/// arguments as Base's giga1 factory takes them: what the factory names isn't what the account runs.
+contract AnySignatureAccount {
+    function validateUserOp(PackedUserOperation calldata, bytes32, uint256 missing) external returns (uint256) {
+        if (missing > 0) { (bool paid, ) = payable(msg.sender).call{value: missing}(""); paid; }
+        return 0;
+    }
+    function execute(address to, uint256 value, bytes calldata data) external {
+        (bool ok, bytes memory r) = to.call{value: value}(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+    }
+    receive() external payable {}
+}
+contract NamingFactory {
+    address public immutable implementation;
+    constructor(address i) { implementation = i; }
+    function createAccount(bytes[] calldata, uint256, bytes32) external returns (address) { return address(new AnySignatureAccount()); }
+}
+/// Code longer than a proxy's that keeps an address in the ERC-1967 implementation slot (and reads it), but runs its
+/// own validation, taking any signature: naming the slot doesn't make it delegate to what is there.
+contract SlotKeeper is AnySignatureAccount {
+    bytes32 constant SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+    constructor(address i) { assembly { sstore(SLOT, i) } }
+    function implementation() external view returns (address a) { assembly { a := sload(SLOT) } }
 }

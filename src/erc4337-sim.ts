@@ -12,7 +12,8 @@
 // deployed through its SenderCreator if it's new, then called with the operation's callData from the EntryPoint
 // (or with executeUserOp(userOp, userOpHash) when callData starts with its selector). Validation, the gas prefund
 // and refund, and a paymaster's postOp charge aren't part of it.
-import { concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, hashMessage, hashTypedData, keccak256, encodeFunctionData, hexToBytes, parseAbi, parseAbiParameters, recoverAddress, sha256, stringToHex, type Hex } from 'viem';
+import { bytesToHex, concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, hashMessage, hashTypedData, keccak256, encodeFunctionData, hexToBytes, numberToHex, parseAbi, parseAbiParameters, recoverAddress, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
+import { p256 } from '@noble/curves/nist';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
@@ -251,9 +252,12 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     const deploy: SimulationRequest = op.origin
       ? { chainId: op.chainId, from: op.origin.toLowerCase(), account: sender, to: creator, data: op.initCode!, value: 0n, stateOverrides: { [creator]: { code: SENDER_FORWARDER } } }
       : { chainId: op.chainId, from: creator, account: sender, to: factory, data: `0x${op.initCode!.slice(42)}` as Hex, value: 0n };
-    const results = await batch([deploy, exec]);
-    if (!results?.[0] || !results[1]) return null;
+    // An operation with no calls: its deployment alone (the EntryPoint calls the account only with callData).
+    const noCalls = op.callData === '0x';
+    const results = await batch(noCalls ? [deploy] : [deploy, exec]);
+    if (!results?.[0] || (!noCalls && !results[1])) return null;
     if (results[0].status === 'reverted') return { result: { ...results[0], revertReason: `deploying the account failed${results[0].revertReason ? `: ${results[0].revertReason}` : ''}` }, deployed: true, requests: [deploy] };
+    if (noCalls || !results[1]) return { result: results[0], deployed: true, requests: [deploy] };
     // A Kernel v3 that ZeroDev's FactoryStaker deploys has no execution hook stored for executeUserOp either (above),
     // and storage can't be set at an address before it's created: its calls as executeUserOp runs them, callData
     // after the selector, from the EntryPoint (which Kernel's execute accepts), without the hook.
@@ -264,6 +268,8 @@ export async function simulateExecution(op: ExecutionInput, deps: Dependencies):
     }
     return { result: results[1], deployed: true, requests: [deploy, exec] };
   }
+  // No calls and nothing to deploy: nothing runs.
+  if (op.callData === '0x') return null;
   // (After earlier operations, one of them may have deployed or delegated the account: the calls are run.)
   if (!pre.length && !factory && !op.delegate && (await deployed()) === false) return { result: { status: 'success', source: 'no code at the account', transfers: [], limited: true }, deployed: false, noCode: true };
   const result = (await batch([exec]))?.[0];
@@ -495,6 +501,11 @@ export const STUB_COSIGNATURE = stubSignature(1);
  */
 interface Stub {
   signature: Hex; p256?: boolean | 'daimo'; verifier?: string; cosigners?: Cosigner[];
+  /**
+   * A passkey's real assertion by the stand-in passkey (standInPasskey), which the account's own P-256 check verifies
+   * against that key, set as the account's for the run (`storage`).
+   */
+  madeUp?: boolean;
   /** The signature the wallet supplied with the operation, run as it is. */
   wallet?: boolean;
   /** Kernel's enable mode: the operation's own enable data, with stand-ins for its two signatures (kernelEnableStub). */
@@ -515,6 +526,11 @@ interface Stub {
   unsure?: boolean;
   /** What the preview says where the account accepts it (how the signature it stands in for differs from others). */
   note?: string;
+  /**
+   * The account pays nothing toward its gas for a signature it refuses (it returns before paying its prefund): where
+   * it could pay, the EntryPoint's rejection for an unpaid prefund (AA21) is that refusal (OperationRun's unpaid).
+   */
+  unpaid?: boolean;
 }
 /** An address shortened for a note: its first and last four hex digits. */
 const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
@@ -525,8 +541,15 @@ const shortAddr = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 type Cosigner = { signature: Hex; signer: string; digest?: Hex };
 type StubContext = {
   deps: Dependencies; chainId: number; sender: string; signer: string; nonce: bigint;
+  /** Whether the request names the signer (else `signer` is the account itself). */
+  named?: boolean;
   /** The code the account runs (its implementation or EIP-7702 delegate), where stubFor read it. */
   runs?: string;
+  /**
+   * The EIP-7702 delegation the operation is signed for, where it isn't the account's now (stubFor's `delegate`): `runs`
+   * is then the delegate the operation's own transaction delegates the account to, whatever its code now.
+   */
+  delegate?: string;
   /** The signature supplied with the operation (Kernel's enable mode keeps the enable data it carries). */
   signature?: Hex;
   /** The operation's hash with chain ID 0, as Kernel v3.2 and later validate a chain-agnostic signature (replayableUserOpHash). */
@@ -571,6 +594,17 @@ function webAuthnAuth(challenge: Hex, rpId: string, more = '') {
   const authenticatorData = concatHex([sha256(stringToHex(rpId)), '0x05', '0x00000000']);
   return { authenticatorData, clientDataJSON, challengeIndex: BigInt(clientDataJSON.indexOf('"challenge"')), typeIndex: BigInt(clientDataJSON.indexOf('"type"')), r: BigInt(P256_STUB.r), s: BigInt(P256_STUB.s) };
 }
+/**
+ * A passkey made up for the runs where no verifier can be stood in for (the P-256 check is in the account's own
+ * Solidity: Zeal's Safe signers, src/safe-sim.ts, and Barz): its private key, and its public key (worked out when first
+ * needed). Its assertions are real ones, which the check verifies against this key where the run sets it as the owner's.
+ */
+export const STAND_IN_PASSKEY = hexToBytes(sha256(stringToHex('signing-preview: a stand-in passkey')));
+let standInPublicKey: { x: Hex; y: Hex } | undefined;
+export const standInPasskey = () => {
+  if (!standInPublicKey) { const key = p256.getPublicKey(STAND_IN_PASSKEY, false); standInPublicKey = { x: bytesToHex(key.slice(1, 33)), y: bytesToHex(key.slice(33)) }; }
+  return standInPublicKey;
+};
 /** Daimo's P256 verifier contract (the same address on every chain here), which passkey accounts call without RIP-7212. */
 export const DAIMO_P256_VERIFIER = '0xc2b78104907f722dabac4c69f826a522b2754de4';
 /** ZeroDev's WebAuthn validator for Kernel v3 (source verified on Sourcify, Arbitrum One). */
@@ -600,6 +634,12 @@ const ZERODEV_WEBAUTHN_SIGNATURE = [{ type: 'bytes' }, { type: 'string' }, { typ
 const LAST_SIGNED = new Map<string, { at: number; head: bigint; signature: Hex | undefined }>();
 /** How far back an account's earlier operation is looked for, and in windows of at most how many blocks. */
 const LAST_SIGNED_REACH = 100_000n, LAST_SIGNED_WINDOW = 10_000n;
+/**
+ * How much further a wide lookup goes, in one read where the node takes it: Arbitrum One's public node answers
+ * 10,000,000 blocks (about 29 days) of one sender's logs at once; publicnode's (the other chains' here) refuse the
+ * read as an archive request, which ends the lookup there (November 2026).
+ */
+const LAST_SIGNED_WIDE = 10_000_000n;
 /** A node's answer that the blocks asked for are older than it serves (Ethereum's public node): the reach ends there. */
 const BEYOND_REACH = /archive|pruned|missing trie node|not available|header not found/i;
 /**
@@ -612,7 +652,7 @@ const BEYOND_REACH = /archive|pruned|missing trie node|not available|header not 
  * at that block or later; a lookup any of whose reads failed is not remembered, and one at an earlier block (a
  * replay) reads again, so an operation never sees one after it.
  */
-export async function lastSignature(c: { deps: Dependencies; chainId: number; sender: string; entryPoint?: string; match?: (signature: Hex) => boolean; key?: string }): Promise<Hex | undefined> {
+export async function lastSignature(c: { deps: Dependencies; chainId: number; sender: string; entryPoint?: string; match?: (signature: Hex) => boolean; key?: string; wide?: boolean }): Promise<Hex | undefined> {
   const rpc = c.deps.rpc;
   if (!rpc?.has(c.chainId) || !c.entryPoint) return undefined;
   let head: bigint;
@@ -624,9 +664,11 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
   const key = `${c.chainId}:${c.entryPoint}:${c.sender}${c.key ? `:${c.key}` : ''}`;
   const known = LAST_SIGNED.get(key);
   if (known && head >= known.head && Date.now() - known.at < (known.signature ? FOUND_FOR : EMPTY_FOR)) return known.signature;
-  let signature: Hex | undefined, failed = false, window = LAST_SIGNED_WINDOW, reached = 0n, fetched = 0;
+  // `wide`: beyond the usual reach (see LAST_SIGNED_WIDE), as far as the node takes in a few reads.
+  let signature: Hex | undefined, failed = false, window = c.wide ? LAST_SIGNED_WIDE : LAST_SIGNED_WINDOW, reached = c.wide ? LAST_SIGNED_REACH : 0n, fetched = 0;
+  const reach = c.wide ? LAST_SIGNED_REACH + LAST_SIGNED_WIDE : LAST_SIGNED_REACH;
   try {
-    for (let reads = 0; reached < LAST_SIGNED_REACH && head - reached > 0n && reads < 16; reads++) {
+    for (let reads = 0; reached < reach && head - reached > 0n && reads < (c.wide ? 4 : 16); reads++) {
       const to = head - reached, from = to >= window ? to - window + 1n : 0n;
       let logs: { transactionHash: string }[];
       try {
@@ -669,7 +711,9 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
  * had it: by the chain's default its operations came out 27-47% low.
  */
 async function zeroDevPrecompiled(c: StubContext): Promise<boolean> {
-  const signature = await lastSignature(c);
+  // Beyond the usual reach too: what the flag costs either way (above) is worth a read more. An account of Blofin's
+  // on Arbitrum One whose last operation was 2,460,000 blocks back (a week) came out 53% low by the chain's default.
+  const signature = await lastSignature(c) ?? await lastSignature({ ...c, wide: true, key: 'wide' });
   const read = (sig: Hex) => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
   const precompiled = signature && (read(signature) ?? (signature.startsWith('0xff') ? read(`0x${signature.slice(4)}`) : undefined));
   return precompiled ?? ZERODEV_PRECOMPILED.has(c.chainId);
@@ -1155,6 +1199,97 @@ async function coinbaseDeployStub(c: StubContext, factoryData: Hex): Promise<Stu
   try { owners = decodeFunctionData({ abi: CREATE_ACCOUNT, data: factoryData }).args[0]; } catch { /* none read */ }
   return coinbaseFor([...owners], c);
 }
+// --- Copies of Coinbase Smart Wallet ---
+// Wallets run their own builds of Coinbase Smart Wallet v1 (its source is MIT-licensed), with their own factories:
+// Base's "giga1" wallet (origin https://giga1.com) a build ported to EntryPoint v0.7 (implementation 0xca7f…6aaf,
+// unpublished, 11,715 bytes against Coinbase's 18,002; factory 0x6455…b749, whose createAccount(bytes[] owners,
+// uint256 nonce, bytes32) takes a word more), behind Solady's ERC-1967 proxy as Coinbase's are. Its passkey owner's
+// operation was simulated as calls only: no stand-in was in its form. Neither is known by address, so one is taken for
+// Coinbase's by what its implementation answers (coinbaseLike), and given Coinbase's stand-ins (coinbaseFor: owners
+// read as Coinbase's keep them, a passkey's assertion in webauthn-sol's WebAuthnAuth, whose P256VERIFY call the
+// stand-in answers); its own validation then decides, as for Coinbase's: a copy that checks signatures another way
+// refuses the stand-in, and the preview says so. That the account runs that implementation is checked on its code,
+// not taken from what a factory or a storage slot names: an existing account's code must be Solady's ERC-1967 proxy
+// (which runs what its slot names), and an account being deployed must be at the address its factory derives for that
+// proxy to the implementation, as Coinbase's factory does (CREATE2, with keccak256(abi.encode(owners, nonce)) as the
+// salt), which only that proxy's creation code can make. Elsewhere it isn't taken for one (the plain stand-in).
+const COINBASE_IMPLEMENTATIONS = new Set(['0x000100abaad02f1cfc8bbe32bd5a564817339e72', '0x00000110dcdedc9581cb5ecb8467282f2926534d']);
+const COINBASE_VIEWS = parseAbi(['function REPLAYABLE_NONCE_KEY() view returns (uint256)', 'function entryPoint() view returns (address)', 'function implementation() view returns (address)',
+  'function eip712Domain() view returns (bytes1 fields, string name, string version, uint256 chainId, address verifyingContract, bytes32 salt, uint256[] extensions)']);
+/** What coinbaseLike and coinbaseFactoryOf found, by chain and address (only where the node answered). */
+const COINBASE_LIKE = new Map<string, Promise<boolean>>(), FACTORY_IMPLEMENTATIONS = new Map<string, Promise<string | undefined>>();
+/** The node answered (an execution error, or nothing to decode), rather than failing to. */
+const answered = (e: unknown) => !!(e as { rpcError?: unknown })?.rpcError || /^Abi/.test(String((e as Error)?.name ?? ''));
+const coinbaseView = async (c: StubContext, to: string, functionName: 'REPLAYABLE_NONCE_KEY' | 'entryPoint' | 'implementation' | 'eip712Domain'): Promise<unknown> =>
+  decodeFunctionResult({ abi: COINBASE_VIEWS, functionName, data: String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to, data: encodeFunctionData({ abi: COINBASE_VIEWS, functionName }) }, 'latest'])) as Hex } as never);
+/**
+ * Whether `implementation` answers as Coinbase Smart Wallet v1's own do: eip712Domain()'s name "Coinbase Smart Wallet"
+ * and version "1", REPLAYABLE_NONCE_KEY() 8453 (Base's chain ID, a constant of its code whatever the chain), and
+ * entryPoint() the operation's EntryPoint (Coinbase's take v0.6's; the giga1 build, v0.7's).
+ */
+function coinbaseLike(c: StubContext, implementation: string): Promise<boolean> {
+  const key = `${c.chainId}:${implementation}:${c.entryPoint}`;
+  let known = COINBASE_LIKE.get(key);
+  if (!known) {
+    known = (async () => {
+      if ((await coinbaseView(c, implementation, 'REPLAYABLE_NONCE_KEY')) !== 8453n) return false;
+      const [domain, entryPoint] = await Promise.all([coinbaseView(c, implementation, 'eip712Domain') as Promise<readonly unknown[]>, coinbaseView(c, implementation, 'entryPoint') as Promise<string>]);
+      return domain[1] === 'Coinbase Smart Wallet' && domain[2] === '1' && entryPoint.toLowerCase() === c.entryPoint?.toLowerCase();
+    })().catch(e => { if (!answered(e)) COINBASE_LIKE.delete(key); return false; });
+    COINBASE_LIKE.set(key, known);
+  }
+  return known;
+}
+/** The implementation a factory deploys (its implementation()), as Coinbase's factories name theirs. */
+function coinbaseFactoryOf(c: StubContext, factory: string): Promise<string | undefined> {
+  const key = `${c.chainId}:${factory}`;
+  let known = FACTORY_IMPLEMENTATIONS.get(key);
+  if (!known) {
+    known = (coinbaseView(c, factory, 'implementation') as Promise<string>).then(a => a.toLowerCase(), e => { if (!answered(e)) FACTORY_IMPLEMENTATIONS.delete(key); return undefined; });
+    FACTORY_IMPLEMENTATIONS.set(key, known);
+  }
+  return known;
+}
+/**
+ * Solady's ERC-1967 proxy (LibClone), which runs whatever implementation its slot names: Coinbase Smart Wallet's factories
+ * deploy its accounts as it (its code, and its creation code for an implementation), and Modular Account v2's factory
+ * its accounts (a semi-modular account's with its immutable args after it: runsModularAccount).
+ */
+const SOLADY_ERC1967 = '0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3';
+const soladyErc1967Creation = (implementation: string): Hex => `0x603d3d8160223d3973${implementation.slice(2).toLowerCase()}60095155f3${SOLADY_ERC1967.slice(2)}`;
+/** How the account was seen to run the copy (coinbaseCopyStub), as its note says. */
+const COPY_RUN = { proxy: "behind Solady's ERC-1967 proxy, as Coinbase's accounts are (its code is that proxy)", deploying: "behind Solady's ERC-1967 proxy, as Coinbase's accounts are (its address is the one its factory's CREATE2 gives that proxy to it)", delegated: 'as its EIP-7702 delegate' };
+const coinbaseCopyNote = (implementation: string, how: keyof typeof COPY_RUN) => `The account runs ${implementation}, not Coinbase's own Coinbase Smart Wallet but a build of it that answers as Coinbase Smart Wallet v1 does (its EIP-712 name and version, replayable nonce key and EntryPoint), ${COPY_RUN[how]}: the stand-in is in Coinbase's form, which its validation took.`;
+/**
+ * Coinbase's stand-in for an account a copy of Coinbase Smart Wallet runs (coinbaseLike), its code Solady's ERC-1967
+ * proxy or an EIP-7702 delegation to the copy (or the operation delegating to it, `delegated`); or that another factory
+ * deploys as that proxy to a copy (its
+ * implementation() coinbaseLike, its call's first two arguments the owners, as Coinbase's createAccount takes them,
+ * each an address's 32 bytes or a passkey's 64, and the nonce, and the account's address the proxy's for that
+ * implementation, from the factory, with Coinbase's salt); undefined for any other.
+ */
+async function coinbaseCopyStub(c: StubContext, runs?: string, factory?: string, factoryData?: Hex, delegated = false): Promise<Stub[] | undefined> {
+  if (!c.deps.rpc?.has(c.chainId) || !c.entryPoint) return undefined;
+  if (!factory) {
+    if (!runs || COINBASE_IMPLEMENTATIONS.has(runs) || !await coinbaseLike(c, runs)) return undefined;
+    let how: keyof typeof COPY_RUN = 'delegated';
+    if (!delegated) {
+      let code: string;
+      try { code = String(await c.deps.rpc.call(c.chainId, 'eth_getCode', [c.sender, 'latest'])).toLowerCase(); } catch { return undefined; }
+      if (code === SOLADY_ERC1967) how = 'proxy';
+      else if (code !== `0xef0100${runs.slice(2)}`) return undefined;
+    }
+    return [{ ...(await coinbaseStub({ ...c, runs })), note: coinbaseCopyNote(runs, how) }];
+  }
+  const implementation = await coinbaseFactoryOf(c, factory);
+  if (!implementation || COINBASE_IMPLEMENTATIONS.has(implementation) || !factoryData || !await coinbaseLike(c, implementation)) return undefined;
+  let owners: readonly Hex[], nonce: bigint;
+  try { [owners, nonce] = decodeAbiParameters([{ type: 'bytes[]' }, { type: 'uint256' }], `0x${factoryData.slice(10)}`); } catch { return undefined; }
+  if (!owners.length || !owners.every(o => /^0x0{24}[0-9a-f]{40}$/i.test(o) || o.length === 2 + 128)) return undefined;
+  const at = getContractAddress({ opcode: 'CREATE2', from: factory as Hex, salt: keccak256(encodeAbiParameters([{ type: 'bytes[]' }, { type: 'uint256' }], [owners, nonce])), bytecodeHash: keccak256(soladyErc1967Creation(implementation)) });
+  if (at.toLowerCase() !== c.sender.toLowerCase()) return undefined;
+  return [{ ...(await coinbaseFor([...owners], c)), note: coinbaseCopyNote(implementation, 'deploying') }];
+}
 /** Stand-ins for accounts a factory is deploying in the operation, by factory (their code doesn't exist yet). */
 const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promise<Stub | Stub[]>> = {
   // Coinbase Smart Wallet's factories (v1 and v1.1).
@@ -1188,6 +1323,9 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
   },
   // OKX Wallet's account factory (see okxStubs).
   '0x5c328f3b5f117ffc693378a2c5b16c4f80f86295': okxDeployStub,
+  // Biconomy's NexusAccountFactory (verified on Sourcify), whose accounts run Nexus 1.2 (its ACCOUNT_IMPLEMENTATION,
+  // an immutable of its code, the same on the six chains here): see nexusDeployStub.
+  '0x0000006648ed9b2b842552be63af870bc74af837': nexusDeployStub,
 };
 const BICONOMY_FACTORY = parseAbi(['function deployCounterFactualAccount(address moduleSetupContract, bytes moduleSetupData, uint256 index)', 'function deployAccount(address moduleSetupContract, bytes moduleSetupData)']);
 /** Biconomy's ECDSA ownership module for Smart Account v2. */
@@ -1196,40 +1334,99 @@ const BICONOMY_ECDSA_MODULE = '0x0000001c5b32f37f5bea87bdd5374eb2ac54ea8e';
 const biconomyStub = (): Stub => ({ signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [STUB_SIGNATURE, BICONOMY_ECDSA_MODULE]) });
 
 // --- An EIP-7702 delegate in Biconomy Smart Account v2's form, with a cosigner ---
-// Unpublished (not on Sourcify, nor its registry or module); read from its code (4,078 bytes, the same at its address on
-// Ethereum, BNB Chain, Base and Arbitrum One; not deployed on Polygon) and its operations. EntryPoint v0.6 is the only
-// one it takes (its ENTRY_POINT()). Its account answers Smart Account v2's calls (execute_ncC, executeBatch_y6U,
-// execute, executeBatch) and takes its signature, abi.encode(the module's signature, a module), but checks it itself:
-// the module is never called (its operations name 0xd88b…9ea3, "Multichain PassKeys Ownership Registry Module" 0.2.0).
+// Two deployments, neither published (not on Sourcify, nor their registries or modules); read from their code and
+// their operations. The first, 0x13e0…9a5a (4,078 bytes, the same at its address on Ethereum, BNB Chain, Base and
+// Arbitrum One; not deployed on Polygon), and the second, 0x6640…831c (4,622 bytes, another compiler's, the same at
+// its address on all six chains here), work alike. EntryPoint v0.6 is the only one either takes (its ENTRY_POINT()).
+// Its account answers Smart Account v2's calls (execute_ncC, executeBatch_y6U, execute, executeBatch) and takes its
+// signature, abi.encode(the module's signature, a module), but checks it itself: the module is never called (the
+// first's operations name 0xd88b…9ea3, "Multichain PassKeys Ownership Registry Module" 0.2.0, the second's
+// 0xba41…967b, the same module's code with another registry in it).
 // The module's signature is abi.encode(a cosignature, the owner's signature), and validation passes only with both:
-// - the cosignature, over the operation's hash (personal_sign, else as is), checked by a registry (0x980d…083b,
-//   isValidSignature(hash, signature) answering a bool): one of its verifying signers' (a mapping at slot 1), unless
-//   it is switched (slot 2) to take or refuse every signature;
+// - the cosignature, over the operation's hash (personal_sign, else as is), checked by the delegate's registry
+//   (isValidSignature(hash, signature) answering a bool): the first's, 0x980d…083b, takes one of its verifying
+//   signers' (a mapping at slot 1), unless it is switched (slot 2) to take or refuse every signature; the second's,
+//   0x82ea…e4dc (the same at its address on all six chains), which the delegate names (its getter 0xa600845b, which
+//   the first lacks), takes its one verifying signer's (getVerifyingSigner(), slot 1's low 20 bytes; none where that
+//   is zero), unless its owner switches it (0x21175b4a; slot 1's byte above the signer, read by 0x295a5212) to take
+//   (1) or refuse (2) every signature. A cosignature its registry refuses, the second pays nothing toward the
+//   operation's gas for (it returns 1 before paying its prefund: without a paymaster, the EntryPoint rejects the
+//   operation, AA21), where it pays for an owner's signature it refuses;
 // - the owner's, in the form of Biconomy's MultichainECDSAValidator (published in @biconomy-devx/account-contracts-v2):
 //   abi.encode(validUntil, validAfter, a Merkle root, the proof, the signature), the account's own key signing the
 //   root (personal_sign, else as is; OpenZeppelin's ECDSA.recover, which reverts on a malformed signature) of a tree
 //   with keccak256(abi.encodePacked(validUntil, validAfter, the operation's hash)) among its leaves: one signature for
-//   operations on several chains. A proof that doesn't reach the root fails validation (1); validUntil 0 is none.
-// The stand-in: the cosignature recovered as the verifying signer that cosigned every operation seen (63 of 63 on BNB
-// Chain and Ethereum, November 2026; listed in the registry on all four chains), and STUB_SIGNATURE over the root of a
-// tree of two leaves, the operation's (no time bounds) and another: most of its operations are signed so, together
-// with one other (39 of 63; 21 alone, 3 with two or three others). Each element of the proof costs about 355 gas: an
-// operation signed alone costs about 390 less than the stand-in, one signed with two or three others about 320 more.
-const COSIGNED_7702_DELEGATE = '0x13e00e089f81ad9f36b655c9e9a07c6bf1489a5a';
-const COSIGNED_7702_MODULE = '0xd88b687ba4237e6b9893020285103f45d8949ea3';
-/** The registry's verifying signer that cosigns the delegate's operations. */
+//   operations on several chains. A proof that doesn't reach the root fails validation (1; the second pays nothing
+//   then either); validUntil 0 is none.
+// The stand-in: the cosignature recovered as the registry's verifying signer (the second's read from it, with its
+// mode, and where it has none, as another key's, refused as any will be; the first's can't be listed, so the one
+// that cosigned every operation seen, 63 of 63 on BNB Chain and Ethereum, November 2026, listed in the registry on
+// all four chains), and STUB_SIGNATURE over the root of a tree as the delegate's operations
+// are mostly signed, with no time bounds. The first's: two leaves, the operation's and another (39 of 63 so; 21
+// alone, 3 with two or three others). The second's: the operation's alone, as every one seen was (6 operations of 4
+// accounts in 40,000 blocks on BNB Chain, 2026-11-15, each cosigned by its registry's signer and sponsored by
+// 0xdeaa…34df). Each element of the proof costs about 355 gas: one of the first's operations signed alone costs
+// about 390 less than the stand-in, one signed with two or three others about 320 more.
+/** The first delegate's registry's verifying signer that cosigns its operations (the registry can't list them). */
 export const COSIGNED_7702_COSIGNER = '0x9ff3c744db7ea31eb38689482ea7cb38438865c6';
+/**
+ * The delegates in that form: the module their operations name, how many other leaves the stand-in's tree has, the
+ * cosigner where the registry can't be asked (otherwise read: see cosigned7702Registry), and whether it pays nothing
+ * toward its gas for a cosignature its registry refuses (Stub's unpaid).
+ */
+const COSIGNED_7702_DELEGATES: Record<string, { module: Hex; siblings: 0 | 1; cosigner?: string; unpaid?: boolean }> = {
+  '0x13e00e089f81ad9f36b655c9e9a07c6bf1489a5a': { module: '0xd88b687ba4237e6b9893020285103f45d8949ea3', siblings: 1, cosigner: COSIGNED_7702_COSIGNER },
+  '0x6640c1cccaf07dbe765ec05e294fe427cc92831c': { module: '0xba418fa699622de824b258c61eb150ed7a13967b', siblings: 0, unpaid: true },
+};
+/**
+ * The second delegate's getter for its registry (selector 0xa600845b; no name for it is published), and the
+ * registry's for its signer and for its mode (0x295a5212, unnamed too: 0 takes the signer's, 1 any, 2 none).
+ */
+const COSIGNED_7702_REGISTRY = '0xa600845b' as Hex, COSIGNED_7702_MODE = '0x295a5212' as Hex;
+const VERIFYING_SIGNER = parseAbi(['function getVerifyingSigner() view returns (address)']);
 /** The other leaf of the stand-in's tree (any word: the account only hashes it with the operation's leaf). */
 const COSIGNED_7702_SIBLING = `0x${'00'.repeat(31)}01` as Hex;
+/**
+ * The registry the delegate names, its verifying signer (the zero address where it has none) and its mode, read from
+ * the chain (undefined if they can't be read).
+ */
+async function cosigned7702Registry(c: StubContext, delegate: string): Promise<{ registry: string; signer: string; mode: number } | undefined> {
+  const call = async (to: string, data: Hex) => {
+    const out = String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to, data }, 'latest']));
+    return /^0x[0-9a-f]{64}$/i.test(out) ? BigInt(out) : undefined;
+  };
+  const address = (v: bigint) => `0x${v.toString(16).padStart(40, '0')}`;
+  try {
+    const registry = await call(delegate, COSIGNED_7702_REGISTRY);
+    if (!registry || registry >> 160n) return undefined;
+    const [signer, mode] = await Promise.all([call(address(registry), encodeFunctionData({ abi: VERIFYING_SIGNER, functionName: 'getVerifyingSigner' })), call(address(registry), COSIGNED_7702_MODE)]);
+    return signer !== undefined && !(signer >> 160n) && mode !== undefined && mode < 3n ? { registry: address(registry), signer: address(signer), mode: Number(mode) } : undefined;
+  } catch { return undefined; }
+}
 async function cosigned7702Stub(c: StubContext): Promise<Stub> {
-  const hash = await c.hash();
+  const delegate = c.runs!, { module: named, siblings, cosigner: known, unpaid } = COSIGNED_7702_DELEGATES[delegate];
+  const [hash, registry] = await Promise.all([c.hash(), known ? undefined : cosigned7702Registry(c, delegate)]);
+  // The cosignature's stand-in: the verifying signer's; where the registry has none, a key that isn't its (a real
+  // cosignature is someone's: refused, as any will be); the registry unread, no one's (refused, or its check reverts).
+  const cosigner = known ?? (registry && (BigInt(registry.signer) ? registry.signer : ECRECOVER_NOBODY));
+  // Why the account may not take it: the signer asked isn't the account (whatever its registry does); its registry
+  // takes no cosignature now; or, unsure, the registry couldn't be read.
+  const reg = registry && shortAddr(registry.registry);
+  const why = c.signer.toLowerCase() !== c.sender.toLowerCase() ? "it takes its own key's signature (it is an EIP-7702 account), with its registry's cosignature, and the signer asked isn't the account"
+    : known ? undefined
+    : !registry ? "its signature carries a cosignature that its registry checks, and the registry couldn't be read"
+    : registry.mode === 2 ? `its registry (${reg}) is switched to refuse every cosignature: the account takes no operation, whoever signs it, until the registry's owner switches it back`
+    : registry.mode === 0 && !BigInt(registry.signer) ? `its registry (${reg}) has no verifying signer, so it refuses every cosignature: the account takes no operation, whoever signs it, until the registry's owner sets one`
+    : undefined;
   const leaf = hash && keccak256(concatHex(['0x000000000000', '0x000000000000', hash]));
   // OpenZeppelin's MerkleProof hashes each pair in sorted order. Without the hash, a root the proof can't reach: the
   // account refuses the signature (validation returns 1) rather than reverting.
-  const root = leaf ? keccak256(BigInt(leaf) < BigInt(COSIGNED_7702_SIBLING) ? concatHex([leaf, COSIGNED_7702_SIBLING]) : concatHex([COSIGNED_7702_SIBLING, leaf])) : `0x${'00'.repeat(32)}` as Hex;
-  const owner = encodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), [0, 0, root, [COSIGNED_7702_SIBLING], STUB_SIGNATURE]);
+  const proof = siblings ? [COSIGNED_7702_SIBLING] : [];
+  const root = !leaf ? `0x${'00'.repeat(32)}` as Hex : !siblings ? leaf : keccak256(BigInt(leaf) < BigInt(COSIGNED_7702_SIBLING) ? concatHex([leaf, COSIGNED_7702_SIBLING]) : concatHex([COSIGNED_7702_SIBLING, leaf]));
+  const owner = encodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), [0, 0, root, proof, STUB_SIGNATURE]);
   const module = encodeAbiParameters(parseAbiParameters('bytes, bytes'), [STUB_COSIGNATURE, owner]);
-  return { signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [module, COSIGNED_7702_MODULE]), cosigners: [{ signature: STUB_COSIGNATURE, signer: COSIGNED_7702_COSIGNER }] };
+  return { signature: encodeAbiParameters([{ type: 'bytes' }, { type: 'address' }], [module, named]), cosigners: cosigner ? [{ signature: STUB_COSIGNATURE, signer: cosigner }] : [],
+    ...(why && { why }), ...(why && !known && !registry && c.signer.toLowerCase() === c.sender.toLowerCase() && { unsure: true }), ...(unpaid && { unpaid }) };
 }
 
 // --- OKX Wallet's smart account ---
@@ -1249,7 +1446,22 @@ async function cosigned7702Stub(c: StubContext): Promise<Stub> {
 // The account runs its calls through executeUserOp, which reads the key's hash back out of the signature and
 // applies that key's settings: with the bare stand-in, an unknown key, an operation that adds an owner (a call to
 // the account itself, as most first operations make) failed with NonAdminSelfCall where the signed one succeeded.
+// A key's type can also be a contract that checks its signatures (an external verifier): the account calls it
+// (selector 0x9b2c81d3) with the key's hash, the digest and the rest of the signature, and takes its answer. One is
+// OKX's passkey verifier (OKX_PASSKEY_VERIFIER, below).
 export const OKX_IMPLEMENTATION = '0x36d3cbd83961868398d056efbf50f5ce15528c0d';
+/**
+ * OKX's passkey verifier (unpublished: an ERC-1967 proxy, EIP-712 domain "SmartWallet" 1.0.0, at this address on every
+ * chain here, its implementation OKX_PASSKEY_VERIFIER_CODE in November 2026), read from its behaviour on an operation
+ * on OP Mainnet (0xb7e5…fc30), its validateUserOp run in a local EVM: a key of its type signs
+ *   key hash | validUntil (uint48) | abi.encode(bytes passkey, bytes cosignature)
+ * the passkey's part as a type-2 key's (x | y | abi.encode(WebAuthnAuth, bytes32[] proof)), whose public key it hashes
+ * against the key's hash and whose assertion it checks (its type and challenge, the digest base64url-encoded, then
+ * P256VERIFY), and an ECDSA signature over the same digest by the key it records for the account (a mapping at its
+ * slot 0): both, or the account's validation fails as for any key's refusal.
+ */
+export const OKX_PASSKEY_VERIFIER = '0xa9215f1afa5e2a5bb924f53186934b5da3459fe8';
+const OKX_PASSKEY_VERIFIER_CODE = '0x47f00fd16ccfdcec08617373f524a5e68ac8a29a';
 /** Its storage root (CUSTOM_STORAGE_ROOT()): a key's type is at keccak256(key hash, root + 1), its settings at keccak256(key hash, root + 2). */
 const OKX_STORAGE_ROOT = 0x653ff6dcbda533c3c7d8ffb646da3e510d0de40f237170c4da3f874472aecb00n;
 const okxSlot = (key: Hex, n: bigint) => keccak256(concatHex([key, `0x${(OKX_STORAGE_ROOT + n).toString(16).padStart(64, '0')}`]));
@@ -1277,6 +1489,19 @@ type OkxKey = { hash: Hex; type: bigint; settings: bigint };
  *   factory has derived the account's address from the real keys by then, and the initializer writes what it would;
  * - as the last resort, the real key's hash with a signature the account won't accept. Its signature check isn't
  *   simulated then (2.3% of the gas of first operations on BNB Chain), but the calls run as that key.
+ * A passkey signs as the account itself (a passkey wallet's way, as Coinbase's, Send's and Barz's do): asked by anyone
+ * else who isn't one of the account's Ethereum keys, where the key most likely to sign is a passkey, the stand-in is
+ * that key's real hash with the stand-in passkey's part, which the account's check refuses, and the preview says the
+ * account is signed by its passkey (no address but the account's can sign as one).
+ * A key of OKX's passkey verifier's type (see OKX_PASSKEY_VERIFIER) is a passkey's too: the stand-in key, of that type,
+ * signs the passkey's part (its assertion checked by the verifier, through P256VERIFY's stand-in) and STUB_COSIGNATURE
+ * as the verifier's cosignature, recovered as the key the verifier records for the account (the preview saying that
+ * key must cosign too). Only while the verifier runs the code its form was read from, and records a key for the
+ * account; otherwise the stand-in is the last resort's (the real key's hash, the form the verifier's known code took),
+ * and the preview says the verifier's check isn't known, so the refusal needn't mean the passkey can't sign. The
+ * account on OP Mainnet whose operation showed it (0x21c9…9359, behind OKX's 797-byte proxy, implementationOf) had been
+ * given the plain stand-in, which it refused: on the latest state its operation came out 36,339 gas (23%) short of its
+ * own signature's run; now 17 gas over.
  */
 async function okxStubs(c: StubContext, keys: OkxKey[], deployed: boolean): Promise<Stub[]> {
   const hash = await c.hash();
@@ -1284,14 +1509,34 @@ async function okxStubs(c: StubContext, keys: OkxKey[], deployed: boolean): Prom
   const now = BigInt(Math.floor(Date.now() / 1000));
   const validUntil = now + 365n * 86400n, until = `0x${validUntil.toString(16).padStart(12, '0')}` as Hex;
   const ecdsa = (key: Hex) => concatHex([key, until, STUB_SIGNATURE]);
-  const passkey = (key: Hex) => concatHex([key, until, OKX_PASSKEY.x, OKX_PASSKEY.y, encodeAbiParameters([WEBAUTHN_AUTH, { type: 'bytes32[]' }], [webAuthnAuth(okxDigest(hash, validUntil), 'okx.com'), []])]);
+  const assertion = concatHex([OKX_PASSKEY.x, OKX_PASSKEY.y, encodeAbiParameters([WEBAUTHN_AUTH, { type: 'bytes32[]' }], [webAuthnAuth(okxDigest(hash, validUntil), 'okx.com'), []])]);
+  const passkey = (key: Hex) => concatHex([key, until, assertion]);
+  const verified = (key: Hex) => concatHex([key, until, encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [assertion, STUB_COSIGNATURE])]);
   const own = keccak256(c.signer as Hex);
   if (keys.some(k => k.hash === own && k.type === 1n)) return [{ signature: ecdsa(own) }];
+  const VERIFIED = BigInt(OKX_PASSKEY_VERIFIER), isPasskey = (k: OkxKey) => k.type === 2n || k.type === VERIFIED;
   const expired = (k: OkxKey) => { const at = (k.settings >> 160n) & 0xffffffffffn; return at !== 0n && at <= now; };
-  const rank = (k: OkxKey) => (k.type === 2n ? 0 : 4) + (expired(k) ? 2 : 0) + (k.settings & OKX_ADMIN ? 0 : 1);
-  const key = keys.filter(k => k.type === 1n || k.type === 2n).sort((a, b) => rank(a) - rank(b))[0];
+  const rank = (k: OkxKey) => (isPasskey(k) ? 0 : 4) + (expired(k) ? 2 : 0) + (k.settings & OKX_ADMIN ? 0 : 1);
+  const key = keys.filter(k => k.type === 1n || isPasskey(k)).sort((a, b) => rank(a) - rank(b))[0];
   if (!key) return [{ signature: STUB_SIGNATURE }];
-  const standIn = key.type === 2n ? keccak256(concatHex([OKX_PASSKEY.x, OKX_PASSKEY.y])) : own;
+  // A key of the verifier's type: the verifier's key for the account (its cosigner), where it runs its known code.
+  const verifier = key.type === VERIFIED ? await okxVerifierCosigner(c) : undefined;
+  const cosigner = verifier?.cosigner;
+  // A passkey, asked by an address that isn't the account (nor one of its Ethereum keys: above): the real key, which
+  // the stand-in passkey's public key doesn't hash to, so the account's check refuses it.
+  if (isPasskey(key) && c.signer !== c.sender) {
+    const by = key.type === 2n ? 'its passkey' : cosigner ? `its passkey, which OKX's passkey verifier (${shortAddr(OKX_PASSKEY_VERIFIER)}) takes only with a cosignature by ${cosigner}` : `its passkey, checked by OKX's passkey verifier (${shortAddr(OKX_PASSKEY_VERIFIER)})`;
+    const asked = cosigner && c.signer === cosigner ? "the signer asked is that cosigner, whose signature is only the second of the two" : "the signer asked is neither the account nor one of its Ethereum keys";
+    return [{ signature: key.type === 2n ? passkey(key.hash) : verified(key.hash), p256: true, why: `OKX Wallet's account here is signed by ${by} (a passkey wallet signs as the account itself), and ${asked}` }];
+  }
+  // The verifier's checks not known (its code isn't the one they were read from, or it records no cosigner for the
+  // account): the last resort, which needn't be refused as the passkey's own signature would be.
+  if (key.type === VERIFIED && !cosigner) {
+    return [{ signature: verified(key.hash), p256: true, unsure: true,
+      why: `the account's key is a passkey checked by OKX's passkey verifier (${shortAddr(OKX_PASSKEY_VERIFIER)}), ${verifier?.unknown ?? "whose checks weren't read"}: the stand-in is in the form its known code takes`,
+      note: `The account's key is a passkey checked by OKX's passkey verifier (${shortAddr(OKX_PASSKEY_VERIFIER)}), ${verifier?.unknown ?? "whose checks weren't read"}: the stand-in, in the form its known code takes, was accepted all the same.` }];
+  }
+  const standIn = isPasskey(key) ? keccak256(concatHex([OKX_PASSKEY.x, OKX_PASSKEY.y])) : own;
   const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}`;
   const storage = { [okxSlot(standIn, 1n)]: word(key.type), [okxSlot(standIn, 2n)]: word(key.settings) };
   // The key's place in initialize((bytes32 keyHash, address keyType)[])'s calldata: the selector, the array's offset
@@ -1303,9 +1548,33 @@ async function okxStubs(c: StubContext, keys: OkxKey[], deployed: boolean): Prom
     registered = implementation && implementation.length > 2
       ? { code: { [OKX_IMPLEMENTATION]: okxInitializing(key.hash, standIn, 4 + 64 + 64 * keys.indexOf(key)), [OKX_MOVED]: implementation as Hex }, warm: [OKX_MOVED] } : undefined;
   }
-  const last: Stub = key.type === 2n ? { signature: passkey(key.hash), p256: true } : { signature: ecdsa(key.hash) };
+  // A key of the verifier's type: the passkey's part and the cosignature, which ecrecover's stand-in recovers as the
+  // verifier's key for the account.
+  const signed = (k: Hex): Stub => key.type === 2n ? { signature: passkey(k), p256: true } : key.type === VERIFIED
+    ? { signature: verified(k), p256: true, cosigners: [{ signature: STUB_COSIGNATURE, signer: cosigner! }],
+      note: `The account's key is a passkey whose signatures OKX's passkey verifier (${shortAddr(OKX_PASSKEY_VERIFIER)}, unpublished: its checks read from what it does) takes only with a cosignature by the key it records for the account (${cosigner}), over the same digest: the stand-in stands in for both, so the operation validates only once that key cosigns it too.` }
+    : { signature: ecdsa(k) };
+  const last: Stub = signed(key.hash);
   if (!registered) return [last];
-  return [key.type === 2n ? { signature: passkey(standIn), p256: true, ...registered } : { signature: ecdsa(standIn), ...registered }, last];
+  return [{ ...signed(standIn), ...registered }, last];
+}
+/**
+ * The key OKX's passkey verifier records for the account (its cosigner: a mapping at its slot 0), while the verifier
+ * runs the code its form was read from (OKX_PASSKEY_VERIFIER_CODE); else why its checks aren't known (`unknown`: its
+ * code isn't that, it records no key for the account, or neither was read).
+ */
+async function okxVerifierCosigner(c: StubContext): Promise<{ cosigner?: string; unknown?: string }> {
+  const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
+  if (!rpc) return { unknown: "whose code and record of the account weren't read" };
+  try {
+    const [code, recorded] = await Promise.all([
+      rpc.call(c.chainId, 'eth_getStorageAt', [OKX_PASSKEY_VERIFIER, ERC1967_IMPLEMENTATION_SLOT, 'latest']),
+      rpc.call(c.chainId, 'eth_getStorageAt', [OKX_PASSKEY_VERIFIER, keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [c.sender as Hex, 0n])), 'latest'])]);
+    const runs = `0x${String(code).slice(-40)}`.toLowerCase();
+    if (runs !== OKX_PASSKEY_VERIFIER_CODE) return { unknown: `whose code (${shortAddr(runs)}) isn't the code its checks were read from` };
+    const key = BigInt(String(recorded));
+    return key !== 0n && key < 1n << 160n ? { cosigner: `0x${key.toString(16).padStart(40, '0')}` } : { unknown: 'which records no cosigner for the account' };
+  } catch { return { unknown: "whose code and record of the account weren't read" }; }
 }
 /** Where OKX's implementation code moves while okxInitializing takes its address. */
 const OKX_MOVED = '0x0000000000000000000000000000000000ec0c0d';
@@ -1493,6 +1762,88 @@ async function sendStub(c: StubContext): Promise<Stub[]> {
   return [{ signature: sendStandIn(hash, slot, validUntil), p256: true }];
 }
 
+// --- Trust Wallet's Barz (a diamond; its facets verified on Sourcify, BNB Chain, at the same addresses on every chain here) ---
+// An account is a diamond proxy (the same 573 bytes for each, BARZ_PROXY its hash) whose AccountFacet validates an
+// operation (EntryPoint v0.6) by delegatecalling the facet installed for validateOwnerSignature: Secp256k1-
+// VerificationFacet for an Ethereum key (the bare signature, which STUB_SIGNATURE is), or Secp256r1VerificationFacet
+// for a passkey, which takes
+//   abi.encode(uint256 r, uint256 s, bytes authenticatorData, string clientDataJSONPre, string clientDataJSONPost)
+// (clientDataJSON: the two around the operation's hash, base64url-encoded) and verifies it in Solidity (LibSecp256r1)
+// against the public key it keeps (r1Storage.q). Another signature fails to decode, which the account reports as
+// AccountFacet__CallNotSuccessful() (AA23: on BNB Chain about one operation an hour was simulated as calls only so,
+// November 2026). With no precompile or verifier contract to stand in at, the stand-in is a real assertion by a passkey
+// made up for the run (standInPasskey), whose public key is set as the account's for the run: validation runs every
+// check the real one's does, for the gas it uses. Its form is the one the account's latest earlier operation's
+// assertion had (Trust Wallet's apps sign with origin https://trustwallet.com, or an Android app's apk-key-hash origin
+// with its package's name, 64 bytes more of clientDataJSON), else the first.
+const BARZ_PROXY = '0xe152e0d0626438840037db419d2e66fa32002f1ee719b1dbe2892314bc67b6de';
+const BARZ_R1_FACET = '0xee1af8e967ec04c84711842796a5e714d2fd33e6';
+/** Where Secp256r1VerificationFacet keeps the passkey's public key (x, then y). */
+const BARZ_R1_SLOT = BigInt(keccak256(stringToHex('v0.trustwallet.diamond.storage.Secp256r1VerificationStorage')));
+const BARZ = parseAbi(['function facetAddress(bytes4 selector) view returns (address)']);
+/** validateOwnerSignature(UserOperation, bytes32), the selector a verification facet validates under. */
+const BARZ_VALIDATE_OWNER = '0x8dd50121';
+const BARZ_SIGNATURE = [{ type: 'uint256' }, { type: 'uint256' }, { type: 'bytes' }, { type: 'string' }, { type: 'string' }] as const;
+/** A Barz passkey's assertion's form: its authenticator data, and clientDataJSON before and after the challenge. */
+export interface BarzForm { authenticatorData: Hex; pre: string; post: string }
+/** Trust Wallet's form (its RP ID's hash, user present, verified and backed up, as its operations carry it). */
+export const BARZ_FORM: BarzForm = { authenticatorData: concatHex([sha256(stringToHex('trustwallet.com')), '0x1d', '0x00000000']), pre: '{"type":"webauthn.get","challenge":"', post: '","origin":"https://trustwallet.com"}' };
+/** The form of a Barz passkey's signature, where it is one (the key Chrome adds to some at random, see bullbitStub, left out). */
+export function barzFormOf(signature: Hex): BarzForm | undefined {
+  try {
+    const [, , authenticatorData, pre, post] = decodeAbiParameters(BARZ_SIGNATURE, signature);
+    return pre.endsWith('"challenge":"') && authenticatorData.length >= 2 + 37 * 2 ? { authenticatorData, pre, post: post.replace(/,"other_keys_can_be_added_here":"[^"]*"/, '') } : undefined;
+  } catch { return undefined; }
+}
+/**
+ * The stand-in passkey's assertion of `hash` in a Barz account's form, signed as WebAuthn signs (over
+ * sha256(authenticatorData || sha256(clientDataJSON))). What LibSecp256r1's check costs turns on the signature: its
+ * Shamir loop takes the scalars u1 = e/s and u2 = r/s two bits at a time and adds a point for every pair of bits but
+ * 0 and 0 (one in sixteen, at random: 8 of its 128 on average), about 850 gas each, so two real signatures of the same
+ * operation can differ by several thousand gas. Of the signatures the stand-in passkey can make (RFC 6979's, with extra
+ * entropy), the stand-in is the first whose loop skips 8, as one does on average. Against two operations' own
+ * signatures on the latest state (BNB Chain's skipping 8, Ethereum's 4): 90 gas over and 3,388 under (0.02% and
+ * 0.64%), where the first signature made came out 3,598 and 5,328 under.
+ */
+export function barzAssertion(hash: Hex, form: BarzForm = BARZ_FORM): Hex {
+  const clientDataJSON = `${form.pre}${base64url(hash)}${form.post}`;
+  const digest = sha256(concatHex([form.authenticatorData, sha256(stringToHex(clientDataJSON))]));
+  let signature = p256.sign(hexToBytes(digest), STAND_IN_PASSKEY);
+  for (let k = 1; k < 64 && p256SkippedPairs(BigInt(digest), signature.r, signature.s) !== 8; k++) signature = p256.sign(hexToBytes(digest), STAND_IN_PASSKEY, { extraEntropy: hexToBytes(numberToHex(k, { size: 32 })) });
+  return encodeAbiParameters(BARZ_SIGNATURE, [signature.r, signature.s, form.authenticatorData, form.pre, form.post]);
+}
+/** How many of the 128 bit pairs of u1 = e/s and u2 = r/s (mod n) are both 0 (see barzAssertion), or -1 when the first is. */
+export function p256SkippedPairs(e: bigint, r: bigint, s: bigint): number {
+  const n = p256.CURVE.n;
+  let w = 1n, base = s % n;
+  for (let x = n - 2n; x > 0n; x >>= 1n) { if (x & 1n) w = w * base % n; base = base * base % n; }
+  const u1 = e % n * w % n, u2 = r * w % n;
+  let skipped = 0;
+  for (let i = 0; i < 128; i++) {
+    const shift = BigInt(254 - 2 * i);
+    if (!((u1 >> shift) & 3n) && !((u2 >> shift) & 3n)) { if (i === 0) return -1; skipped++; }
+  }
+  return skipped;
+}
+async function barzStub(c: StubContext): Promise<Stub[]> {
+  const plain = [{ signature: STUB_SIGNATURE }];
+  const rpc = c.deps.rpc?.has(c.chainId) ? c.deps.rpc : undefined;
+  if (!rpc) return plain;
+  try {
+    // An Ethereum key's account (Secp256k1VerificationFacet) takes the plain stand-in.
+    const facet = decodeFunctionResult({ abi: BARZ, functionName: 'facetAddress', data: String(await rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: BARZ, functionName: 'facetAddress', args: [BARZ_VALIDATE_OWNER] }) }, 'latest'])) as Hex });
+    const hash = await c.hash();
+    if (facet.toLowerCase() !== BARZ_R1_FACET || !hash) return plain;
+    const last = await lastSignature({ ...c, match: s => !!barzFormOf(s), key: 'barz' });
+    const signature = barzAssertion(hash, (last && barzFormOf(last)) ?? BARZ_FORM);
+    // A passkey wallet asks the account itself to sign (as Coinbase's, coinbaseFor); asked by anyone else, the account's
+    // own key checks the stand-in's assertion, and refuses it.
+    if (c.signer !== c.sender) return [{ signature, madeUp: true, why: "Trust Wallet's Barz account here is signed by its passkey (a passkey wallet signs as the account itself), and the signer asked isn't the account" }];
+    const { x, y } = standInPasskey();
+    return [{ signature, madeUp: true, storage: { [`0x${BARZ_R1_SLOT.toString(16)}`]: x, [`0x${(BARZ_R1_SLOT + 1n).toString(16)}`]: y } }];
+  } catch { return plain; }
+}
+
 // --- Rhinestone's SmartSession (session keys for ERC-7579 accounts; both deployments verified on Sourcify, Arbitrum One) ---
 // An account validates through it when its nonce names it (Safe7579, the adapter that makes a Safe an ERC-7579
 // account, reads its validator from the nonce's top 20 bytes; Biconomy Nexus's and Kernel's nonces name it too). Its
@@ -1538,13 +1889,17 @@ export const OWNABLE_VALIDATOR = '0x2483da3a338895199e5e538530213157e931bf06';
 export const K1MEE_VALIDATOR = '0x0000000031ef4155c978d48a8a7d4edba03b04fe';
 /** Other session validators, by name. */
 const SESSION_VALIDATOR_NAMES: Record<string, string> = { [K1MEE_VALIDATOR]: "Biconomy's K1MeeValidator" };
-/** A supertransaction's hash (the root of a Merkle tree of its operations' hashes) and the proof of an operation's hash in it. */
-export interface SupertransactionProof { root: Hex; proof: readonly Hex[] }
+/**
+ * A supertransaction's hash (the root of a Merkle tree of its operations' hashes) and the proof of an operation's leaf
+ * in it; `bounds`, the operation's time bounds, where its leaf is MEE's hash of its hash and them (meeLeaf in
+ * src/supertransaction.ts), as an account's own K1MeeValidator checks it (nexusStub).
+ */
+export interface SupertransactionProof { root: Hex; proof: readonly Hex[]; bounds?: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint } }
 /**
  * Why an account refused the stand-in for a supertransaction signer's, where no stand-in says why (simulateOperation):
- * the root's signature is stood in for only in a K1MeeValidator session's simple mode.
+ * the root's signature is stood in for only in K1MeeValidator's simple mode, a session's or a Nexus account's own.
  */
-const SUPERTRANSACTION_WHY = "the signature of a supertransaction's hash is stood in for only as a K1MeeValidator session's (SmartSession), in simple mode; an account that checks the operation's hash doesn't take it, and an account's own K1MeeValidator's simple mode, with the operation's time bounds, isn't stood in for";
+const SUPERTRANSACTION_WHY = "the signature of a supertransaction's hash is stood in for only as Biconomy's K1MeeValidator takes it, in simple mode: a session's (SmartSession), or the owner's for a Biconomy Nexus account whose default validator it is; an account that checks the operation's hash doesn't take it";
 /**
  * A K1MeeValidator session's part of the signature (after SmartSession's mode and permission ID), its key's 65-byte
  * `signature` in the form of what it signed: the operation's hash, the plain form (the signature alone); or a
@@ -1659,6 +2014,145 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
   } catch { return [bare]; }
 }
 
+// --- Biconomy's Nexus, its owner signing through its default validator, K1MeeValidator ---
+// Nexus 1.2 (its implementation 0x0000…50ac, verified on Sourcify; at that address on the six chains here, the same
+// code but for its EIP-712 domain's cached chain) runs behind the ERC-1967 proxy its factory deploys, behind a
+// Biconomy Smart Account v2 proxy it has upgraded (its implementation in the slot of the proxy's own address), or as
+// an EIP-7702 delegate. Its nonce names what validates an operation: 3 bytes of MEE's, a mode byte (0x00 validates
+// as it is; 0x01 installs a module first, 0x02 initializes an EIP-7702 account), the validator (0 for its default
+// validator, an immutable of its code: K1MeeValidator 1.0.3, above, on all six chains) and the sequence.
+// K1MeeValidator checks its owner for the account (smartAccountOwners, set when the account installs it; getOwner,
+// the account itself where none is, as for an EIP-7702 account that set none), in one of its forms (above). As an
+// account's own validator (validateUserOp) its simple mode carries the operation's time bounds too: 0x177eee00, then
+// abi.encode(the supertransaction's hash, the lower and upper bounds, the proof, the owner's signature over the root,
+// as it is or as a message), its leaf MEE's hash of the operation's hash and the bounds (MEEUserOpHashLib), which it
+// returns as the operation's validity (validAfter, validUntil). Every such operation seen (2026-11-15) came in simple
+// mode, with mode 0x00 and the default validator, the owner having signed the root as a message, as Biconomy's MEE node
+// sends them: on OP Mainnet 127 of 248 EntryPoint v0.7 operations in 3,000 blocks (about 100 minutes; 1 to 5 proof
+// elements), on Arbitrum One 21 of 1,325 in 30,000 blocks, on Base 4 of 22,764 in 40,000 (and the operation that
+// deployed its account through the factory, a day before), on Ethereum 17 of 19,900 in 7,000 (16 of 6 EIP-7702
+// accounts), on BNB Chain 17 of 12,952 in 40,000 (14 of 5 EIP-7702 accounts), on Polygon none in 20,000; none in
+// on-chain or permit mode (whose root the owner signs in a transaction or an ERC-2612 permit, which aren't previewed
+// as a supertransaction's). Accounts on a later Nexus (0x0000…7e9d on Base, 0x54f2…7fb2 on Ethereum: 7 operations of
+// 2 accounts in those spans) validate through K1MeeValidator 1.1.0, whose supertransaction hash is EIP-712's: not
+// stood in for.
+// The stand-in, for an operation its default validator validates: asked to sign a supertransaction's hash (with its
+// operations: src/supertransaction.ts), simple mode with that root, the operation's proof and its time bounds (0 and
+// 0 where it was supplied without them: its leaf is then its hash, which the validator doesn't check, and it refuses
+// the stand-in as it would the real signature); asked to sign the operation's hash, the plain form. Either way the
+// owner's 65 bytes are STUB_COSIGNATURE, recovered as the signer over what the wallet signs and as no one over the
+// other form, each for the precompile's price. Asked by anyone but the owner, the same, which the validator refuses,
+// and the preview names the owner. An account that keeps no owner (getOwner then answers the account itself) is
+// signed for only by an EIP-7702 account's own key: a contract has none (the factory's proxy set up without the
+// default validator, through NexusBootstrap's initNexus, initNexusScoped or initNexusWithSingleValidator), so the
+// stand-in asked of the account itself is recovered as no one there, as any signature would be, and the preview says
+// no signature validates through that validator. Other modes and validators get STUB_SIGNATURE (a session key's
+// operation, whose nonce names SmartSession, smartSessionStub).
+/** Nexus implementations whose default validator (an immutable of their code) is K1MeeValidator 1.0.3. */
+const NEXUS_K1MEE_IMPLEMENTATIONS = new Set(['0x00000000383e8cbe298514674ea60ee1d1de50ac']);
+/** NexusBootstrap 1.2.1 (verified on Sourcify; its default validator K1MeeValidator), which the factory's accounts are set up through. */
+const NEXUS_BOOTSTRAP = '0x0000003edf18913c01cbc482c978bbd3d6e8ffa3';
+const NEXUS = parseAbi(['function createAccount(bytes initData, bytes32 salt)', 'function getOwner(address smartAccount) view returns (address)']);
+/**
+ * NexusBootstrap's calls that install the default validator, its install data their first argument:
+ * initNexusWithDefaultValidator(bytes), and with other modules, without a registry and with one.
+ */
+const NEXUS_DEFAULT_VALIDATOR_SETUPS = new Set<string>(['initNexusWithDefaultValidator(bytes)',
+  'initNexusWithDefaultValidatorAndOtherModulesNoRegistry(bytes,(address,bytes)[],(address,bytes)[],(address,bytes),(address,bytes)[],(uint256,address,bytes)[])',
+  'initNexusWithDefaultValidatorAndOtherModules(bytes,(address,bytes)[],(address,bytes)[],(address,bytes),(address,bytes)[],(uint256,address,bytes)[],(address,address[],uint8))'].map(f => toFunctionSelector(f)));
+/** NexusBootstrap's other set-ups, which install other validators (and modules) but not the default validator. */
+const NEXUS_OTHER_SETUPS = new Set<string>(['initNexusWithSingleValidator(address,bytes,(address,address[],uint8))', 'initNexusWithSingleValidatorNoRegistry(address,bytes)',
+  'initNexus((address,bytes)[],(address,bytes)[],(address,bytes),(address,bytes)[],(uint256,address,bytes)[],(address,address[],uint8))', 'initNexusNoRegistry((address,bytes)[],(address,bytes)[],(address,bytes),(address,bytes)[],(uint256,address,bytes)[])',
+  'initNexusScoped((address,bytes)[],(address,bytes),(address,address[],uint8))', 'initNexusScopedNoRegistry((address,bytes)[],(address,bytes))'].map(f => toFunctionSelector(f)));
+/** K1MeeValidator's simple mode as an account's own validator takes it: the root, the time bounds, the proof, the signature. */
+const K1MEE_OWN_SIMPLE = parseAbiParameters('bytes32, uint256, uint256, bytes32[], bytes');
+/** K1MeeValidator's simple mode for an account's own operation, its owner's 65-byte `signature` over the root (see above). */
+export function k1meeOwnSimple(signature: Hex, tree: SupertransactionProof): Hex {
+  return concatHex(['0x177eee00', encodeAbiParameters(K1MEE_OWN_SIMPLE, [tree.root, tree.bounds?.lowerBoundTimestamp ?? 0n, tree.bounds?.upperBoundTimestamp ?? 0n, tree.proof, signature])]);
+}
+/**
+ * A Nexus account's stand-in (see above): `owner`, the owner its validator keeps for it (read from K1MeeValidator),
+ * or, for an account its factory deploys in the operation, the one its set-up installs (`deploying`; `none` where
+ * its set-up is NexusBootstrap's without the default validator, which then keeps no owner for it).
+ */
+async function nexusStub(c: StubContext, deploying?: { owner?: string; none?: boolean }): Promise<Stub[]> {
+  const key = c.nonce.toString(16).padStart(64, '0');
+  if (key.slice(6, 8) !== '00' || !/^0{40}$/.test(key.slice(8, 48))) return [{ signature: STUB_SIGNATURE }];
+  const sender = c.sender.toLowerCase();
+  let owner = deploying?.owner?.toLowerCase();
+  if (!deploying && c.deps.rpc?.has(c.chainId)) {
+    try {
+      const out = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: K1MEE_VALIDATOR, data: encodeFunctionData({ abi: NEXUS, functionName: 'getOwner', args: [c.sender as Hex] }) }, 'latest']));
+      if (/^0x0{24}[0-9a-f]{40}$/i.test(out)) owner = `0x${out.slice(26)}`.toLowerCase();
+    } catch { /* not read */ }
+  }
+  const signer = c.signer.toLowerCase(), tree = c.supertransaction;
+  // With no owner set, K1MeeValidator takes the account's own address as its owner (getOwner). Only an EIP-7702
+  // account has a key for that address (its code a delegation now, or the operation signed for one); a contract (the
+  // factory's proxy, a Smart Account v2 proxy upgraded to Nexus) has none, so no signature validates through its
+  // default validator. Which it is, is read where it matters: no owner set, or none read and the account itself the
+  // signer (the request names it, or no signer). `keyed` is undefined where its code couldn't be read.
+  const self = signer === sender, none = owner === sender || !!deploying?.none;
+  let keyed: boolean | undefined = deploying ? false : c.delegate ? true : undefined;
+  if (keyed === undefined && (none || (!owner && self))) {
+    try { keyed = /^0xef0100[0-9a-f]{40}$/i.test(String(await c.deps.rpc!.call(c.chainId, 'eth_getCode', [sender, 'latest']))); } catch { /* not read */ }
+  }
+  // The account itself as the signer, no key known for it and no other owner: the stand-in is recovered as no one
+  // (ECRECOVER_NOBODY), as any signature would be, where the validator would otherwise take it as its owner's.
+  const keyless = self && keyed !== true && (none || !owner);
+  const itself = keyed === false ? 'for which no key signs, the account being a contract' : "for which only an EIP-7702 account's own key signs (the account's code couldn't be read)";
+  const nobody = keyless ? " (here ecrecover recovered the stand-in as no one, as it would any signature)" : '';
+  // Why it may refuse the stand-in: who its owner is (none, and for a contract no signature validates); for a
+  // supertransaction's operation supplied without its time bounds, that its leaf isn't what the validator checks;
+  // that the signer, the one asked or the account itself where none is, isn't that owner.
+  const validates = "it validates through its default validator, Biconomy's K1MeeValidator, which takes its owner's signature";
+  const why = none && keyed !== true
+    ? `${validates}, and keeps no owner for it: it then takes the account's own address as its owner, ${itself}${keyed === false ? ', so no signature validates through it' : !self ? ", and the signer asked isn't the account" : ''}${nobody}`
+    : `${validates}${none ? ' (the account itself, as none is set for it)' : owner ? ` (${shortAddr(owner)})` : deploying ? " (which its set-up doesn't name)" : " (which couldn't be read)"}`
+      + (tree && !tree.bounds ? " over a supertransaction's hash with the proof of MEE's hash of the operation's hash and its time bounds, and the operation was supplied without them (its leaf its hash, as a session key's is)" : '')
+      + (owner && signer !== owner ? (c.named ? ", and the signer asked isn't its owner" : ", and the request names no signer: the stand-in was taken as the account's own, and the account isn't its owner")
+        : keyless ? `, and the request ${c.named ? 'names the account itself as the signer' : 'names no signer (the account itself, then)'}, ${itself}${nobody}` : '');
+  // (STUB_COSIGNATURE, recovered as the signer over what the wallet signs and as no one over the other form, which the
+  // validator tries first or second: each for the precompile's price, as a real signature's recovery costs.)
+  const cosigners = [{ signature: STUB_COSIGNATURE, signer: keyless ? ECRECOVER_NOBODY : signer, ...(c.digest && { digest: c.digest }) }];
+  const unsure = keyless && keyed === undefined;
+  if (tree) return [{
+    signature: k1meeOwnSimple(STUB_COSIGNATURE, tree), cosigners, why, ...(unsure && { unsure }),
+    note: "The account's owner signs the supertransaction's hash, which the account's own validator (Nexus's default, Biconomy's K1MeeValidator) checks with this operation's proof, its leaf MEE's hash of the operation's hash and its time bounds (simple mode), as Biconomy's MEE node submits it: the stand-in carries the hash, the proof and the bounds, which the validator returns as the operation's validity.",
+  }];
+  return [{ signature: STUB_COSIGNATURE, cosigners, why, ...(unsure && { unsure }),
+    note: `The account's owner signs the operation's hash itself, which its validator (Nexus's default, Biconomy's K1MeeValidator) takes as it is (its plain form). Sent through Biconomy's MEE node, the owner would sign a supertransaction's hash instead, a Merkle root of its operations' hashes, and the operation would carry it, its time bounds and its proof (simple mode): ${NEXUS_SIMPLE_COSTS}. To preview that request, sign the supertransaction's hash with its operations (and their time bounds) in context.meeOperations.` }];
+}
+/**
+ * What simple mode costs over the plain form, the proof and the longer signature copied and checked: operations
+ * replayed in the plain form against their receipts (2026-11-15) came out 1,676 to 1,709 gas under with one proof
+ * element (Base's 5, OP Mainnet's 2), 2,366 to 2,397 with three (OP Mainnet's 3) and 2,666 to 2,776 with four (OP
+ * Mainnet's 7, each alone or first in its bundle); on Nexus's and the validator's own code (test/nexus-k1mee-owner.test.ts) 1,624 with
+ * one, each further element 313 to 315 more.
+ */
+const NEXUS_SIMPLE_COSTS = 'its validation costs about 1,700 gas more than simulated here with one proof element and about 330 more for each further one (operations replayed so against their receipts on Base and OP Mainnet came out 1,676 to 1,709 gas under with one, 2,366 to 2,397 with three, 2,666 to 2,776 with four)';
+/**
+ * A Nexus account its factory deploys in the operation (createAccount(initData, salt), initData abi.encode(the
+ * bootstrap, its call)): its owner, the first 20 bytes of the default validator's install data where NexusBootstrap
+ * installs it; none where NexusBootstrap's set-up installs other validators only (initNexus, initNexusScoped,
+ * initNexusWithSingleValidator and their forms without a registry: the validator then takes the account itself, a
+ * contract, as its owner); else none named.
+ */
+async function nexusDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> {
+  let owner: string | undefined, none = false;
+  try {
+    const { functionName, args } = decodeFunctionData({ abi: NEXUS, data: factoryData });
+    if (functionName === 'createAccount') {
+      const [bootstrap, call] = decodeAbiParameters([{ type: 'address' }, { type: 'bytes' }], args[0]);
+      const ours = bootstrap.toLowerCase() === NEXUS_BOOTSTRAP, installs = NEXUS_DEFAULT_VALIDATOR_SETUPS.has(call.slice(0, 10));
+      const [data] = ours && installs ? decodeAbiParameters([{ type: 'bytes' }], `0x${call.slice(10)}`) : [];
+      if (data && data.length >= 42 && BigInt(`0x${data.slice(2, 42)}`)) owner = `0x${data.slice(2, 42)}`;
+      none = ours && NEXUS_OTHER_SETUPS.has(call.slice(0, 10));
+    }
+  } catch { /* another call */ }
+  return nexusStub(c, { owner, none });
+}
+
 // --- Splits' Smart Vault (verified source on Sourcify, Base) ---
 // A multi-signer account (EOAs and passkeys, by index, with a threshold). validateUserOp reads the signature's first
 // byte as its SignatureTypes enum: 0 for one operation, 1 for a Merkle tree of them, 2 (ERC-1271's) reverts, and
@@ -1716,19 +2210,84 @@ async function splitsVaultStub(c: StubContext, deploying?: { signers: readonly {
   } catch { return [{ signature: STUB_SIGNATURE }]; }
 }
 
+// --- Alchemy's Modular Account v2: the validation its nonce names ---
+// Its verified source (ModularAccountBase, ValidationLocatorLib, AccountStorage; Sourcify, Arbitrum One): the nonce
+// key's low byte is the validation's options (1 global, 2 a deferred action, 4 a direct-call validation, whose
+// address is the 20 bytes above it), and otherwise the 4 bytes above it are the validation's entity ID, whose module
+// the account keeps: validationStorage[entityId << 8].module, a mapping in its ERC-7201 storage
+// (Alchemy.ModularAccount.Storage_V2, the mapping its third slot), the module's address in the word's low 20 bytes.
+// Its signature is each validation hook's segment, then 0xff and the validation's own: for Alchemy's
+// SingleSignerValidationModule (most accounts' validation, and the account's own fallback signer), a type byte (0x00
+// for an EOA) and the owner's signature, the 0xff00 form every other validation gets as before.
+// Aave Labs' MultiSigValidationModule (`aave-labs.multi-sig-validation-module.1.0.0`; source verified on Sourcify,
+// Arbitrum One): 2-of-2, its two signers per entity ID and account (getSigners(entityId, account)), each signing the
+// operation's hash as a message (toEthSignedMessageHash); its signature is their two 65-byte signatures, 130 bytes or
+// it reverts (InvalidMultisigSignatureLength: the 0xff00 stand-in's 66), in either order, each recovering to one of
+// them and not both to the same one (InvalidDuplicateSigners); in getSigners' order, as the app's operations are
+// signed, it costs about 170 gas less (the other way round, each key is compared with the other's slot first). On
+// Arbitrum One, 123 operations of 95 accounts in a day (2026-11-15, through the paymaster 0x8868…35d3), each
+// account's signers its own key and one key all 95 share.
+// The stand-in: the signer's in its place among the account's signers, and the other's, recovered as that key (where
+// the signer asked is neither, its stand-in and the second signer's, which the module refuses); only for an account
+// that runs Modular Account v2's code (runsModularAccount), else the 0xff00 form.
+const MODULAR_ACCOUNT_STORAGE = 0x596912a710dec01bac203cb0ed2c7e56a2ce6b2a68276967fff6dd57561bdd00n;
+const AAVE_MULTISIG_MODULES = new Set(['0xcbecfad4196836b5185dac5c2f3c81b19ed7a3e6']);
+const MULTISIG_SIGNERS = parseAbi(['function getSigners(uint32 entityId, address account) view returns (address[2])']);
+/** The module of the validation an operation's nonce names (a direct-call validation's or a deferred action's: undefined). */
+async function modularAccountModule(c: StubContext): Promise<{ module: string; entityId: number } | undefined> {
+  const key = c.nonce >> 64n;
+  if (key & 6n) return undefined;
+  const entityId = Number((key >> 8n) & 0xffffffffn);
+  const slot = keccak256(encodeAbiParameters(parseAbiParameters('uint256, uint256'), [BigInt(entityId) << 8n, MODULAR_ACCOUNT_STORAGE + 2n]));
+  try { return { module: `0x${String(await c.deps.rpc!.call(c.chainId, 'eth_getStorageAt', [c.sender, slot, 'latest'])).slice(-40)}`.toLowerCase(), entityId }; } catch { return undefined; }
+}
+/**
+ * Whether the account runs the Modular Account v2 code stubFor found for it: delegating to it (EIP-7702: now, or in
+ * the operation's own transaction), or with the code of Solady's ERC-1967 proxy (SOLADY_ERC1967), as Modular Account
+ * v2's factory deploys its accounts. implementationOf takes the ERC-1967 slot of any short code, whose code may run
+ * anything else: such an account's storage and a module's records for it say nothing of how it validates.
+ */
+async function runsModularAccount(c: StubContext): Promise<boolean> {
+  if (c.delegate) return true;
+  try {
+    const code = String(await c.deps.rpc!.call(c.chainId, 'eth_getCode', [c.sender, 'latest'])).toLowerCase();
+    return code === `0xef0100${c.runs!.slice(2)}` || code.startsWith(SOLADY_ERC1967);
+  } catch { return false; }
+}
+async function modularAccountStub(c: StubContext): Promise<Stub> {
+  const validation = await modularAccountModule(c);
+  if (!validation || !AAVE_MULTISIG_MODULES.has(validation.module) || !(await runsModularAccount(c))) return shaped('0xff00')();
+  const name = `Aave Labs' MultiSigValidationModule (${shortAddr(validation.module)}, named by its nonce)`;
+  let signers: string[] = [];
+  try {
+    const out = await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: validation.module, data: encodeFunctionData({ abi: MULTISIG_SIGNERS, functionName: 'getSigners', args: [validation.entityId, c.sender as Hex] }) }, 'latest']);
+    signers = decodeFunctionResult({ abi: MULTISIG_SIGNERS, functionName: 'getSigners', data: out as Hex }).map(a => a.toLowerCase()).filter(a => BigInt(a) !== 0n);
+  } catch { /* unread: below */ }
+  const signer = c.signer.toLowerCase(), others = signers.filter(s => s !== signer);
+  if (signers.length === 2 && others.length === 1) {
+    return { signature: concatHex(['0xff', ...signers.map(s => (s === signer ? STUB_SIGNATURE : STUB_COSIGNATURE))]), cosigners: [{ signature: STUB_COSIGNATURE, signer: others[0] }],
+      note: `The account validates this operation through ${name}, which takes the signatures of both of the account's signers: the signer's key is one of the 2, and the other, ${others[0]}, must sign the operation too before any bundler can include it (here its signature was stood in for, recovered as that key's).` };
+  }
+  return { signature: concatHex(['0xff', STUB_SIGNATURE, STUB_COSIGNATURE]), ...(signers.length && { cosigners: [{ signature: STUB_COSIGNATURE, signer: signers.at(-1)! }] }),
+    why: signers.length ? `it validates through ${name}, which takes the signatures of both of the account's signers, ${signers.join(' and ')}, and the signer asked isn't one of them`
+      : `it validates through ${name}, which takes the signatures of the account's two signers, and they couldn't be read`, ...(!signers.length && { unsure: true }) };
+}
+
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
 /**
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
  * delegate or ERC-1967 implementation). Others get STUB_SIGNATURE as is, unless the wallet supplies its own stub.
  */
 const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<Stub | Stub[]>> = {
-  // Alchemy's Modular Account v2 for EIP-7702: its fallback validation (0xff), an EOA signature (0x00), the signature.
-  '0x69007702764179f14f51cdce752f4f775d74e139': shaped('0xff00'),
+  // Alchemy's Modular Account v2 for EIP-7702: its fallback validation (0xff), an EOA signature (0x00), the signature;
+  // or the validation its nonce names (see modularAccountStub).
+  '0x69007702764179f14f51cdce752f4f775d74e139': modularAccountStub,
   // An EIP-7702 delegate whose operations on Ethereum carry the same 0xff00 prefix (checked: it validates the shape).
   '0x77021100bd87b7008e5e1989d0eb38555d0d0000': shaped('0xff00'),
   // Account implementations (ERC-1967) with the same 0xff00 prefix (Modular Account v2's own shape), on Ethereum and
-  // on Arbitrum (checked there: it validates the shape as signed by its owner).
-  '0x000000000000c5a9089039570dd36455b5c07383': shaped('0xff00'), '0x00000000000002377b26b1eda7b0bc371c60dd4f': shaped('0xff00'),
+  // on Arbitrum (checked there: it validates the shape as signed by its owner), but for Aave Labs' 2-of-2 validation
+  // (see modularAccountStub).
+  '0x000000000000c5a9089039570dd36455b5c07383': modularAccountStub, '0x00000000000002377b26b1eda7b0bc371c60dd4f': modularAccountStub,
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
   '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
@@ -1748,8 +2307,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // module, which recovers the owner over the personal_sign form of the hash (or the hash itself); seen so on
   // Ethereum (EntryPoint v0.6). Accounts it has upgraded to Nexus keep the proxy and run Nexus's code instead.
   '0x0000002512019dafb59528b82cb92d3c5d2423ac': biconomyStub,
-  // An EIP-7702 delegate in that form, with a cosigner and the owner's signature over a Merkle root (see cosigned7702Stub).
-  [COSIGNED_7702_DELEGATE]: cosigned7702Stub,
+  // EIP-7702 delegates in that form, with a cosigner and the owner's signature over a Merkle root (see cosigned7702Stub).
+  ...Object.fromEntries(Object.keys(COSIGNED_7702_DELEGATES).map(d => [d, cosigned7702Stub])),
   // ZeroDev Kernel v3.1 and v3.2: by its validator (see kernelV3Stub).
   '0xbac849bb641841b44e965fb01a4bf5f074f84b4d': kernelV3Stub, '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1': kernelV3Stub,
   // ZeroDev's Kernel for EIP-7702 (an EIP-7702 delegate; its verified source): the nonce names what validates as in
@@ -1764,12 +2323,23 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   [SPLITS_VAULT_IMPLEMENTATION]: splitsVaultStub,
   // Send's account (see sendStub).
   [SEND_IMPLEMENTATION]: sendStub,
+  // Biconomy's Nexus 1.2, its default validator K1MeeValidator (see nexusStub).
+  ...Object.fromEntries([...NEXUS_K1MEE_IMPLEMENTATIONS].map(i => [i, (c: StubContext) => nexusStub(c)])),
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
+const ERC1967_IMPLEMENTATION_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+/**
+ * OKX Wallet's 797-byte account proxy (its code's keccak256, the same on OP Mainnet and Ethereum): its own initializer
+ * (initialize(...), 0xd1f57894, then a delegatecall), and otherwise a delegatecall to what its ERC-1967 slot names.
+ */
+const OKX_LONG_PROXY = '0x3e5ad3de6e8de44f4a56d8784bd4b0257e51f4d05fc0dc06e79f8e92e1a775f9';
 /**
  * The code an account runs: the ERC-1967 implementation its proxy (or Biconomy Smart Account v2's proxy's) (or its EIP-7702 delegate, such as Coinbase's
- * EIP7702Proxy) runs, else its EIP-7702 delegate. Undefined if neither, or unreadable.
+ * EIP7702Proxy) runs, else its EIP-7702 delegate. Undefined if neither, or unreadable. A proxy is short (up to 199
+ * bytes), or OKX Wallet's 797-byte proxy (OKX_LONG_PROXY: the accounts on OP Mainnet and Ethereum behind it were stood
+ * in for as no account in particular, and refused it). Other longer code isn't followed, whatever its slot holds:
+ * naming the slot doesn't make code delegate to what is in it.
  */
 export async function implementationOf(deps: Dependencies, chainId: number, account: string): Promise<string | undefined> {
   if (!deps.rpc?.has(chainId)) return undefined;
@@ -1780,18 +2350,26 @@ export async function implementationOf(deps: Dependencies, chainId: number, acco
     // earlier delegation (Coinbase's EIP7702Proxy writes one) isn't what it runs now. Only a delegate that is itself
     // a proxy is followed to the implementation in the slot.
     if (delegate && STUB_SHAPES[delegate]) return delegate;
-    if (code === '0x' || code.length > 400) return undefined;
+    if (code === '0x' || (code.length > 400 && keccak256(code as Hex) !== OKX_LONG_PROXY)) return undefined;
     // Biconomy Smart Account v2's proxy keeps its implementation in the slot numbered by its own address.
     const own = code.toLowerCase().startsWith(BICONOMY_PROXY);
-    const slot = String(await deps.rpc.call(chainId, 'eth_getStorageAt', [account, own ? `0x${account.slice(2).toLowerCase().padStart(64, '0')}` : '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', 'latest']));
+    const slot = String(await deps.rpc.call(chainId, 'eth_getStorageAt', [account, own ? `0x${account.slice(2).toLowerCase().padStart(64, '0')}` : ERC1967_IMPLEMENTATION_SLOT, 'latest']));
     return /^0x0*[1-9a-f]/i.test(slot) ? `0x${slot.slice(-40)}`.toLowerCase() : delegate;
   } catch { return undefined; }
 }
 
+/**
+ * Stand-ins by the account's own code (its keccak256), for accounts that are neither ERC-1967 proxies nor EIP-7702
+ * delegates: Trust Wallet's Barz diamond (see barzStub).
+ */
+const CODE_SHAPES: Record<string, (c: StubContext) => Promise<Stub[]>> = { [BARZ_PROXY]: c => barzStub(c) };
 /** The stand-in for this account: shaped for the code it runs (see STUB_SHAPES) or its factory's, or STUB_SIGNATURE. */
 async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promise<Stub[]> {
   const factory = initCode && initCode.length >= 42 ? `0x${initCode.slice(2, 42)}`.toLowerCase() : undefined;
   if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)].flat();
+  // Another factory deploying a copy of Coinbase Smart Wallet (see coinbaseCopyStub). (Not a factory on 0x7702, an
+  // EIP-7702 account's initialization.)
+  if (factory && !delegate && !/^0x7702(00)*$/i.test(factory)) { const copy = await coinbaseCopyStub(c, undefined, factory, `0x${initCode!.slice(42)}`); if (copy) return copy; }
   // A session key's operation (an existing account validating through SmartSession, which its nonce names), whatever
   // the account: SmartSession takes the signature as it is (not a Kernel in enable mode installing it, whose signature
   // carries more: smartSessionOf leaves it out).
@@ -1799,7 +2377,18 @@ async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promi
   if (session) return smartSessionStub(c, session);
   const runs = delegate?.toLowerCase() ?? await implementationOf(c.deps, c.chainId, c.sender);
   const shape = runs ? STUB_SHAPES[runs] : undefined;
-  return shape ? [await shape({ ...c, runs })].flat() : [{ signature: STUB_SIGNATURE }];
+  if (shape) return [await shape({ ...c, runs, ...(delegate && { delegate: delegate.toLowerCase() }) })].flat();
+  // A copy of Coinbase Smart Wallet, which no address names; else an account known by its own code.
+  const copy = runs && !factory ? await coinbaseCopyStub(c, runs, undefined, undefined, !!delegate) : undefined;
+  if (copy) return copy;
+  if (!runs && !factory && c.deps.rpc?.has(c.chainId)) {
+    try {
+      const code = String(await c.deps.rpc.call(c.chainId, 'eth_getCode', [c.sender, 'latest'])) as Hex;
+      const own = code.length > 2 ? CODE_SHAPES[keccak256(code)] : undefined;
+      if (own) return own(c);
+    } catch { /* not read: the plain stand-in */ }
+  }
+  return [{ signature: STUB_SIGNATURE }];
 }
 
 /** Where the real ecrecover and P256VERIFY move while their stand-ins take their addresses. */
@@ -2017,10 +2606,17 @@ export interface OperationRun {
    * (Kernel's enable mode) the operation's own enable data with stand-ins for the owner's and the new key's signatures.
    */
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
+  /** The passkey's stand-in is a real assertion by a passkey made up for the run, its key set as the account's (Stub's `madeUp`). */
+  madeUp?: boolean;
   /** Why the account may not take the stand-in as the signer's (Stub's `why`): said where it rejects it. */
   why?: string;
   /** The refusal doesn't show the signer can't sign (Stub's `unsure`). */
   unsure?: boolean;
+  /**
+   * The account pays nothing toward its gas for a signature it refuses (Stub's `unpaid`, or a supplied signature to
+   * such an account): `rejected` AA21, where the account can pay, is its refusal of the signature.
+   */
+  unpaid?: boolean;
   /**
    * Sent by anyone else, the account's deployment (`factory`) or validation (`account`) fails (`rejected`, as the
    * simulation's own bundler): the operation was simulated as `bundler`, which recently sent that factory's
@@ -2036,6 +2632,42 @@ export interface OperationRun {
   /** What was simulated for `result` (and the `after` calls): for tracing it. */
   requests?: SimulationRequest[];
 }
+
+/**
+ * The chain's node failed a whole operation's simulation: it threw (an HTTP error or a rate limit the client's own
+ * retries didn't get past, a timeout, a dropped connection, a block it won't run) or the run reverted without any of
+ * the EntryPoint's reasons. Nothing about the operation or its account: simulateOperation throws it once a passing
+ * failure has been asked again, and the preview says so (it used to fall back to the calls alone, saying nothing: 3
+ * of the 19 operations a survey of 2,025 on six chains didn't validate, 2 on Polygon whose whole run came back with
+ * nothing, twice each, and 1 on Arbitrum One, whose public node was answering HTTP 429 to most requests). `passing`:
+ * one a later ask can get past (the node's rate or load, a timeout, the connection).
+ */
+export class NodeFailure extends Error {
+  passing: boolean;
+  constructor(message: string, passing: boolean) { super(message.slice(0, 300)); this.name = 'NodeFailure'; this.passing = passing; }
+}
+const PASSING_FAILURE = /HTTP (429|5\d\d)|rate.?limit|too many requests|capacity|overload|busy|time(d)? ?out|aborted|fetch failed|socket|ECONNRESET|ETIMEDOUT|EAI_AGAIN|network|header not found|unexpected result/i;
+/** How long a passing failure waits before it is asked again (once: the client has retried it already). */
+const NODE_RETRY_MS = 2000;
+/**
+ * A run, asked once more after a passing failure of the node; a NodeFailure if it still fails, or if it failed
+ * otherwise (a simulator that can't run calls in sequence isn't a failure: rethrown as it is).
+ */
+async function patiently<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await run(); } catch (e) {
+      if (e instanceof NodeFailure && !e.passing) throw e;
+      if (e instanceof Error && e.name === 'BatchSimulationUnsupported') throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      const passing = e instanceof NodeFailure || PASSING_FAILURE.test(message) || (e instanceof Error && /TimeoutError|AbortError/.test(e.name));
+      if (!passing || attempt >= 1) throw e instanceof NodeFailure ? e : new NodeFailure(message, passing);
+      await new Promise(r => setTimeout(r, NODE_RETRY_MS));
+    }
+  }
+}
+
+/** How the paymaster refused a run: in its validation (2: AA33), in its charge after the calls (1: AA50, or postOp reverting), or not (0). */
+const paymasterRefused = (r: OperationRun | null): number => (r?.rejected?.startsWith('AA33') ? 2 : r?.rejected?.startsWith('AA50') || r?.postOpReverted ? 1 : 0);
 
 export function validity(data: bigint): Validity {
   const low = data & ((1n << 160n) - 1n);
@@ -2113,7 +2745,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       [sender as Hex, op.nonce, keccak256(op.initCode), keccak256(op.callData), f.accountGasLimits, op.preVerificationGas, f.gasFees, keccak256(op.paymasterAndData)]));
     return keccak256(encodeAbiParameters(parseAbiParameters('bytes32, address, uint256'), [packed, entryPoint as Hex, 0n]));
   };
-  const context: StubContext = { deps, chainId: op.chainId, sender, signer, nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint, replayableHash, ...(op.digest && { digest: op.digest }), ...(op.supertransaction && { supertransaction: op.supertransaction }) };
+  const context: StubContext = { deps, chainId: op.chainId, sender, signer, ...(op.signer !== undefined && { named: true }), nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint, replayableHash, ...(op.digest && { digest: op.digest }), ...(op.supertransaction && { supertransaction: op.supertransaction }) };
   const supplied: Stub | undefined = op.signature && op.signature !== '0x' ? { signature: op.signature, wallet: true, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }), ...(op.warm?.length && { warm: op.warm }) } : undefined;
   // A supplied signature runs as it is, except a Kernel operation's in enable mode (its nonce's first byte 0x01): the
   // enable data it carries is kept, with stand-ins for the signatures in it (kernelEnableStub), which a dApp's SDK
@@ -2160,6 +2792,10 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // the 0xff form, InvalidSignature); and a candidate that couldn't run doesn't replace one that did.
   let result: OperationRun | null = null;
   const rank = (r: OperationRun) => (r.rejected?.startsWith('AA23') ? 0 : 1);
+  // An account that pays nothing toward its gas for a signature it refuses (Stub's unpaid): a supplied signature's
+  // run too, by the code the account runs, looked up only where its prefund went unpaid.
+  let unpaidCode: Promise<boolean> | undefined;
+  const refusesUnpaid = () => unpaidCode ??= (op.delegate ? Promise.resolve(op.delegate.toLowerCase()) : implementationOf(deps, op.chainId, sender)).then(runs => !!runs && !!COSIGNED_7702_DELEGATES[runs]?.unpaid);
   for (const stub of stubs) {
     const ran = await withStub(stub);
     if (ran && !ran.account?.signatureFailed && !ran.rejected?.startsWith('AA23')) return ran;
@@ -2181,7 +2817,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     : encodeFunctionData({ abi: HANDLE, functionName: 'simulateHandleOp', args: [fields(stub.signature) as never, `0x${'00'.repeat(20)}`, '0x'] }); // v0.7 to v0.9: packed
   // (The EntryPoint is watched too: its balanceOf is the account's deposit, which is read around the run with the
   // account's balance, for the coin its calls move: withoutGas.)
-  const run = (bundler: string, recover: Hex) => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(price !== undefined && price > 0n && { gasPrice: price }), watch: [entryPoint, ...(op.watch ?? []).filter(t => t.toLowerCase() !== entryPoint)],
+  const run = (bundler: string, recover: Hex) => patiently(() => runOperation(op, sim!, { chainId: op.chainId, from: bundler, account: sender, to: entryPoint, data, value: 0n, ...(fee !== undefined && { baseFee: fee }), ...(price !== undefined && price > 0n && { gasPrice: price }), watch: [entryPoint, ...(op.watch ?? []).filter(t => t.toLowerCase() !== entryPoint)],
     // The moved precompile is warm, as precompiles are (EIP-2929), so validation costs what it will.
     // An account the bundle delegates (EIP-7702) is warm from its authorization on, as the chain has it.
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] },
@@ -2199,20 +2835,51 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       ...(stub.p256 === true && { '0x0000000000000000000000000000000000000100': { code: p256Accepting(), movePrecompileToAddress: P256_MOVED } }),
       ...(verifier && { [verifierAt!]: { code: verifierAccepting() }, [VERIFIER_MOVED]: { code: verifier } }),
       ...Object.fromEntries(Object.entries(stub.code ?? {}).map(([address, code]) => [address, { code }])),
-      ...((op.delegate || stub.storage) && { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: stub.storage }) } }) }) }, ep!.version);
-  const standIn = stub.wallet ? 'wallet' as const : stub.enable ? 'enable' as const : stub.p256 ? 'passkey' as const : 'ecdsa' as const;
+      ...((op.delegate || stub.storage) && { [sender]: { ...(op.delegate && { code: `0xef0100${op.delegate.toLowerCase().slice(2)}` }), ...(stub.storage && { stateDiff: stub.storage }) } }) }) }, ep!.version));
+  // A run after the first (as another bundler). One the node failed says nothing of that bundler, so the first run's
+  // rejection can't be said to stand: kept (`failed`), and thrown once no other bundler gets the operation further
+  // (the preview then says the node failed it, not that bundlers would reject it). A failure that can pass (the
+  // node's rate, a timeout: run already asked twice) ends the runs, as the next would meet it too.
+  let failed: NodeFailure | undefined;
+  const another = async (bundler: string, recover: Hex) => {
+    try { return await run(bundler, recover); } catch (e) {
+      if (!(e instanceof NodeFailure)) throw e;
+      failed = e;
+      if (e.passing) throw e;
+      return null;
+    }
+  };
+  const nodeFailed = (e: NodeFailure, who: string, first: OperationRun) =>
+    new NodeFailure(`${who} refused the simulation's own bundler (${first.rejected?.slice(0, 4) ?? 'postOp reverting'}), and the run as a bundler it took lately failed: ${e.message}`, e.passing);
+  const standIn = stub.wallet ? 'wallet' as const : stub.enable ? 'enable' as const : stub.p256 || stub.madeUp ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
-    const ran = await run(origin?.bundler ?? first, recover);
-    // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one.
-    if (paymaster && ran?.rejected?.startsWith('AA33')) {
+    let ran = await run(origin?.bundler ?? first, recover);
+    // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one, in
+    // its validation (AA33) or in its charge after the calls (postOp: on EntryPoint v0.6 a failing postOp is run again
+    // and, failing again, rejects the operation, AA50; from v0.7 the calls are undone and the paymaster still pays).
+    // Coinbase's VerifyingPaymaster (on Base, for v0.6; source verified) refuses in postOp: its data's allowAnyBundler
+    // byte 0 and the transaction's origin not on its list (isBundlerAllowed), BundlerNotAllowed(tx.origin), in either
+    // postOp. Its 82 operations in 2,000 blocks on Base (2026-11-15) all had that byte 0 and all came from its one
+    // listed bundler: one whose lookup took longer than the first run waits for it was simulated as anyone else, and
+    // shown as one bundlers would reject (AA50).
+    if (paymaster && paymasterRefused(ran)) {
       // An empty list here can be a passing node failure (the lookup is not remembered when so), not "no bundlers":
       // ask once more before falling back to the account's calls alone.
       let found = (await bundlers).filter(b => b !== first);
       if (!found.length) found = notSender(await recentBundlers(deps, op.chainId, entryPoint, op.paymasterAndData)).filter(b => b !== first);
-      for (const bundler of found) {
-        const again = await run(bundler, recover);
-        if (again && !again.rejected?.startsWith('AA33')) return again;
-      }
+      failed = undefined;
+      const refused = ran;
+      try {
+        for (const bundler of found) {
+          const again = await another(bundler, recover);
+          if (!again) continue;
+          if (!paymasterRefused(again)) return again;
+          // Past the paymaster's validation, though its postOp still fails: the furthest the operation got, if none gets further.
+          if (paymasterRefused(again) < paymasterRefused(ran)) ran = again;
+        }
+      } catch (e) { if (e instanceof NodeFailure) throw nodeFailed(e, 'the paymaster', refused!); throw e; }
+      // A run the node failed could have been the one the paymaster takes: not its refusal, the node's failure.
+      if (failed) throw nodeFailed(failed, 'the paymaster', refused!);
     }
     // Deploying the account, or its validation, failed: once more as the bundlers its factory's deployments, or its
     // own operations, came through lately, in case it only takes them. A deployment is tried so once per operation
@@ -2225,9 +2892,12 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       const found = (await originBundlers(deps, op.chainId, entryPoint, by, by === 'factory' ? factory! : sender)).filter(b => b !== first && b !== sender);
       // `answered`: the runs that came back. One that didn't (null: the node failed, as under load) says nothing of
       // that bundler, so the rejection is said to stand as these bundlers too only when every run made answered.
-      let answered = 0, unanswered = 0;
+      let answered = 0, unanswered = 0, same = false;
+      const whose = by === 'factory' ? "the account's factory" : 'the account';
+      failed = undefined;
       for (const bundler of found) {
-        const again = await run(bundler, recover);
+        let again: OperationRun | null;
+        try { again = await another(bundler, recover); } catch (e) { if (e instanceof NodeFailure) throw nodeFailed(e, whose, ran); throw e; }
         if (!again) { unanswered++; continue; }
         if (!again.rejected?.startsWith(code)) { origin = { by, rejected: ran.rejected, bundler, tried: answered + 1 }; return again; }
         answered++;
@@ -2235,8 +2905,11 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
         // was taken as anyone else is, so the failure doesn't turn on who sends it, and the rest aren't run (an AA13
         // that has nothing to do with the sender cost up to five runs more). The OKX factory's deployments all came
         // through the one bundler it accepts.
-        if (again.result.returnData === ran.result.returnData && again.result.gasUsed !== undefined && again.result.gasUsed === ran.result.gasUsed) break;
+        if (again.result.returnData === ran.result.returnData && again.result.gasUsed !== undefined && again.result.gasUsed === ran.result.gasUsed) { same = true; break; }
       }
+      // As for the paymaster: a run the node failed (not one that came back limited) leaves the rejection unsaid,
+      // unless a bundler was rejected exactly as the first was (the failure doesn't turn on who sends it).
+      if (failed && !same) throw nodeFailed(failed, whose, ran);
       if (!unanswered) origin = { by, rejected: ran.rejected, tried: answered, ...(answered < found.length && { of: found.length }) };
     }
     return ran;
@@ -2245,8 +2918,8 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // account checks another form of the hash, over any. Not for a supertransaction's signer (op.supertransaction):
   // what it signs is the root, not a form of this operation's hash, and an account that takes the stand-in only over
   // another digest doesn't take that signature (an account checking the operation's hash, or a passkey's assertion
-  // over it: run over any digest, either showed validating, where only a K1MeeValidator session's simple mode takes
-  // the root's signature).
+  // over it: run over any digest, either showed validating, where only K1MeeValidator's simple mode takes the root's
+  // signature, a session's or a Nexus account's own).
   const recoverGas = ecrecoverPrice(op.chainId);
   // (An enable-mode stand-in's signatures are all its own, none STUB_SIGNATURE: ecrecover stands in for those alone.)
   const recover = (cosigners: Cosigner[] | undefined, digest?: Hex) => stub.enable && cosigners?.length ? ecrecoverAsMany(cosigners, recoverGas) : ecrecoverAs(signer, digest, cosigners, recoverGas);
@@ -2254,7 +2927,8 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
-  return result && { ...result, standIn, ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(origin && { origin }) };
+  const unpaid = stub.unpaid || (stub.wallet && result?.rejected?.startsWith('AA21') && await refusesUnpaid());
+  return result && { ...result, standIn, ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
   }
 }
 
@@ -2312,7 +2986,11 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   if (!r) return null;
   if (r.status === 'reverted') {
     const rejected = failedOp(r.returnData);
-    return rejected ? { rejected, result: r, executed: false, paid: 0n, requests } : null;
+    if (rejected) return { rejected, result: r, executed: false, paid: 0n, requests };
+    // Reverted without any of the EntryPoint's reasons, which it gives for whatever it refuses (the account's
+    // validation and deployment, the paymaster's, the gas): not the operation's answer but the run's, such as the
+    // node giving it too little gas.
+    throw new NodeFailure(`its run reverted without any of the EntryPoint's reasons${r.revertReason ? ` (${r.revertReason})` : ''}`, false);
   }
   if (r.limited || !r.returnData || !r.logs) return null;
   let decoded: readonly [bigint, bigint, bigint, bigint, boolean, Hex];

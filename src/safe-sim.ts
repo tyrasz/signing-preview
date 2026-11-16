@@ -6,12 +6,12 @@
 // In the same simulated block, the Safe's configuration is read again (owners, threshold, singleton, guard,
 // fallback handler, modules) and compared with now: what a delegatecall did to the Safe shows even when its
 // calldata looks harmless, as in the 2025 Bybit theft (a delegatecall that replaced the Safe's singleton).
-import { bytesToHex, concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, hexToBytes, hexToString, keccak256, parseAbi, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, hexToBytes, hexToString, keccak256, parseAbi, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
 import { p256 } from '@noble/curves/nist';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
 import type { BlockAt } from './block.ts';
-import { base64url, ecdsaStandIn, lastSignature, mergeOverrides, P256_STUB, passkeyVerifiersStandIn, STUB_SIGNATURE } from './erc4337-sim.ts';
+import { base64url, ecdsaStandIn, lastSignature, mergeOverrides, P256_STUB, passkeyVerifiersStandIn, STAND_IN_PASSKEY, standInPasskey, STUB_SIGNATURE } from './erc4337-sim.ts';
 import { effectOf, roomFor } from './evm/effects.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 
@@ -202,13 +202,8 @@ const ZEAL_DEPLOYMENT_ROUTER = '0xf2230dc5924b7cb5757c86dbd658515a8894b493', SET
 const ZEAL_FACTORY = '0xf2b940e16b93a78f8884f80b89fa691460069bd1', IMPLEMENTATION_SIGNER = '0xa4462d85';
 /** Where the signer's code moves while the stand-in takes its address. */
 const ZEAL_SIGNER_MOVED = '0x0000000000000000000000000000000000ec2ea1';
-/** The stand-in passkey: a private key made up for the run, and its public key (worked out when first needed). */
-const STAND_IN_PASSKEY = hexToBytes(sha256(stringToHex('signing-preview: a stand-in passkey')));
-let standInPublicKey: { x: Hex; y: Hex } | undefined;
-export const standInPasskey = () => {
-  if (!standInPublicKey) { const key = p256.getPublicKey(STAND_IN_PASSKEY, false); standInPublicKey = { x: bytesToHex(key.slice(1, 33)), y: bytesToHex(key.slice(33)) }; }
-  return standInPublicKey;
-};
+// The stand-in passkey (STAND_IN_PASSKEY, standInPasskey): a private key made up for the run (src/erc4337-sim.ts).
+export { standInPasskey };
 /** checkSignature(authenticatorData, flagMask, clientData, challenge, challengeOffset, rs, Q): the public key Q is its 8th and 9th words. */
 const CHECK_SIGNATURE = toFunctionSelector('checkSignature(bytes,bytes1,bytes,bytes32,uint256,uint256[2],uint256[2])').slice(2);
 /**

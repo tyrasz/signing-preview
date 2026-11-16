@@ -4,10 +4,10 @@ import { concatHex, decodeAbiParameters, hexToBytes, keccak256, type Hex } from 
 import { formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
 import { describeSafeTx, reportConfigChanges, safeOutcome, viaExecTransaction, type SafeExecution } from '../safe.ts';
-import { mergeOverrides, simulateExecution, simulateOperation, STUB_SIGNATURE, stubSignature } from '../erc4337-sim.ts';
+import { mergeOverrides, NodeFailure, simulateExecution, simulateOperation, STUB_SIGNATURE, stubSignature } from '../erc4337-sim.ts';
 import { approvalsFor, config as safeConfig, readConfig, reads, safeSetupOf, safeSignatures, safeWebAuthnStub, SAFE_WEBAUTHN_SHARED_SIGNER, sharedSignerVerifiers, webAuthnSignerVerifiers, zealStandIn } from '../safe-sim.ts';
 import { callerOverrides, decodeTransaction, warnOverridden } from '../evm/transaction.ts';
-import { gasDetails, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
+import { gasDetails, nodeFailed, nonceCheck, paymasterOf, reportRun } from './user-operation.ts';
 import { big, domainChainId, str, typedDataDigest, type TypedAdapter, type TypedEnv } from './common.ts';
 import { combineChanges, type OperationChanges } from '../operation-changes.ts';
 
@@ -172,7 +172,7 @@ const safeOp: TypedAdapter = async (data, env) => {
         const run = await simulateOperation({ chainId, entryPoint, sender: safe, nonce, initCode: initCode as Hex, callData, callGasLimit: call, verificationGasLimit: verification, preVerificationGas: preVerification,
           maxFeePerGas: maxFee, maxPriorityFeePerGas: maxPriority, paymasterAndData: (str(m.paymasterAndData) || '0x').toLowerCase() as Hex, signature, ...(signer && { signer }), ...(cosigners.length && { cosigners }), watch,
           ...(verifiers && BigInt(verifiers.precompile) === 0x100n && { p256: true }), ...(verifiers && !zero(verifiers.fallback) && { verifier: verifiers.fallback }), ...(zeal && { warm: zeal.warm }),
-          ...((zeal || (approvals && Object.keys(approvals.stateDiff).length) || overrides) && { stateOverrides: mergeOverrides(overrides, { ...zeal?.stateOverrides, ...(approvals && Object.keys(approvals.stateDiff).length && { [safe]: { stateDiff: approvals.stateDiff } }) }) }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch(() => null);
+          ...((zeal || (approvals && Object.keys(approvals.stateDiff).length) || overrides) && { stateOverrides: mergeOverrides(overrides, { ...zeal?.stateOverrides, ...(approvals && Object.keys(approvals.stateDiff).length && { [safe]: { stateDiff: approvals.stateDiff } }) }) }), ...(before && { after: reads(safe).map(r => ({ chainId, from: ZERO, to: r.to, data: r.data, value: 0n })) }) }, env.deps).catch((e: unknown) => { if (e instanceof NodeFailure) nodeFailed(b, e); return null; });
         if (run) warnOverridden(b, overrides);
         const changes = await reportRun(run, { sender: safe, paymaster: pm.paymaster, entryPointName: known.entryPointName, signature }, chainId, env, b,
           { deploys, validation: passkey ? `with a stand-in for the owner's passkey signature (${zeal ? "a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : 'a WebAuthn assertion, which the P-256 verifier its passkey is checked with accepts, after running its real check'})${approvals && before!.threshold > 1n ? `, and ${before!.threshold - 1n} other owner${before!.threshold === 2n ? '' : 's'} approving it on-chain in place of theirs` : cosigners.length ? ` and ${cosigners.length} other owner${cosigners.length === 1 ? '\'s' : 's\''}, which ecrecover attributes to each` : ''}`

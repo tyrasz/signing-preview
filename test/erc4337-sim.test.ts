@@ -776,6 +776,11 @@ test('OKX Wallet’s account: the stand-in names a key, so validation runs its c
   assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts'), []);
   assert.deepEqual(usdcChange(p), ['out 50']);
 
+  // Asked by an Ethereum key that isn't one of its keys: no address but the account's can sign as its passkey, so the
+  // stand-in is the passkey's real key, which the account refuses, and the preview says who signs.
+  p = await preview(operation({ sender: account, callData: calls(account) }), BOB);
+  assert.match(whole(p), /doesn't accept it as theirs \(OKX Wallet's account here is signed by its passkey \(a passkey wallet signs as the account itself\), and the signer asked is neither the account nor one of its Ethereum keys\)/);
+
   // An account whose only key isn't an admin: the stand-in key gets the same settings, so the call to itself fails as it will.
   const limited = await make([[passkey, 2n, 0n]]);
   p = await preview(operation({ sender: limited, callData: calls(limited) }), limited);
@@ -912,6 +917,321 @@ test('An EIP-7702 delegate in Biconomy Smart Account v2’s form with a cosigner
   await list(COSIGNED_7702_COSIGNER, false);
   p = await preview(op, user, '0.6');
   assert.match(whole(p) ?? notes(p), /doesn't accept/);
+});
+
+test('The cosigned EIP-7702 delegate’s second deployment: its registry’s signer read from the chain, the owner’s tree the operation alone', async () => {
+  // The delegate's and its registry's code as deployed (unpublished), and an account delegating to it whose key signs.
+  const { readFileSync } = await import('node:fs');
+  const { STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
+  const { ecrecoverPrice } = await import('../src/chains.ts');
+  const { keccak256, encodeAbiParameters, encodePacked, parseAbiParameters, decodeAbiParameters, pad } = await import('viem');
+  const { createAddressFromString: at, hexToBytes: toBytes } = await import('@ethereumjs/util');
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/cosigned-7702-v2.json', import.meta.url), 'utf8')) as { delegate: { address: string; code: Hex }; registry: { address: string; code: Hex; signer: string }; operation: Record<string, Hex> & { userOpHash: Hex; sender: string } };
+  await chain.putCode(fx.delegate.address, fx.delegate.code);
+  await chain.putCode(fx.registry.address, fx.registry.code);
+  const key = privateKeyToAccount(`0x${'7b'.repeat(32)}`), cosigner = privateKeyToAccount(`0x${'c1'.repeat(32)}`), next = privateKeyToAccount(`0x${'c2'.repeat(32)}`);
+  const user = key.address.toLowerCase();
+  // The registry's one verifying signer (getVerifyingSigner(), slot 1).
+  const verifying = async (a: string) => chain.evm.stateManager.putStorage(at(fx.registry.address), toBytes(pad('0x01')), toBytes(a as Hex));
+  await verifying(cosigner.address);
+  await chain.putCode(user, `0xef0100${fx.delegate.address.slice(2)}` as Hex);
+  await chain.exec(usdc, call('mint', [user, 100_000_000n]));
+  await chain.setBalance(user, E);
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute_ncC(address dest, uint256 value, bytes func)']), functionName: 'execute_ncC', args: [usdc as Hex, 0n, call('transfer', [BOB, 50_000_000n])] });
+  const op = operation({ sender: user, callData: execute, paymasterAndData: '0x' });
+  const notes = (p: Preview) => p.decoding.notes.join(' | ');
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated as EntryPoint v0\.6/.test(n));
+  const gasUsed = (p: Preview) => BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+
+  // The stand-in: the account asked to sign, the cosignature its registry's signer's. Validated, and the calls run.
+  let p = await preview(op, user, '0.6');
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts' || c === 'userop_rejected'), []);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  const standIn = gasUsed(p);
+
+  // A real signature in the account's form, as its operations are signed: the cosigner's over the operation's hash,
+  // the key's over the root of a tree of the operation alone (with a validity window), and no proof.
+  const hash = userOpHash(readOperation(op, '0.6')!, EP6, 999, '0.6');
+  const validUntil = 1_900_000_000, validAfter = 0;
+  const root = keccak256(encodePacked(['uint48', 'uint48', 'bytes32'], [validUntil, validAfter, hash]));
+  const owner = encodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), [validUntil, validAfter, root, [], await key.signMessage({ message: { raw: root } })]);
+  const signed = { ...op, signature: encodeAbiParameters(parseAbiParameters('bytes, address'), [encodeAbiParameters(parseAbiParameters('bytes, bytes'), [await cosigner.signMessage({ message: { raw: hash } }), owner]), '0xba418fa699622de824b258c61eb150ed7a13967b']) };
+  p = await preview(signed, user, '0.6');
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  // The same gas but for the two signatures passing through the replaced ecrecover (about 200 gas each more than
+  // calling the precompile, where the stand-in's cost exactly the chain's price for it) and the window's bytes.
+  const real = gasUsed(p), priced = 2n * BigInt(ecrecoverPrice(999) - 3000);
+  assert.ok(real + priced - standIn >= 350n && real + priced - standIn <= 450n, `${real} ${standIn}`);
+
+  // The registry's signer changes: the stand-in's cosignature follows it, read from the registry, and the operation
+  // the old signer cosigned is refused, as it will be.
+  await verifying(next.address);
+  p = await preview(op, user, '0.6');
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  // (This delegate pays nothing toward its gas for a cosignature its registry refuses, so the EntryPoint rejects the
+  // operation as unpaid, AA21, as bundlers will: the preview says it's the signature, not the account's funds.)
+  const q = await preview(signed, user, '0.6');
+  assert.equal(whole(q), undefined);
+  assert.equal(q.warnings.find(w => w.code === 'userop_rejected'), undefined);
+  assert.match(notes(q), /The account doesn't accept the signature the wallet supplied and pays nothing toward its gas for a signature it refuses, so the EntryPoint rejects the operation \(AA21 didn't pay prefund\) and only its calls were simulated/);
+
+  // A real operation of the delegate's (BNB Chain), its validateUserOp run here as the EntryPoint calls it, with the
+  // hash it was signed over and the registry's signer of the chain: its tree is the operation alone, as the stand-in's.
+  await verifying(fx.registry.signer);
+  const onChain = fx.operation;
+  await chain.putCode(onChain.sender, `0xef0100${fx.delegate.address.slice(2)}` as Hex);
+  const VALIDATE = parseAbi(['struct UserOperation { address sender; uint256 nonce; bytes initCode; bytes callData; uint256 callGasLimit; uint256 verificationGasLimit; uint256 preVerificationGas; uint256 maxFeePerGas; uint256 maxPriorityFeePerGas; bytes paymasterAndData; bytes signature; }',
+    'function validateUserOp(UserOperation op, bytes32 hash, uint256 missing) returns (uint256)']);
+  const fields = { sender: onChain.sender as Hex, initCode: onChain.initCode, callData: onChain.callData, paymasterAndData: onChain.paymasterAndData, signature: onChain.signature,
+    ...Object.fromEntries((['nonce', 'callGasLimit', 'verificationGasLimit', 'preVerificationGas', 'maxFeePerGas', 'maxPriorityFeePerGas'] as const).map(k => [k, BigInt(onChain[k])])) } as never;
+  const validate = async (h: Hex) => {
+    const r = await chain.evm.runCall({ caller: at(EP6), to: at(onChain.sender), data: toBytes(encodeFunctionData({ abi: VALIDATE, functionName: 'validateUserOp', args: [fields, h, 0n] })), gasLimit: 1_000_000n });
+    assert.equal(r.execResult.exceptionError, undefined);
+    return BigInt(`0x${Buffer.from(r.execResult.returnValue).toString('hex')}`);
+  };
+  const [moduleSig, named] = decodeAbiParameters(parseAbiParameters('bytes, address'), onChain.signature);
+  assert.equal(named.toLowerCase(), '0xba418fa699622de824b258c61eb150ed7a13967b');
+  const [, ownerSig] = decodeAbiParameters(parseAbiParameters('bytes, bytes'), moduleSig);
+  const [until, after, onChainRoot, proof] = decodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), ownerSig);
+  assert.equal(proof.length, 0);
+  assert.equal(onChainRoot, keccak256(encodePacked(['uint48', 'uint48', 'bytes32'], [until, after, onChain.userOpHash])));
+  assert.equal(await validate(onChain.userOpHash), (BigInt(after) << 208n) | (BigInt(until) << 160n));
+  assert.equal(await validate(keccak256(onChain.userOpHash)), 1n);
+  // The bare stand-in, which the account got before: its validation reverts, so only the calls would run.
+  p = await preview({ ...op, signature: STUB_SIGNATURE }, user, '0.6');
+  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23/);
+
+  // Another key asked: the account takes only its own.
+  p = await preview(op, OWNER, '0.6');
+  assert.match(whole(p) ?? notes(p), /doesn't accept it as theirs \(it takes its own key's signature \(it is an EIP-7702 account\), with its registry's cosignature, and the signer asked isn't the account\)/);
+  await verifying(fx.registry.signer);
+});
+
+test('Modular Account v2 validating through Aave Labs’ 2-of-2 multisig module: the signer’s stand-in in its place and the other signer’s, and the preview says that one must sign too', async () => {
+  // Alchemy's implementation, Aave Labs' module and an account's proxy as deployed (Arbitrum One), set up as the
+  // chain has them: the account's validation for entity ID 1 (its storage word) and the module's two signers for it.
+  const { readFileSync } = await import('node:fs');
+  const { ecrecoverPrice } = await import('../src/chains.ts');
+  const { keccak256, encodeAbiParameters, parseAbiParameters, pad, concatHex: cat } = await import('viem');
+  const { createAddressFromString: at, hexToBytes: toBytes } = await import('@ethereumjs/util');
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/mav2-multisig.json', import.meta.url), 'utf8')) as Record<'account' | 'implementation' | 'module', { address: string; code: Hex }> & { validation: { slot: Hex; word: Hex }; signers: string[]; operation: Record<string, Hex> & { userOpHash: Hex; sender: string } };
+  await chain.putCode(fx.implementation.address, fx.implementation.code);
+  await chain.putCode(fx.module.address, fx.module.code);
+  const put = (a: string, slot: Hex, v: Hex) => chain.evm.stateManager.putStorage(at(a), toBytes(slot), toBytes(v));
+  // signersInEntity[entityId][account] (the module's first slot): signer1, then signer2.
+  const signersSlot = (account: string) => BigInt(keccak256(encodeAbiParameters(parseAbiParameters('address, bytes32'), [account as Hex, keccak256(encodeAbiParameters(parseAbiParameters('uint256, uint256'), [1n, 0n]))])));
+  const install = async (account: string, signers: string[]) => {
+    await chain.putCode(account, fx.account.code);
+    await put(account, '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', pad(fx.implementation.address as Hex));
+    await put(account, fx.validation.slot, fx.validation.word);
+    for (const [i, s] of signers.entries()) await put(fx.module.address, pad(`0x${(signersSlot(account) + BigInt(i)).toString(16)}`), pad(s as Hex));
+  };
+  const user = privateKeyToAccount(`0x${'a1'.repeat(32)}`), app = privateKeyToAccount(`0x${'a2'.repeat(32)}`);
+  const account = '0x226f000000000000000000000000000000000001';
+  await install(account, [user.address, app.address]);
+  await chain.exec(usdc, call('mint', [account, 100_000_000n]));
+  await chain.setBalance(account, E);
+  // Its nonce names the validation: parallel key 1, entity ID 1, global (options 0x01).
+  const op = operation({ sender: account, nonce: numberToHex(((1n << 40n) | (1n << 8n) | 1n) << 64n) });
+  const notes = (p: Preview) => p.decoding.notes.join(' | ');
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated as EntryPoint v0\.7/.test(n));
+  const gasUsed = (p: Preview) => BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+
+  // Asked by the account's own key: validated, the calls run, and the preview says the other signer must sign too.
+  let p = await preview(op, user.address.toLowerCase());
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.deepEqual(codes(p).filter(c => c === 'userop_execution_reverts' || c === 'userop_rejected'), []);
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  assert.match(notes(p), new RegExp(`MultiSigValidationModule \\(0xcbec…a3e6, named by its nonce\\), which takes the signatures of both of the account's signers: the signer's key is one of the 2, and the other, ${app.address.toLowerCase()}, must sign the operation too before any bundler can include it`));
+  const standIn = gasUsed(p);
+  // Asked by the other signer: the same, naming the account's own key as the one still to sign.
+  p = await preview(op, app.address.toLowerCase());
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.match(notes(p), new RegExp(`and the other, ${user.address.toLowerCase()}, must sign`));
+  // Asked by a key that is neither: refused, and the preview names the two.
+  p = await preview(op, OWNER);
+  assert.match(whole(p) ?? '', new RegExp(`doesn't accept it as theirs \\(it validates through Aave Labs' MultiSigValidationModule .*${user.address.toLowerCase()} and ${app.address.toLowerCase()}, and the signer asked isn't one of them\\)`));
+
+  // Both keys' real signatures of the operation's hash as a message, in the module's order (getSigners'): validated,
+  // for the stand-in's gas but the two passing through the replaced ecrecover (about 200 gas each more than calling
+  // the precompile). In the other order too, for about 170 more (each recovered key compared with the other slot first).
+  const hash = userOpHash(readOperation(op, '0.7')!, EP, 999, '0.7');
+  const [a, b] = [await user.signMessage({ message: { raw: hash } }), await app.signMessage({ message: { raw: hash } })];
+  const priced = 2n * BigInt(ecrecoverPrice(999) - 3000), gas: bigint[] = [];
+  for (const signature of [cat(['0xff', a, b]), cat(['0xff', b, a])]) {
+    p = await preview({ ...op, signature }, user.address.toLowerCase());
+    assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+    gas.push(gasUsed(p));
+  }
+  assert.ok(gas[0] + priced - standIn >= 350n && gas[0] + priced - standIn <= 450n, `${gas[0]} ${standIn}`);
+  assert.ok(gas[1] - gas[0] >= 100n && gas[1] - gas[0] <= 250n, `${gas}`);
+  // Modular Account v2's own form, which the account got before: the module reverts on its length (AA23).
+  p = await preview({ ...op, signature: cat(['0xff00', a]) }, user.address.toLowerCase());
+  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23/);
+
+  // A real operation of such an account (Arbitrum One), its validateUserOp run here as the EntryPoint calls it, with
+  // the hash it was signed over and its signers as the module has them: 0xff, then each signer's signature in turn.
+  const onChain = fx.operation;
+  await install(onChain.sender, fx.signers);
+  const PACKED_OP = parseAbi(['struct PackedUserOperation { address sender; uint256 nonce; bytes initCode; bytes callData; bytes32 accountGasLimits; uint256 preVerificationGas; bytes32 gasFees; bytes paymasterAndData; bytes signature; }',
+    'function validateUserOp(PackedUserOperation op, bytes32 hash, uint256 missing) returns (uint256)']);
+  const fields = { sender: onChain.sender as Hex, nonce: BigInt(onChain.nonce), initCode: onChain.initCode, callData: onChain.callData, accountGasLimits: onChain.accountGasLimits, preVerificationGas: BigInt(onChain.preVerificationGas), gasFees: onChain.gasFees, paymasterAndData: onChain.paymasterAndData, signature: onChain.signature } as never;
+  const validate = async (h: Hex) => {
+    const r = await chain.evm.runCall({ caller: at(EP), to: at(onChain.sender), data: toBytes(encodeFunctionData({ abi: PACKED_OP, functionName: 'validateUserOp', args: [fields, h, 0n] })), gasLimit: 1_000_000n });
+    assert.equal(r.execResult.exceptionError, undefined);
+    return BigInt(`0x${Buffer.from(r.execResult.returnValue).toString('hex')}`);
+  };
+  assert.equal(onChain.signature.length, 2 + 131 * 2);
+  assert.equal(await validate(onChain.userOpHash), 0n);
+  assert.equal(await validate(keccak256(onChain.userOpHash)), 1n);
+});
+
+test('The cosigned delegate’s second deployment, its registry switched by its owner: taking every cosignature validates, refusing every one is said to be the signature, not the account’s funds', async () => {
+  // The registry keeps a mode next to its signer (slot 1's byte above it; its owner sets it): 0 takes the signer's
+  // cosignature, 1 any, 2 none. Refusing a cosignature, this delegate pays nothing toward its gas, so without a
+  // paymaster the EntryPoint rejects the operation as unpaid (AA21) though the account can pay.
+  const { readFileSync } = await import('node:fs');
+  const { encodeAbiParameters, encodePacked, keccak256, parseAbiParameters, pad } = await import('viem');
+  const { createAddressFromString: at, hexToBytes: toBytes } = await import('@ethereumjs/util');
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/cosigned-7702-v2.json', import.meta.url), 'utf8')) as { delegate: { address: string; code: Hex }; registry: { address: string; code: Hex; signer: string } };
+  await chain.putCode(fx.delegate.address, fx.delegate.code);
+  await chain.putCode(fx.registry.address, fx.registry.code);
+  const key = privateKeyToAccount(`0x${'7d'.repeat(32)}`), cosigner = privateKeyToAccount(`0x${'c3'.repeat(32)}`);
+  const user = key.address.toLowerCase();
+  const slot1 = (mode: bigint, signer: string) => chain.evm.stateManager.putStorage(at(fx.registry.address), toBytes(pad('0x01')), toBytes(pad(numberToHex((mode << 160n) | BigInt(signer)))));
+  await chain.putCode(user, `0xef0100${fx.delegate.address.slice(2)}` as Hex);
+  await chain.exec(usdc, call('mint', [user, 100_000_000n]));
+  await chain.setBalance(user, E);
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute_ncC(address dest, uint256 value, bytes func)']), functionName: 'execute_ncC', args: [usdc as Hex, 0n, call('transfer', [BOB, 50_000_000n])] });
+  const op = operation({ sender: user, callData: execute, paymasterAndData: '0x' });
+  const notes = (p: Preview) => p.decoding.notes.join(' | ');
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated as EntryPoint v0\.6/.test(n));
+  const validated = (p: Preview) => assert.ok(whole(p) && !/doesn't (accept|take)/.test(whole(p)!), notes(p));
+
+  // Taking its signer's cosignature, or any: the stand-in validates and the calls run.
+  for (const mode of [0n, 1n]) {
+    await slot1(mode, cosigner.address);
+    const p = await preview(op, user, '0.6');
+    validated(p);
+    assert.deepEqual(usdcChange(p), ['out 50']);
+  }
+  // Refusing every cosignature: the stand-in refused for that reason, which every signature will be, and no caution
+  // that the account can't pay; only its calls simulated.
+  await slot1(2n, cosigner.address);
+  let p = await preview(op, user, '0.6');
+  assert.equal(whole(p), undefined);
+  assert.deepEqual(codes(p).filter(c => c === 'userop_rejected' || c === 'userop_cannot_prefund'), []);
+  assert.match(notes(p), /The account doesn't accept a stand-in for the signature as theirs \(its registry \(0x82ea…e4dc\) is switched to refuse every cosignature: the account takes no operation, whoever signs it, until the registry's owner switches it back\) and pays nothing toward its gas for a signature it refuses, so the EntryPoint rejects the operation \(AA21 didn't pay prefund\) and only its calls were simulated/);
+  assert.match(notes(p), /The operation's calls were simulated as the EntryPoint runs it/);
+  // The signature itself, by the key and the registry's signer, refused the same way.
+  const hash = userOpHash(readOperation(op, '0.6')!, EP6, 999, '0.6');
+  const root = keccak256(encodePacked(['uint48', 'uint48', 'bytes32'], [0, 0, hash]));
+  const owner = encodeAbiParameters(parseAbiParameters('uint48, uint48, bytes32, bytes32[], bytes'), [0, 0, root, [], await key.signMessage({ message: { raw: root } })]);
+  const signed = { ...op, signature: encodeAbiParameters(parseAbiParameters('bytes, address'), [encodeAbiParameters(parseAbiParameters('bytes, bytes'), [await cosigner.signMessage({ message: { raw: hash } }), owner]), '0xba418fa699622de824b258c61eb150ed7a13967b']) };
+  p = await preview(signed, user, '0.6');
+  assert.match(notes(p), /The account doesn't accept the signature the wallet supplied and pays nothing toward its gas for a signature it refuses, so the EntryPoint rejects the operation \(AA21 didn't pay prefund\)/);
+  // An account that can't pay is told so, as before: not put down to the signature.
+  await chain.setBalance(user, 0n);
+  p = await preview(op, user, '0.6');
+  assert.ok(codes(p).includes('userop_cannot_prefund'), codes(p).join());
+  assert.doesNotMatch(notes(p), /pays nothing toward its gas/);
+  await chain.setBalance(user, E);
+  // Switched back: validated, the same signature too.
+  await slot1(0n, cosigner.address);
+  validated(await preview(op, user, '0.6'));
+  validated(await preview(signed, user, '0.6'));
+  await slot1(0n, fx.registry.signer);
+});
+
+test('The cosigned delegate’s second deployment: asked by a key that isn’t the account, refused for certain whether or not its registry is read; a registry with no signer read as such', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { pad } = await import('viem');
+  const { createAddressFromString: at, hexToBytes: toBytes } = await import('@ethereumjs/util');
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/cosigned-7702-v2.json', import.meta.url), 'utf8')) as { delegate: { address: string; code: Hex }; registry: { address: string; code: Hex; signer: string } };
+  await chain.putCode(fx.delegate.address, fx.delegate.code);
+  await chain.putCode(fx.registry.address, fx.registry.code);
+  const user = privateKeyToAccount(`0x${'7e'.repeat(32)}`).address.toLowerCase();
+  const slot1 = (v: Hex) => chain.evm.stateManager.putStorage(at(fx.registry.address), toBytes(pad('0x01')), toBytes(pad(v)));
+  await chain.putCode(user, `0xef0100${fx.delegate.address.slice(2)}` as Hex);
+  await chain.exec(usdc, call('mint', [user, 100_000_000n]));
+  await chain.setBalance(user, E);
+  const execute = encodeFunctionData({ abi: parseAbi(['function execute_ncC(address dest, uint256 value, bytes func)']), functionName: 'execute_ncC', args: [usdc as Hex, 0n, call('transfer', [BOB, 50_000_000n])] });
+  const op = operation({ sender: user, callData: execute, paymasterAndData: '0x' });
+  const notes = (p: Preview) => p.decoding.notes.join(' | ');
+  const other = "it takes its own key's signature \\(it is an EIP-7702 account\\), with its registry's cosignature, and the signer asked isn't the account";
+
+  // The registry's signer unread (the node failing to answer for it): the cosignature's stand-in is no one's, and the
+  // registry's check reverts on it. Asked by another key, the reason given is the certain one, the signer not being
+  // the account, not the registry; asked by the account itself, the registry, unsure.
+  const failing: Dependencies = { ...deps, rpc: { has: id => deps.rpc!.has(id), call: async (id, method, params) => {
+    if (method === 'eth_call' && String((params[0] as { data?: string }).data).startsWith('0x521e47b9')) throw new Error('unavailable');
+    return deps.rpc!.call(id, method, params);
+  } } };
+  const unread = async (signer: string) => {
+    const hash = userOpHash(readOperation(op, '0.6')!, EP6, 999, '0.6');
+    return previewRequest({ method: 'personal_sign', params: [hash, signer] }, { now: NOW, chainId: 999, userOperation: { entryPoint: EP6, operation: op } }, failing);
+  };
+  let p = await unread(OWNER);
+  assert.match(notes(p), new RegExp(`validation reverts on a stand-in for the signature \\(AA23[^)]*\\): ${other}, so only its calls were simulated`));
+  assert.doesNotMatch(notes(p), /couldn't be read/);
+  p = await unread(user);
+  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23[^)]*\): its signature carries a cosignature that its registry checks, and the registry couldn't be read, so only its calls were simulated/);
+
+  // The registry read, with no verifying signer (its slot zero, taking the signer's cosignature): every cosignature
+  // refused, said for certain, as read, not as unread.
+  await slot1('0x00');
+  p = await preview(op, user, '0.6');
+  assert.match(notes(p), /The account doesn't accept a stand-in for the signature as theirs \(its registry \(0x82ea…e4dc\) has no verifying signer, so it refuses every cosignature: the account takes no operation, whoever signs it, until the registry's owner sets one\) and pays nothing toward its gas for a signature it refuses, so the EntryPoint rejects the operation \(AA21 didn't pay prefund\)/);
+  assert.doesNotMatch(notes(p), /couldn't be read|needn't mean/);
+  // And another key asked: the certain reason that is its own.
+  p = await preview(op, OWNER, '0.6');
+  assert.match(notes(p), new RegExp(`doesn't accept a stand-in for the signature as theirs \\(${other}\\)`));
+  await slot1(fx.registry.signer as Hex);
+});
+
+test('Modular Account v2 through Aave Labs’ 2-of-2 multisig: stood in for, and the other signer named, only for an account that runs Modular Account v2’s code', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { keccak256, encodeAbiParameters, parseAbiParameters, pad } = await import('viem');
+  const { createAddressFromString: at, hexToBytes: toBytes } = await import('@ethereumjs/util');
+  const fx = JSON.parse(readFileSync(new URL('./fixtures/mav2-multisig.json', import.meta.url), 'utf8')) as Record<'account' | 'implementation' | 'module', { address: string; code: Hex }> & { validation: { slot: Hex; word: Hex } };
+  await chain.putCode(fx.implementation.address, fx.implementation.code);
+  await chain.putCode(fx.module.address, fx.module.code);
+  const put = (a: string, slot: Hex, v: Hex) => chain.evm.stateManager.putStorage(at(a), toBytes(slot), toBytes(v));
+  const signersSlot = (account: string) => BigInt(keccak256(encodeAbiParameters(parseAbiParameters('address, bytes32'), [account as Hex, keccak256(encodeAbiParameters(parseAbiParameters('uint256, uint256'), [1n, 0n]))])));
+  // An account set up as Modular Account v2's are, with `code`: its ERC-1967 slot naming Alchemy's implementation,
+  // its validation for entity ID 1 Aave Labs' module, and the module's two signers for it (which any contract can
+  // register for itself, installing the module).
+  const install = async (account: string, signers: string[], code: Hex) => {
+    await chain.putCode(account, code);
+    await put(account, '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', pad(fx.implementation.address as Hex));
+    await put(account, fx.validation.slot, fx.validation.word);
+    for (const [i, s] of signers.entries()) await put(fx.module.address, pad(`0x${(signersSlot(account) + BigInt(i)).toString(16)}`), pad(s as Hex));
+    await chain.exec(usdc, call('mint', [account, 100_000_000n]));
+    await chain.setBalance(account, E);
+  };
+  const user = privateKeyToAccount(`0x${'a3'.repeat(32)}`).address.toLowerCase(), app = privateKeyToAccount(`0x${'a4'.repeat(32)}`).address.toLowerCase();
+  const nonce = numberToHex(((1n << 40n) | (1n << 8n) | 1n) << 64n);
+  const notes = (p: Preview) => p.decoding.notes.join(' | ');
+  const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated as EntryPoint v0\.7/.test(n));
+
+  // The factory's proxy (Solady's ERC-1967 proxy, as deployed): validated through the module, the other signer named.
+  const real = '0x226f000000000000000000000000000000000041';
+  await install(real, [user, app], fx.account.code);
+  let p = await preview(operation({ sender: real, nonce }), user);
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.match(notes(p), new RegExp(`MultiSigValidationModule \\(0xcbec…a3e6, named by its nonce\\), which takes the signatures of both of the account's signers: the signer's key is one of the 2, and the other, ${app}, must sign`));
+
+  // A look-alike: code of its own that pays its prefund and takes any operation (returning 0 for validateUserOp), the
+  // same slot, validation and signers. Its run validates, as it would on-chain, with no signature needed: nothing is
+  // said of a second signer it doesn't need.
+  //   selector == validateUserOp ? (call(gas, caller, missingAccountFunds) ; return 0) : stop
+  const acceptsAny = '0x60003560e01c6319822f7c14601057005b6000600060006000604435335af150600060005260206000f3' as Hex;
+  const fake = '0x226f000000000000000000000000000000000042';
+  await install(fake, [user, app], acceptsAny);
+  p = await preview(operation({ sender: fake, nonce }), user);
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.doesNotMatch(notes(p), /MultiSigValidationModule|must sign the operation too/);
 });
 
 test('A whole operation’s trace: the EntryPoint’s run of it, from validation to the calls and the gas payment', async () => {

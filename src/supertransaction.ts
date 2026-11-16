@@ -127,9 +127,11 @@ export async function previewSupertransaction(method: string, params: unknown[],
     const o = ops[i], op = o.op!, ep = o.ep!, proof = tree ? tree.proofs[i] : o.proof!;
     const pm = paymasterOf(op.paymasterAndData, ep.version === '0.7');
     const input: Operation = {
-      chainId: o.chainId, entryPoint: o.entryPoint, entryPointName: ep.name, sender: op.sender, nonce: op.nonce, initCode: op.initCode, callData: op.callData === '0x' ? null : op.callData, paymaster: pm.paymaster,
+      chainId: o.chainId, entryPoint: o.entryPoint, entryPointName: ep.name, sender: op.sender, nonce: op.nonce, initCode: op.initCode, callData: op.callData, paymaster: pm.paymaster,
       gas: { verification: op.verificationGasLimit, call: op.callGasLimit, preVerification: op.preVerificationGas, maxFee: op.maxFeePerGas, maxPriority: op.maxPriorityFeePerGas, ...pm, v06: ep.version === '0.6' },
-      userOpHash: o.hash!, paymasterAndData: op.paymasterAndData, digest, supertransaction: { root, proof },
+      // (Its time bounds too, where its leaf is MEE's hash of them: an account's own K1MeeValidator checks that leaf
+      // and returns the bounds as the operation's validity.)
+      userOpHash: o.hash!, paymasterAndData: op.paymasterAndData, digest, supertransaction: { root, proof, ...(o.bounds && { bounds: o.bounds }) },
       // The other operations' accounts on its chain: what it moves of theirs is theirs to lose (an app's operation
       // can take your account's tokens with an allowance one of yours grants it).
       alsoFor: ops.filter(x => x.chainId === o.chainId && !sameAddress(x.op!.sender, op.sender)).map(x => x.op!.sender),
@@ -185,6 +187,8 @@ export async function previewSupertransaction(method: string, params: unknown[],
     for (const w of ob.warnings) {
       if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message);
       else if (w.code === 'userop_owner_signature' && !d.accepted) continue;
+      // The account's validity from its time bounds (its own K1MeeValidator returns them), said above from the bounds.
+      else if (o.bounds && (w.code === 'userop_expired' || w.code === 'userop_not_yet_valid')) continue;
       else b.warnings.push({ ...w, message: `${label}: ${w.message}` });
     }
     // Calls that fail now, which another operation of the supertransaction may change: on another chain (a bridge,

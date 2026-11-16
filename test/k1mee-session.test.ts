@@ -276,7 +276,7 @@ test('A supertransaction’s hash the operations supplied don’t make up: a dan
   assert.doesNotMatch(wholeNote(t, 2), /doesn't accept/);
 });
 
-test('A supertransaction’s hash covering operations whose accounts take no signature of it here: refused, not run over any digest (an ECDSA account checking the operation’s hash; an account’s own K1MeeValidator, its leaf with time bounds)', async () => {
+test('A supertransaction’s hash covering operations whose accounts take no signature of it here: refused, not run over any digest (an ECDSA account checking the operation’s hash; an account that isn’t Nexus with its own K1MeeValidator, its leaf with time bounds)', async () => {
   // An account that checks its owner's signature over the operation's hash as a message: the key's signature of the
   // root doesn't validate there, though a stand-in recovered over any digest would.
   const plain = await chain.deploy('Account4337', 'address,address', [KEY, EP]);
@@ -288,13 +288,14 @@ test('A supertransaction’s hash covering operations whose accounts take no sig
   for (const method of ['personal_sign', 'eth_sign']) {
     const p = await signRoot(root, KEY, [{ operation: own }, { operation: session.op }], method);
     assert.ok(codes(p).includes('mee_supertransaction_verified'), codes(p).join());
-    assert.match(wholeNote(p, 1), /doesn't accept it as theirs \(the signature of a supertransaction's hash is stood in for only as a K1MeeValidator session's/);
+    assert.match(wholeNote(p, 1), /doesn't accept it as theirs \(the signature of a supertransaction's hash is stood in for only as Biconomy's K1MeeValidator takes it, in simple mode: a session's \(SmartSession\), or the owner's for a Biconomy Nexus account whose default validator it is; an account that checks the operation's hash doesn't take it\)/);
     assert.doesNotMatch(wholeNote(p, 2), /doesn't accept/);
   }
   // The same with only the plain account's operation and its proof (the root covering more).
   assert.match(wholeNote(await signRoot(root, KEY, [{ operation: own, proof: [hashOf(session.op)] }]), 1), /doesn't accept it as theirs/);
-  // A Nexus account whose own validator is K1MeeValidator, its owner the key (installed as the account installs it):
-  // its simple mode carries the operation's time bounds, which no stand-in is laid out in.
+  // An account whose own validator is K1MeeValidator, its owner the key (installed as the account installs it), but
+  // which isn't Nexus's code (a mock naming the validator in its nonce): not one the stand-in is shaped for, refused
+  // (Nexus itself: test/nexus-k1mee-owner.test.ts).
   const nexus = await chain.deploy('NexusLike', 'address', [EP]);
   await chain.exec(K1MEE_VALIDATOR, encodeFunctionData({ abi: parseAbi(['function onInstall(bytes)']), functionName: 'onInstall', args: [KEY as Hex] }), nexus);
   await chain.exec(usdc, call('mint', [nexus, 100_000_000n]));
@@ -303,7 +304,7 @@ test('A supertransaction’s hash covering operations whose accounts take no sig
   const timed = meeLeaf(hashOf(mine), { lowerBoundTimestamp: 100n, upperBoundTimestamp: 2_000_000_000n });
   const t = await signRoot(pair(timed, hashOf(session.op)), KEY, [{ operation: mine, lowerBoundTimestamp: 100, upperBoundTimestamp: 2_000_000_000 }, { operation: session.op }]);
   assert.ok(codes(t).includes('mee_supertransaction_verified'), codes(t).join());
-  assert.match(wholeNote(t, 1), /doesn't accept it as theirs \(.*own K1MeeValidator's simple mode, with the operation's time bounds, isn't stood in for\)/);
+  assert.match(wholeNote(t, 1), /doesn't accept it as theirs \(the signature of a supertransaction's hash is stood in for only as Biconomy's K1MeeValidator takes it, in simple mode: a session's \(SmartSession\), or the owner's for a Biconomy Nexus account whose default validator it is/);
   // (Asked to sign that operation's own hash, its owner validates as before.)
   assert.doesNotMatch(wholeNote(await preview(mine, KEY)), /doesn't accept/);
 });

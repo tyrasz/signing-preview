@@ -10,6 +10,8 @@ import { chainName } from '../src/chains.ts';
 type Row = {
   hash: string; kind: string; outcome: boolean; whole: boolean; standIn?: string; passkeyExtraKey?: boolean; notSimulated?: boolean; prefix?: string;
   bundle?: { size: number; index: number }; gas?: { percent: number }; timeBumped?: boolean; relayedBy?: string; tokens?: string; callsOnlyBecause?: string; tokenDiffs?: unknown;
+  /** The node failed the whole operation's simulation (see scripts/accuracy-4337.ts): not the stand-in, not the account. */
+  nodeFailed?: boolean;
   /** What the harness found the preview got wrong (see scripts/accuracy-4337.ts): 'outcome', 'gas', 'tokens'. */
   differs?: string[];
   /** An outcome the preview got wrong while warning it might (see scripts/accuracy-4337.ts). */
@@ -21,7 +23,7 @@ if (!dir) throw new Error('usage: node scripts/replay-summary.ts <dir>');
 const CHAINS = new Proxy({} as Record<string, string>, { get: (_, id: string) => chainName(Number(id)) });
 const pct = (n: number, d: number) => (d ? `${n}/${d}` : '–');
 const lines = ['| Chain | EntryPoint | Operations | Outcome matches | Ran whole | Stand-in validated | Gas within 0.5% | Gas within 0.05% | Token movements matched | Differing | Skipped |', '|---|---|---|---|---|---|---|---|---|---|---|'];
-const differing: string[] = [], fallbacks: string[] = [], warned: string[] = [];
+const differing: string[] = [], fallbacks: string[] = [], warned: string[] = [], nodeFailures: string[] = [];
 const skips = new Map<string, number>();
 let total = 0, wrongTotal = 0;
 for (const name of readdirSync(dir).sort()) {
@@ -47,11 +49,13 @@ for (const name of readdirSync(dir).sort()) {
   lines.push(`| ${CHAINS[m[1]] ?? m[1]} | v${m[2]} | ${rows.length} | ${pct(rows.filter(r => r.outcome).length, rows.length)} | ${pct(rows.filter(r => r.whole).length, rows.length)} | ${pct(rows.filter(r => r.standIn === 'validated').length, rows.filter(r => r.whole).length)} | ${pct(gas.filter(r => Math.abs(r.gas!.percent) < 0.5).length, gas.length)} | ${pct(gas.filter(r => Math.abs(r.gas!.percent) < 0.05).length, gas.length)} | ${pct(tokens.filter(r => r.tokens !== 'other').length, tokens.length)} | ${wrong.length || ''} | ${skippedTotal || ''} |`);
   for (const r of wrong) differing.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`${r.bundle ? ` (operation ${r.bundle.index + 1} of ${r.bundle.size})` : ''}: ${r.differs!.map(d => d === 'outcome' ? 'outcome differs' : d === 'gas' ? `gas ${r.gas?.percent}%` : `tokens ${JSON.stringify(r.tokenDiffs)}`).join('; ')}`);
   for (const r of rows.filter(x => x.warned)) warned.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`${r.warned !== 'outcome' ? `: ${r.warned}` : ''}`);
-  for (const r of rows.filter(x => !x.whole && !x.notSimulated)) fallbacks.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`: ${(r.callsOnlyBecause ?? '').slice(0, 160)}`);
+  for (const r of rows.filter(x => !x.whole && x.nodeFailed)) nodeFailures.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`: ${(r.callsOnlyBecause ?? '').slice(0, 160)}`);
+  for (const r of rows.filter(x => !x.whole && !x.notSimulated && !x.nodeFailed)) fallbacks.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`: ${(r.callsOnlyBecause ?? '').slice(0, 160)}`);
 }
 console.log(`## UserOperation replays: ${total} operations${wrongTotal ? `, ${wrongTotal} differing from their receipts` : ', none differing from their receipts'}\n`);
 console.log(lines.join('\n'));
 if (differing.length) console.log(`\n### Previews that differed from what happened\n\n${differing.join('\n')}`);
 if (warned.length) console.log(`\n### Reported, not failed (an outcome that differed where an account reads its stand-in signature while running its calls, unless another reason is given)\n\n${warned.join('\n')}`);
 if (skips.size) console.log(`\n### Not replayed\n\n${[...skips].sort((a, b) => b[1] - a[1]).map(([why, n]) => `- ${n}: ${why}`).join('\n')}`);
+if (nodeFailures.length) console.log(`\n### Operations the node failed to simulate whole (its failure, not the stand-in's or the account's)\n\n${nodeFailures.slice(0, 40).join('\n')}${nodeFailures.length > 40 ? `\n- … and ${nodeFailures.length - 40} more` : ''}`);
 if (fallbacks.length) console.log(`\n### Operations whose calls were simulated alone (a signature shape the stand-in doesn't take, or a paymaster refusing)\n\n${fallbacks.slice(0, 40).join('\n')}${fallbacks.length > 40 ? `\n- … and ${fallbacks.length - 40} more` : ''}`);

@@ -110,7 +110,7 @@ export async function previewSignedOperation(method: string, params: unknown[], 
   const pm = paymasterOf(op!.paymasterAndData, ep!.version === '0.7');
   const b = new PreviewBuilder();
   const d = await describeOperation({
-    chainId, entryPoint, entryPointName: ep!.name, sender: op!.sender, nonce: op!.nonce, initCode: op!.initCode, callData: op!.callData === '0x' ? null : op!.callData, paymaster: pm.paymaster,
+    chainId, entryPoint, entryPointName: ep!.name, sender: op!.sender, nonce: op!.nonce, initCode: op!.initCode, callData: op!.callData, paymaster: pm.paymaster,
     gas: { verification: op!.verificationGasLimit, call: op!.callGasLimit, preVerification: op!.preVerificationGas, maxFee: op!.maxFeePerGas, maxPriority: op!.maxPriorityFeePerGas, ...pm, v06: ep!.version === '0.6' },
     userOpHash: expected, paymasterAndData: op!.paymasterAndData,
     // What the wallet's signature will be over: personal_sign prefixes the hash; eth_sign signs it as it is.
