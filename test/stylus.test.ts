@@ -238,15 +238,44 @@ test('a call after a Stylus one in a batch runs on the chain\'s node after it, o
   assert.equal(out[1].status, 'success');
   assert.equal(out[1].gasUsed, 21_000n);
   assert.match(out[1].source, new RegExp(`^chain 42161's node, after call 1 of the batch, which is made straight to the Stylus \\(WASM\\) program ${PROGRAM}`));
-  // The node was given the deposit first, then the reads around the second call (USDC's balance among them, seen in
-  // the deposit's events), and the call.
-  const [block] = node.asked.at(-1)!.blocks;
-  assert.equal(block.calls[0].data, deposit);
-  assert.equal(block.calls[1].to, '0x00000000000000000000000000000000ba1a9ce5');
-  assert.equal(block.calls.findIndex((c: { to: string; data: string }) => c.to.toLowerCase() === USDC && c.data === '0x'), 3);
-  // The second call's sender nonce, for the L1 charge: one up from the first's.
-  const [, probe] = node.asked.at(-1)!.blocks;
-  assert.equal(probe.calls[1].nonce, '0x8');
+  // Both in one request to the node, not one each: the reads before the deposit (in one call: the native balance,
+  // and USDC's, seen in the deposit's events), the deposit, the reads after it (the ones before the second call), the
+  // call, and the reads after it. One request a round: the first round, then the one that watches USDC.
+  assert.equal(node.asked.length, 2);
+  const [block, probe] = node.asked.at(-1)!.blocks;
+  assert.deepEqual(block.calls.map((c: { to: string }) => c.to.toLowerCase()), [VIEW_READER, PROGRAM, VIEW_READER, USDC, VIEW_READER]);
+  assert.equal(block.calls[1].data, deposit);
+  // The reads: the native balance through the balance reader, then USDC's balanceOf.
+  assert.deepEqual(block.calls[0].data.slice(2).match(/.{384}/g).map((v: string) => `0x${v.slice(24, 64)}`), ['0x00000000000000000000000000000000ba1a9ce5', USDC]);
+  // Each call's probe in the block after, with its sender's nonce for the L1 charge: the second's one up from the first's.
+  assert.deepEqual(probe.calls.slice(1).map((c: { to: string; nonce: string }) => [c.to.toLowerCase(), c.nonce]), [[PROGRAM, '0x7'], [USDC, '0x8']]);
+  assert.deepEqual(probe.stateOverrides, { [PROGRAM]: { code: '0x' }, [USDC]: { code: '0x' }, [USER]: { balance: hex(1n << 200n) } });
+});
+
+test('calls the node runs in a batch are asked in one request, or as few as its 30-call cap allows; one it refuses whole is asked call by call', async () => {
+  // Arbitrum One's public node lets about one eth_simulateV1 through every 3 to 5 s after a short burst: one request
+  // a call had a batch of four the node ran take longer than a preview has (2026-11-16).
+  clearForkCaches();
+  const node = arbitrum();
+  const sim = new ForkSimulator({ 42161: URL_ }, { fetchImpl: node.fetchImpl, prefetch: false, watchTokens: false });
+  const batch = Array.from({ length: 12 }, () => ({ chainId: 42161, from: USER, to: PROGRAM, data: getOwner, value: 0n }));
+  const out = (await sim.trace(batch))!;
+  assert.equal(out.length, 12);
+  for (const r of out) { assert.equal(r.status, 'success'); assert.equal(r.gasUsed, 41_351n); assert.equal(r.returnData, word(BigInt(OWNER))); }
+  // Nine calls fit in 30 (with the reads around each and their probes), then the three after, with the nine first.
+  const sizes = node.asked.map(a => a.blocks.reduce((n: number, b: { calls: unknown[] }) => n + b.calls.length, 0));
+  assert.equal(node.asked.length, 2, String(sizes));
+  assert.ok(sizes.every(n => n <= 30), String(sizes));
+  assert.deepEqual(node.asked.map(a => a.blocks[1].calls.length - 1), [9, 3]);
+  assert.deepEqual(node.asked[1].blocks[1].calls.slice(1).map((c: { nonce: string }) => c.nonce), ['0x10', '0x11', '0x12']);
+  // A node that refuses the whole request (a sender that can't pay): asked again one by one, each failing as any
+  // call does that its sender can't pay for.
+  clearForkCaches();
+  const refusing = arbitrum(2_544n, { refuseFunds: true });
+  const sim2 = new ForkSimulator({ 42161: URL_ }, { fetchImpl: refusing.fetchImpl, prefetch: false, watchTokens: false });
+  const two = (await sim2.trace(batch.slice(0, 2).map(r => ({ ...r, gas: 100_000n, gasPrice: 10n ** 15n, baseFee: 20_000_000n }))))!;
+  assert.deepEqual(two.map(r => r.status), ['reverted', 'reverted']);
+  for (const r of two) assert.match(r.revertReason ?? '', /^insufficient funds: the account can't pay for the call's gas at its price/);
 });
 
 test('a call to a Stylus program its sender can\'t pay for fails as any call does, not the whole simulation', async () => {

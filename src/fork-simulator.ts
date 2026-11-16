@@ -1774,6 +1774,12 @@ const AMSTERDAM_AUTHORIZATION = 7_816n;
 /** A request as eth_simulateV1 takes a call. */
 const nodeCall = (r: SimulationRequest) => { const hex = (v: bigint) => `0x${v.toString(16)}`; return { from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
   ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) }; };
+/**
+ * At most this many calls in one eth_simulateV1 the node runs for the local EVM (runOnNode), counted across its blocks:
+ * Arbitrum One's public node answers HTTP 429 to any more, every time (30 ran, 31 never did; 15+15 ran and 15+16 did
+ * not, 2026-11-16).
+ */
+const NODE_CALLS = 30;
 /** An empty account (no code, never used): runOnNode's call that takes a simulated block's first-call difference. */
 const L1_PROBE = '0x5717e5a1c0de0000000000000000000000001ce5';
 const requestKey = (reqs: SimulationRequest[]) => reqs.map(r => `${r.chainId}:${r.from}:${r.to}:${r.value}:${r.data}`).join('|').toLowerCase();
@@ -2695,6 +2701,9 @@ export class ForkSimulator implements Simulator {
     // From the request that reaches a Stylus program on, the calls are the chain's node's (rounds' `nodeFrom`, or a
     // request whose own target is one, found below).
     let onNode = nodeFrom;
+    /** The node's results for requests asked with an earlier one (runOnNode's group), and whether to ask one by one. */
+    const ahead = new Map<number, SimulationResult>();
+    let oneByOne = false;
     /** Whether a call ran (one its sender couldn't pay for didn't, and has no gas). */
     const ran = (r: SimulationResult | undefined) => r?.gasUsed !== undefined;
     for (let i = start; i < reqs.length; i++) {
@@ -2725,23 +2734,47 @@ export class ForkSimulator implements Simulator {
         // after, the node's refusal says so.)
         const ranBy = `chain ${chainId}'s node, ${nodeReason(why)}`;
         const unpaid = (reason: string) => { results.push({ status: 'reverted', source: ranBy, revertReason: `insufficient funds: ${reason}`, transfers: [], basis: 'fork' }); byRequest[i] = []; };
-        // The sender's nonce as the call starts, which the node counts in its charge for L1 data: as this EVM has it
+        // The sender's nonce as each call starts, which the node counts in its charge for L1 data: as this EVM has it
         // where the node takes over, then up by one for each call it sent that the node ran since, and for each
         // authorization of its own (EIP-7702) for the nonce it had by then.
-        const own = await state.peek(caller);
-        let nonce = own.nonce;
-        for (let k = onNode.at; k < i; k++) {
-          if (!ran(results[k])) continue;
-          if (hexOf(reqs[k].from) === caller) nonce++;
-          for (const a of auths[k]) if (a.authority === caller && (a.chainId === 0n || a.chainId === BigInt(chainId)) && (a.nonce === undefined || a.nonce === nonce)) nonce++;
+        const nonceAt = async (j: number) => {
+          const sender = hexOf(reqs[j].from);
+          let n = (await state.peek(sender)).nonce;
+          for (let k = onNode!.at; k < j; k++) {
+            // (A call of the group asked with this one runs, or the node refuses them all.)
+            if (k < i && !ran(results[k])) continue;
+            if (hexOf(reqs[k].from) === sender) n++;
+            for (const a of auths[k]) if (a.authority === sender && (a.chainId === 0n || a.chainId === BigInt(chainId)) && (a.nonce === undefined || a.nonce === n)) n++;
+          }
+          return n;
+        };
+        let result = ahead.get(i);
+        if (!result) {
+          if (!why.after && req.value > (await state.peek(caller)).balance) { unpaid(`the account holds ${units(chainId, (await state.peek(caller)).balance)} and the call sends ${units(chainId, req.value)}`); continue; }
+          const earlier = reqs.slice(0, i).flatMap((_, k) => (ran(results[k]) ? [k] : []));
+          // This call and the ones after it of the same account (up to a creation, refused when its turn comes) are
+          // asked in one request, not one each: Arbitrum One's public node lets about one eth_simulateV1 through
+          // every 3 to 5 s after a short burst, and a batch with four calls the node ran had taken longer than the
+          // time a preview has (2026-11-16). One the node refuses whole (a sender that can't pay) is asked again
+          // call by call, so the one that can't pay is told apart.
+          let group = [i];
+          if (!oneByOne) for (let j = i + 1; j < reqs.length && reqs[j].to && hexOf(reqs[j].account ?? reqs[j].from) === from; j++) group.push(j);
+          for (;;) {
+            try {
+              const nonces = await Promise.all(group.map(nonceAt));
+              const got = await this.runOnNode(reqs, group, earlier, auths, source, [...tokens], touched, chainId, profile, nonces, group.map(j => ({ ...onNode!, after: j > onNode!.at })));
+              got.forEach((r, g) => ahead.set(group[g], r));
+              break;
+            } catch (e) {
+              if (!/insufficient funds/i.test((e as Error).message ?? '')) throw e;
+              if (group.length === 1) break;
+              oneByOne = true; group = [i];
+            }
+          }
+          result = ahead.get(i);
+          if (!result) { unpaid(`the account can't pay for the call's gas at its price and what it sends (the chain's node refused it)`); continue; }
         }
-        if (!why.after && req.value > own.balance) { unpaid(`the account holds ${units(chainId, own.balance)} and the call sends ${units(chainId, req.value)}`); continue; }
-        const earlier = reqs.slice(0, i).flatMap((_, k) => (ran(results[k]) ? [k] : []));
-        try { results.push(await this.runOnNode(reqs, i, earlier, auths, source, block, [...tokens], touched, chainId, profile, nonce, why)); }
-        catch (e) {
-          if (!/insufficient funds/i.test((e as Error).message ?? '')) throw e;
-          unpaid(`the account can't pay for the call's gas at its price and what it sends (the chain's node refused it)`); continue;
-        }
+        results.push(result);
         byRequest[i] = [];
         for (const l of results[i].logs ?? []) if (l.topics[0] === TRANSFER && l.topics.length === 3 && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from) && !tokens.has(hexOf(l.address))) { seenTokens.add(hexOf(l.address)); rerun = true; grewAt.push(i); }
         // The approvals it set are read after the calls after it too, and around the calls before it (as a local run's).
@@ -2914,26 +2947,29 @@ export class ForkSimulator implements Simulator {
   }
 
   /**
-   * A request the local EVM can't run, run by the chain's node: one whose own target is a Stylus program (Arbitrum's
+   * Requests the local EVM can't run, run by the chain's node: one whose own target is a Stylus program (Arbitrum's
    * WASM contracts, which no EVM runs), one that reaches a Stylus program from inside another contract, and each
-   * request after either in the batch (`why`). One eth_simulateV1, on the block the preview's own simulation uses (a
-   * replay's, with its earlier transactions first), with the batch's calls before it that ran (`earlier`: not one
-   * its sender couldn't pay for, which the node would refuse the whole simulation for), on what every request of
-   * the batch sets (as the local EVM's run has it). Its outcome, return data, events and gas are the node's own run;
-   * so is the whole of it: what the local EVM had begun of it, up to the program, is not kept. Around it, in the same
-   * block, the node reads the account's native balance and its balance of each token watched, before and after, and
-   * after it the approvals touched: the amounts are the node's. The same call with the target's code taken away, in
-   * a block after, gives the charge for L1 data the node adds to a call's gas: it comes off, as the local EVM's gas is
-   * the L2 part. The trace is one frame (TraceCall.node): what it called, and what storage it wrote, the node doesn't
-   * say, so the result has no state changes.
+   * request after either in the batch (`whys`). `group`: consecutive requests of one account, run in one
+   * eth_simulateV1 (or as few as the node's cap on calls allows, NODE_CALLS), on the block the preview's own
+   * simulation uses (a replay's, with its earlier transactions first), with the batch's calls before them that ran
+   * (`earlier`: not one its sender couldn't pay for, which the node would refuse the whole simulation for), on what
+   * every request of the batch sets (as the local EVM's run has it). Each one's outcome, return data, events and gas
+   * are the node's own run; so is the whole of it: what the local EVM had begun of it, up to the program, is not
+   * kept. Around each, in the same block, the node reads the account's native balance, its balance of each token
+   * watched and the approvals touched: the amounts are the node's. The same calls with their targets' code taken
+   * away, in a block after, give the charge for L1 data the node adds to each call's gas: it comes off, as the local
+   * EVM's gas is the L2 part. Each trace is one frame (TraceCall.node): what it called, and what storage it wrote,
+   * the node doesn't say, so the results have no state changes.
    */
-  private async runOnNode(reqs: SimulationRequest[], i: number, earlier: number[], auths: Authorization[][], source: StateSource, block: Awaited<ReturnType<ForkSimulator['blockContext']>>, watch: string[],
-    watchedApprovals: Map<string, SimulatedApproval>, chainId: number, profile: ChainProfile, nonce: bigint, why: NodeWhy): Promise<SimulationResult> {
-    const req = reqs[i], from = hexOf(req.account ?? req.from);
+  private async runOnNode(reqs: SimulationRequest[], group: number[], earlier: number[], auths: Authorization[][], source: StateSource, watch: string[],
+    watchedApprovals: Map<string, SimulatedApproval>, chainId: number, profile: ChainProfile, nonces: bigint[], whys: NodeWhy[]): Promise<SimulationResult[]> {
+    const from = hexOf(reqs[group[0]].account ?? reqs[group[0]].from);
     // A creation's charge for L1 data can't be measured apart from what its code uses: there is no code to take away,
     // the code it runs being its calldata, which the charge counts.
-    if (!req.to) throw new ForkUnsupported(`the transaction creates a contract ${why.after ? `after a call the chain's node runs (${nodeReason(why)})` : `whose code reaches the Stylus (WASM) program ${why.program}, which the local EVM can't run`}: the chain's node could run it, but its charge for a creation's L1 data can't be told apart from the gas the creation uses`);
-    const target = hexOf(req.to);
+    group.forEach((i, g) => {
+      const why = whys[g];
+      if (!reqs[i].to) throw new ForkUnsupported(`the transaction creates a contract ${why.after ? `after a call the chain's node runs (${nodeReason(why)})` : `whose code reaches the Stylus (WASM) program ${why.program}, which the local EVM can't run`}: the chain's node could run it, but its charge for a creation's L1 data can't be told apart from the gas the creation uses`);
+    });
     const hex = (v: bigint) => `0x${v.toString(16)}`, pad = (a: string) => a.slice(2).padStart(64, '0');
     // What the batch's requests set (and a replay's block had changed, beneath them), as the node takes it; not the
     // code standing in for a signed EIP-7702 authorization, which the node applies itself. An authorization the wallet
@@ -2956,123 +2992,161 @@ export class ForkSimulator implements Simulator {
     // with its gas limit, and one not given has the block's gas left, which differs from the call to its probe
     // (measured on Arbitrum One, 2026-11-16: the same 388-byte call charged 1,161 for L1 data first in its block,
     // 1,170 after three calls, and 1,170 at either place given 30,000,000; its L2 part had come out 6 gas over).
-    const limit = req.gas === undefined ? { gas: hex(GAS) } : {};
-    const before = await Promise.all(earlier.map(k => call(reqs[k]))), own = { ...await call(req), ...limit };
+    const limit = (r: SimulationRequest) => (r.gas === undefined ? { gas: hex(GAS) } : {});
     put(BALANCE_READER, { code: BALANCE_READER_CODE });
     put(VIEW_READER, { code: VIEW_READER_CODE });
-    // The reads on each side of the call: the account's native balance, and its balance of each token watched and
-    // each approval touched in one call to VIEW_READER (each read on 10 million gas, as a call of its own was), each
-    // a static call, as the local EVM's views are. As calls of their own, they ran as transactions in the node's
-    // block: a contract read as a token (the call's own target is one) ran its code there, and the call ran on what
-    // it left. And they made the request too big for Arbitrum One's public node, which answers an eth_simulateV1 of
-    // more than 30 calls (across its blocks) with HTTP 429 every time (30 ran, 31 never did, 2026-11-16): a call that
-    // named ten more tokens took 37 and ran out of time. Here a call adds five: the call, the reads on each side.
+    // The reads around each call, in one call to VIEW_READER: the account's native balance (BALANCE_READER's), its
+    // balance of each token watched and each approval touched, each a static call on 10 million gas, as the local
+    // EVM's views are. As calls of their own, they ran as transactions in the node's block: a contract read as a
+    // token (the call's own target is one) ran its code there, and the call ran on what it left. And they made the
+    // request too big for Arbitrum One's public node, which answers an eth_simulateV1 of more than 30 calls (across
+    // its blocks) with HTTP 429 every time (30 ran, 31 never did, 2026-11-16): a call that named ten more tokens took
+    // 37 and ran out of time. The reads after a call are the ones before the next.
     const reads = (approvals: SimulatedApproval[]) => {
-      const views: [string, Hex][] = [...watch.map(t => [t, `0x70a08231${pad(from)}`] as [string, Hex]), ...approvals.map(ap => [ap.kind === 'permit2' ? ap.emitter : ap.token, stateCall(ap)] as [string, Hex])];
-      return [{ to: BALANCE_READER, data: `0x${pad(from)}` }, ...(views.length ? [{ to: VIEW_READER, data: viewReads(views), gas: hex(VIEW_GAS * BigInt(views.length) + 1_000_000n) }] : [])];
+      const views: [string, Hex][] = [[BALANCE_READER, `0x${pad(from)}`], ...watch.map(t => [t, `0x70a08231${pad(from)}`] as [string, Hex]), ...approvals.map(ap => [ap.kind === 'permit2' ? ap.emitter : ap.token, stateCall(ap)] as [string, Hex])];
+      return { to: VIEW_READER, data: viewReads(views), gas: hex(VIEW_GAS * BigInt(views.length) + 1_000_000n) };
     };
     /** The native read and the views of `reads`, as one result each (viewResults). */
-    const readsOf = (calls: NodeCallResult[], views: number) => [calls[0], ...(views ? viewResults(calls[1], views) : [])];
-    // The same call with nothing to run: the program's code taken away, in a block after (behind a call that takes
-    // the block's first-call difference). Its `to` is the program's own and its nonce the call's, which the charge
-    // counts with the calldata (measured: the same call sent again, a nonce later, was charged 10 gas more), and its
-    // value, which the charge counts too: sent with none, the probe came out 35 gas short of the charge for a call
-    // with 1 ETH and 44 for one with 5,373 ETH (base fee 0.02 gwei, 2026-11-15). Its sender is given the balance to
-    // send it in that block.
-    const probe = { ...req, authorizationList: undefined, unsignedAuthorizations: undefined, stateOverrides: undefined };
-    const probeState: Record<string, Override> = { [hexOf(req.from)]: { balance: hex(1n << 200n) } };
-    probeState[target] = { ...probeState[target], code: '0x' };
+    const readsOf = (c: NodeCallResult | undefined, views: number) => viewResults(c, 1 + views);
+    const results: SimulationResult[] = [];
+    // As many calls as fit in one request, with the ones before them, the reads before the first, each call and the
+    // reads after it, and their probes (one each, behind one that takes the block's first-call difference): nine
+    // with none before them. At least one.
+    for (let start = 0, ran = [...earlier]; start < group.length;) {
+      const room = Math.max(1, Math.floor((NODE_CALLS - (source.after?.calls.length ?? 0) - ran.length - 2) / 3));
+      const part = group.slice(start, start + room);
+      results.push(...await this.nodePart(reqs, part, ran, nonces.slice(start, start + room), whys.slice(start, start + room), source, from, watch, watchedApprovals, chainId, profile,
+        { overrides, call, limit, reads, readsOf }));
+      ran = [...ran, ...part];
+      start += part.length;
+    }
+    return results;
+  }
+
+  /** runOnNode's requests `part`, in one eth_simulateV1: the calls `earlier` first, then each with the reads around it. */
+  private async nodePart(reqs: SimulationRequest[], part: number[], earlier: number[], nonces: bigint[], whys: NodeWhy[], source: StateSource, from: string, watch: string[],
+    watchedApprovals: Map<string, SimulatedApproval>, chainId: number, profile: ChainProfile, at: {
+      overrides: Record<string, { balance?: string; nonce?: string; code?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string }>;
+      call: (r: SimulationRequest) => Promise<Record<string, unknown>>; limit: (r: SimulationRequest) => { gas?: string };
+      reads: (approvals: SimulatedApproval[]) => Record<string, unknown>; readsOf: (c: NodeCallResult | undefined, views: number) => NodeCallResult[];
+    }): Promise<SimulationResult[]> {
+    const { overrides, call, limit, reads, readsOf } = at;
+    const hex = (v: bigint) => `0x${v.toString(16)}`;
+    const before = await Promise.all(earlier.map(k => call(reqs[k]))), own = await Promise.all(part.map(async i => ({ ...await call(reqs[i]), ...limit(reqs[i]) })));
+    // The same calls with nothing to run: their targets' code taken away, in a block after (behind a call that takes
+    // the block's first-call difference). Each one's `to` is the target's own and its nonce the call's, which the
+    // charge counts with the calldata (measured: the same call sent again, a nonce later, was charged 10 gas more),
+    // and its value, which the charge counts too: sent with none, the probe came out 35 gas short of the charge for a
+    // call with 1 ETH and 44 for one with 5,373 ETH (base fee 0.02 gwei, 2026-11-15). Each sender is given the
+    // balance to send it in that block. (Given a gas limit, a call's charge is the same wherever in its block.)
+    const probes = part.map(i => ({ ...reqs[i], authorizationList: undefined, unsignedAuthorizations: undefined, stateOverrides: undefined }));
+    const probeState: typeof overrides = {};
+    for (const p of probes) {
+      const s = hexOf(p.from), t = hexOf(p.to!);
+      probeState[s] = { ...probeState[s], balance: hex(1n << 200n) };
+      probeState[t] = { ...probeState[t], code: '0x' };
+    }
     const ask = async (approvals: SimulatedApproval[]) => {
-      const calls = [...before, ...reads([]), own, ...reads(approvals)];
-      const at = reqs[0].at, after = source.after;
-      const blockOverrides = after ? after.blockOverrides : at ? nodeOverrides(at.header) : req.baseFee !== undefined ? { baseFeePerGas: hex(req.baseFee) } : undefined;
-      if (after) for (const [a, o] of Object.entries(after.state ?? {}).reverse()) overrides[hexOf(a)] = { ...(o as Override), ...overrides[hexOf(a)], ...(((o as Override).stateDiff || overrides[hexOf(a)]?.stateDiff) && { stateDiff: { ...(o as Override).stateDiff, ...overrides[hexOf(a)]?.stateDiff } }) };
+      const around = reads(approvals), calls = [...before, around, ...own.flatMap(o => [o, around])];
+      const first = reqs[0].at, after = source.after;
+      const blockOverrides = after ? after.blockOverrides : first ? nodeOverrides(first.header) : reqs[part[0]].baseFee !== undefined ? { baseFeePerGas: hex(reqs[part[0]].baseFee!) } : undefined;
+      if (after) for (const [a, o] of Object.entries(after.state ?? {}).reverse()) overrides[hexOf(a)] = { ...(o as typeof overrides[string]), ...overrides[hexOf(a)], ...(((o as typeof overrides[string]).stateDiff || overrides[hexOf(a)]?.stateDiff) && { stateDiff: { ...(o as typeof overrides[string]).stateDiff, ...overrides[hexOf(a)]?.stateDiff } }) };
       const fee = blockOverrides?.baseFeePerGas;
       let answer: NodeCallResult[][];
       try {
         answer = await source.nodeRun([{ calls: [...(after?.calls ?? []), ...calls], ...(blockOverrides && { blockOverrides }), stateOverrides: overrides },
-          { ...(fee && { blockOverrides: { baseFeePerGas: fee } }), stateOverrides: probeState, calls: [{ to: L1_PROBE, data: '0x' }, { ...nodeCall(probe), ...limit, nonce: hex(nonce) }] }]);
+          { ...(fee && { blockOverrides: { baseFeePerGas: fee } }), stateOverrides: probeState, calls: [{ to: L1_PROBE, data: '0x' }, ...probes.map((p, g) => ({ ...nodeCall(p), ...limit(reqs[part[g]]), nonce: hex(nonces[g]) }))] }]);
       } catch (e) {
         // A node without eth_simulateV1 can't be handed the call: refused, saying why. (Only the method being missing:
         // not the state, which Arbitrum's node says "historical state … is not available" of, as the next may have it.)
         const m = e instanceof Error ? e.message : String(e);
-        if (/\bmethod\b[^.]*\b(not found|does not exist|not available|not supported|unsupported)\b|unsupported method|-32601/i.test(m)) throw new ForkUnsupported(`the call is one the chain's node must run (${nodeReason(why)}), and the node has no eth_simulateV1 to run it`);
+        if (/\bmethod\b[^.]*\b(not found|does not exist|not available|not supported|unsupported)\b|unsupported method|-32601/i.test(m)) throw new ForkUnsupported(`the call is one the chain's node must run (${nodeReason(whys[0])}), and the node has no eth_simulateV1 to run it`);
         throw e;
       }
       const [out, probed] = answer;
-      return [...out.slice(after?.calls.length ?? 0), probed[1]];
+      return { out: out.slice(after?.calls.length ?? 0), probed: probed.slice(1) };
     };
-    // The approvals its events show are read after it too: asked again when they weren't already.
-    let approvals = [...watchedApprovals.values()], out = await ask(approvals);
-    // (Each side's reads are one call, or two with views: the native balance's, and VIEW_READER's.)
-    const side = (views: number) => (views ? 2 : 1);
-    const n = before.length, readsBefore = readsOf(out.slice(n, n + side(watch.length)), watch.length);
-    let ran = out[n + side(watch.length)];
-    const parsed = parseLogs((ran.logs ?? []).map(l => ({ ...l, address: l.address.toLowerCase() })));
-    const named = ran.status === '0x1' ? namedApproval(req, from, parsed.approvals) : undefined;
-    if (named && !parsed.approvals.some(a => approvalKey(a) === approvalKey(named))) parsed.approvals.push(named);
-    const more = parsed.approvals.filter(a => a.owner === from && !watchedApprovals.has(approvalKey(a)));
-    if (more.length) { approvals = [...approvals, ...more]; out = await ask(approvals); ran = out[n + side(watch.length)]; }
-    const afterReads = readsOf(out.slice(n + side(watch.length) + 1, -1), watch.length + approvals.length);
-    const readsAfter = afterReads.slice(0, 1 + watch.length), approvalReads = afterReads.slice(1 + watch.length), l1 = out.at(-1)!;
-    // The node's charge for L1 data: what the call with no code to run used over what its calldata and access list
-    // cost (no calldata floor: measured on Arbitrum One, 2026-11-15, a 68-byte call to an empty account used 21,620
-    // with no base fee, the floor being 22,550). The charge counts the call's `to` with its calldata: with 200 zero
-    // bytes of calldata, a probe to another (mostly zero) address came out 176 gas short of the program's call.
-    const l1Charge = profile.arbitrum ? BigInt(l1.gasUsed) - intrinsicGas(probe, false).intrinsic : 0n;
-    const less = (g: bigint) => g > l1Charge ? g - l1Charge : 0n;
-    const gasUsed = less(BigInt(ran.gasUsed)), peak = less(BigInt(ran.maxUsedGas ?? ran.gasUsed));
-    // A call that failed has its return data in `error.data` on Arbitrum's node, with `returnData` empty.
-    const failed = ran.status !== '0x1', returnData = ((failed ? ran.error?.data : undefined) ?? ran.returnData ?? '0x') as Hex;
-    const logs = failed ? [] : (ran.logs ?? []).map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data }));
-    const revertReason = failed ? decodeRevert(returnData) ?? ran.error?.message ?? 'reverted' : undefined;
-    const source_ = `chain ${chainId}'s node, ${nodeReason(why)}`;
-    const intrinsic = intrinsicGas(req, false).intrinsic;
-    const gasLimit = req.gas ? req.gas - intrinsic - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS;
-    const known = 'its outcome, return data, events and gas are the node\'s; the calls it made aren\'t known, so its events are all listed here';
-    const trace: TraceCall | undefined = req.trace ? { type: 'call', from: hexOf(req.from), to: target, value: req.value, input: req.data, gas: gasLimit > 0n ? gasLimit : 0n, gasUsed: peak > intrinsic ? peak - intrinsic : 0n,
-      node: why.target && !why.after ? `a Stylus (WASM) program, run by the chain's node: ${known}` : `run by the chain's node, ${nodeReason(why)}: ${known}`,
-      ...(returnData.length > 2 && { output: returnData }), ...(failed && { error: revertReason }),
-      ...(logs.length && { logs: logs.map((l, index) => ({ index, ...l })) }) } : undefined;
-    if (failed) return { status: 'reverted', source: source_, gasUsed, revertReason, transfers: [], basis: 'fork', returnData, ...(trace && { trace }) };
-    const transfers: SimulatedTransfer[] = [];
-    const other = target === from ? ELSEWHERE : target;
-    const add = (asset: string, delta: bigint) => {
-      if (delta < 0n) transfers.push({ asset, from, to: other, raw: -delta });
-      else if (delta > 0n) transfers.push({ asset, from: other, to: from, raw: delta });
+    /** Where call `g` of the part is in the block: the reads before it just before, the reads after it just after. */
+    const at_ = (g: number) => earlier.length + 1 + 2 * g;
+    /** Call `g`'s events, with the approval the request names when it succeeded. */
+    const parse = (ran: NodeCallResult, g: number) => {
+      const parsed = parseLogs((ran.logs ?? []).map(l => ({ ...l, address: l.address.toLowerCase() })));
+      const named = ran.status === '0x1' ? namedApproval(reqs[part[g]], from, parsed.approvals) : undefined;
+      if (named && !parsed.approvals.some(a => approvalKey(a) === approvalKey(named))) parsed.approvals.push(named);
+      return parsed;
     };
-    const value = (c: NodeCallResult | undefined) => c?.status === '0x1' && c.returnData.length >= 66 ? BigInt(c.returnData.slice(0, 66)) : undefined;
-    const nativeBefore = value(readsBefore[0]), nativeAfter = value(readsAfter[0]);
-    // The sender's balance after the call is less its fee too, which the node takes at the call's price for all the
-    // gas it used (its L1 charge included; at a price above the base fee as well, 2026-11-15): the fee is counted
-    // apart, as the local EVM's runs leave it out of the amounts, so it is put back.
-    const paidFee = hexOf(req.from) === from && req.gasPrice ? BigInt(ran.gasUsed) * req.gasPrice : 0n;
-    // (What was read, as a local run's readAssets: the native coin and each token whose balance the node read both
-    // times. A UserOperation's coin is counted from them, with its EntryPoint deposit: withoutGas, src/erc4337-sim.ts.)
-    const read: string[] = [];
-    if (nativeBefore !== undefined && nativeAfter !== undefined) { add('native', nativeAfter - nativeBefore + paidFee); read.push('native'); }
-    const logNet = new Map<string, bigint>();
-    for (const t of parsed.transfers) {
-      if (t.from === from) logNet.set(t.asset, (logNet.get(t.asset) ?? 0n) - t.raw);
-      if (t.to === from) logNet.set(t.asset, (logNet.get(t.asset) ?? 0n) + t.raw);
-    }
-    const nftLogs = new Set(logs.filter(l => l.topics[0] === TRANSFER && l.topics.length === 4).map(l => l.address));
-    // Each token's balance as the node read it, before and after; one not watched (or unreadable) moves by its events.
-    for (const t of new Set([...watch, ...logNet.keys()])) {
-      if (t === 'native' || nftLogs.has(t)) continue;
-      const k = watch.indexOf(t), b = k >= 0 ? value(readsBefore[1 + k]) : undefined, a = k >= 0 ? value(readsAfter[1 + k]) : undefined;
-      if (b !== undefined && a !== undefined) read.push(t);
-      // (A contract that answers balanceOf with something else, an NFT collection's count, moves by its events only.)
-      if (b !== undefined && a !== undefined && (a !== b || logNet.has(t))) add(t, a - b);
-      else if (logNet.has(t)) add(t, logNet.get(t)!);
-    }
-    const approvalState: SimulatedApproval[] = [];
-    approvals.forEach((ap, k) => {
-      const r = approvalReads[k];
-      const st = r?.status === '0x1' ? decodeState(ap, r.returnData) : undefined;
-      if (st) approvalState.push(st);
+    // The approvals their events show are read after each call too: asked again when they weren't already.
+    let approvals = [...watchedApprovals.values()], asked = await ask(approvals);
+    const more: SimulatedApproval[] = [];
+    part.forEach((_, g) => {
+      for (const a of parse(asked.out[at_(g)], g).approvals) if (a.owner === from && !watchedApprovals.has(approvalKey(a)) && !more.some(m => approvalKey(m) === approvalKey(a))) more.push(a);
     });
-    return { status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', readAssets: read, returnData, logs, ...(trace && { trace }) };
+    if (more.length) { approvals = [...approvals, ...more]; asked = await ask(approvals); }
+    const views = watch.length + approvals.length;
+    return part.map((i, g) => {
+      const req = reqs[i], why = whys[g], target = hexOf(req.to!), ran = asked.out[at_(g)], parsed = parse(ran, g);
+      const readsBefore = readsOf(asked.out[at_(g) - 1], views).slice(0, 1 + watch.length);
+      const afterReads = readsOf(asked.out[at_(g) + 1], views);
+      const readsAfter = afterReads.slice(0, 1 + watch.length), approvalReads = afterReads.slice(1 + watch.length), l1 = asked.probed[g];
+      // The node's charge for L1 data: what the call with no code to run used over what its calldata and access list
+      // cost (no calldata floor: measured on Arbitrum One, 2026-11-15, a 68-byte call to an empty account used 21,620
+      // with no base fee, the floor being 22,550). The charge counts the call's `to` with its calldata: with 200 zero
+      // bytes of calldata, a probe to another (mostly zero) address came out 176 gas short of the program's call.
+      const l1Charge = profile.arbitrum ? BigInt(l1.gasUsed) - intrinsicGas(probes[g], false).intrinsic : 0n;
+      const less = (v: bigint) => v > l1Charge ? v - l1Charge : 0n;
+      const gasUsed = less(BigInt(ran.gasUsed)), peak = less(BigInt(ran.maxUsedGas ?? ran.gasUsed));
+      // A call that failed has its return data in `error.data` on Arbitrum's node, with `returnData` empty.
+      const failed = ran.status !== '0x1', returnData = ((failed ? ran.error?.data : undefined) ?? ran.returnData ?? '0x') as Hex;
+      const logs = failed ? [] : (ran.logs ?? []).map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data }));
+      const revertReason = failed ? decodeRevert(returnData) ?? ran.error?.message ?? 'reverted' : undefined;
+      const source_ = `chain ${chainId}'s node, ${nodeReason(why)}`;
+      const intrinsic = intrinsicGas(req, false).intrinsic;
+      const gasLimit = req.gas ? req.gas - intrinsic - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS;
+      const known = 'its outcome, return data, events and gas are the node\'s; the calls it made aren\'t known, so its events are all listed here';
+      const trace: TraceCall | undefined = req.trace ? { type: 'call', from: hexOf(req.from), to: target, value: req.value, input: req.data, gas: gasLimit > 0n ? gasLimit : 0n, gasUsed: peak > intrinsic ? peak - intrinsic : 0n,
+        node: why.target && !why.after ? `a Stylus (WASM) program, run by the chain's node: ${known}` : `run by the chain's node, ${nodeReason(why)}: ${known}`,
+        ...(returnData.length > 2 && { output: returnData }), ...(failed && { error: revertReason }),
+        ...(logs.length && { logs: logs.map((l, index) => ({ index, ...l })) }) } : undefined;
+      if (failed) return { status: 'reverted', source: source_, gasUsed, revertReason, transfers: [], basis: 'fork', returnData, ...(trace && { trace }) };
+      const transfers: SimulatedTransfer[] = [];
+      const other = target === from ? ELSEWHERE : target;
+      const add = (asset: string, delta: bigint) => {
+        if (delta < 0n) transfers.push({ asset, from, to: other, raw: -delta });
+        else if (delta > 0n) transfers.push({ asset, from: other, to: from, raw: delta });
+      };
+      const value = (c: NodeCallResult | undefined) => c?.status === '0x1' && c.returnData.length >= 66 ? BigInt(c.returnData.slice(0, 66)) : undefined;
+      const nativeBefore = value(readsBefore[0]), nativeAfter = value(readsAfter[0]);
+      // The sender's balance after the call is less its fee too, which the node takes at the call's price for all the
+      // gas it used (its L1 charge included; at a price above the base fee as well, 2026-11-15): the fee is counted
+      // apart, as the local EVM's runs leave it out of the amounts, so it is put back.
+      const paidFee = hexOf(req.from) === from && req.gasPrice ? BigInt(ran.gasUsed) * req.gasPrice : 0n;
+      // (What was read, as a local run's readAssets: the native coin and each token whose balance the node read both
+      // times. A UserOperation's coin is counted from them, with its EntryPoint deposit: withoutGas, src/erc4337-sim.ts.)
+      const read: string[] = [];
+      if (nativeBefore !== undefined && nativeAfter !== undefined) { add('native', nativeAfter - nativeBefore + paidFee); read.push('native'); }
+      const logNet = new Map<string, bigint>();
+      for (const t of parsed.transfers) {
+        if (t.from === from) logNet.set(t.asset, (logNet.get(t.asset) ?? 0n) - t.raw);
+        if (t.to === from) logNet.set(t.asset, (logNet.get(t.asset) ?? 0n) + t.raw);
+      }
+      const nftLogs = new Set(logs.filter(l => l.topics[0] === TRANSFER && l.topics.length === 4).map(l => l.address));
+      // Each token's balance as the node read it, before and after; one not watched (or unreadable) moves by its events.
+      for (const t of new Set([...watch, ...logNet.keys()])) {
+        if (t === 'native' || nftLogs.has(t)) continue;
+        const k = watch.indexOf(t), b = k >= 0 ? value(readsBefore[1 + k]) : undefined, a = k >= 0 ? value(readsAfter[1 + k]) : undefined;
+        if (b !== undefined && a !== undefined) read.push(t);
+        // (A contract that answers balanceOf with something else, an NFT collection's count, moves by its events only.)
+        if (b !== undefined && a !== undefined && (a !== b || logNet.has(t))) add(t, a - b);
+        else if (logNet.has(t)) add(t, logNet.get(t)!);
+      }
+      const approvalState: SimulatedApproval[] = [];
+      approvals.forEach((ap, k) => {
+        const r = approvalReads[k];
+        const st = r?.status === '0x1' ? decodeState(ap, r.returnData) : undefined;
+        if (st) approvalState.push(st);
+      });
+      return { status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', readAssets: read, returnData, logs, ...(trace && { trace }) } as SimulationResult;
+    });
   }
 
   /**

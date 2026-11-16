@@ -1952,7 +1952,7 @@ test('Arbitrum: a UserOperation’s run that reaches a Stylus program goes to th
   assert.ok(r.readAssets?.includes('native') && r.readAssets.includes(dai), String(r.readAssets));
 });
 
-test('Arbitrum: the reads around a call the node runs are two calls on each side, however many tokens are watched', async () => {
+test('Arbitrum: the reads around a call the node runs are one call on each side, however many tokens are watched', async () => {
   // Arbitrum One's public node answers an eth_simulateV1 of more than 30 calls with HTTP 429, every time (2026-11-16):
   // read as calls of their own, a call with twelve tokens watched took 2 × 13 + 1 of them and was never run.
   clearForkCaches();
@@ -1960,8 +1960,8 @@ test('Arbitrum: the reads around a call the node runs are two calls on each side
   const req: SimulationRequest = { ...arbReq({ from: USER, to: sweeper, data: sweepAll }), watch: [program, dai, ...others] };
   const [r] = (await arbFork({ watchTokens: false }).simulateBatch([req]))!;
   const [block] = simulated.at(-1)!;
-  // The native balance and one call for the twelve views, before; the call; the same after.
-  assert.equal(block.calls.length, 5, JSON.stringify(block.calls.map(c => c.to)));
+  // One call for the native balance and the twelve views, before; the call; the same after.
+  assert.equal(block.calls.length, 3, JSON.stringify(block.calls.map(c => c.to)));
   agrees(r, (await nodeOwn([{ from: USER, to: sweeper, data: sweepAll }]))[0]);
   // The amounts are still the node's reads: all of USER's 1,000 USDC (the program, read through the reader), DAI read
   // and unmoved, the addresses with no code not read.
@@ -1977,9 +1977,9 @@ test('Arbitrum: an approval a call the node runs sets is read back through the r
   const [r] = (await arbFork({ watchTokens: false }).simulateBatch([req]))!;
   assert.equal(r.status, 'success');
   assert.deepEqual(r.approvalState?.map(a => [a.token, a.owner, a.spender, a.amount]), [[program, USER, BOB, 77n]]);
-  // Asked again with the approval read after the call: the native balance and the reader on each side, still.
+  // Asked again with the approval read after the call: the reader on each side, still.
   const [block] = simulated.at(-1)!;
-  assert.equal(block.calls.length, 5, JSON.stringify(block.calls.map(c => c.to)));
+  assert.equal(block.calls.length, 3, JSON.stringify(block.calls.map(c => c.to)));
 });
 
 test('Arbitrum: a call to a proxy whose implementation is a Stylus program says it reaches the program from inside another contract, though a read of the proxy reached it first', async () => {
