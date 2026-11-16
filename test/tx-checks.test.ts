@@ -44,6 +44,30 @@ test('The network fee: gas used at the base fee plus tip, the most the request a
   assert.equal(detail(tipped, 'Network fee'), '≈ 0.0000561 ETH (51,000 gas at 1.1 gwei, 1,000 of it for the data posted to Ethereum)');
 });
 
+test('Transactions every node refuses whatever the state: a tip above the fee cap, an empty authorization list, a type-4 creation', async () => {
+  // Each refused outright by every chain's node, with its validation off too (2026-11-16); the preview said nothing.
+  assert.ok(codes(await send({ maxFeePerGas: toHex(GWEI), maxPriorityFeePerGas: toHex(2n * GWEI) })).includes('tip_above_fee_cap'));
+  assert.equal(codes(await send({ maxFeePerGas: toHex(2n * GWEI), maxPriorityFeePerGas: toHex(GWEI) })).includes('tip_above_fee_cap'), false);
+  assert.ok(codes(await send({ authorizationList: [] })).includes('authorization_list_empty'));
+  assert.equal(codes(await send({})).includes('authorization_list_empty'), false);
+  const creation = await send({ to: null, data: '0x6000', authorizationList: [{ address: BOB, chainId: '0x1' }] });
+  assert.ok(codes(creation).includes('authorizations_with_creation'));
+  assert.equal(codes(await send({ authorizationList: [{ address: BOB, chainId: '0x1' }] })).includes('authorizations_with_creation'), false);
+});
+
+test('A call that runs out of gas under its limit is said to need its peak, not what it uses after its refund', async () => {
+  // Clearing five slots: 36,824 gas in the end, 46,030 at its most (eth_simulateV1's maxUsedGas). On 40,000 it ran
+  // out, and was said to need 36,824, less than the limit it had run out on.
+  const refunding = { ...simulator, simulate: async (r: SimulationRequest): Promise<SimulationResult> => r.gas !== undefined && r.gas < 46_030n
+    ? { status: 'reverted', source: 'mock', gasUsed: r.gas, revertReason: 'out of gas', transfers: [] }
+    : { status: 'success', source: 'mock', gasUsed: 36_824n, gasPeak: 46_030n, transfers: [] } };
+  const p = await send({ gas: toHex(40_000n) }, { ...deps(), simulator: refunding });
+  assert.equal(p.simulation?.revertReason, 'out of gas: the gas limit (40,000) is below the 46,030 gas this call needs while it runs (36,824 in the end, after its refund)');
+  // With no peak known, what it used, as before.
+  const plain = await send({ gas: toHex(40_000n) });
+  assert.equal(plain.simulation?.revertReason, 'out of gas: the gas limit (40,000) is below the 50,000 gas this call needs');
+});
+
 test('OP Stack (Base, OP Mainnet): the L1 data fee is added to the gas, in the estimate, the maximum and the funds needed', async () => {
   const base = await send({ chainId: '0x2105' });
   assert.equal(detail(base, 'Network fee'), '≈ 0.000065 ETH (50,000 gas at 1.1 gwei, plus 0.00001 ETH for the data posted to Ethereum)');

@@ -524,6 +524,13 @@ export interface SimulationResult {
   status: 'success' | 'reverted';
   source: string;
   gasUsed?: bigint;
+  /**
+   * The most gas the transaction had used at any point as it ran (before its refund; at least the calldata floor):
+   * what a gas limit must hold for it to run as simulated, where it is more than `gasUsed` (eth_simulateV1's
+   * maxUsedGas; the local EVM's execution before the refund). A call clearing five slots used 36,824 in the end and
+   * ran out of gas on 40,000: it peaked at 46,030.
+   */
+  gasPeak?: bigint;
   revertReason?: string;
   /** Fungible transfers (ERC-20 and native). */
   transfers: SimulatedTransfer[];

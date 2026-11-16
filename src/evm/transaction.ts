@@ -126,7 +126,7 @@ export function normalizeTransaction(raw: unknown, context: PreviewContext, fall
   // An access list in the standard shape ({ address, storageKeys }[]); anything else is left out.
   const accessList = Array.isArray(t.accessList) && t.accessList.length && t.accessList.every(a => a && typeof a === 'object' && ADDRESS.test(String((a as { address?: unknown }).address)) && Array.isArray((a as { storageKeys?: unknown }).storageKeys) && ((a as { storageKeys: unknown[] }).storageKeys).every(k => typeof k === 'string' && /^0x[0-9a-fA-F]{64}$/.test(k)))
     ? (t.accessList as { address: string; storageKeys: string[] }[]).map(a => ({ address: a.address.toLowerCase(), storageKeys: a.storageKeys.map(k => k.toLowerCase()) })) : undefined;
-  return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value'), ...(authorizations?.length && { authorizations }),
+  return { chainId, from: from.toLowerCase(), to: to ? (to as string).toLowerCase() : null, data: data.toLowerCase() as `0x${string}`, value: quantity(t.value, 'value'), ...(authorizations?.length && { authorizations }), ...(authorizations && !authorizations.length && { emptyAuthorizations: true as const }),
     ...Object.fromEntries(Object.entries(fees).filter(([, v]) => v !== undefined)), ...(accessList && { accessList }) };
 }
 
@@ -307,7 +307,11 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length && !replay) {
       try {
         const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined, ...(at && { at }), ...(context.stateOverrides && { stateOverrides: context.stateOverrides }) });
-        if (unlimited?.status === 'success') sim = { ...sim, revertReason: `out of gas: the gas limit (${tx.gas.toLocaleString('en-US')}) is below the ${unlimited.gasUsed !== undefined ? `${unlimited.gasUsed.toLocaleString('en-US')} gas` : 'gas'} this call needs` };
+        // (What it needs is its peak, before its refund, where the simulator says: a call clearing slots used 36,824
+        // in the end and ran out on 40,000, having needed 46,030 on the way. Quoted as needing 36,824, the message
+        // gave less than the limit it had just run out on.)
+        const needs = unlimited?.gasPeak ?? unlimited?.gasUsed;
+        if (unlimited?.status === 'success') sim = { ...sim, revertReason: `out of gas: the gas limit (${tx.gas.toLocaleString('en-US')}) is below the ${needs !== undefined ? `${needs.toLocaleString('en-US')} gas` : 'gas'} this call needs${unlimited.gasPeak !== undefined && unlimited.gasUsed !== undefined ? ` while it runs (${unlimited.gasUsed.toLocaleString('en-US')} in the end, after its refund)` : ''}` };
       } catch { /* keep the first answer */ }
     }
     if (context.stateOverrides && !replay && !preset) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));

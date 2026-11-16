@@ -3,6 +3,7 @@
 // delegation is changed. An unsigned entry asks the wallet to sign it for the sender's account; a signed one may
 // belong to another account (a sponsor submitting someone else's upgrade).
 import { recoverAuthorizationAddress } from 'viem/utils';
+import { appliedSignature } from '../authorization.ts';
 import { type PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
 import type { AbiResolver, ContractAbi, Dependencies } from '../types.ts';
@@ -22,6 +23,8 @@ async function verifiedName(deps: Dependencies, chainId: number, address: string
 /** The account an authorization changes: the sender's own when unsigned, else whoever signed it (null if unreadable). */
 async function authorityOf(tx: Tx, a: AuthorizationRequest): Promise<string | null> {
   if (!a.signature) return tx.from;
+  // (One the chain doesn't apply, a high s or a parity other than 0 or 1, changes no account: appliedSignature.)
+  if (!appliedSignature(a.signature as { r: string; s: string; yParity?: number })) return null;
   try {
     const signer = await recoverAuthorizationAddress({
       authorization: { address: a.address as `0x${string}`, chainId: a.chainId ?? tx.chainId, nonce: Number(a.nonce ?? 0n) },

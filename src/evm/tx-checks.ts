@@ -95,6 +95,14 @@ export function l1FeeInput(tx: Tx, f: { nonce: bigint; gas: bigint; maxFeePerGas
  * gas; without it, the fee is only shown as the maximum the request allows. Needs an RPC for the chain.
  */
 export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, deps: Dependencies, context: PreviewContext, b: PreviewBuilder): Promise<NetworkFee | undefined> {
+  // What makes a transaction one the network refuses whatever the chain's state: every chain's node refuses each of
+  // these outright, with its validation off too (2026-11-16), and the preview had said nothing (a simulation that
+  // ignores the fields showed success).
+  if (tx.maxPriorityFeePerGas !== undefined && tx.maxFeePerGas !== undefined && tx.maxPriorityFeePerGas > tx.maxFeePerGas) {
+    b.warn('danger', 'tip_above_fee_cap', `The priority fee (${gwei(tx.maxPriorityFeePerGas)}) is above the fee cap (${gwei(tx.maxFeePerGas)}): the network will reject this transaction as it is.`);
+  }
+  if (tx.emptyAuthorizations) b.warn('danger', 'authorization_list_empty', 'The request carries an EIP-7702 authorization list with nothing in it, which makes it a type-4 transaction with no authorizations: the network will reject it as it is.');
+  if (tx.to === null && tx.authorizations?.length) b.warn('danger', 'authorizations_with_creation', 'This transaction creates a contract and carries EIP-7702 authorizations, which a type-4 transaction can\'t do: the network will reject it as it is.');
   const rpc = deps.rpc;
   if (!rpc?.has(tx.chainId)) return undefined;
   const call = <T>(method: string, params: unknown[]) => rpc.call(tx.chainId, method, params).then(r => r as T, () => undefined);

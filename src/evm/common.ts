@@ -12,6 +12,8 @@ export interface Tx {
   value: bigint;
   /** EIP-7702 authorization list (type-4 transactions). */
   authorizations?: AuthorizationRequest[];
+  /** The request named an authorization list with nothing in it: a type-4 transaction the network refuses. */
+  emptyAuthorizations?: true;
   /** The sender's code will be in place when this runs though the chain shows none yet (a UserOperation that deploys its account first). */
   codeInPlace?: boolean;
   /** The request's own gas limit, fees and nonce, when it sets them (wallets usually fill them in). */

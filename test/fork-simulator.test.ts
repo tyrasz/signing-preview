@@ -223,6 +223,15 @@ test('EIP-7702 authorizations are applied as the chain does: validity, nonces, p
   assert.equal(sponsored.gasUsed, without.gasUsed! + 25_000n);
   assert.equal(next.status, 'reverted');
   assert.equal(next.revertReason, 'balance');
+  // Signed so the chain won't apply it: s over half the group order (n - s, the same signature otherwise), or a parity
+  // of 27. Every node skips it (on Ethereum, 2026-11-16: no code, 49,127 gas); it was applied here (81,362).
+  const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+  const good = await signed(KEY, 1);
+  for (const bad of [{ ...good, s: toHex(N - BigInt(good.s), { size: 32 }), yParity: toHex(1 - Number(good.yParity)) }, { ...good, yParity: toHex(27 + Number(good.yParity)) }]) {
+    const [skipped] = (await sim.simulateBatch([{ ...base, authorizationList: [bad], stateOverrides: { [USER]: { code: '0x' } } }]))!;
+    assert.deepEqual(skipped.transfers, []);
+    assert.equal(skipped.gasUsed, 21_000n + 25_000n + calldataGas(execute));
+  }
 });
 
 test('A wallet upgrading its own account and running a batch through it shows the batch’s balance changes', async () => {

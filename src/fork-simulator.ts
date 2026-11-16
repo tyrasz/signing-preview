@@ -15,11 +15,12 @@ import { dirname } from 'node:path';
 import { createEVM, EVMError, getActivePrecompiles, paramsEVM, type EVM, type PrecompileInput } from '@ethereumjs/evm';
 import { Common, createCustomCommon, Hardfork, Mainnet } from '@ethereumjs/common';
 import { SimpleStateManager } from '@ethereumjs/statemanager';
-import { Account, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
-import { decodeAbiParameters, keccak256 } from 'viem';
+import { Account, bigIntToBytes, bytesToHex, createAddressFromString, hexToBytes, setLengthLeft, unpadBytes, type Address } from '@ethereumjs/util';
+import { decodeAbiParameters, encodeAbiParameters, keccak256 } from 'viem';
 import { createHash } from 'node:crypto';
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { recoverAuthorizationAddress } from 'viem/utils';
+import { appliedSignature } from './authorization.ts';
 import { builtinTokens, CHAINS, PERMIT2, PRECOMPILE_SCALE } from './chains.ts';
 import { headerAfter, NEXT_BLOCK, nodeOverrides, priceFields, type StateChanges } from './block.ts';
 import { calldataCandidates } from './simulation-probe.ts';
@@ -169,8 +170,12 @@ const BNB_MILLI_TIMESTAMP: TimedPrecompile = {
 /** The chain's own precompiles in effect at `time` (ChainProfile.timedPrecompiles). */
 export const timedPrecompilesAt = (profile: ChainProfile | undefined, time: bigint) => (profile?.timedPrecompiles ?? []).filter(p => time >= p.from);
 
-/** HyperEVM's read precompiles (0x…0800 onward: positions, spot balances, prices, L1 block number...). */
-const HYPERCORE_READS = Array.from({ length: 64 }, (_, i) => `0x${(0x800 + i).toString(16).padStart(40, '0')}`);
+/**
+ * HyperEVM's read precompiles, 0x…0800 to 0x…0814 (positions, spot balances, prices, the L1 block number...): the
+ * node has none above (2026-11-16: a call to 0x…0815 to 0x…083f was a cold empty account's there, 2,622 gas, and had
+ * been a warm forwarded read here, 1,122). To be probed again when HyperCore adds a read.
+ */
+const HYPERCORE_READS = Array.from({ length: 0x15 }, (_, i) => `0x${(0x800 + i).toString(16).padStart(40, '0')}`);
 
 /**
  * HyperCore read precompile gas, measured on HyperEVM mainnet (2026-11-05) with a contract reading gasleft() around
@@ -196,7 +201,27 @@ const ARBOS_READS: Record<string, number> = {
   // ArbRetryableTx.redeem of a ticket that doesn't exist reads it twice before NoTicketWithID() (2,406, measured);
   // keepalive, cancel and getTimeout once (1,606). Redeeming or keeping alive one that exists is refused (ARBOS_WRITES).
   '0xeda1122c': 2,
+  // Measured on Arbitrum One's node, 2026-11-16 (each had been taken to read one): getL1PricingSurplus three;
+  // getPreferredAggregator, ArbRetryableTx's getLifetime and getCurrentRedeemer, ArbStatistics' getStats none.
+  '0x520acdd7': 3, '0x52f10740': 0, '0x81e6e083': 0, '0xde4ba2b3': 0, '0xc59d4847': 0,
 };
+/**
+ * ArbOS methods that return a list and read a slot for its length and one for each entry: getAllChainOwners and
+ * getBatchPosters, each 4,000 and 3 a word for a list of three (2026-11-16; they had been taken to read one).
+ */
+const ARBOS_LISTS = new Set(['0x516b4e0f', '0xe10573a3']);
+/**
+ * ArbWasm's parameters (stylusVersion, inkPrice), read from one slot kept warm: 800, 100 for the read, 3 a word
+ * (1,021 spent around the call where 1,721 had been taken, 2026-11-16).
+ */
+const ARBWASM_PARAMS = new Set(['0xa996e0c2', '0xd1c17abc']);
+/**
+ * ArbInfo (0x65): getBalance and getCode, answered from the simulation's own state (forwarded, they had answered
+ * with the chain's, which hasn't what the simulation changed: an overridden balance came back as the chain's).
+ * getBalance costs 1,500 (ArbOS's 800 and an account's balance, 700), getCode 2,900 (800 and a cold slot's 2,100)
+ * and 3 a word of the code, and each 3 a word given and returned: 1,506 and, for a 1-byte code, 2,915 (measured).
+ */
+const ARB_INFO = low(0x65), ARB_GET_BALANCE = '0xf8b2cb4f', ARB_GET_CODE = '0x7e105ce2';
 /**
  * ArbFilteredTransactionsManager (0x74, as eth_config names it): 1,600 gas whatever it is given
  * (none, a byte, 36 or 1,036 bytes), and when it refuses a call (addFilteredTransaction from an account that isn't
@@ -209,7 +234,9 @@ const arbosGas = (input: number, output: number, selector?: string, address?: st
   if (address === ARB_FILTERED_TRANSACTIONS) return 1_600n;
   // A pure method doesn't open ArbOS's state: 3 a word (mapL1SenderContractAddressToL2Alias 9, measured).
   if (address && selector && ARBOS_METHODS[address]?.pure?.includes(selector)) return words;
-  return 800n + 800n * BigInt(address === ARBOS_ACTS ? 0 : ARBOS_READS[selector ?? ''] ?? 1) + words;
+  if (selector && ARBWASM_PARAMS.has(selector)) return 900n + words;
+  const slots = address === ARBOS_ACTS ? 0 : selector && ARBOS_LISTS.has(selector) ? 1 + Math.max(0, Math.ceil(output / 32) - 2) : ARBOS_READS[selector ?? ''] ?? 1;
+  return 800n + 800n * BigInt(slots) + words;
 };
 
 /**
@@ -1722,7 +1749,7 @@ async function authorizationsOf(req: SimulationRequest): Promise<Authorization[]
   for (const a of req.authorizationList ?? []) {
     let authority: string | null = null;
     try {
-      authority = (await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase();
+      if (appliedSignature(a)) authority = (await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase();
     } catch { /* the chain skips it */ }
     out.push({ authority, address: hexOf(a.address), chainId: BigInt(a.chainId), nonce: BigInt(a.nonce) });
   }
@@ -2200,6 +2227,20 @@ export class ForkSimulator implements Simulator {
         const price = profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n;
         if (price > input.gasLimit) return burnt(input.gasLimit);
         return { executionGasUsed: price, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      }
+      // ArbInfo's getBalance and getCode: the simulation's own (ARB_INFO).
+      if (profile.arbitrum && address === ARB_INFO && (selector === ARB_GET_BALANCE || selector === ARB_GET_CODE) && input.data.length >= 36) {
+        const who = createAddressFromString(bytesToHex(input.data.subarray(16, 36)));
+        const words = (n: number) => BigInt(Math.ceil(n / 32));
+        if (selector === ARB_GET_BALANCE) {
+          const price = 1_500n + 3n * (words(input.data.length - 4) + 1n);
+          if (price > input.gasLimit) return burnt(input.gasLimit);
+          return { executionGasUsed: price, returnValue: setLengthLeft(bigIntToBytes((await state.getAccount(who))?.balance ?? 0n), 32) };
+        }
+        const code = await state.getCode(who), out = hexToBytes(encodeAbiParameters([{ type: 'bytes' }], [bytesToHex(code)]));
+        const price = 2_900n + 3n * words(code.length) + 3n * (words(input.data.length - 4) + words(out.length));
+        if (price > input.gasLimit) return burnt(input.gasLimit);
+        return { executionGasUsed: price, returnValue: out };
       }
       // (Run here only in the transaction's own EVM, whose messages are followed; the views read around it never send.)
       if (profile.arbitrum && address === ARBSYS && (selector === SEND_TX_TO_L1 || selector === WITHDRAW_ETH) && input._EVM === evm) {
@@ -2881,7 +2922,10 @@ export class ForkSimulator implements Simulator {
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
       // (Arbitrum: less the gas the chain took for the transaction's L1 data before running it, where it is known.)
-      let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS;
+      // (With none given, 30,000,000 in all, as HyperEVM's node gives an eth_call: GAS read first came out 21,000 and
+      // the calldata's cost higher here than there, 2026-11-16. The other nodes give their own caps, 32 to 160 million,
+      // which code reading gasleft() alone sees; a call that burns all it is given would take that much longer here.)
+      let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState;
       // Amsterdam meters new state apart from the rest (EIP-8037). What a transaction's gas limit holds over the cap
       // on ordinary gas (EIP-7825's 16,777,216, less what it pays before its call) is a reservoir for state alone;
       // state gas is drawn from it first, then from the call's gas, and state gas given back (a slot set and cleared
@@ -2929,6 +2973,9 @@ export class ForkSimulator implements Simulator {
       // to an empty account: 37,000 gas there, the floor's 61,000 on Ethereum, Base, OP Mainnet, Polygon and BNB
       // Chain; 2026-11-15).
       const gasUsed = transactionGas(req, spent > 0n ? spent : 0n, (ex.gasRefund ?? 0n) + authRefund, !BEFORE_PRAGUE.has(profile.hardfork) && !profile.arbitrum, profile.hardfork === 'amsterdam');
+      // (What it had used at its most, before the refund: SimulationResult.gasPeak.)
+      const peakGas = transactionGas(req, spent > 0n ? spent : 0n, 0n, !BEFORE_PRAGUE.has(profile.hardfork) && !profile.arbitrum, profile.hardfork === 'amsterdam');
+      const gasPeak = peakGas > gasUsed ? { gasPeak: peakGas } : {};
       // The fee itself is paid once everything this call reports has been read: the calls after it in the batch are
       // the transactions after it, and meet a sender that has paid (the gas used at its price) and a fee recipient
       // that has been tipped (the price over the base fee), as on the chain.
@@ -2960,7 +3007,7 @@ export class ForkSimulator implements Simulator {
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
         await settle();
-        results.push({ status: 'reverted', source: source_, gasUsed, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data,
+        results.push({ status: 'reverted', source: source_, gasUsed, ...gasPeak, revertReason: ex.exceptionError.error === 'revert' ? decodeRevert(data) : ex.exceptionError.error, transfers: [], basis: 'fork', returnData: data,
           // A call that fails changes nothing itself; the transaction's authorizations (EIP-7702) stay as applied.
           ...(traced?.trace && { trace: traced.trace, ...(traced.stateChanges.length && { stateChanges: traced.stateChanges }) }) });
         continue;
@@ -3018,7 +3065,7 @@ export class ForkSimulator implements Simulator {
         const s = r && decodeState(ap, bytesToHex(r) as Hex);
         if (s) approvalState.push(s);
       }
-      results.push({ status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', readAssets: read, returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })),
+      results.push({ status: 'success', source: source_, gasUsed, ...gasPeak, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', readAssets: read, returnData: bytesToHex(ex.returnValue), logs: logs.map(l => ({ ...l, address: l.address.toLowerCase() })),
         ...(traced?.trace && { trace: traced.trace, stateChanges: traced.stateChanges }) });
       await settle();
     }
@@ -3243,6 +3290,12 @@ export class ForkSimulator implements Simulator {
   private async authorize(state: LazyState, evm: EVM, list: Authorization[], chainId: number, sender: string): Promise<{ refund: bigint; state: bigint }> {
     let refund = 0n, added = 0n;
     const written = new Set([sender]);
+    // What Amsterdam charges for the state an authority gains is judged against the authority as the transaction
+    // found it, once: a new account's bytes if it had none, a delegation's if it had none and one is set. Judged
+    // against what the tuples before had left, a list that cleared a delegation and set one again paid the 23 bytes
+    // twice (Sepolia, 2026-11-16: "D1, clear, D2" 301,428 gas here and 266,238 on the node; "delegated to D1: clear,
+    // then D1" 74,822 and 39,632).
+    const found = new Map<string, { existed: boolean; delegated: boolean; paid: { account: boolean; delegation: boolean } }>();
     for (const a of list) {
       if (!a.authority || (a.chainId !== 0n && a.chainId !== BigInt(chainId))) continue;
       const who = createAddressFromString(a.authority);
@@ -3250,9 +3303,14 @@ export class ForkSimulator implements Simulator {
       const code = await state.getCode(who);
       if (code.length && !isDelegation(code)) continue;
       const account = await state.getAccount(who);
+      if (!found.has(a.authority)) found.set(a.authority, { existed: !!account, delegated: isDelegation(code), paid: { account: false, delegation: false } });
       if (a.nonce !== undefined && (account?.nonce ?? 0n) !== a.nonce) continue;
       if (account) refund += 12_500n;
-      added += (written.has(a.authority) ? 0n : 9_000n) + (account ? 0n : 120n * 1_530n) + (isDelegation(code) || a.address === ZERO ? 0n : 23n * 1_530n);
+      const was = found.get(a.authority)!;
+      const newAccount = !was.existed && !was.paid.account, newDelegation = !was.delegated && !was.paid.delegation && a.address !== ZERO;
+      added += (written.has(a.authority) ? 0n : 9_000n) + (newAccount ? 120n * 1_530n : 0n) + (newDelegation ? 23n * 1_530n : 0n);
+      if (newAccount) was.paid.account = true;
+      if (newDelegation) was.paid.delegation = true;
       written.add(a.authority);
       const next = account ?? new Account();
       next.nonce++;

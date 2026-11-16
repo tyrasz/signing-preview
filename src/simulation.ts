@@ -1,6 +1,7 @@
 import { decodeAbiParameters, decodeErrorResult, encodeAbiParameters, keccak256, parseAbi, stringToBytes, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { recoverAuthorizationAddress } from 'viem/utils';
+import { appliedSignature } from './authorization.ts';
 import { builtinTokens, CHAINS, PERMIT2 } from './chains.ts';
 import { knownError } from './errors.ts';
 import { nodeOverrides, priceFields, type StateChanges } from './block.ts';
@@ -39,7 +40,7 @@ export const NATIVE_LOG_ADDRESS = '0xfffffffffffffffffffffffffffffffffffffffe';
 /** Multicall3, at this address on every chain the previewer simulates on: getEthBalance(address) reads a native balance. */
 const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11';
 
-type RawCallResult = { status: string; gasUsed: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
+type RawCallResult = { status: string; gasUsed: string; maxUsedGas?: string; returnData: Hex; logs?: { address: string; topics: string[]; data: string }[]; error?: { message?: string; data?: Hex } };
 
 export interface RpcSimulatorOptions {
   fetchImpl?: typeof fetch;
@@ -103,6 +104,7 @@ async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChang
   if (reqs.some(r => r.unsignedAuthorizations?.length)) all[UNSIGNED_STAND_IN.address] = { ...UNSIGNED_STAND_IN.state };
   for (const r of reqs) for (const a of r.authorizationList ?? []) {
     try {
+      if (!appliedSignature(a)) continue;
       const authority = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } });
       const own = all[authority.toLowerCase()];
       if (own) { delete own.code; if (!Object.keys(own).length) delete all[authority.toLowerCase()]; }
@@ -373,10 +375,11 @@ export class RpcSimulator implements Simulator {
     }
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     const parsed: SimulationResult[] = results.map(result => {
-      const gasUsed = BigInt(result.gasUsed);
+      const gasUsed = BigInt(result.gasUsed), peak = result.maxUsedGas ? BigInt(result.maxUsedGas) : undefined;
+      const gasPeak = peak !== undefined && peak > gasUsed ? { gasPeak: peak } : {};
       return result.status !== '0x1'
-        ? { status: 'reverted', source, gasUsed, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [], ...((result.error?.data ?? result.returnData) && { returnData: result.error?.data ?? result.returnData }) }
-        : { status: 'success', source, gasUsed, ...parseLogs(result.logs ?? []), ...(result.returnData && { returnData: result.returnData }),
+        ? { status: 'reverted', source, gasUsed, ...gasPeak, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [], ...((result.error?.data ?? result.returnData) && { returnData: result.error?.data ?? result.returnData }) }
+        : { status: 'success', source, gasUsed, ...gasPeak, ...parseLogs(result.logs ?? []), ...(result.returnData && { returnData: result.returnData }),
           // Without the native transfers traceTransfers adds (logged by a pseudo-address).
           logs: (result.logs ?? []).filter(l => l.address.toLowerCase() !== NATIVE_PSEUDO_TOKEN).map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data })) };
     });
@@ -386,7 +389,38 @@ export class RpcSimulator implements Simulator {
     const ranOn = this.at(chainId, reqs).tag === 'latest' && body.result?.[0]?.number ? `0x${(BigInt(body.result[0].number) - 1n).toString(16)}` : undefined;
     // Whatever stops the reads, the event-based values stand, and the results say why.
     try { await this.readState(url, reqs, parsed, ranOn); } catch (e) { for (const p of parsed) p.stateReadError ??= String((e as Error)?.message ?? e).slice(0, 200); }
+    // (After the reads, which match the calls' gas to the node's own figure.)
+    await this.amsterdamStandIns(url, reqs, parsed, ranOn ?? this.at(chainId, reqs).tag, body.result?.[0] as { blockAccessListHash?: string } | undefined);
     return parsed;
+  }
+
+  /**
+   * Under Amsterdam (Glamsterdam: Sepolia), what an unsigned authorization's stand-in costs isn't what the sender's
+   * own will: the stand-in, another account, pays 9,000 for the first write to its account, which the sender's own
+   * doesn't (the transaction has written the sender already), and it clears a delegation it hasn't, where the
+   * sender's own, delegating an account not delegated yet, pays for the delegation's 23 bytes (35,190). Measured on
+   * Sepolia (2026-11-16): 31,816 gas with the stand-in for a fresh sender where its own authorization took 58,006,
+   * and for one already delegated 31,816 where its own took 22,816. Each request's gas is corrected by the difference,
+   * from the sender's code before the block (an authorization for another chain doesn't apply, and isn't counted).
+   */
+  private async amsterdamStandIns(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], tag: string, simulated?: { blockAccessListHash?: string }) {
+    const asked = reqs.map((r, i) => ({ r, i })).filter(({ r, i }) => parsed[i]?.gasUsed !== undefined && r.unsignedAuthorizations?.some(a => a.chainId === 0 || a.chainId === r.chainId));
+    if (!asked.length) return;
+    const amsterdam = reqs[0].at?.header.amsterdam ?? (simulated?.blockAccessListHash !== undefined
+      || !!((await this.post(url, 'eth_getBlockByNumber', [tag, false]).catch(() => undefined)) as { result?: { blockAccessListHash?: string } } | undefined)?.result?.blockAccessListHash);
+    if (!amsterdam) return;
+    for (const { r, i } of asked) {
+      // (The sender's code before the transaction: as the block's state beneath the request has it, else the chain's.
+      // Not the request's own override, which is the authorization's effect standing in: its delegation.)
+      const given = Object.entries(r.at?.state ?? {}).find(([k]) => k.toLowerCase() === r.from.toLowerCase())?.[1]?.code;
+      const code = given ?? ((await this.post(url, 'eth_getCode', [r.from, tag]).catch(() => undefined)) as { result?: string } | undefined)?.result;
+      if (typeof code !== 'string') continue;
+      const delegated = /^0xef0100[0-9a-f]{40}$/i.test(code), applying = r.unsignedAuthorizations!.filter(a => a.chainId === 0 || a.chainId === r.chainId);
+      const bytes = !delegated && applying.some(a => !/^0x0{40}$/i.test(a.address)) ? 23n * 1_530n : 0n;
+      const p = parsed[i], fix = (g: bigint) => (g + bytes > 9_000n ? g + bytes - 9_000n : g);
+      p.gasUsed = fix(p.gasUsed!);
+      if (p.gasPeak !== undefined) p.gasPeak = fix(p.gasPeak);
+    }
   }
 
   /**

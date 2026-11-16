@@ -7,6 +7,7 @@
 // node keeps all of them.
 import type { Hex } from 'viem';
 import { recoverAuthorizationAddress } from 'viem/utils';
+import { appliedSignature } from './authorization.ts';
 import { accessListChanges, afterParent, blobBaseFeeAfter, blockAccessList, headerOf, keepsToBlock, LATEST_ONLY, type BlockAt, type RpcHeader } from './block.ts';
 import { chainName, CHAINS, OP_STACK } from './chains.ts';
 import { formatUnits } from './format.ts';
@@ -213,7 +214,7 @@ async function delegations(chainId: number, t: RpcTx, tag: string, deps: Depende
   const out: Record<string, { code: string }> = {};
   for (const a of t.authorizationList) {
     try {
-      if (![0, chainId].includes(Number(a.chainId))) continue;
+      if (![0, chainId].includes(Number(a.chainId)) || !appliedSignature(a)) continue;
       const authority = (await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } })).toLowerCase();
       const nonce = BigInt(String(await deps.rpc!.call(chainId, 'eth_getTransactionCount', [authority, tag]))) + (authority === t.from.toLowerCase() ? 1n : 0n);
       if (BigInt(a.nonce) === nonce) out[authority] = { code: /^0x0{40}$/.test(a.address) ? '0x' : `0xef0100${a.address.slice(2).toLowerCase()}` };

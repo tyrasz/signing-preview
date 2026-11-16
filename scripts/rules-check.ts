@@ -2375,7 +2375,9 @@ async function precompileEdgePrograms(chainId: number): Promise<Program[]> {
     core(0x80c, 'tokenInfo with no input', ''); core(0x80c, 'tokenInfo(0) with 32 bytes more', `${word(0)}${word(7)}`);
     core(0x810, 'coreUserExists(someone) on 2,089 gas', user, { gas: 1000 + 33 * 64 - 1 }); core(0x810, 'coreUserExists(someone) on 3,112 gas', user, { gas: 1000 + 33 * 64 });
     core(0x810, 'coreUserExists(someone), 1 wei', user, { value: 1n }); core(0x810, 'coreUserExists(someone) by DELEGATECALL', user, { op: 'DELEGATECALL' }); core(0x810, 'coreUserExists(someone) by CALLCODE', user, { op: 'CALLCODE' });
-    // (Not 0x0815 to 0x083f, which the node runs as empty accounts and the local EVM forwards as reads, 2026-11-16.)
+    // 0x0815 to 0x083f, which the node runs as empty accounts (cold: 2,622 gas) and the local EVM forwarded as reads
+    // (warm: 1,122) until 2026-11-16: the first past the reads, one in the middle and the last, with no input and with a wei.
+    for (const a of [0x815, 0x820, 0x83f]) { core(a, 'with no input (no precompile there)', ''); core(a, 'with a wei (no precompile there)', '', { value: 1n }); }
   }
 
   // The identity precompile's answer written over its own input in memory, and into less room than it returns and
