@@ -1722,3 +1722,343 @@ test('A state read the node answers only after the simulation’s time is up say
   assert.ok(Date.now() - started < 8000, `${Date.now() - started} ms`);
   clearForkCaches();
 });
+
+// Arbitrum's Stylus programs (WASM behind the code prefix 0xEFF000, which no EVM runs), on a chain of their own: its
+// node answers eth_getCode for a program with the prefix, so the local EVM sees a Stylus program there, and runs the
+// contract's EVM code when it is asked to simulate, standing in for the WASM. Each simulated call's gas is as
+// Arbitrum's node gives it: the transaction's (21,000 and its calldata, on top of what ran) and a charge for L1 data.
+const STYLUS_CODE = `0xeff00000${'1b'.repeat(40)}`, CODE_READER = '0x00000000000000000000000000000000c0de9ead', L1 = 2_544n, ARB_URL = 'http://arbitrum.invalid';
+const txGas = (data: string) => 21_000n + [...(data.slice(2).match(/../g) ?? [])].reduce((g, b) => g + (b === '00' ? 4n : 16n), 0n);
+type NodeCall = { status: string; returnData: Hex; gasUsed: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
+const arb = await testChain();
+arb.simulateV1 = true;
+const programs = new Set<string>();
+/** Each eth_simulateV1 the node was asked: its blocks of calls and overrides. */
+const simulated: { calls: { from?: string; to?: string; data?: Hex; value?: Hex; authorizationList?: { address: string }[] }[]; stateOverrides?: Record<string, { code?: Hex; balance?: Hex; nonce?: Hex }> }[][] = [];
+const arbFetch = (async (url: string, init: RequestInit) => {
+  const body = JSON.parse(String(init.body));
+  const asked: { id: number; method: string; params: any[] }[] = Array.isArray(body) ? body : [body];
+  const res = await (await arb.fetchImpl(url, init)).json();
+  const answers = Array.isArray(res) ? res : [res];
+  for (const a of answers) {
+    const r = asked.find(x => x.id === a.id);
+    if (!r || !a.result) continue;
+    if (r.method === 'eth_getCode' && programs.has(String(r.params[0]).toLowerCase())) a.result = STYLUS_CODE;
+    if (r.method === 'eth_simulateV1') {
+      const blocks = r.params[0].blockStateCalls;
+      simulated.push(blocks);
+      a.result.forEach((b: { calls: NodeCall[] }, k: number) => b.calls.forEach((out, j) => {
+        const c = blocks[k].calls[j];
+        out.gasUsed = `0x${(BigInt(out.gasUsed) + txGas(c.data ?? '0x') + L1).toString(16)}`;
+        // (The local EVM's read of code after a block's earlier transactions, through a reader: a program's prefix.)
+        if (c.to?.toLowerCase() === CODE_READER && programs.has(`0x${c.data.slice(26)}`)) out.returnData = STYLUS_CODE as Hex;
+      }));
+    }
+  }
+  return new Response(JSON.stringify(Array.isArray(res) ? answers : answers[0]));
+}) as typeof fetch;
+const program = await arb.deploy('Token', 'string,uint8', ['USDC', 6]);
+programs.add(program);
+const dai = await arb.deploy('Token', 'string,uint8', ['DAI', 18]);
+const sweeper = await arb.deploy('Sweeper');
+await arb.exec(program, call('mint', [USER, 1000_000_000n]));
+await arb.exec(dai, call('mint', [USER, 10n * E]));
+await arb.exec(program, call('approve', [sweeper, MAX]), USER);
+await arb.setBalance(USER, 10n * E);
+const SW = parseAbi(['function sweep(address,address)']);
+const sweepAll = encodeFunctionData({ abi: SW, functionName: 'sweep', args: [program as Hex, BOB] });
+const callsProgram = (before = '') => `0x${before}600060006000600060007${'3'}${program.slice(2)}5af15000` as Hex; // CALL(gas, program, 0, 0, 0, 0, 0); POP; STOP
+const arbFork = (o: Partial<ConstructorParameters<typeof ForkSimulator>[1]> = {}) => new ForkSimulator({ 42161: ARB_URL }, { fetchImpl: arbFetch, prefetch: false, ...o });
+type ArbRequest = { from: string; to?: string; data: Hex; value?: bigint };
+const arbReq = (r: ArbRequest): SimulationRequest => ({ chainId: 42161, value: 0n, ...r, to: r.to ?? null });
+/** The last eth_simulateV1 the node was asked whose first block has a call that `has`. */
+const lastAsked = (has: (c: (typeof simulated)[number][number]['calls'][number]) => boolean) => [...simulated].reverse().find(b => b[0].calls.some(has))!;
+/** The node's own run of the calls, in order in one simulated block, as its eth_simulateV1 answers. */
+async function nodeOwn(calls: ArbRequest[]): Promise<NodeCall[]> {
+  const res = await arbFetch(ARB_URL, { method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ calls: calls.map(c => ({ from: c.from, ...(c.to && { to: c.to }), data: c.data, value: toHex(c.value ?? 0n) })) }], validation: false }, 'latest'] }) });
+  return (await res.json()).result[0].calls;
+}
+/** What a result says of a call, against the node's own run of it: outcome, return data, events, gas less the L1 charge. */
+const agrees = (r: SimulationResult, own: NodeCall) => {
+  assert.equal(r.status, own.status === '0x1' ? 'success' : 'reverted');
+  assert.equal(r.returnData, own.returnData);
+  assert.deepEqual(r.logs ?? [], own.logs.map(l => ({ ...l, address: l.address.toLowerCase() })));
+  assert.equal(r.gasUsed, BigInt(own.gasUsed) - L1);
+};
+const moved = (r: SimulationResult) => r.transfers.map(t => [t.asset, t.from, t.to, t.raw]);
+
+test('Arbitrum: a Stylus program reached from inside another contract runs on the chain’s node, the call whole, its events, gas and amounts the node’s', async () => {
+  clearForkCaches();
+  const req = { from: USER, to: sweeper, data: sweepAll };
+  const [r] = (await arbFork().trace([arbReq(req)]))!;
+  const [ask] = simulated.slice(-1);
+  agrees(r, (await nodeOwn([req]))[0]);
+  assert.equal(r.source, `chain 42161's node, for the Stylus (WASM) program ${program}, which the local EVM can't run, reached from inside another contract`);
+  // The amounts are the node's reads, before and after: all of the account's 1,000 USDC, swept.
+  assert.deepEqual(moved(r), [[program, USER, sweeper, 1000_000_000n]]);
+  assert.ok(r.readAssets?.includes('native') && r.readAssets.includes(program), String(r.readAssets));
+  // One frame, the node's, saying why and which program; no state changes (the node doesn't say).
+  assert.equal(r.trace?.to, sweeper);
+  assert.equal(r.trace?.calls, undefined);
+  assert.equal(r.trace?.node, `run by the chain's node, for the Stylus (WASM) program ${program}, which the local EVM can't run, reached from inside another contract: its outcome, return data, events and gas are the node's; the calls it made aren't known, so its events are all listed here`);
+  assert.equal(r.stateChanges, undefined);
+  // The node ran the call alone in its block (among the reads around it); the probe a block later, the caller's code
+  // taken away.
+  assert.equal(ask[0].calls.filter(c => c.data === sweepAll).length, 1);
+  assert.deepEqual(ask[1].stateOverrides?.[sweeper], { code: '0x' });
+  // Was refused before: "...is a Stylus (WASM) contract, which the local EVM can't run: the transaction reaches it
+  // from inside another contract".
+});
+
+test('Arbitrum: what a call did before it reached a Stylus program is not kept: the node runs it whole, and the calls before it stay the local EVM’s', async () => {
+  clearForkCaches();
+  // A contract that writes its storage and emits an event, then calls the program (with no calldata, which the
+  // program refuses: the call goes on).
+  const writer = '0x00000000000000000000000000000000000057e1';
+  await arb.putCode(writer, callsProgram('600160005560006000a0'));
+  const batch = [{ from: USER, to: dai, data: call('transfer', [BOB, 5n]) }, { from: USER, to: writer, data: '0x' as Hex }];
+  const sim = arbFork({ trace: true });
+  const out = (await sim.simulateBatch(batch.map(r => ({ ...arbReq(r), trace: true }))))!;
+  const own = await nodeOwn(batch);
+  assert.match(out[0].source, /^local EVM/);
+  assert.deepEqual(moved(out[0]), [[dai, USER, dai, 5n]]);
+  agrees(out[1], own[1]);
+  // One event (the writer's): not a second from the local run that stopped at the program. No state changes.
+  assert.equal(out[1].logs?.length, 1);
+  assert.equal(out[1].stateChanges, undefined);
+  assert.ok(out[0].stateChanges?.some(s => s.address === dai));
+  // The storage steps recorded are the first call's only: none of the second's local run.
+  assert.ok(sim.last!.trace!.length > 0 && sim.last!.trace!.every(s => s.call === 0), JSON.stringify(sim.last!.trace!.map(s => s.call)));
+  // The node ran the first call before it.
+  const ask = lastAsked(c => c.to === writer);
+  assert.deepEqual(ask[0].calls.filter(c => c.to === dai || c.to === writer).map(c => c.to), [dai, writer]);
+});
+
+test('Arbitrum: the calls after a Stylus one in a batch run on the node after it, on the state it left', async () => {
+  clearForkCaches();
+  // A call made straight to the program, then one that reaches it inside, then a plain EVM token's.
+  const batch = [{ from: USER, to: program, data: call('transfer', [BOB, 100_000_000n]) }, { from: USER, to: sweeper, data: sweepAll }, { from: USER, to: dai, data: call('transfer', [BOB, 5n]) }];
+  const out = (await arbFork().simulateBatch(batch.map(arbReq)))!;
+  const own = await nodeOwn(batch);
+  out.forEach((r, i) => agrees(r, own[i]));
+  assert.equal(out[0].source, "chain 42161's node, for a Stylus (WASM) program the local EVM can't run");
+  for (const r of out.slice(1)) assert.equal(r.source, `chain 42161's node, after call 1 of the batch, which is made straight to the Stylus (WASM) program ${program} (the local EVM can't run it, so hasn't the state the calls after it run on)`);
+  // The sweep takes what the first call left: 900 USDC.
+  assert.deepEqual(out.map(moved), [[[program, USER, program, 100_000_000n]], [[program, USER, sweeper, 900_000_000n]], [[dai, USER, dai, 5n]]]);
+  // Each ran with the calls before it, in order.
+  const last = lastAsked(c => c.to === dai);
+  assert.deepEqual(last[0].calls.filter(c => [program, sweeper, dai].includes(c.to!) && c.data!.length > 10).map(c => c.to), [program, sweeper, dai]);
+  // A local call first: it stays the local EVM's, and the node runs it before the one that reaches the program.
+  clearForkCaches();
+  const mixed = [batch[2], batch[1], batch[2]];
+  const got = (await arbFork().simulateBatch(mixed.map(arbReq)))!;
+  const theirs = await nodeOwn(mixed);
+  assert.match(got[0].source, /^local EVM/);
+  agrees(got[1], theirs[1]);
+  agrees(got[2], theirs[2]);
+  assert.match(got[1].source, /reached from inside another contract$/);
+  assert.match(got[2].source, new RegExp(`after call 2 of the batch, which reaches the Stylus \\(WASM\\) program ${program}`));
+  assert.deepEqual(got.map(moved), [[[dai, USER, dai, 5n]], [[program, USER, sweeper, 1000_000_000n]], [[dai, USER, dai, 5n]]]);
+});
+
+test('Arbitrum: a Stylus program reached on a value the run guessed is not taken for reached: the value is read first', async () => {
+  // A contract that calls whatever address its slot 0 holds. The speculative rounds guess a slot not read yet from
+  // the last value seen of it (shared by all simulations).
+  const caller = '0x00000000000000000000000000000000ca11e400';
+  await arb.putCode(caller, '0x600060006000600060006000545af15000');
+  const holds = (a: string) => arb.evm.stateManager.putStorage(createAddressFromString(caller), setLengthLeft(hexToBytes('0x00'), 32), hexToBytes(a as Hex));
+  const req = arbReq({ from: USER, to: caller, data: '0x' });
+  // (No tokens watched: a read of the contract's balanceOf ahead of the rounds would read the slot first.)
+  clearForkCaches();
+  await holds(dai);
+  assert.match((await arbFork({ watchTokens: false }).simulate(req))!.source, /^local EVM/);
+  // Now the program: the first round guesses DAI, and runs; the next reads the slot, and reaches the program.
+  await holds(program);
+  const to = arbFork({ watchTokens: false });
+  assert.match((await to.simulate(req))!.source, /^chain 42161's node, for the Stylus/);
+  assert.ok(to.last!.rounds >= 2, `${to.last!.rounds} rounds`);
+  // And back: the first round guesses the program and reaches it, which isn't an answer; the next reads DAI and runs.
+  await holds(dai);
+  const sim = arbFork({ watchTokens: false });
+  const back = (await sim.simulate(req))!;
+  assert.match(back.source, /^local EVM/);
+  assert.ok(sim.last!.rounds >= 2, `${sim.last!.rounds} rounds`);
+});
+
+test('Arbitrum: an EIP-7702 authorization the wallet has yet to sign stands in on the node as its code, its gas a stand-in’s', async () => {
+  clearForkCaches();
+  const delegate = '0x00000000000000000000000000000000de1e9a7e';
+  await arb.putCode(delegate, callsProgram());
+  const req: SimulationRequest = { ...arbReq({ from: USER, to: USER, data: '0x' }), unsignedAuthorizations: [{ address: delegate, chainId: 42161 }], stateOverrides: { [USER]: { code: `0xef0100${delegate.slice(2)}` } } };
+  const [r] = (await arbFork().simulateBatch([req]))!;
+  assert.match(r.source, /reached from inside another contract$/);
+  const [block] = simulated.at(-1)!;
+  assert.equal(block.stateOverrides?.[USER]?.code, `0xef0100${delegate.slice(2)}`);
+  const own = block.calls.find(c => c.to === USER)!;
+  assert.deepEqual(own.authorizationList?.map(a => a.address), ['0x0000000000000000000000000000000000000000']);
+  assert.ok(Object.values(block.stateOverrides ?? {}).some(o => o.balance === '0x1' && o.nonce === '0x0' && o.code === '0x'));
+});
+
+test('Arbitrum: an earlier call its sender can’t pay for is left out of the node’s calls, as it is out of the local run', async () => {
+  clearForkCaches();
+  const out = (await arbFork().simulateBatch([arbReq({ from: USER, to: BOB, data: '0x', value: 10n ** 30n }), arbReq({ from: USER, to: sweeper, data: sweepAll })]))!;
+  assert.match(out[0].revertReason ?? '', /^insufficient funds: the account holds/);
+  assert.equal(out[1].status, 'success');
+  assert.ok(!simulated.at(-1)![0].calls.some(c => c.to === BOB && BigInt(c.value ?? '0x0') > 0n));
+});
+
+test('Arbitrum: a replay that reaches a Stylus program inside runs on the node after its block’s earlier transactions', async () => {
+  clearForkCaches();
+  const earlier = { from: USER, to: program, data: call('transfer', [BOB, 1_000_000n]) }, own = { from: USER, to: sweeper, data: sweepAll };
+  const header = { number: 16n, arbBlockNumber: 17n, timestamp: 0x65000001n, coinbase: '0xa4b000000000000000000073657175656e636572', prevRandao: `0x${'00'.repeat(31)}01` as Hex, gasLimit: 30_000_000n, baseFeePerGas: 0n };
+  const at = { block: 'latest', header, before: [arbReq(earlier)] };
+  const [r] = (await arbFork().simulateBatch([{ ...arbReq(own), at }]))!;
+  agrees(r, (await nodeOwn([earlier, own]))[1]);
+  assert.deepEqual(moved(r), [[program, USER, sweeper, 999_000_000n]]);
+  // Its block's earlier transaction first, then the replayed one.
+  const ask = lastAsked(c => c.to === sweeper);
+  assert.deepEqual(ask[0].calls.filter(c => c.to === program || c.to === sweeper).map(c => c.to), [program, sweeper]);
+});
+
+test('Arbitrum: where the node can’t be handed the call, it is refused, saying why: no eth_simulateV1, or a creation', async () => {
+  clearForkCaches();
+  const without = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    if ((Array.isArray(body) ? body : [body]).some((r: { method: string }) => r.method === 'eth_simulateV1')) return new Response(JSON.stringify((Array.isArray(body) ? body : [body]).map((r: { id: number }) => ({ jsonrpc: '2.0', id: r.id, error: { code: -32601, message: 'the method eth_simulateV1 does not exist/is not available' } }))));
+    return arbFetch(url, init);
+  }) as typeof fetch;
+  await assert.rejects(new ForkSimulator({ 42161: ARB_URL }, { fetchImpl: without, prefetch: false }).simulate(arbReq({ from: USER, to: sweeper, data: sweepAll })),
+    (e: Error) => e instanceof ForkUnsupported && e.message === `the call is one the chain's node must run (for the Stylus (WASM) program ${program}, which the local EVM can't run, reached from inside another contract), and the node has no eth_simulateV1 to run it`);
+  // A creation whose code reaches the program: the node's charge for its L1 data can't be told apart from its gas.
+  clearForkCaches();
+  await assert.rejects(arbFork().simulate(arbReq({ from: USER, data: callsProgram() })),
+    (e: Error) => e instanceof ForkUnsupported && /^the transaction creates a contract whose code reaches the Stylus \(WASM\) program 0x[0-9a-f]{40}, which the local EVM can't run: the chain's node could run it, but its charge for a creation's L1 data can't be told apart/.test(e.message));
+});
+
+test('Arbitrum: a UserOperation’s run that reaches a Stylus program goes to the node with its stand-ins, and says what it read', async () => {
+  // As src/erc4337-sim.ts asks it: from the bundler, for the account, its EntryPoint watched (whose balanceOf is the
+  // account's deposit), ecrecover's stand-in code with the precompile moved. Here the "EntryPoint" is the sweeper,
+  // and DAI stands for the deposit's token.
+  clearForkCaches();
+  const bundler = '0xb0d1e70000000000000000000000000000004337', moved = '0x0000000000000000000000000000000000c0ffee';
+  const req: SimulationRequest = { ...arbReq({ from: bundler, to: sweeper, data: sweepAll }), account: USER, watch: [dai],
+    stateOverrides: { '0x0000000000000000000000000000000000000001': { code: '0x00', movePrecompileToAddress: moved } } };
+  const [r] = (await arbFork().simulateBatch([req]))!;
+  assert.match(r.source, /reached from inside another contract$/);
+  const [block] = simulated.at(-1)!;
+  assert.deepEqual(block.stateOverrides?.['0x0000000000000000000000000000000000000001'], { code: '0x00', movePrecompileToAddress: moved });
+  // The account's native coin and DAI were read before and after (readAssets: withoutGas counts the account's coin
+  // from them, with its deposit).
+  assert.ok(r.readAssets?.includes('native') && r.readAssets.includes(dai), String(r.readAssets));
+});
+
+test('Arbitrum: the reads around a call the node runs are two calls on each side, however many tokens are watched', async () => {
+  // Arbitrum One's public node answers an eth_simulateV1 of more than 30 calls with HTTP 429, every time (2026-11-16):
+  // read as calls of their own, a call with twelve tokens watched took 2 × 13 + 1 of them and was never run.
+  clearForkCaches();
+  const others = Array.from({ length: 10 }, (_, i) => `0x${(0xe0a0e0 + i).toString(16).padStart(40, '0')}`);
+  const req: SimulationRequest = { ...arbReq({ from: USER, to: sweeper, data: sweepAll }), watch: [program, dai, ...others] };
+  const [r] = (await arbFork({ watchTokens: false }).simulateBatch([req]))!;
+  const [block] = simulated.at(-1)!;
+  // The native balance and one call for the twelve views, before; the call; the same after.
+  assert.equal(block.calls.length, 5, JSON.stringify(block.calls.map(c => c.to)));
+  agrees(r, (await nodeOwn([{ from: USER, to: sweeper, data: sweepAll }]))[0]);
+  // The amounts are still the node's reads: all of USER's 1,000 USDC (the program, read through the reader), DAI read
+  // and unmoved, the addresses with no code not read.
+  assert.deepEqual(moved(r), [[program, USER, sweeper, 1000_000_000n]]);
+  assert.deepEqual(r.readAssets, ['native', program, dai]);
+});
+
+test('Arbitrum: an approval a call the node runs sets is read back through the reader, after the call', async () => {
+  clearForkCaches();
+  // USER approves BOB on the program, a call made straight to it: an approval by name (the mock token emits no
+  // Approval event), read back after the call, through the reader with the token's balance.
+  const req: SimulationRequest = { ...arbReq({ from: USER, to: program, data: call('approve', [BOB, 77n]) }), watch: [program] };
+  const [r] = (await arbFork({ watchTokens: false }).simulateBatch([req]))!;
+  assert.equal(r.status, 'success');
+  assert.deepEqual(r.approvalState?.map(a => [a.token, a.owner, a.spender, a.amount]), [[program, USER, BOB, 77n]]);
+  // Asked again with the approval read after the call: the native balance and the reader on each side, still.
+  const [block] = simulated.at(-1)!;
+  assert.equal(block.calls.length, 5, JSON.stringify(block.calls.map(c => c.to)));
+});
+
+test('Arbitrum: a call to a proxy whose implementation is a Stylus program says it reaches the program from inside another contract, though a read of the proxy reached it first', async () => {
+  // The call's target is watched, so the run reads its balanceOf before the call, and that read is what first reaches
+  // the program (as live on Arbitrum One, 2026-11-16). It is reached from inside another contract all the same.
+  clearForkCaches();
+  const proxy = '0x00000000000000000000000000000000000d1e60';
+  // CALLDATACOPY the calldata; DELEGATECALL the program with it; return or revert with what came back.
+  await arb.putCode(proxy, `0x366000600037600060003660007${'3'}${program.slice(2)}5af43d600060003e6031573d6000fd5b3d6000f3` as Hex);
+  const [r] = (await arbFork().simulateBatch([arbReq({ from: USER, to: proxy, data: call('approve', [BOB, 5n]) })]))!;
+  assert.equal(r.status, 'success');
+  assert.equal(r.source, `chain 42161's node, for the Stylus (WASM) program ${program}, which the local EVM can't run, reached from inside another contract (first by a read of a balance or a permission around the call)`);
+});
+
+test('Arbitrum: the node’s reads around a call it runs are static, as the local EVM’s are: a contract read as a token changes nothing the call runs on', async () => {
+  clearForkCaches();
+  // A contract that pays USER 1 DAI of its own the first time it is called (slot 0 records it), and, called with no
+  // calldata, calls the program first. It is the call's target, so it is read around the call as a token
+  // (balanceOf): a read that ran as a call would pay instead, and the call would find it paid.
+  //   CALLDATASIZE ISZERO PUSH1 0x08 JUMPI PUSH1 0x2b JUMP JUMPDEST <CALL(gas, program, 0, 0, 0, 0, 0)> POP
+  //   JUMPDEST PUSH1 0 SLOAD PUSH1 0xa6 JUMPI PUSH1 1 PUSH1 0 SSTORE <CALL(gas, dai, 0, transfer(USER, 1))> POP JUMPDEST STOP
+  const once = '0x00000000000000000000000000000000017e0001', word = (a: string) => a.slice(2).padStart(64, '0');
+  await arb.putCode(once, `0x36156008576${'0'}2b565b600060006000600060007${'3'}${program.slice(2)}5af1505b600054${'60a6'}576001600055` +
+    `7fa9059cbb${'00'.repeat(28)}6000527f${word(USER)}6004526001602452600060006044600060007${'3'}${dai.slice(2)}5af1505b00` as Hex);
+  await arb.exec(dai, call('mint', [once, 100n]));
+  const req = { from: USER, to: once, data: '0x' as Hex };
+  const [r] = (await arbFork().simulateBatch([{ ...arbReq(req), watch: [dai] }]))!;
+  assert.match(r.source, /reached from inside another contract$/);
+  // The node's own run of the call: it pays, and USER's DAI goes up by 1.
+  agrees(r, (await nodeOwn([req]))[0]);
+  assert.equal(r.logs?.length, 1);
+  assert.deepEqual(moved(r), [[dai, once, USER, 1n]]);
+  // Each read went through a reader, as a static call.
+  const [block] = simulated.at(-1)!;
+  assert.ok(!block.calls.some(c => c.to === once && c.data !== '0x'), JSON.stringify(block.calls.map(c => c.to)));
+});
+
+test('Arbitrum: a read around a call that reaches a Stylus program hands the call to the node, and the calls after it say so', async () => {
+  clearForkCaches();
+  // A "token" that forwards whatever it is asked to the program: its balanceOf, read around the call, reaches it.
+  const wrapper = '0x00000000000000000000000000000000a11a0001';
+  await arb.putCode(wrapper, `0x3660006000376000600036600060007${'3'}${program.slice(2)}5af1503d600060003e3d6000f3` as Hex);
+  const batch = [{ from: USER, to: dai, data: call('transfer', [BOB, 5n]) }, { from: USER, to: BOB, data: '0x' as Hex, value: E }];
+  const out = (await arbFork().simulateBatch(batch.map(r => ({ ...arbReq(r), watch: [wrapper] }))))!;
+  const own = await nodeOwn(batch);
+  out.forEach((r, i) => agrees(r, own[i]));
+  assert.equal(out[0].source, `chain 42161's node, for the Stylus (WASM) program ${program}, which the local EVM can't run, reached by a read around the call (a balance or a permission)`);
+  // Not "which reaches": call 1 itself doesn't.
+  assert.equal(out[1].source, `chain 42161's node, after call 1 of the batch, a read around which reaches the Stylus (WASM) program ${program} (the local EVM can't run it, so hasn't the state the calls after it run on)`);
+  assert.deepEqual(out.map(moved), [[[dai, USER, dai, 5n]], [['native', USER, BOB, E]]]);
+  assert.ok(out[0].readAssets?.includes(wrapper), String(out[0].readAssets));
+});
+
+test('Arbitrum: across the hand-over, an approval made before it is read after each node-run call, and native coin sent after it is the node’s', async () => {
+  clearForkCaches();
+  const batch = [{ from: USER, to: dai, data: call('approve', [sweeper, 7n]) }, { from: USER, to: sweeper, data: sweepAll }, { from: USER, to: BOB, data: '0x' as Hex, value: E }];
+  const out = (await arbFork().simulateBatch(batch.map(arbReq)))!;
+  const own = await nodeOwn(batch);
+  out.forEach((r, i) => agrees(r, own[i]));
+  assert.match(out[0].source, /^local EVM/);
+  assert.deepEqual(out.map(moved), [[], [[program, USER, sweeper, 1000_000_000n]], [['native', USER, BOB, E]]]);
+  for (const r of out) assert.deepEqual(r.approvalState?.map(a => [a.token, a.spender, (a as { amount?: bigint }).amount]), [[dai, sweeper, 7n]]);
+});
+
+test('Arbitrum: a program first reached by a read after a call that ran here without reaching it is said to be reached by that read, not by the call', async () => {
+  // A proxy with no implementation until a call with no calldata sets one (slot 0): its balanceOf answers 0 before
+  // the call and delegates to the program after it. Neither the read before the call nor the call reaches the
+  // program here; the reads after it do. (Read before the call, the proxy would have been taken for the way the call
+  // goes, as above.)
+  //   CALLDATASIZE ISZERO PUSH1 0x48 JUMPI PUSH1 0 SLOAD ISZERO PUSH1 0x42 JUMPI <CALLDATACOPY; DELEGATECALL the program;
+  //   return or revert with what came back> 0x42: JUMPDEST PUSH1 0x20 PUSH1 0 RETURN 0x48: JUMPDEST PUSH1 1 PUSH1 0 SSTORE STOP
+  clearForkCaches();
+  const proxy = '0x00000000000000000000000000000000000d1e61';
+  await arb.putCode(proxy, `0x36156048576000541560425736600060003760006000366000${'73'}${program.slice(2)}5af43d600060003e603d573d6000fd5b3d6000f35b60206000f35b600160005500` as Hex);
+  const batch = [{ from: USER, to: proxy, data: '0x' as Hex }, { from: USER, to: BOB, data: '0x' as Hex, value: E }];
+  const out = (await arbFork().simulateBatch(batch.map(arbReq)))!;
+  const own = await nodeOwn(batch);
+  out.forEach((r, i) => agrees(r, own[i]));
+  assert.equal(out[0].source, `chain 42161's node, for the Stylus (WASM) program ${program}, which the local EVM can't run, reached by a read around the call (a balance or a permission)`);
+  assert.equal(out[1].source, `chain 42161's node, after call 1 of the batch, a read around which reaches the Stylus (WASM) program ${program} (the local EVM can't run it, so hasn't the state the calls after it run on)`);
+  assert.deepEqual(out.map(moved), [[], [['native', USER, BOB, E]]]);
+});

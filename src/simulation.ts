@@ -83,7 +83,7 @@ const overridesOf = (reqs: SimulationRequest[]) => {
  * stand-ins for the authorizations the wallet has yet to sign (see standIns).
  */
 const simulationFields = async (req: SimulationRequest) => {
-  const authorizationList = authorizationsForNode([...(req.authorizationList ?? []), ...await standIns(req)]);
+  const authorizationList = authorizationsForNode([...(req.authorizationList ?? []), ...await unsignedStandIns(req)]);
   return {
     ...(req.gas !== undefined && { gas: '0x' + req.gas.toString(16) }),
     ...priceFields(req),
@@ -100,7 +100,7 @@ const simulationFields = async (req: SimulationRequest) => {
 async function simulateV1Overrides(reqs: SimulationRequest[], state?: StateChanges) {
   const all: Record<string, { code?: string; balance?: string; nonce?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string }> = overridesOf(reqs) ?? {};
   // The stand-in for unsigned authorizations: an existing account, without code, at nonce 0.
-  if (reqs.some(r => r.unsignedAuthorizations?.length)) all[STAND_IN.address.toLowerCase()] = { balance: '0x1', nonce: '0x0', code: '0x' };
+  if (reqs.some(r => r.unsignedAuthorizations?.length)) all[UNSIGNED_STAND_IN.address] = { ...UNSIGNED_STAND_IN.state };
   for (const r of reqs) for (const a of r.authorizationList ?? []) {
     try {
       const authority = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity: Number(a.yParity) } });
@@ -157,8 +157,10 @@ export function authorizationsForNode<T extends { chainId: string; nonce: string
   return list.map(a => ({ ...a, chainId: quantity(a.chainId), nonce: quantity(a.nonce), r: quantity(a.r), s: quantity(a.s), yParity: quantity(a.yParity) }));
 }
 
-/** A throwaway account standing in for the sender in the gas of authorizations not signed yet (see standIns). */
+/** A throwaway account standing in for the sender in the gas of authorizations not signed yet (see unsignedStandIns). */
 const STAND_IN = privateKeyToAccount(keccak256(stringToBytes('signing-preview: EIP-7702 gas stand-in')));
+/** The stand-in's account as eth_simulateV1 is given it: an existing account, without code, at nonce 0 (see unsignedStandIns). */
+export const UNSIGNED_STAND_IN = { address: STAND_IN.address.toLowerCase(), state: { balance: '0x1', nonce: '0x0', code: '0x' } } as const;
 type AuthorizationJson = NonNullable<SimulationRequest['authorizationList']>[number];
 
 /**
@@ -167,7 +169,7 @@ type AuthorizationJson = NonNullable<SimulationRequest['authorizationList']>[num
  * in the call's list. The node charges 25,000 for it and refunds 12,500 within the refund cap, exactly as the chain
  * will for the wallet's own. One for another chain is signed for that chain, so it costs the same and doesn't apply.
  */
-async function standIns(req: SimulationRequest): Promise<AuthorizationJson[]> {
+export async function unsignedStandIns(req: SimulationRequest): Promise<AuthorizationJson[]> {
   let nonce = 0;
   const out: AuthorizationJson[] = [];
   for (const a of req.unsignedAuthorizations ?? []) {

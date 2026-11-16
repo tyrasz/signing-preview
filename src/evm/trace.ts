@@ -342,8 +342,12 @@ export async function tracePreviews(requests: SimulationRequest[], shown: (Simul
     // recorded for the transaction (the last call traced).
     const state = env.recorded && i === traced.length - 1 ? compareWithAccessList(t.stateChanges, env.recorded) : undefined;
     const stateDiffers = state && !state.agrees ? `The state the traced run changed isn't what the block's access list records for this transaction (${state.differences!.slice(0, 3).join('; ')}${state.differences!.length > 3 ? `; and ${state.differences!.length - 3} more` : ''}): the trace is a guide to what it did, not its record.` : undefined;
-    // A call the local EVM handed to the chain's node (a Stylus program, TraceCall.node): said, with what isn't known.
-    const byNode = t.trace.node ? `${t.trace.to} is a Stylus (WASM) program, which the local EVM can't run: the chain's node ran the call, and the trace shows it as one frame with the node's outcome, return data, events and gas (the L2 part). What the program called, and the storage it wrote, the node doesn't say.` : undefined;
+    // A call the local EVM handed to the chain's node (TraceCall.node): said, with why and what isn't known. A Stylus
+    // program called straight; or a call that reaches one from inside another contract, or comes after such a call in
+    // the batch, which the node ran for the reason its source gives ("chain 42161's node, for ...").
+    const nodeWhy = t.trace.node && !/^a Stylus/.test(t.trace.node) ? t.source.replace(/^chain \d+'s node, /, '') : undefined;
+    const byNode = !t.trace.node ? undefined : !nodeWhy ? `${t.trace.to} is a Stylus (WASM) program, which the local EVM can't run: the chain's node ran the call, and the trace shows it as one frame with the node's outcome, return data, events and gas (the L2 part). What the program called, and the storage it wrote, the node doesn't say.`
+      : `The chain's node ran this call, ${nodeWhy}: the trace shows it as one frame with the node's outcome, return data, events and gas (the L2 part). What it called, and the storage it wrote, the node doesn't say.`;
     const note = [s?.traceNote, byNode, differs, gasDiffers, stateDiffers, standInNote, t.rulesNote].filter(Boolean).join(' ');
     return describeTrace(t.trace, t.stateChanges, env, { source: t.source === 'mock' ? 'mock data' : where, ...(agrees !== undefined && { agrees }), ...(gasAgrees !== undefined && { gasAgrees }), ...(state && { stateAgrees: state.agrees }), ...(note && { note }) });
   }));

@@ -26,7 +26,7 @@ import { calldataCandidates } from './simulation-probe.ts';
 import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_BOOTSTRAP_SLOT, B20_FACTORY_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
 import { formatUnits } from './format.ts';
 import { ARBOS_STATE, ARBSYS, l1Send, SEND_TX_TO_L1, WITHDRAW_ETH } from './evm/arbos.ts';
-import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall } from './simulation.ts';
+import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall, UNSIGNED_STAND_IN, unsignedStandIns } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -398,6 +398,20 @@ export class ForkUnsupported extends Error {
   constructor(message: string) { super(message); this.name = 'ForkUnsupported'; }
 }
 
+/**
+ * A run reached an Arbitrum Stylus program (WASM, which no EVM runs) from inside another contract, at request
+ * `request` of the batch: by its own call (`call`), or by a read around it (a balance or a permission; `read`, the
+ * token, where it was a read of a balance before the call). Not an answer: ForkSimulator.rounds runs that request,
+ * and every one after it, on the chain's node instead (runOnNode).
+ */
+export class StylusReached extends ForkUnsupported {
+  readonly program: string; readonly request: number; readonly call: boolean; readonly read?: string;
+  constructor(program: string, request: number, call: boolean, read?: string) {
+    super(`${program} is a Stylus (WASM) contract, which the local EVM can't run: the transaction reaches it from inside another contract`);
+    this.program = program; this.request = request; this.call = call; this.read = read;
+  }
+}
+
 /** The simulation ran out of its time budget. */
 export class ForkTimeout extends Error {
   constructor(message: string) { super(message); this.name = 'ForkTimeout'; }
@@ -511,6 +525,31 @@ const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 const BALANCE_READER = '0x00000000000000000000000000000000ba1a9ce5', CODE_READER = '0x00000000000000000000000000000000c0de9ead';
 const BALANCE_READER_CODE = '0x60005b8036111560155780353181526020016002565b366000f3', SLOT_READER_CODE = '0x60005b8036111560155780355481526020016002565b366000f3';
 const CODE_READER_CODE = '0x600035803b8060006000843c6000f3';
+/**
+ * The reader runOnNode places for the views around a call the node runs: several static calls in one. Its calldata
+ * is 192 bytes for each (the address, the length of the calldata, the calldata in 128 bytes); it returns 160 bytes
+ * for each: whether the call succeeded, the length of what it returned, and the first 96 bytes of that. Each call
+ * gets 10 million gas (VIEW_GAS), as a view of its own did.
+ *   PUSH1 0 PUSH1 0 [JUMPDEST DUP1 CALLDATASIZE GT ISZERO PUSH2 0x3c JUMPI
+ *   DUP1 PUSH1 0x20 ADD CALLDATALOAD DUP1 DUP3 PUSH1 0x40 ADD CALLDATASIZE CALLDATACOPY
+ *   PUSH1 0x60 DUP4 PUSH1 0x40 ADD DUP3 CALLDATASIZE DUP6 CALLDATALOAD PUSH3 10000000 STATICCALL DUP4 MSTORE POP
+ *   RETURNDATASIZE DUP3 PUSH1 0x20 ADD MSTORE PUSH1 0xc0 ADD SWAP1 PUSH1 0xa0 ADD SWAP1 PUSH1 4 JUMP]
+ *   JUMPDEST POP PUSH1 0 RETURN
+ * (Each call's calldata is copied past the answers, at CALLDATASIZE, which is beyond them. No PUSH0.)
+ */
+const VIEW_READER = '0x00000000000000000000000000000000ba1a9ce6';
+const VIEW_READER_CODE = '0x600060005b8036111561003c578060200135808260400136376060836040018236853562989680fa8352503d826020015260c0019060a001906004565b506000f3';
+/** VIEW_READER's calldata for the views (address, calldata of at most 128 bytes). */
+const viewReads = (views: [string, Hex][]): Hex => `0x${views.map(([to, data]) => `${to.slice(2).toLowerCase().padStart(64, '0')}${((data.length - 2) / 2).toString(16).padStart(64, '0')}${data.slice(2).padEnd(256, '0')}`).join('')}`;
+/** VIEW_READER's answer, as the `count` views' own results would have been (their status, and what they returned). */
+function viewResults(c: NodeCallResult | undefined, count: number): NodeCallResult[] {
+  const out = c?.status === '0x1' ? c.returnData.slice(2) : '';
+  return Array.from({ length: count }, (_, k) => {
+    const e = out.slice(k * 320, (k + 1) * 320);
+    const ok = e.length === 320 && BigInt(`0x${e.slice(0, 64)}`) === 1n, size = ok ? Math.min(Number(BigInt(`0x${e.slice(64, 128)}`)), 96) : 0;
+    return { status: ok ? '0x1' : '0x0', returnData: `0x${e.slice(128, 128 + 2 * size)}` as Hex, gasUsed: '0x0', logs: [] };
+  });
+}
 
 /**
  * What a forwarded call that reverts was charged (ChainProfile.revertsKeepGas): the node is asked with an eth_call
@@ -1050,6 +1089,28 @@ interface RunSnapshot {
 }
 
 /**
+ * Where a run hands the batch to the chain's node (runOnNode): request `at`, which reaches the Stylus program
+ * `program`, and every request after it, whose state the local EVM then doesn't have. `call`: reached by the
+ * request's own call (else by a read around it); `ownRead`: by a read of the request's own target before its call;
+ * `target`: the program is the request's own target.
+ */
+interface NodeFrom { at: number; program: string; call: boolean; ownRead?: boolean; target?: boolean }
+/** Why a request is run on the node: where the batch was handed to it, and whether this request comes after that one. */
+type NodeWhy = NodeFrom & { after: boolean };
+/**
+ * What a run on the node is for, as its result's source and its trace frame say ("chain 42161's node, ..."). A program
+ * first reached by a read, before the call, of the call's own target (always a token watched) is reached from inside
+ * another contract all the same, the one the call goes to: a proxy whose implementation is the program (live on
+ * Arbitrum One, 2026-11-16: a call to such a proxy was handed over at the read of its balanceOf before the call). One
+ * reached by any other read (a token watched behind such a proxy, or a read after a call that ran here without
+ * reaching it) is said to be reached by a read: that the call reaches it isn't known.
+ */
+const nodeReason = (w: NodeWhy) => w.after
+  ? `after call ${w.at + 1} of the batch, ${w.target ? 'which is made straight to' : w.call || w.ownRead ? 'which reaches' : 'a read around which reaches'} the Stylus (WASM) program ${w.program} (the local EVM can't run it, so hasn't the state the calls after it run on)`
+  : w.target ? 'for a Stylus (WASM) program the local EVM can\'t run'
+  : `for the Stylus (WASM) program ${w.program}, which the local EVM can't run, ${w.call ? 'reached from inside another contract' : w.ownRead ? 'reached from inside another contract (first by a read of a balance or a permission around the call)' : 'reached by a read around the call (a balance or a permission)'}`;
+
+/**
  * SimpleStateManager whose missing values come from the StateSource. With `misses` set (a speculative run), a value
  * not fetched yet reads as empty and is noted; without it, it is fetched on the spot.
  */
@@ -1100,8 +1161,9 @@ class LazyState extends SimpleStateManager {
     if (!a) return undefined;
     // Arbitrum's Stylus contracts are WASM behind a 0xEFF000 prefix, which no EVM runs: better no answer than a wrong
     // one. (A call made straight to one, a request's own target, the chain's node runs instead: ForkSimulator's runOnNode.
-    // Reached from inside the EVM, the program would have to run in the middle of the local run: refused.)
-    if (NEXT_BLOCK[this.source.chainId]?.arbitrum && isStylus(a.code)) throw new ForkUnsupported(`${key} is a Stylus (WASM) contract, which the local EVM can't run: the transaction reaches it from inside another contract (a call made straight to one is run by the chain's node, and traced as one frame)`);
+    // Reached from inside the EVM, the program would have to run in the middle of the local run: the run stops here,
+    // and the request is run on the node too, with those after it: StylusReached.)
+    if (NEXT_BLOCK[this.source.chainId]?.arbitrum && isStylus(a.code)) throw new StylusReached(key, this.at.request, this.at.call, this.at.read);
     // Any other code that starts with 0xEF and isn't an EIP-7702 delegation is a marker, not EVM code (none can be
     // deployed since London): a contract the chain's node runs itself, as Base does its B20 tokens. Base's are run
     // from their Solidity references, on the chain's storage (nativeStandIn); any other is refused.
@@ -1126,6 +1188,19 @@ class LazyState extends SimpleStateManager {
     if (!NEXT_BLOCK[this.source.chainId]?.arbitrum) return false;
     const a = await this.data(hexOf(key));
     return !!a && isStylus(a.code);
+  }
+
+  /**
+   * The request run() is at, whether its own call is running (not a read around it), and the token a read of a
+   * balance before the call is of: what StylusReached says.
+   */
+  at: { request: number; call: boolean; read?: string } = { request: 0, call: false };
+
+  /** `key`'s balance and nonce as this run has them, read without load()'s refusals (a Stylus program's own account). */
+  async peek(key: string): Promise<{ balance: bigint; nonce: bigint }> {
+    const k = hexOf(key) as Hex, top = this.topAccountStack();
+    const a = top.has(k) ? top.get(k) : await this.data(k);
+    return { balance: a?.balance ?? 0n, nonce: a?.nonce ?? 0n };
   }
 
   override async getCode(address: Address): Promise<Uint8Array> {
@@ -1970,12 +2045,16 @@ export class ForkSimulator implements Simulator {
     // approvals watched are the same.
     let resume: (RunSnapshot & { watching: string }) | undefined;
     const watching = () => `${[...tokens].join()}|${[...approvals.keys()].join()}`;
+    // Where the runs hand the batch to the chain's node (a request that reached a Stylus program from inside another
+    // contract: StylusReached), once a run has come to one on fetched values alone.
+    let nodeFrom: NodeFrom | undefined;
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
       const now = watching();
       let run: Awaited<ReturnType<ForkSimulator['run']>>;
       try {
-        run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId, resume?.watching === now ? resume : undefined);
+        // (A snapshot is from before where the node takes over: none is kept past it.)
+        run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId, resume?.watching === now && !(nodeFrom && resume.at > nodeFrom.at) ? resume : undefined, nodeFrom);
         if (run.snapshot) resume = { ...run.snapshot, watching: now };
       } catch (e) {
         // (An extra run, with a later-seen token watched, out of time: the answer it was to improve stands.)
@@ -1983,7 +2062,18 @@ export class ForkSimulator implements Simulator {
           this.last = { rounds: round - 1, requests: source.requests, ms: Date.now() - started, ...source.ran, ...(answer.trace && { trace: answer.trace }) };
           return answer.results;
         }
-        if (e instanceof ForkTimeout || e instanceof ForkUnsupported || !misses || !missCount(misses)) throw e;
+        // A Stylus program reached from inside another contract on values read from the chain, nothing guessed: the
+        // run is thrown away, what it had begun of that request with it, and run again with that request and the
+        // ones after it on the chain's node. (Reached on a value guessed, it may not be reached at all: the values
+        // are fetched, and the round run again, as for any break.) Each time at an earlier request, or it is refused:
+        // the calls before it read nothing guessed and ran as they will in every run.
+        if (e instanceof StylusReached && (!misses || !missCount(misses)) && e.request < (nodeFrom?.at ?? reqs.length)) {
+          const to = reqs[e.request].to;
+          nodeFrom = { at: e.request, program: e.program, call: e.call, ...(!e.call && to && e.read === hexOf(to) && { ownRead: true }) };
+          round--;
+          continue;
+        }
+        if (e instanceof ForkTimeout || (e instanceof ForkUnsupported && !(e instanceof StylusReached)) || !misses || !missCount(misses)) throw e;
         run = undefined as never; // a speculative run broke on made-up values: fetch what it asked for and retry
       }
       const grew = !!run && run.rerun;
@@ -2023,10 +2113,11 @@ export class ForkSimulator implements Simulator {
 
   /**
    * One run of the calls, in order, on a fresh state over `source`; or, given `resume`, of the calls from where an
-   * earlier run got to on fetched values alone, on the state it had there (RunSnapshot).
+   * earlier run got to on fetched values alone, on the state it had there (RunSnapshot). Given `nodeFrom`, the calls
+   * from there on are the chain's node's (runOnNode).
    */
   private async run(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, misses: Misses | null, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
-    profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number, resume?: RunSnapshot) {
+    profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number, resume?: RunSnapshot, nodeFrom?: NodeFrom) {
     const state = new LazyState(source, misses, { common });
     if (resume) state.restore(resume.state);
     // The point-evaluation precompile (EIP-4844's, at 0x0a) needs a KZG library and trusted setup this package doesn't
@@ -2601,43 +2692,72 @@ export class ForkSimulator implements Simulator {
     const keeps = !!misses && !this.opts.trace && chainId !== BASE;
     let snapshot: RunSnapshot | undefined;
     const start = resume?.at ?? 0;
+    // From the request that reaches a Stylus program on, the calls are the chain's node's (rounds' `nodeFrom`, or a
+    // request whose own target is one, found below).
+    let onNode = nodeFrom;
+    /** Whether a call ran (one its sender couldn't pay for didn't, and has no gas). */
+    const ran = (r: SimulationResult | undefined) => r?.gasUsed !== undefined;
     for (let i = start; i < reqs.length; i++) {
       const req = reqs[i];
-      if (keeps && i > start && !missCount(misses!)) {
+      // (Not past where the node takes over: what this EVM holds there isn't the state the calls left.)
+      if (keeps && i > start && !missCount(misses!) && !(onNode && i > onNode.at)) {
         const kept = state.snapshot();
         if (kept) snapshot = { at: i, state: kept, touched: [...journal.touched], results: [...results], byRequest: [...byRequest], seenTokens: [...seenTokens], seenApprovals: [...seenApprovals],
           touchedApprovals: [...touched], rerun, grewAt: [...grewAt], nft: [...nft] };
       }
+      state.at = { request: i, call: false };
       // `from` is the account whose balances are reported; `caller` sends the call (the same, unless the request
       // names another account, e.g. a smart account the EntryPoint calls into).
       const caller = hexOf(req.from), from = hexOf(req.account ?? req.from), target = req.to ? hexOf(req.to) : ZERO;
       // A call made straight to a Stylus program (Arbitrum's WASM contracts, which the local EVM can't run): the
-      // chain's node runs it, and its run is this call's result, its trace one frame (runOnNode).
-      if (req.to && await state.stylus(target)) {
-        if (i < reqs.length - 1) throw new ForkUnsupported(`${target} is a Stylus (WASM) contract, which the local EVM can't run: the chain's node runs a call made straight to one, but the calls after it in this batch would then run on state the local EVM doesn't have`);
+      // chain's node runs it, and its run is this call's result, its trace one frame (runOnNode). So too a call that
+      // reaches one from inside another contract (StylusReached), and every call after either in the batch, which
+      // would run here on state this EVM doesn't have: each is run on the node with the batch's calls before it.
+      if (!(onNode && i >= onNode.at) && req.to && await state.stylus(target)) onNode = { at: i, program: target, call: true, target: true };
+      if (onNode && i >= onNode.at) {
+        // (A speculative run that has read something it had to guess isn't the answer: the round is run again once
+        // that is fetched, so the node isn't asked yet. Its calls are requests to the node, which rate-limits.)
+        if (misses && missCount(misses)) break;
+        const why: NodeWhy = { ...onNode, after: i > onNode.at };
         // A call its sender can't pay for fails as any call here does (the node would refuse the whole simulation:
         // "insufficient funds for gas * price + value"): its value, here; with its gas at its price too, when the
-        // node says so.
-        const ranBy = `chain ${chainId}'s node, for a Stylus (WASM) program the local EVM can't run`;
-        const unpaid = (why: string) => { results.push({ status: 'reverted', source: ranBy, revertReason: `insufficient funds: ${why}`, transfers: [], basis: 'fork' }); byRequest[i] = []; };
-        const held = await native(caller);
-        if (req.value > held) { unpaid(`the account holds ${units(chainId, held)} and the call sends ${units(chainId, req.value)}`); continue; }
-        // (The sender's nonce as the call starts: the node counts it in its charge for L1 data.)
-        const nonce = (await state.getAccount(createAddressFromString(caller)))?.nonce ?? 0n;
-        try { results.push(await this.runOnNode(reqs, i, auths, source, block, [...tokens], watchedApprovals, chainId, profile, nonce)); }
+        // node says so. (For the first call the node runs: this EVM's state is the one it starts from. For the ones
+        // after, the node's refusal says so.)
+        const ranBy = `chain ${chainId}'s node, ${nodeReason(why)}`;
+        const unpaid = (reason: string) => { results.push({ status: 'reverted', source: ranBy, revertReason: `insufficient funds: ${reason}`, transfers: [], basis: 'fork' }); byRequest[i] = []; };
+        // The sender's nonce as the call starts, which the node counts in its charge for L1 data: as this EVM has it
+        // where the node takes over, then up by one for each call it sent that the node ran since, and for each
+        // authorization of its own (EIP-7702) for the nonce it had by then.
+        const own = await state.peek(caller);
+        let nonce = own.nonce;
+        for (let k = onNode.at; k < i; k++) {
+          if (!ran(results[k])) continue;
+          if (hexOf(reqs[k].from) === caller) nonce++;
+          for (const a of auths[k]) if (a.authority === caller && (a.chainId === 0n || a.chainId === BigInt(chainId)) && (a.nonce === undefined || a.nonce === nonce)) nonce++;
+        }
+        if (!why.after && req.value > own.balance) { unpaid(`the account holds ${units(chainId, own.balance)} and the call sends ${units(chainId, req.value)}`); continue; }
+        const earlier = reqs.slice(0, i).flatMap((_, k) => (ran(results[k]) ? [k] : []));
+        try { results.push(await this.runOnNode(reqs, i, earlier, auths, source, block, [...tokens], touched, chainId, profile, nonce, why)); }
         catch (e) {
           if (!/insufficient funds/i.test((e as Error).message ?? '')) throw e;
           unpaid(`the account can't pay for the call's gas at its price and what it sends (the chain's node refused it)`); continue;
         }
         byRequest[i] = [];
         for (const l of results[i].logs ?? []) if (l.topics[0] === TRANSFER && l.topics.length === 3 && [l.topics[1], l.topics[2]].some(t => `0x${t.slice(26)}` === from) && !tokens.has(hexOf(l.address))) { seenTokens.add(hexOf(l.address)); rerun = true; grewAt.push(i); }
+        // The approvals it set are read after the calls after it too, and around the calls before it (as a local run's).
+        for (const a of results[i].approvals ?? []) if (a.owner === from) {
+          if (i > 0 && !watchedApprovals.has(approvalKey(a))) { rerun = true; grewAt.push(i); }
+          seenApprovals.push(a); touched.set(approvalKey(a), a);
+        }
         continue;
       }
       // (A Stylus program among the tokens watched can't be read here: its amounts are its events'.)
       const watch: string[] = [];
       for (const t of tokens) if (!await state.stylus(t)) watch.push(t);
       const before = new Map<string, bigint | undefined>();
-      for (const t of watch) before.set(t, await balanceOf(t, from));
+      // (Each token read noted, for StylusReached, should its read reach a Stylus program before the call has run.)
+      for (const t of watch) { state.at.read = t; before.set(t, await balanceOf(t, from)); }
+      state.at.read = undefined;
       const nativeBefore = await native(from);
       if (req.value > await native(caller)) {
         results.push({ status: 'reverted', source: source_, revertReason: `insufficient funds: the account holds ${units(chainId, nativeBefore)} and the call sends ${units(chainId, req.value)}`, transfers: [], basis: 'fork' });
@@ -2695,9 +2815,11 @@ export class ForkSimulator implements Simulator {
       if (charging) { evm.events!.removeListener('step', chargeStep); charging = undefined; }
       opened.length = 0; reached.clear();
       source.ran.calls++;
+      state.at.call = true;
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
+      state.at.call = false;
       byRequest[i] = [...reached];
       if (bought) { const account = (await state.getAccount(sender)) ?? new Account(); account.balance += bought; await state.putAccount(sender, account); }
       const ex = res.execResult;
@@ -2792,36 +2914,65 @@ export class ForkSimulator implements Simulator {
   }
 
   /**
-   * A request whose own target is a Stylus program (Arbitrum's WASM contracts, which no EVM runs), run by the chain's
-   * node: one eth_simulateV1, on the block the preview's own simulation uses (a replay's, with its earlier
-   * transactions first), with the batch's calls before it. Its outcome, return data, events and gas are the node's
-   * own run. Around it, in the same block, the node reads the account's native balance and its balance of each token
-   * watched, before and after, and after it the approvals touched: the amounts are the node's. The same call with the
-   * program's code taken away, in a block after, gives the charge for L1 data the node adds to a call's gas: it comes
-   * off, as the local EVM's gas is the L2 part. The trace is one frame (TraceCall.node): what the program called, and
-   * what storage it wrote, the node doesn't say, so the result has no state changes.
+   * A request the local EVM can't run, run by the chain's node: one whose own target is a Stylus program (Arbitrum's
+   * WASM contracts, which no EVM runs), one that reaches a Stylus program from inside another contract, and each
+   * request after either in the batch (`why`). One eth_simulateV1, on the block the preview's own simulation uses (a
+   * replay's, with its earlier transactions first), with the batch's calls before it that ran (`earlier`: not one
+   * its sender couldn't pay for, which the node would refuse the whole simulation for), on what every request of
+   * the batch sets (as the local EVM's run has it). Its outcome, return data, events and gas are the node's own run;
+   * so is the whole of it: what the local EVM had begun of it, up to the program, is not kept. Around it, in the same
+   * block, the node reads the account's native balance and its balance of each token watched, before and after, and
+   * after it the approvals touched: the amounts are the node's. The same call with the target's code taken away, in
+   * a block after, gives the charge for L1 data the node adds to a call's gas: it comes off, as the local EVM's gas is
+   * the L2 part. The trace is one frame (TraceCall.node): what it called, and what storage it wrote, the node doesn't
+   * say, so the result has no state changes.
    */
-  private async runOnNode(reqs: SimulationRequest[], i: number, auths: Authorization[][], source: StateSource, block: Awaited<ReturnType<ForkSimulator['blockContext']>>, watch: string[],
-    watchedApprovals: Map<string, SimulatedApproval>, chainId: number, profile: ChainProfile, nonce: bigint): Promise<SimulationResult> {
-    const req = reqs[i], from = hexOf(req.account ?? req.from), target = hexOf(req.to!);
+  private async runOnNode(reqs: SimulationRequest[], i: number, earlier: number[], auths: Authorization[][], source: StateSource, block: Awaited<ReturnType<ForkSimulator['blockContext']>>, watch: string[],
+    watchedApprovals: Map<string, SimulatedApproval>, chainId: number, profile: ChainProfile, nonce: bigint, why: NodeWhy): Promise<SimulationResult> {
+    const req = reqs[i], from = hexOf(req.account ?? req.from);
+    // A creation's charge for L1 data can't be measured apart from what its code uses: there is no code to take away,
+    // the code it runs being its calldata, which the charge counts.
+    if (!req.to) throw new ForkUnsupported(`the transaction creates a contract ${why.after ? `after a call the chain's node runs (${nodeReason(why)})` : `whose code reaches the Stylus (WASM) program ${why.program}, which the local EVM can't run`}: the chain's node could run it, but its charge for a creation's L1 data can't be told apart from the gas the creation uses`);
+    const target = hexOf(req.to);
     const hex = (v: bigint) => `0x${v.toString(16)}`, pad = (a: string) => a.slice(2).padStart(64, '0');
     // What the batch's requests set (and a replay's block had changed, beneath them), as the node takes it; not the
-    // code standing in for an EIP-7702 authorization, which the node applies itself.
+    // code standing in for a signed EIP-7702 authorization, which the node applies itself. An authorization the wallet
+    // has yet to sign, the node can't apply: its code stands in, from the start of the block, and for its gas an
+    // authorization signed by a throwaway account set up to be charged the same (as RpcSimulator's eth_simulateV1).
     type Override = { balance?: string; nonce?: string; code?: string; stateDiff?: Record<string, string>; movePrecompileToAddress?: string };
     const overrides: Record<string, Override> = {};
-    const authorities = new Set(auths.flat().map(a => a.authority));
+    const authorities = new Set(auths.flat().filter(a => a.nonce !== undefined).map(a => a.authority));
     const put = (a: string, o: Override) => {
       const k = hexOf(a), was = overrides[k] ?? {};
       overrides[k] = { ...was, ...o, ...((was.stateDiff || o.stateDiff) && { stateDiff: { ...was.stateDiff, ...o.stateDiff } }) };
     };
     if (!source.after) for (const [a, o] of Object.entries(reqs[0].at?.state ?? {})) put(a, o as Override);
-    for (const r of reqs.slice(0, i + 1)) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
+    for (const r of reqs) for (const [a, o] of Object.entries(r.stateOverrides ?? {})) {
       put(a, { ...(o.balance !== undefined && { balance: o.balance }), ...(o.stateDiff && { stateDiff: o.stateDiff }), ...(o.code !== undefined && !authorities.has(hexOf(a)) && { code: o.code }), ...(o.movePrecompileToAddress && { movePrecompileToAddress: o.movePrecompileToAddress }) });
     }
+    if (reqs.some(r => r.unsignedAuthorizations?.length)) put(UNSIGNED_STAND_IN.address, UNSIGNED_STAND_IN.state);
+    const call = async (r: SimulationRequest) => ({ ...nodeCall(r), ...(r.unsignedAuthorizations?.length && { authorizationList: authorizationsForNode([...(r.authorizationList ?? []), ...await unsignedStandIns(r)]) }) });
+    // A call with no gas limit is given one, the local EVM's, and its probe the same: the node prices a call's L1 data
+    // with its gas limit, and one not given has the block's gas left, which differs from the call to its probe
+    // (measured on Arbitrum One, 2026-11-16: the same 388-byte call charged 1,161 for L1 data first in its block,
+    // 1,170 after three calls, and 1,170 at either place given 30,000,000; its L2 part had come out 6 gas over).
+    const limit = req.gas === undefined ? { gas: hex(GAS) } : {};
+    const before = await Promise.all(earlier.map(k => call(reqs[k]))), own = { ...await call(req), ...limit };
     put(BALANCE_READER, { code: BALANCE_READER_CODE });
-    const VIEW_GAS = hex(10_000_000n);
-    const reads = (approvals: SimulatedApproval[]) => [{ to: BALANCE_READER, data: `0x${pad(from)}` }, ...watch.map(t => ({ to: t, data: `0x70a08231${pad(from)}`, gas: VIEW_GAS })),
-      ...approvals.map(ap => ({ to: ap.kind === 'permit2' ? ap.emitter : ap.token, data: stateCall(ap), gas: VIEW_GAS }))];
+    put(VIEW_READER, { code: VIEW_READER_CODE });
+    // The reads on each side of the call: the account's native balance, and its balance of each token watched and
+    // each approval touched in one call to VIEW_READER (each read on 10 million gas, as a call of its own was), each
+    // a static call, as the local EVM's views are. As calls of their own, they ran as transactions in the node's
+    // block: a contract read as a token (the call's own target is one) ran its code there, and the call ran on what
+    // it left. And they made the request too big for Arbitrum One's public node, which answers an eth_simulateV1 of
+    // more than 30 calls (across its blocks) with HTTP 429 every time (30 ran, 31 never did, 2026-11-16): a call that
+    // named ten more tokens took 37 and ran out of time. Here a call adds five: the call, the reads on each side.
+    const reads = (approvals: SimulatedApproval[]) => {
+      const views: [string, Hex][] = [...watch.map(t => [t, `0x70a08231${pad(from)}`] as [string, Hex]), ...approvals.map(ap => [ap.kind === 'permit2' ? ap.emitter : ap.token, stateCall(ap)] as [string, Hex])];
+      return [{ to: BALANCE_READER, data: `0x${pad(from)}` }, ...(views.length ? [{ to: VIEW_READER, data: viewReads(views), gas: hex(VIEW_GAS * BigInt(views.length) + 1_000_000n) }] : [])];
+    };
+    /** The native read and the views of `reads`, as one result each (viewResults). */
+    const readsOf = (calls: NodeCallResult[], views: number) => [calls[0], ...(views ? viewResults(calls[1], views) : [])];
     // The same call with nothing to run: the program's code taken away, in a block after (behind a call that takes
     // the block's first-call difference). Its `to` is the program's own and its nonce the call's, which the charge
     // counts with the calldata (measured: the same call sent again, a nonce later, was charged 10 gas more), and its
@@ -2832,25 +2983,38 @@ export class ForkSimulator implements Simulator {
     const probeState: Record<string, Override> = { [hexOf(req.from)]: { balance: hex(1n << 200n) } };
     probeState[target] = { ...probeState[target], code: '0x' };
     const ask = async (approvals: SimulatedApproval[]) => {
-      const calls = [...reqs.slice(0, i).map(nodeCall), ...reads([]), nodeCall(req), ...reads(approvals)];
+      const calls = [...before, ...reads([]), own, ...reads(approvals)];
       const at = reqs[0].at, after = source.after;
       const blockOverrides = after ? after.blockOverrides : at ? nodeOverrides(at.header) : req.baseFee !== undefined ? { baseFeePerGas: hex(req.baseFee) } : undefined;
       if (after) for (const [a, o] of Object.entries(after.state ?? {}).reverse()) overrides[hexOf(a)] = { ...(o as Override), ...overrides[hexOf(a)], ...(((o as Override).stateDiff || overrides[hexOf(a)]?.stateDiff) && { stateDiff: { ...(o as Override).stateDiff, ...overrides[hexOf(a)]?.stateDiff } }) };
       const fee = blockOverrides?.baseFeePerGas;
-      const [out, probed] = await source.nodeRun([{ calls: [...(after?.calls ?? []), ...calls], ...(blockOverrides && { blockOverrides }), stateOverrides: overrides },
-        { ...(fee && { blockOverrides: { baseFeePerGas: fee } }), stateOverrides: probeState, calls: [{ to: L1_PROBE, data: '0x' }, { ...nodeCall(probe), nonce: hex(nonce) }] }]);
+      let answer: NodeCallResult[][];
+      try {
+        answer = await source.nodeRun([{ calls: [...(after?.calls ?? []), ...calls], ...(blockOverrides && { blockOverrides }), stateOverrides: overrides },
+          { ...(fee && { blockOverrides: { baseFeePerGas: fee } }), stateOverrides: probeState, calls: [{ to: L1_PROBE, data: '0x' }, { ...nodeCall(probe), ...limit, nonce: hex(nonce) }] }]);
+      } catch (e) {
+        // A node without eth_simulateV1 can't be handed the call: refused, saying why. (Only the method being missing:
+        // not the state, which Arbitrum's node says "historical state … is not available" of, as the next may have it.)
+        const m = e instanceof Error ? e.message : String(e);
+        if (/\bmethod\b[^.]*\b(not found|does not exist|not available|not supported|unsupported)\b|unsupported method|-32601/i.test(m)) throw new ForkUnsupported(`the call is one the chain's node must run (${nodeReason(why)}), and the node has no eth_simulateV1 to run it`);
+        throw e;
+      }
+      const [out, probed] = answer;
       return [...out.slice(after?.calls.length ?? 0), probed[1]];
     };
     // The approvals its events show are read after it too: asked again when they weren't already.
     let approvals = [...watchedApprovals.values()], out = await ask(approvals);
-    const n = reqs.slice(0, i).length, readsBefore = out.slice(n, n + 1 + watch.length);
-    let ran = out[n + 1 + watch.length];
+    // (Each side's reads are one call, or two with views: the native balance's, and VIEW_READER's.)
+    const side = (views: number) => (views ? 2 : 1);
+    const n = before.length, readsBefore = readsOf(out.slice(n, n + side(watch.length)), watch.length);
+    let ran = out[n + side(watch.length)];
     const parsed = parseLogs((ran.logs ?? []).map(l => ({ ...l, address: l.address.toLowerCase() })));
     const named = ran.status === '0x1' ? namedApproval(req, from, parsed.approvals) : undefined;
     if (named && !parsed.approvals.some(a => approvalKey(a) === approvalKey(named))) parsed.approvals.push(named);
     const more = parsed.approvals.filter(a => a.owner === from && !watchedApprovals.has(approvalKey(a)));
-    if (more.length) { approvals = [...approvals, ...more]; out = await ask(approvals); ran = out[n + 1 + watch.length]; }
-    const readsAfter = out.slice(n + 2 + watch.length, n + 3 + 2 * watch.length), approvalReads = out.slice(n + 3 + 2 * watch.length, -1), l1 = out.at(-1)!;
+    if (more.length) { approvals = [...approvals, ...more]; out = await ask(approvals); ran = out[n + side(watch.length)]; }
+    const afterReads = readsOf(out.slice(n + side(watch.length) + 1, -1), watch.length + approvals.length);
+    const readsAfter = afterReads.slice(0, 1 + watch.length), approvalReads = afterReads.slice(1 + watch.length), l1 = out.at(-1)!;
     // The node's charge for L1 data: what the call with no code to run used over what its calldata and access list
     // cost (no calldata floor: measured on Arbitrum One, 2026-11-15, a 68-byte call to an empty account used 21,620
     // with no base fee, the floor being 22,550). The charge counts the call's `to` with its calldata: with 200 zero
@@ -2862,11 +3026,12 @@ export class ForkSimulator implements Simulator {
     const failed = ran.status !== '0x1', returnData = ((failed ? ran.error?.data : undefined) ?? ran.returnData ?? '0x') as Hex;
     const logs = failed ? [] : (ran.logs ?? []).map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data }));
     const revertReason = failed ? decodeRevert(returnData) ?? ran.error?.message ?? 'reverted' : undefined;
-    const source_ = `chain ${chainId}'s node, for a Stylus (WASM) program the local EVM can't run`;
+    const source_ = `chain ${chainId}'s node, ${nodeReason(why)}`;
     const intrinsic = intrinsicGas(req, false).intrinsic;
     const gasLimit = req.gas ? req.gas - intrinsic - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS;
+    const known = 'its outcome, return data, events and gas are the node\'s; the calls it made aren\'t known, so its events are all listed here';
     const trace: TraceCall | undefined = req.trace ? { type: 'call', from: hexOf(req.from), to: target, value: req.value, input: req.data, gas: gasLimit > 0n ? gasLimit : 0n, gasUsed: peak > intrinsic ? peak - intrinsic : 0n,
-      node: 'a Stylus (WASM) program, run by the chain\'s node: its outcome, return data, events and gas are the node\'s; the calls it made aren\'t known, so its events are all listed here',
+      node: why.target && !why.after ? `a Stylus (WASM) program, run by the chain's node: ${known}` : `run by the chain's node, ${nodeReason(why)}: ${known}`,
       ...(returnData.length > 2 && { output: returnData }), ...(failed && { error: revertReason }),
       ...(logs.length && { logs: logs.map((l, index) => ({ index, ...l })) }) } : undefined;
     if (failed) return { status: 'reverted', source: source_, gasUsed, revertReason, transfers: [], basis: 'fork', returnData, ...(trace && { trace }) };
@@ -2882,7 +3047,10 @@ export class ForkSimulator implements Simulator {
     // gas it used (its L1 charge included; at a price above the base fee as well, 2026-11-15): the fee is counted
     // apart, as the local EVM's runs leave it out of the amounts, so it is put back.
     const paidFee = hexOf(req.from) === from && req.gasPrice ? BigInt(ran.gasUsed) * req.gasPrice : 0n;
-    if (nativeBefore !== undefined && nativeAfter !== undefined) add('native', nativeAfter - nativeBefore + paidFee);
+    // (What was read, as a local run's readAssets: the native coin and each token whose balance the node read both
+    // times. A UserOperation's coin is counted from them, with its EntryPoint deposit: withoutGas, src/erc4337-sim.ts.)
+    const read: string[] = [];
+    if (nativeBefore !== undefined && nativeAfter !== undefined) { add('native', nativeAfter - nativeBefore + paidFee); read.push('native'); }
     const logNet = new Map<string, bigint>();
     for (const t of parsed.transfers) {
       if (t.from === from) logNet.set(t.asset, (logNet.get(t.asset) ?? 0n) - t.raw);
@@ -2893,6 +3061,7 @@ export class ForkSimulator implements Simulator {
     for (const t of new Set([...watch, ...logNet.keys()])) {
       if (t === 'native' || nftLogs.has(t)) continue;
       const k = watch.indexOf(t), b = k >= 0 ? value(readsBefore[1 + k]) : undefined, a = k >= 0 ? value(readsAfter[1 + k]) : undefined;
+      if (b !== undefined && a !== undefined) read.push(t);
       // (A contract that answers balanceOf with something else, an NFT collection's count, moves by its events only.)
       if (b !== undefined && a !== undefined && (a !== b || logNet.has(t))) add(t, a - b);
       else if (logNet.has(t)) add(t, logNet.get(t)!);
@@ -2903,7 +3072,7 @@ export class ForkSimulator implements Simulator {
       const st = r?.status === '0x1' ? decodeState(ap, r.returnData) : undefined;
       if (st) approvalState.push(st);
     });
-    return { status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', returnData, logs, ...(trace && { trace }) };
+    return { status: 'success', source: source_, gasUsed, transfers, nftTransfers: parsed.nftTransfers, approvals: parsed.approvals, ...(approvalState.length && { approvalState }), ...(parsed.coreActions && { coreActions: parsed.coreActions }), basis: 'fork', readAssets: read, returnData, logs, ...(trace && { trace }) };
   }
 
   /**

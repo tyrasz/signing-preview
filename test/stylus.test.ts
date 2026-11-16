@@ -1,15 +1,16 @@
 // Arbitrum's Stylus (WASM) programs in the local EVM: a call made straight to one is run by the chain's node and
-// spliced in as one frame (ForkSimulator's runOnNode); one reached from inside another contract is refused.
+// spliced in as one frame (ForkSimulator's runOnNode); so is a call that reaches one from inside another contract,
+// and each call after either in a batch.
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import assert from 'node:assert/strict';
-import { ForkSimulator, ForkUnsupported, isStylus, clearForkCaches } from '../src/fork-simulator.ts';
+import { ForkSimulator, isStylus, clearForkCaches } from '../src/fork-simulator.ts';
 import { tracePreviews } from '../src/evm/trace.ts';
 
 const URL_ = 'http://arbitrum.test';
 const PROGRAM = '0x382ede30fc954bf36e0d23f7125ebf9d0f486602', USDC = '0xaf88d065e77c8cc2239327c5edb3a432268e5831', USER = '0x48ef3deeaa36c8b1dc161b1b8ae49e193923a628';
-const CALLER = '0x00000000000000000000000000000000000ca11e';
+const CALLER = '0x00000000000000000000000000000000000ca11e', VIEW_READER = '0x00000000000000000000000000000000ba1a9ce6';
 const STYLUS_CODE = '0xeff00000' + '1b'.repeat(40);
 // CALLER: CALL(gas, PROGRAM, 0, 0, 0, 0, 0), then STOP: an EVM contract that calls the program.
 const CALLER_CODE = `0x6000600060006000600073${PROGRAM.slice(2)}5af100`;
@@ -62,11 +63,22 @@ function arbitrum(l1 = 2_544n, { valueCharge = 0n, funded = true, refuseFunds = 
             let native = 10n ** 18n, usdc = 5_000_000_000n;
             return { calls: b.calls.map((c: any) => {
               const to = c.to?.toLowerCase(), value = BigInt(c.value ?? '0x0'), charge = l1 + (value > 0n ? valueCharge : 0n);
-              // The probe block: the program's code taken away, the same call: what its calldata and L1 data cost.
-              if (k === 1) return { status: '0x1', returnData: '0x', gasUsed: hex(to === PROGRAM ? calldataGas(c.data) + charge : 21_000n), logs: [] };
+              // The views the simulator makes through its reader, 192 bytes of calldata each (the address, then the
+              // calldata), answered 160 bytes each: whether the view succeeded, the length of its answer, and that.
+              // USDC answers balanceOf; the program and CALLER answer no view here.
+              if (k === 0 && to === VIEW_READER) {
+                const views = c.data.slice(2).match(/.{384}/g) ?? [];
+                return { status: '0x1', gasUsed: '0x5208', logs: [], returnData: `0x${views.map((v: string) => {
+                  const of = `0x${v.slice(24, 64)}`;
+                  return of === PROGRAM || of === CALLER ? '00'.repeat(160) : `${word(1n).slice(2)}${word(32n).slice(2)}${word(of === USDC ? usdc : native).slice(2)}${'00'.repeat(64)}`;
+                }).join('')}` };
+              }
+              // The probe block: the target's code taken away, the same call: what its calldata and L1 data cost.
+              if (k === 1) return { status: '0x1', returnData: '0x', gasUsed: hex(to === PROGRAM || to === CALLER ? calldataGas(c.data) + charge : 21_000n), logs: [] };
               // The reads around it: the native balance reader, and USDC's balanceOf.
-              if (to !== PROGRAM) return { status: '0x1', returnData: word(to === USDC ? usdc : native), gasUsed: '0x5208', logs: [] };
-              const ran = program(c.data, value), gasUsed = ran.gas + charge;
+              if (to !== PROGRAM && to !== CALLER) return { status: '0x1', returnData: word(to === USDC ? usdc : native), gasUsed: '0x5208', logs: [] };
+              // (CALLER calls the program with no calldata, which it takes: 24,170 in all, the caller's own included.)
+              const ran = to === CALLER ? { ok: true, gas: 24_170n } as ReturnType<typeof program> : program(c.data, value), gasUsed = ran.gas + charge;
               native -= gasUsed * BigInt(c.gasPrice ?? c.maxFeePerGas ?? '0x0') + (ran.ok ? value : 0n);
               if (ran.ok) usdc -= ran.usdcOut ?? 0n;
               const max = hex((ran.max ?? ran.gas) + charge);
@@ -101,6 +113,7 @@ test('a call made straight to a Stylus program: the node runs it, its result and
   assert.equal(r.logs?.length, 2);
   // The amounts are the node's own balance reads, before and after.
   assert.deepEqual(r.transfers.map(t => [t.asset, t.from, t.to, t.raw]), [[USDC, USER, PROGRAM, 1_000_000_000n]]);
+  assert.ok(r.readAssets?.includes('native') && r.readAssets.includes(USDC), String(r.readAssets));
   assert.equal(r.trace?.to, PROGRAM);
   assert.ok(r.trace?.node && /Stylus/.test(r.trace.node));
   // The frame's gas is the node's before refunds (83,208), less the call's intrinsic 21,596.
@@ -194,20 +207,46 @@ test('the preview trace says the frame is the node\'s', async () => {
   assert.ok(valid(JSON.parse(JSON.stringify(t, (_k, v) => typeof v === 'bigint' ? v.toString() : v))), JSON.stringify(valid.errors?.slice(0, 3)));
 });
 
-test('a Stylus program reached from inside another contract is still refused, saying so', async () => {
+test('a Stylus program reached from inside another contract: the chain\'s node runs the call, the frame saying why and which program', async () => {
+  // Refused before: "...is a Stylus (WASM) contract, which the local EVM can't run: the transaction reaches it from
+  // inside another contract".
   clearForkCaches();
   const node = arbitrum();
   const sim = new ForkSimulator({ 42161: URL_ }, { fetchImpl: node.fetchImpl, prefetch: false, watchTokens: false });
-  await assert.rejects(sim.trace([{ chainId: 42161, from: USER, to: CALLER, data: '0x', value: 0n }]),
-    (e: unknown) => e instanceof ForkUnsupported && /is a Stylus \(WASM\) contract, which the local EVM can't run: the transaction reaches it from inside another contract/.test(e.message));
+  const [r] = (await sim.trace([{ chainId: 42161, from: USER, to: CALLER, data: '0x', value: 0n, baseFee: 20_000_000n }]))!;
+  assert.equal(r.status, 'success');
+  // The node's gas less its L1 charge (what the probe, the caller's code taken away, used over its 21,000).
+  assert.equal(r.gasUsed, 24_170n);
+  assert.equal(r.source, `chain 42161's node, for the Stylus (WASM) program ${PROGRAM}, which the local EVM can't run, reached from inside another contract`);
+  assert.equal(r.trace?.to, CALLER);
+  assert.match(r.trace?.node ?? '', new RegExp(`^run by the chain's node, for the Stylus \\(WASM\\) program ${PROGRAM}, which the local EVM can't run, reached from inside another contract: `));
+  const [, probe] = node.asked.at(-1)!.blocks;
+  assert.deepEqual(probe.stateOverrides[CALLER], { code: '0x' });
+  // The preview trace says so.
+  const env = { chainId: 42161, deps: { simulator: sim, tokens: { get: async () => undefined } } } as any;
+  const [t] = (await tracePreviews([{ chainId: 42161, from: USER, to: CALLER, data: '0x', value: 0n }], [undefined], env))!;
+  assert.match(t!.note ?? '', new RegExp(`^The chain's node ran this call, for the Stylus \\(WASM\\) program ${PROGRAM}, which the local EVM can't run, reached from inside another contract: the trace shows it as one frame`));
 });
 
-test('a call after a Stylus one in a batch is refused: it would run on state the local EVM does not have', async () => {
+test('a call after a Stylus one in a batch runs on the chain\'s node after it, on the state it left', async () => {
+  // Refused before: "...the calls after it in this batch would then run on state the local EVM doesn't have".
   clearForkCaches();
   const node = arbitrum();
   const sim = new ForkSimulator({ 42161: URL_ }, { fetchImpl: node.fetchImpl, prefetch: false, watchTokens: false });
-  await assert.rejects(sim.trace([{ chainId: 42161, from: USER, to: PROGRAM, data: deposit, value: 0n }, { chainId: 42161, from: USER, to: USDC, data: '0x', value: 0n }]),
-    (e: unknown) => e instanceof ForkUnsupported && /calls after it in this batch/.test(e.message));
+  const out = (await sim.trace([{ chainId: 42161, from: USER, to: PROGRAM, data: deposit, value: 0n }, { chainId: 42161, from: USER, to: USDC, data: '0x', value: 0n }]))!;
+  assert.equal(out[0].gasUsed, 78_408n);
+  assert.equal(out[1].status, 'success');
+  assert.equal(out[1].gasUsed, 21_000n);
+  assert.match(out[1].source, new RegExp(`^chain 42161's node, after call 1 of the batch, which is made straight to the Stylus \\(WASM\\) program ${PROGRAM}`));
+  // The node was given the deposit first, then the reads around the second call (USDC's balance among them, seen in
+  // the deposit's events), and the call.
+  const [block] = node.asked.at(-1)!.blocks;
+  assert.equal(block.calls[0].data, deposit);
+  assert.equal(block.calls[1].to, '0x00000000000000000000000000000000ba1a9ce5');
+  assert.equal(block.calls.findIndex((c: { to: string; data: string }) => c.to.toLowerCase() === USDC && c.data === '0x'), 3);
+  // The second call's sender nonce, for the L1 charge: one up from the first's.
+  const [, probe] = node.asked.at(-1)!.blocks;
+  assert.equal(probe.calls[1].nonce, '0x8');
 });
 
 test('a call to a Stylus program its sender can\'t pay for fails as any call does, not the whole simulation', async () => {

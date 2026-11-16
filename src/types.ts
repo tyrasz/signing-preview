@@ -200,7 +200,7 @@ export interface TraceEntry {
   /** Why the call failed. What a failed call did is undone, the calls under it included. */
   error?: string;
   events?: TraceEvent[];
-  /** The call ran on the chain's node, not in the local EVM (an Arbitrum Stylus program): TraceCall.node. */
+  /** The call ran on the chain's node, not in the local EVM, and why (an Arbitrum Stylus program, reached or after one): TraceCall.node. */
   node?: string;
 }
 
@@ -461,8 +461,9 @@ export interface TraceCall {
   /** A precompile (ecrecover, sha256...), not a contract. */
   precompile?: boolean;
   /**
-   * The call ran on the chain's node, not in the local EVM, and what it is (an Arbitrum Stylus program, WASM): its
-   * outcome, output, events and gas are the node's run, the calls it made unknown (its events are all listed here).
+   * The call ran on the chain's node, not in the local EVM, and why: it is an Arbitrum Stylus program (WASM), or it
+   * reaches one from inside another contract, or it comes after such a call in the batch, on the state that left.
+   * Its outcome, output, events and gas are the node's run, the calls it made unknown (its events are all listed here).
    */
   node?: string;
   /** The events this call's own code emitted, numbered across the transaction. Those of a call that failed, or under one, aren't kept. */

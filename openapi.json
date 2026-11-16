@@ -1375,7 +1375,7 @@
           },
           "node": {
             "type": "string",
-            "description": "Set when the call ran on the chain's node, not in the local EVM, and says what it is (an Arbitrum Stylus program, WASM): its outcome, output, events and gas are the node's run; the calls it made aren't known."
+            "description": "Set when the call ran on the chain's node, not in the local EVM, and says why: it is an Arbitrum Stylus program (WASM), or it reaches one from inside another contract (naming it), or it comes after such a call in the batch. Its outcome, output, events and gas are the node's run; the calls it made aren't known."
           }
         }
       },
