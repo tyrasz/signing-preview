@@ -507,8 +507,7 @@ export class RpcSimulator implements Simulator {
     const logged = parsed.flatMap(r => r.transfers.filter(t => t.asset !== 'native' && (owners.includes(t.from) || owners.includes(t.to))).map(t => t.asset));
     const named = reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(a => a.toLowerCase());
     const tokens = [...new Set([...logged, ...named, ...builtinTokens(reqs[0].chainId).map(t => t.address.toLowerCase())])].filter(a => !skip(a) && !nftCollections.has(a)).slice(0, 48);
-    const READER = '0x0000000000000000000000000000000000000000';
-    const calls: unknown[] = [];
+    const calls: SimCall[] = [];
     const balanceReads = () => owners.flatMap(o => tokens.map(t => { calls.push({ from: READER, to: t, data: `0x70a08231${o.slice(2).padStart(64, '0')}` }); return { owner: o, token: t, index: calls.length - 1 }; }));
     // ERC-721 contracts count NFTs in balanceOf: those are shown per token ID instead.
     const nftChecks = tokens.map(t => { calls.push({ from: READER, to: t, data: `0x01ffc9a780ac58cd${'00'.repeat(28)}` }); return calls.length - 1; });
@@ -550,7 +549,10 @@ export class RpcSimulator implements Simulator {
       else if (unlogged > 0n) p.transfers.push({ asset: 'native', from: target, to: owner, raw: unlogged });
       return true;
     };
-    const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]);
+    // (On a node that caps the calls it runs, the reads between calls go packed: packReads.)
+    const pack = PACKED_READS.has(reqs[0].chainId) ? packReads(calls) : undefined;
+    const sentOverrides = pack ? { ...stateOverrides, [VIEW_READER]: { code: VIEW_READER_CODE } } : stateOverrides;
+    const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...(pack?.calls ?? calls)], ...(blockOverrides && { blockOverrides }), ...(sentOverrides && { stateOverrides: sentOverrides }) }], validation: false }, tag]);
     // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
     // asked once more after a pause, since without these reads the amounts are only the events'. It says so in an
     // error or with HTTP 429, which post throws once its own retries are spent. Once only: a preview waits on it.)
@@ -559,7 +561,7 @@ export class RpcSimulator implements Simulator {
     let reply = await patiently();
     if (busy(reply.error?.message)) { await new Promise(r => setTimeout(r, 3000)); reply = await patiently(); }
     const body = reply as { result?: { calls: RawCallResult[] }[] };
-    const out = body.result?.[0]?.calls?.slice(before.length);
+    const answered = body.result?.[0]?.calls?.slice(before.length), out = answered && pack ? pack.expand(answered) : answered;
     // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the
     // tokens the logs name are asked again in a lean pass (leanReads). On a node that splits the block's gas among
     // the calls that set none, a call that set none may have run short among the reads, and a batch's thousands of
@@ -648,8 +650,7 @@ export class RpcSimulator implements Simulator {
    * outcome and the same gas used, or nothing is read. The values by `${callsBefore}:${owner}:${token}`.
    */
   private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[], tag: string): Promise<Map<string, bigint> | undefined> {
-    const READER = '0x0000000000000000000000000000000000000000';
-    const calls: unknown[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
+    const calls: SimCall[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
     const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push(token === 'native' ? { from: READER, to: MULTICALL3, data: `0x4d2301cc${owner.slice(2).padStart(64, '0')}` } : { from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
     const fields = await Promise.all(this.warmed(reqs).map(simulationFields));
     reads(0);
@@ -663,14 +664,86 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(reqs[0].chainId, reqs);
-    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], validation: false }, tag]) as { result?: { calls: RawCallResult[] }[] };
-    const out = body.result?.[0]?.calls?.slice(before.length);
+    const pack = PACKED_READS.has(reqs[0].chainId) ? packReads(calls) : undefined;
+    const sentOverrides = pack ? { ...stateOverrides, [VIEW_READER]: { code: VIEW_READER_CODE } } : stateOverrides;
+    const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...(pack?.calls ?? calls)], ...(blockOverrides && { blockOverrides }), ...(sentOverrides && { stateOverrides: sentOverrides }) }], validation: false }, tag]) as { result?: { calls: RawCallResult[] }[] };
+    const answered = body.result?.[0]?.calls?.slice(before.length), out = answered && pack ? pack.expand(answered) : answered;
     if (!out || out.length !== calls.length) return undefined;
     if (callIndex.some((ci, i) => (out[ci].status === '0x1') !== (parsed[i].status === 'success') || (parsed[i].gasUsed !== undefined && BigInt(out[ci].gasUsed) !== parsed[i].gasUsed))) return undefined;
     const values = new Map<string, bigint>();
     for (const { key, index } of where) { const r = out[index]; if (r.status === '0x1' && r.returnData.length >= 66) values.set(key, BigInt(r.returnData.slice(0, 66))); }
     return values;
   }
+}
+
+/**
+ * A reader for views, several static calls in one: ForkSimulator's runOnNode places it for the reads around a call
+ * the chain's node runs, and readState for its reads on a node that caps the calls it runs (packReads). Its calldata
+ * is 192 bytes for each (the address, the length of the calldata, the calldata in 128 bytes); it returns 160 bytes
+ * for each: whether the call succeeded, the length of what it returned, and the first 96 bytes of that. Each call
+ * gets 10 million gas (VIEW_GAS), as a view of its own did.
+ *   PUSH1 0 PUSH1 0 [JUMPDEST DUP1 CALLDATASIZE GT ISZERO PUSH2 0x3c JUMPI
+ *   DUP1 PUSH1 0x20 ADD CALLDATALOAD DUP1 DUP3 PUSH1 0x40 ADD CALLDATASIZE CALLDATACOPY
+ *   PUSH1 0x60 DUP4 PUSH1 0x40 ADD DUP3 CALLDATASIZE DUP6 CALLDATALOAD PUSH3 10000000 STATICCALL DUP4 MSTORE POP
+ *   RETURNDATASIZE DUP3 PUSH1 0x20 ADD MSTORE PUSH1 0xc0 ADD SWAP1 PUSH1 0xa0 ADD SWAP1 PUSH1 4 JUMP]
+ *   JUMPDEST POP PUSH1 0 RETURN
+ * (Each call's calldata is copied past the answers, at CALLDATASIZE, which is beyond them. No PUSH0.)
+ */
+export const VIEW_READER = '0x00000000000000000000000000000000ba1a9ce6';
+export const VIEW_READER_CODE = '0x600060005b8036111561003c578060200135808260400136376060836040018236853562989680fa8352503d826020015260c0019060a001906004565b506000f3';
+/** VIEW_READER's calldata for the views (address, calldata of at most 128 bytes). */
+export const viewReads = (views: [string, Hex][]): Hex => `0x${views.map(([to, data]) => `${to.slice(2).toLowerCase().padStart(64, '0')}${((data.length - 2) / 2).toString(16).padStart(64, '0')}${data.slice(2).padEnd(256, '0')}`).join('')}`;
+/** VIEW_READER's answer, as the `count` views' own results would have been (their status, and what they returned). */
+export function viewResults(c: { status: string; returnData: Hex } | undefined, count: number): { status: string; returnData: Hex; gasUsed: Hex; logs: { address: string; topics: string[]; data: string }[] }[] {
+  const out = c?.status === '0x1' ? c.returnData.slice(2) : '';
+  return Array.from({ length: count }, (_, k) => {
+    const e = out.slice(k * 320, (k + 1) * 320);
+    const ok = e.length === 320 && BigInt(`0x${e.slice(0, 64)}`) === 1n, size = ok ? Math.min(Number(BigInt(`0x${e.slice(64, 128)}`)), 96) : 0;
+    return { status: ok ? '0x1' : '0x0', returnData: `0x${e.slice(128, 128 + 2 * size)}` as Hex, gasUsed: '0x0', logs: [] };
+  });
+}
+
+/** Each view in a VIEW_READER call gets this much gas, as a view of its own had (ForkSimulator's VIEW_GAS). */
+const READ_GAS = 10_000_000n;
+/**
+ * Chains whose public node caps the calls in an eth_simulateV1: Arbitrum One's answers one of more than 30 calls,
+ * counted across its blocks, with HTTP 429, every time (30 ran, 31 never did, 2026-11-16). readState's reads are
+ * three calls a token for one call (its balance before and after, and whether it is an NFT collection), so a call
+ * naming twelve tokens more than its own took 51 and lost its reads to ten refusals ("RPC HTTP 429", 19.6 s).
+ */
+const PACKED_READS = new Set([42161]);
+/** A call in an eth_simulateV1's block, as readState and leanReads build them. */
+type SimCall = { from?: string; to?: string; data?: string; [field: string]: unknown };
+/** The address readState's and leanReads' reads come from: it has no nonce to move. */
+const READER = '0x0000000000000000000000000000000000000000';
+/**
+ * The calls of an eth_simulateV1 with each run of reads (calls from READER) packed into one call to VIEW_READER, as
+ * static calls, and `expand`, which gives the answer back one result a call, as the calls unpacked would have had it.
+ * (A read with calldata over VIEW_READER's 128 bytes stays a call of its own; none of readState's is.)
+ */
+function packReads(calls: SimCall[]): { calls: unknown[]; expand: <T extends { status: string; returnData: Hex }>(out: T[]) => T[] } {
+  const packed: unknown[] = [], where: [number, number][] = [], counts = new Map<number, number>();
+  const isRead = (c: SimCall) => c.from === READER && !!c.to && (c.data ?? '0x').length <= 2 + 256;
+  for (let k = 0; k < calls.length;) {
+    if (!isRead(calls[k])) { where.push([packed.length, -1]); packed.push(calls[k]); k++; continue; }
+    const views: [string, Hex][] = [];
+    while (k < calls.length && isRead(calls[k])) { where.push([packed.length, views.length]); views.push([calls[k].to!, (calls[k].data ?? '0x') as Hex]); k++; }
+    counts.set(packed.length, views.length);
+    packed.push({ from: READER, to: VIEW_READER, data: viewReads(views), gas: `0x${(READ_GAS * BigInt(views.length) + 1_000_000n).toString(16)}` });
+  }
+  return {
+    calls: packed,
+    expand: <T extends { status: string; returnData: Hex }>(out: T[]) => {
+      // (An answer not whole stays as short as it was: the caller sees it isn't.)
+      if (out.length !== packed.length) return out;
+      const views = new Map<number, T[]>();
+      return where.map(([p, v]) => {
+        if (v < 0) return out[p];
+        if (!views.has(p)) views.set(p, viewResults(out[p], counts.get(p)!) as unknown as T[]);
+        return views.get(p)![v];
+      });
+    },
+  };
 }
 
 /** The permission an approve / increaseAllowance / setApprovalForAll / Permit2 approve call sets, by its arguments. */

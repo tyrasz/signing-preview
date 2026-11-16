@@ -141,25 +141,35 @@ test('RpcSimulator returns NFT transfers and approvals from eth_simulateV1 logs'
 
 test('RpcSimulator reads the real allowance after each call, so a silently spent approval is not shown as still open', async () => {
   // Like USDC: approve emits Approval(10 USDC); the spend in call 2 lowers the allowance without an event.
-  const bodies: { params: [{ blockStateCalls: { calls: { to?: string; data: string }[] }[] }] }[] = [];
+  const bodies: { params: [{ blockStateCalls: { calls: { to?: string; data: string }[]; stateOverrides?: Record<string, { code?: string }> }[] }] }[] = [];
+  const READER = '0x00000000000000000000000000000000ba1a9ce6';
+  /** The views a reader call makes: each one's address and calldata (192 bytes each: address, length, calldata). */
+  const views = (data: string) => (data.slice(2).match(/.{384}/g) ?? []).map(v => ({ to: `0x${v.slice(24, 64)}`, data: `0x${v.slice(128, 128 + 2 * Number(BigInt(`0x${v.slice(64, 128)}`)))}` }));
   const fetchImpl = (async (_url: string, init: RequestInit) => {
     const body = JSON.parse(String(init.body)); bodies.push(body);
-    const calls = body.params[0].blockStateCalls[0].calls as { data: string }[];
+    const calls = body.params[0].blockStateCalls[0].calls as { to?: string; data: string }[];
     if (bodies.length === 1) return new Response(JSON.stringify({ result: [{ calls: [
       { status: '0x1', gasUsed: '0x1', returnData: '0x', logs: [{ address: USDC, topics: [T.approval, w(ALICE), w(ROUTER)], data: data(10_000_000n) }] },
       { status: '0x1', gasUsed: '0x1', returnData: '0x', logs: [{ address: USDC, topics: [T.transfer, w(ALICE), w(ROUTER)], data: data(10_000_000n) }] },
     ] }] }));
-    // Second pass: [balance reads, call 1, allowance read, balance reads, call 2, allowance read, balance reads]; the
-    // allowance is 10 USDC after call 1 and 0 after call 2.
+    // Second pass, on Arbitrum One the reads packed into one call to the reader between the calls: [reads, call 1,
+    // reads (the allowance among them), call 2, reads]; the allowance is 10 USDC after call 1 and 0 after call 2, and
+    // every other view answers nothing.
+    const spent = (i: number) => calls.slice(0, i).some(x => x.data.startsWith('0xdeadbeef'));
     return new Response(JSON.stringify({ result: [{ calls: calls.map((c, i) => ({ status: '0x1', gasUsed: '0x1', logs: [],
-      returnData: c.data.startsWith('0xdd62ed3e') ? data(calls.slice(0, i).some(x => x.data.startsWith('0xdeadbeef')) ? 0n : 10_000_000n) : '0x' })) }] }));
+      returnData: c.to?.toLowerCase() !== READER ? '0x' : `0x${views(c.data).map(v => v.data.startsWith('0xdd62ed3e') ? `${data(1n).slice(2)}${data(32n).slice(2)}${data(spent(i) ? 0n : 10_000_000n).slice(2)}${'00'.repeat(64)}` : `${data(1n).slice(2)}${'00'.repeat(128)}`).join('')}` })) }] }));
   }) as typeof fetch;
   const simulator = new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl });
   const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [ROUTER, 10_000_000n] });
   const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [{ to: USDC, data: approve }, { to: ROUTER, data: '0xdeadbeef' }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
   assert.equal(bodies.length, 2, 'the simulation, then the state read back');
-  const reads = new Set(['0x70a08231', '0x01ffc9a7', '0x4d2301cc']); // balances, NFT checks and native balances, around the calls
-  assert.deepEqual(bodies[1].params[0].blockStateCalls[0].calls.map(c => c.data.slice(0, 10)).filter(s => !reads.has(s)), [approve.slice(0, 10), '0xdd62ed3e', '0xdeadbeef', '0xdd62ed3e']);
+  const [block] = bodies[1].params[0].blockStateCalls;
+  // Five calls, not one a read (Arbitrum One's public node refuses more than 30): the reader, given its code, between them.
+  assert.deepEqual(block.calls.map(c => c.to?.toLowerCase() === READER ? 'reads' : c.data.slice(0, 10)), ['reads', approve.slice(0, 10), 'reads', '0xdeadbeef', 'reads']);
+  assert.ok(block.stateOverrides?.[READER]?.code);
+  // Balances, NFT checks and native balances around the calls; the allowance after each.
+  const reads = new Set(['0x70a08231', '0x01ffc9a7', '0x4d2301cc']);
+  assert.deepEqual(block.calls.map(c => c.to?.toLowerCase() === READER ? views(c.data).map(v => v.data.slice(0, 10)).filter(s => !reads.has(s)) : []), [[], [], ['0xdd62ed3e'], [], ['0xdd62ed3e']]);
   assert.deepEqual(p.calls?.[0].approvals?.map(a => [a.allowance, a.basis]), [['10 USDC', 'simulated_state']], 'state after call 1');
   assert.deepEqual(p.approvals?.map(a => [a.allowance, a.revoked, a.basis]), [['none', true, 'simulated_state']], 'state after the batch');
 });

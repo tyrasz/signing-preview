@@ -1982,6 +1982,38 @@ test('Arbitrum: an approval a call the node runs sets is read back through the r
   assert.equal(block.calls.length, 3, JSON.stringify(block.calls.map(c => c.to)));
 });
 
+test('Arbitrum: RpcSimulator\'s reads around each call go in one reader call, as static calls, and read what calls of their own did', async () => {
+  // Arbitrum One's public node answers an eth_simulateV1 of more than 30 calls with HTTP 429, every time: read as calls
+  // of their own (three a token for one call), a call that named twelve tokens took 51 and lost its reads (2026-11-16).
+  clearForkCaches();
+  const MULTICALL3 = '0xca11bde05977b3631167028862be2a173976ca11';
+  // Multicall3's getEthBalance(address): CALLDATALOAD(4) BALANCE, returned.
+  const getEthBalance = { [MULTICALL3]: { code: '0x6004353160005260206000f3' as Hex } };
+  const others = Array.from({ length: 10 }, (_, i) => `0x${(0xe0a0f0 + i).toString(16).padStart(40, '0')}`);
+  const batch = (chainId: number): SimulationRequest[] => [
+    { chainId, from: USER, to: dai, data: call('transfer', [BOB, 5n]), value: 0n, watch: [dai, program, ...others], stateOverrides: getEthBalance },
+    { chainId, from: USER, to: BOB, data: '0x', value: E / 4n, stateOverrides: getEthBalance },
+  ];
+  const sizes: number[] = [];
+  const counting = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    for (const r of Array.isArray(body) ? body : [body]) if (r.method === 'eth_simulateV1') sizes.push(r.params[0].blockStateCalls.reduce((n: number, b: { calls: unknown[] }) => n + b.calls.length, 0));
+    return arbFetch(url, init);
+  }) as typeof fetch;
+  // The same batch on another chain, whose reads are calls of their own, and on Arbitrum One.
+  const plain = (await new RpcSimulator({ 1: ARB_URL }, { fetchImpl: counting }).simulateBatch(batch(1)))!;
+  const plainSize = sizes.at(-1)!;
+  const packed = (await new RpcSimulator({ 42161: ARB_URL }, { fetchImpl: counting }).simulateBatch(batch(42161)))!;
+  // Five calls: the reads, each call, the reads after it.
+  assert.equal(sizes.at(-1), 5);
+  assert.ok(plainSize > 30, String(plainSize));
+  const view = (r: SimulationResult) => [r.status, r.balancesRead, r.readAssets, moved(r), r.stateReadError];
+  assert.deepEqual(packed.map(view), plain.map(view));
+  // What they read: DAI moved, the program (a token here) read and unmoved, the native coin sent.
+  assert.deepEqual(packed.map(moved), [[[dai, USER, dai, 5n]], [['native', USER, BOB, E / 4n]]]);
+  assert.deepEqual(packed[0].readAssets, [dai, program, 'native']);
+});
+
 test('Arbitrum: a call to a proxy whose implementation is a Stylus program says it reaches the program from inside another contract, though a read of the proxy reached it first', async () => {
   // The call's target is watched, so the run reads its balanceOf before the call, and that read is what first reaches
   // the program (as live on Arbitrum One, 2026-11-16). It is reached from inside another contract all the same.

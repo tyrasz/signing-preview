@@ -26,7 +26,7 @@ import { calldataCandidates } from './simulation-probe.ts';
 import { ACTIVATION_REGISTRY_CODE, B20_ASSET_CODE, B20_BOOTSTRAP_SLOT, B20_FACTORY_CODE, B20_STABLECOIN_CODE, POLICY_REGISTRY_CODE } from './b20-reference.ts';
 import { formatUnits } from './format.ts';
 import { ARBOS_STATE, ARBSYS, l1Send, SEND_TX_TO_L1, WITHDRAW_ETH } from './evm/arbos.ts';
-import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall, UNSIGNED_STAND_IN, unsignedStandIns } from './simulation.ts';
+import { approvalKey, authorizationsForNode, decodeRevert, decodeState, ELSEWHERE, fitGas, hadRoom, namedApproval, NATIVE_LOG_ADDRESS, parseLogs, stateCall, UNSIGNED_STAND_IN, unsignedStandIns, VIEW_READER, VIEW_READER_CODE, viewReads, viewResults } from './simulation.ts';
 import type { SimulatedApproval, SimulatedTransfer, SimulationRequest, SimulationResult, Simulator, StateChange, TraceCall } from './types.ts';
 
 type Hex = `0x${string}`;
@@ -525,32 +525,6 @@ const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523
 const BALANCE_READER = '0x00000000000000000000000000000000ba1a9ce5', CODE_READER = '0x00000000000000000000000000000000c0de9ead';
 const BALANCE_READER_CODE = '0x60005b8036111560155780353181526020016002565b366000f3', SLOT_READER_CODE = '0x60005b8036111560155780355481526020016002565b366000f3';
 const CODE_READER_CODE = '0x600035803b8060006000843c6000f3';
-/**
- * The reader runOnNode places for the views around a call the node runs: several static calls in one. Its calldata
- * is 192 bytes for each (the address, the length of the calldata, the calldata in 128 bytes); it returns 160 bytes
- * for each: whether the call succeeded, the length of what it returned, and the first 96 bytes of that. Each call
- * gets 10 million gas (VIEW_GAS), as a view of its own did.
- *   PUSH1 0 PUSH1 0 [JUMPDEST DUP1 CALLDATASIZE GT ISZERO PUSH2 0x3c JUMPI
- *   DUP1 PUSH1 0x20 ADD CALLDATALOAD DUP1 DUP3 PUSH1 0x40 ADD CALLDATASIZE CALLDATACOPY
- *   PUSH1 0x60 DUP4 PUSH1 0x40 ADD DUP3 CALLDATASIZE DUP6 CALLDATALOAD PUSH3 10000000 STATICCALL DUP4 MSTORE POP
- *   RETURNDATASIZE DUP3 PUSH1 0x20 ADD MSTORE PUSH1 0xc0 ADD SWAP1 PUSH1 0xa0 ADD SWAP1 PUSH1 4 JUMP]
- *   JUMPDEST POP PUSH1 0 RETURN
- * (Each call's calldata is copied past the answers, at CALLDATASIZE, which is beyond them. No PUSH0.)
- */
-const VIEW_READER = '0x00000000000000000000000000000000ba1a9ce6';
-const VIEW_READER_CODE = '0x600060005b8036111561003c578060200135808260400136376060836040018236853562989680fa8352503d826020015260c0019060a001906004565b506000f3';
-/** VIEW_READER's calldata for the views (address, calldata of at most 128 bytes). */
-const viewReads = (views: [string, Hex][]): Hex => `0x${views.map(([to, data]) => `${to.slice(2).toLowerCase().padStart(64, '0')}${((data.length - 2) / 2).toString(16).padStart(64, '0')}${data.slice(2).padEnd(256, '0')}`).join('')}`;
-/** VIEW_READER's answer, as the `count` views' own results would have been (their status, and what they returned). */
-function viewResults(c: NodeCallResult | undefined, count: number): NodeCallResult[] {
-  const out = c?.status === '0x1' ? c.returnData.slice(2) : '';
-  return Array.from({ length: count }, (_, k) => {
-    const e = out.slice(k * 320, (k + 1) * 320);
-    const ok = e.length === 320 && BigInt(`0x${e.slice(0, 64)}`) === 1n, size = ok ? Math.min(Number(BigInt(`0x${e.slice(64, 128)}`)), 96) : 0;
-    return { status: ok ? '0x1' : '0x0', returnData: `0x${e.slice(128, 128 + 2 * size)}` as Hex, gasUsed: '0x0', logs: [] };
-  });
-}
-
 /**
  * What a forwarded call that reverts was charged (ChainProfile.revertsKeepGas): the node is asked with an eth_call
  * to a contract placed for it, which calls the precompile with the calldata on METERED_GAS and returns the
