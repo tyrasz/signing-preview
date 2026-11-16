@@ -12,12 +12,12 @@ import { codes, detail, NOW } from './helpers.ts';
 
 const GWEI = 10n ** 9n;
 const l1Inputs: string[] = [];
-/** A node: nonces 5 mined and 7 pending, 1 gwei base fee, a 0.1 gwei tip, and (Arbitrum) 1,000 gas of L1 data. */
-const rpc = (balance: bigint) => ({ has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+/** A node: nonces 5 mined and 7 pending, 1 gwei base fee, a 0.1 gwei tip (none on Arbitrum, as its node suggests), and (Arbitrum) 1,000 gas of L1 data. */
+const rpc = (balance: bigint) => ({ has: () => true, call: async (c: number, method: string, params: unknown[]) => {
   if (method === 'eth_getTransactionCount') return params[1] === 'pending' ? '0x7' : '0x5';
   if (method === 'eth_getBalance') return toHex(balance);
   if (method === 'eth_getBlockByNumber') return { baseFeePerGas: toHex(GWEI) };
-  if (method === 'eth_maxPriorityFeePerGas') return toHex(GWEI / 10n);
+  if (method === 'eth_maxPriorityFeePerGas') return toHex(c === 42161 ? 0n : GWEI / 10n);
   if (method === 'eth_call' && (params[0] as { to: string }).to === '0x00000000000000000000000000000000000000c8') return encodeAbiParameters([{ type: 'uint64' }, { type: 'uint256' }, { type: 'uint256' }], [1000n, GWEI, 0n]);
   // OP Stack's GasPriceOracle: 0.00001 ETH of L1 data fee for whatever it is given, which it records.
   if (method === 'eth_call' && (params[0] as { to: string }).to === '0x420000000000000000000000000000000000000f') { l1Inputs.push((params[0] as { data: string }).data); return encodeAbiParameters([{ type: 'uint256' }], [10n ** 13n]); }
@@ -39,6 +39,9 @@ test('The network fee: gas used at the base fee plus tip, the most the request a
   assert.equal(detail(capped, 'Network fee'), '≈ 0.000055 ETH (50,000 gas at 1.1 gwei); at most 0.00012 ETH');
   const arb = await send({ chainId: '0xa4b1' });
   assert.equal(detail(arb, 'Network fee'), '≈ 0.000051 ETH (51,000 gas at 1 gwei, 1,000 of it for the data posted to Ethereum)');
+  // A tip the request names is charged on Arbitrum One too, as on any EIP-1559 chain (it was priced at the base fee).
+  const tipped = await send({ chainId: '0xa4b1', maxFeePerGas: toHex(2n * GWEI), maxPriorityFeePerGas: toHex(GWEI / 10n) });
+  assert.equal(detail(tipped, 'Network fee'), '≈ 0.0000561 ETH (51,000 gas at 1.1 gwei, 1,000 of it for the data posted to Ethereum)');
 });
 
 test('OP Stack (Base, OP Mainnet): the L1 data fee is added to the gas, in the estimate, the maximum and the funds needed', async () => {

@@ -431,8 +431,36 @@ test('Gas is bought before a transaction runs: its sender’s balance is lower b
   // (21,000 gas at the price), and has bought its own gas.
   const [, second] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: BOB, data: '0x', value: 0n, gas: 100_000n, gasPrice: 10n ** 9n }, { ...req, gas: 100_000n, gasPrice: 10n ** 9n }]))!;
   assert.equal(BigInt(second.returnData!), whole - 21_000n * 10n ** 9n - 100_000n * 10n ** 9n);
-  // A sender that couldn't pay for the gas is left as it is (the chain would refuse the transaction).
-  assert.equal(BigInt((await fork().simulate({ ...req, gas: 100_000n, gasPrice: whole }))!.returnData!), whole);
+  // A sender that can't pay for the gas at its price fails without running, as every node refuses it ("insufficient
+  // funds for gas * price + value"; it used to run here, at its whole balance).
+  const unpaid = (await fork().simulate({ ...req, gas: 100_000n, gasPrice: whole }))!;
+  assert.deepEqual([unpaid.status, unpaid.gasUsed], ['reverted', undefined]);
+  assert.match(unpaid.revertReason ?? '', /^insufficient funds: the account holds .*, and the gas limit at its price and what the call sends come to/);
+});
+
+test('A priced call’s fee goes where the chain pays it: the tip to the fee recipient, OP Stack’s base fee to its BaseFeeVault, Arbitrum’s to its fee accounts', async () => {
+  // Measured on each node (2026-11-16): OP Mainnet's BaseFeeVault gained a priced call's gas at the base fee, which
+  // the local EVM burnt; Arbitrum One paid its infrastructure account the gas at ArbOS's minimum price (here none is
+  // read: the base fee), its network account the rest of the price, tip included, and COINBASE nothing.
+  const AT = '0x00000000000000000000000000000000c0de0005', TIPPED = '0x00000000000000000000000000000000000c01b5';
+  const VAULT = '0x4200000000000000000000000000000000000019', INFRA = '0xbf5041fc07e1c866d15c749156657b8eed0fb649', NETWORK = '0x32e7af5a8151934f3787d0cd59eb6edd0a736b1d';
+  const watched = [TIPPED, VAULT, INFRA, NETWORK];
+  // The code returns the balance of each watched account: PUSH20 it, BALANCE, MSTORE at its word.
+  const code = `0x${watched.map((a, i) => `73${a.slice(2)}3160${(i * 32).toString(16).padStart(2, '0')}52`).join('')}60${(watched.length * 32).toString(16)}6000f3` as Hex;
+  const header = { number: 100n, timestamp: 1_800_000_000n, coinbase: TIPPED, prevRandao: `0x${'00'.repeat(32)}` as Hex, gasLimit: 30_000_000n, baseFeePerGas: 10_000_000n };
+  const read = async (chain: number, price?: bigint) => {
+    const sim = fork({ profiles: { 999: { ...CHAIN_PROFILES[chain] } } });
+    const out = (await sim.simulateBatch([{ chainId: 999, from: USER, to: BOB, data: '0x', value: 0n, ...(price && { gas: 100_000n, gasPrice: price }), at: { block: 'latest', header } },
+      { chainId: 999, from: USER, to: AT, data: '0x', value: 0n, stateOverrides: { [AT]: { code } }, at: { block: 'latest', header } }]))!;
+    return out[1].returnData!.slice(2).match(/.{64}/g)!.map(w => BigInt(`0x${w}`));
+  };
+  const paid = async (chain: number) => { const [a, b] = [await read(chain), await read(chain, 15_000_000n)]; return b.map((v, i) => v - a[i]); };
+  // Ethereum: the tip to COINBASE, the base fee burnt.
+  assert.deepEqual(await paid(1), [21_000n * 5_000_000n, 0n, 0n, 0n]);
+  // OP Mainnet: the base fee to its BaseFeeVault too.
+  assert.deepEqual(await paid(10), [21_000n * 5_000_000n, 21_000n * 10_000_000n, 0n, 0n]);
+  // Arbitrum One: nothing to COINBASE; the gas at the minimum price to the infrastructure account, the rest to the network's.
+  assert.deepEqual(await paid(42161), [0n, 0n, 21_000n * 10_000_000n, 21_000n * 5_000_000n]);
 });
 
 test('A block given a later time for the chain’s node runs at its own time in the local EVM', async () => {

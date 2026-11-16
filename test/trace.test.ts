@@ -75,7 +75,13 @@ test('A trace made readable: verified names first, standard ones, then a guess; 
 test('The block a simulation names: each chain’s next block, and what the node is told of it', async () => {
   const h = { number: '0x64', timestamp: '0x3e8', miner: '0x00000000000000000000000000000000000000AA', mixHash: `0x${'ab'.repeat(32)}`, gasLimit: '0x1c9c380', baseFeePerGas: '0x7', difficulty: '0x2', l1BlockNumber: '0x10' };
   // Ethereum: twelve seconds on, the fee recipient, base fee and randomness carried over.
-  assert.deepEqual(headerAfter(1, h), { number: 101n, timestamp: 1012n, coinbase: '0x00000000000000000000000000000000000000aa', gasLimit: 30_000_000n, baseFeePerGas: 7n, prevRandao: `0x${'ab'.repeat(32)}` });
+  // And the beacon root its start writes (EIP-4788): zero, as Ethereum's node writes in a simulated block.
+  assert.deepEqual(headerAfter(1, h), { number: 101n, timestamp: 1012n, coinbase: '0x00000000000000000000000000000000000000aa', gasLimit: 30_000_000n, baseFeePerGas: 7n, prevRandao: `0x${'ab'.repeat(32)}`, beaconRoot: `0x${'00'.repeat(32)}` });
+  // A block as it was has its header's root, and the node is given it (a replay of an EigenPod checkpoint read zero);
+  // OP Stack's simulated next block has its parent's; chains without the contract's write have none.
+  const rooted = { ...h, parentBeaconBlockRoot: `0x${'be'.repeat(32)}` };
+  assert.deepEqual([headerOf(1, rooted).beaconRoot, nodeOverrides(headerOf(1, rooted)).beaconRoot, headerAfter(10, rooted).beaconRoot, headerOf(8453, rooted).beaconRoot, headerAfter(42161, rooted).beaconRoot, headerOf(137, rooted).beaconRoot, headerAfter(56, rooted).beaconRoot],
+    [`0x${'be'.repeat(32)}`, `0x${'be'.repeat(32)}`, `0x${'be'.repeat(32)}`, `0x${'be'.repeat(32)}`, undefined, undefined, undefined]);
   // Arbitrum: NUMBER is the L1 block, the chain's own kept apart; the same second; opcode 0x44 is 1.
   assert.deepEqual(headerAfter(42161, h), { number: 16n, arbBlockNumber: 101n, timestamp: 1000n, coinbase: '0x00000000000000000000000000000000000000aa', gasLimit: 30_000_000n, baseFeePerGas: 7n, prevRandao: `0x${'00'.repeat(31)}01` });
   // BNB Chain and Polygon: opcode 0x44 is the difficulty, which both nodes are given as an override of its own.
@@ -89,7 +95,7 @@ test('The block a simulation names: each chain’s next block, and what the node
   assert.deepEqual([headerOf(8453, h).number, headerOf(8453, h).timestamp, headerOf(42161, h).number, headerOf(42161, h).arbBlockNumber], [100n, 1000n, 16n, 100n]);
   // (Polygon's fee recipient is one fixed address in every block, whatever its header's miner field says.)
   assert.deepEqual(nodeOverrides(headerAfter(137, h)), { time: '0x3ea', feeRecipient: '0x7ee41d8a25641000661b1ef5e6ae8a00400466b0', prevRandao: `0x${'00'.repeat(31)}02`, baseFeePerGas: '0x7', difficulty: '0x2' });
-  assert.deepEqual(Object.keys(nodeOverrides(headerAfter(1, h))), ['time', 'feeRecipient', 'prevRandao', 'baseFeePerGas']);
+  assert.deepEqual(Object.keys(nodeOverrides(headerAfter(1, h))), ['time', 'feeRecipient', 'prevRandao', 'baseFeePerGas', 'beaconRoot']);
   const rpc = { has: (c: number) => c === 8453, call: async (_c: number, m: string) => (m === 'eth_getBlockByNumber' ? h : null) };
   assert.deepEqual(await pinLatest(rpc, 8453), { block: '0x64', header: headerAfter(8453, h) });
   assert.equal(await pinLatest(rpc, 1), undefined);

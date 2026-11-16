@@ -29,8 +29,10 @@ jobs:
   rules:
     runs-on: ubuntu-latest
     # Arbitrum's public RPC rate-limits GitHub's runners: its part took 14 minutes in the first scheduled run, which
-    # was cancelled at 30 before reaching the last chain.
-    timeout-minutes: 60
+    # was cancelled at 30 before reaching the last chain. The whole run took 39 minutes on 2026-11-15; the programs
+    # added from the audit of 2026-11-16 (about 900 more a chain) took Arbitrum One from 3.7 to 14.5 minutes here, and
+    # Ethereum to 2.5.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

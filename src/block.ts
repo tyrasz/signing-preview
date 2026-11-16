@@ -24,6 +24,14 @@ export interface BlockAt {
     ownMilliseconds?: bigint;
     /** Arbitrum: the chain's own block number (`number` is then the L1 block the chain last saw, which NUMBER returns). */
     arbBlockNumber?: bigint;
+    /**
+     * EIP-4788: the beacon root the block's start writes into its contract (BEACON_ROOT_CHAINS), which beacon-proof
+     * contracts read at the block's own time (EigenLayer's EigenPod.startCheckpoint). A block as it was has its
+     * header's parentBeaconBlockRoot; a simulated next block has the one the chain's node writes: zero on Ethereum and
+     * Sepolia, the parent's on OP Stack. The node is given it (nodeOverrides): without it, a replay of an EigenPod
+     * checkpoint on Ethereum read a zero root (71,644 gas against its receipt's 76,444), and with it matched.
+     */
+    beaconRoot?: Hex;
     /** The block's blob base fee (BLOBBASEFEE), on chains with blobs: a rollup's batch poster reads it. */
     blobBaseFee?: bigint;
     /**
@@ -163,7 +171,14 @@ export const NEXT_BLOCK: Record<number, { blockTime: number; /** What COINBASE r
 };
 
 /** A block header as eth_getBlockByNumber returns it (the fields used here). */
-export interface RpcHeader { number: string; timestamp: string; miner: string; mixHash?: string; gasLimit: string; baseFeePerGas?: string; difficulty?: string; l1BlockNumber?: string; /** EIP-7928: present from Amsterdam (Glamsterdam) on. */ blockAccessListHash?: string; /** EIP-7843: the beacon slot, from Amsterdam on. */ slotNumber?: string }
+export interface RpcHeader { number: string; timestamp: string; miner: string; mixHash?: string; gasLimit: string; baseFeePerGas?: string; difficulty?: string; l1BlockNumber?: string; /** EIP-7928: present from Amsterdam (Glamsterdam) on. */ blockAccessListHash?: string; /** EIP-7843: the beacon slot, from Amsterdam on. */ slotNumber?: string; /** EIP-4788, from Cancun on. */ parentBeaconBlockRoot?: string }
+
+/**
+ * The chains whose blocks start by writing a beacon root (EIP-4788) that their nodes' simulations write too, and how a
+ * simulated next block's is chosen: Ethereum's and Sepolia's nodes write zero, OP Stack's the parent's (measured
+ * 2026-11-16: a contract reading the root at the block's own time). Arbitrum, Polygon, BNB Chain and HyperEVM don't.
+ */
+const BEACON_ROOT_CHAINS: Record<number, 'zero' | 'parent'> = { 1: 'zero', 11155111: 'zero', 10: 'parent', 8453: 'parent' };
 
 const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
 
@@ -187,6 +202,7 @@ export function headerAfter(chainId: number, h: RpcHeader): BlockAt['header'] {
     ...(rules.milliseconds && { milliseconds: 0n }),
     ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
     ...(h.slotNumber !== undefined && { slotNumber: BigInt(h.slotNumber) + 1n }),
+    ...(BEACON_ROOT_CHAINS[chainId] === 'zero' ? { beaconRoot: word(0n) } : BEACON_ROOT_CHAINS[chainId] === 'parent' && h.parentBeaconBlockRoot ? { beaconRoot: h.parentBeaconBlockRoot as Hex } : {}),
   };
 }
 
@@ -206,6 +222,7 @@ export function headerOf(chainId: number, h: RpcHeader): BlockAt['header'] {
     ...(rules.milliseconds && { milliseconds: millisecondsOf(h.mixHash) }),
     ...(h.blockAccessListHash !== undefined && { amsterdam: true }),
     ...(h.slotNumber !== undefined && { slotNumber: BigInt(h.slotNumber) }),
+    ...(BEACON_ROOT_CHAINS[chainId] && h.parentBeaconBlockRoot && { beaconRoot: h.parentBeaconBlockRoot as Hex }),
   };
 }
 
@@ -368,5 +385,6 @@ export function nodeOverrides(h: BlockAt['header']): Record<string, string> {
   return {
     time: `0x${h.timestamp.toString(16)}`, feeRecipient: h.coinbase, ...(h.arbBlockNumber === undefined && h.milliseconds === undefined && { prevRandao: h.prevRandao }), baseFeePerGas: `0x${h.baseFeePerGas.toString(16)}`,
     ...(h.difficulty !== undefined && { difficulty: `0x${h.difficulty.toString(16)}` }),
+    ...(h.beaconRoot !== undefined && { beaconRoot: h.beaconRoot }),
   };
 }

@@ -12,7 +12,12 @@ import type { Tx } from './common.ts';
 
 const NODE_INTERFACE = '0x00000000000000000000000000000000000000c8';
 const L1_COMPONENT = parseAbi(['function gasEstimateL1Component(address to, bool contractCreation, bytes data) payable returns (uint64 gasEstimateForL1, uint256 baseFee, uint256 l1BaseFeeEstimate)']);
-/** Arbitrum chains: L2 gas is charged at the base fee (no tip), and the L1 data is charged as extra gas. */
+/**
+ * Arbitrum chains: the L1 data is charged as extra gas. The tip a transaction names is charged too, up to its fee cap,
+ * as on any EIP-1559 chain: 49 of 77 user transactions in 25 blocks of Arbitrum One (2026-11-16) paid above the base
+ * fee, and their fees were 1.41 times what the base fee alone gives (one with a 0.01 gwei tip and a cap of 0.025 gwei,
+ * at a base fee of 0.020086, paid its cap). Its node suggests no tip (eth_maxPriorityFeePerGas: 0).
+ */
 const ARBITRUM = new Set([42161, 421614]);
 /**
  * The most gas one transaction may be given (EIP-7825, in Fusaka), and the chains that refuse more. Measured on
@@ -47,16 +52,15 @@ export async function expectedGasPrice(tx: Tx, deps: Dependencies, baseFeeOf?: b
   const rpc = deps.rpc;
   if (!rpc?.has(tx.chainId)) return undefined;
   const call = <T>(method: string, params: unknown[]) => rpc.call(tx.chainId, method, params).then(r => r as T, () => undefined);
-  const arbitrum = ARBITRUM.has(tx.chainId);
   const [block, suggested] = await Promise.all([
     // `baseFeeOf`: the base fee of a block named for the simulation (a past one), in place of the latest block's.
     baseFeeOf !== undefined ? Promise.resolve({ baseFeePerGas: `0x${baseFeeOf.toString(16)}` }) : call<{ baseFeePerGas?: string }>('eth_getBlockByNumber', ['latest', false]),
-    tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
+    tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
   ]);
   if (block?.baseFeePerGas === undefined) return undefined;
   try {
     const baseFee = BigInt(block.baseFeePerGas);
-    const tip = arbitrum ? 0n : tx.maxPriorityFeePerGas ?? (tx.gasPrice !== undefined ? (tx.gasPrice > baseFee ? tx.gasPrice - baseFee : 0n) : suggested !== undefined ? BigInt(suggested) : 0n);
+    const tip = tx.maxPriorityFeePerGas ?? (tx.gasPrice !== undefined ? (tx.gasPrice > baseFee ? tx.gasPrice - baseFee : 0n) : suggested !== undefined ? BigInt(suggested) : 0n);
     const cap = tx.maxFeePerGas ?? tx.gasPrice;
     const gasPrice = cap !== undefined && baseFee + tip > cap ? cap : baseFee + tip;
     return gasPrice > 0n && gasPrice >= baseFee ? { gasPrice, baseFee, tip: gasPrice - baseFee } : undefined;
@@ -100,7 +104,7 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     call<string>('eth_getTransactionCount', [tx.from, 'pending']),
     call<string>('eth_getBalance', [tx.from, 'latest']),
     call<{ baseFeePerGas?: string; blockAccessListHash?: string; gasLimit?: string }>('eth_getBlockByNumber', ['latest', false]),
-    tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined && !arbitrum ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
+    tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
     arbitrum ? call<string>('eth_call', [{ to: NODE_INTERFACE, data: encodeFunctionData({ abi: L1_COMPONENT, functionName: 'gasEstimateL1Component', args: [(tx.to ?? '0x0000000000000000000000000000000000000000') as Hex, tx.to === null, tx.data] }) }, 'latest']) : Promise.resolve(undefined),
     // HyperEVM: which kind of block the account's transactions go into, and big blocks' base fee (HYPEREVM).
     tx.chainId === HYPEREVM ? call<boolean>('eth_usingBigBlocks', [tx.from]) : Promise.resolve(undefined),
@@ -144,10 +148,10 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     b.warn('danger', 'gas_limit_above_cap', `The gas limit (${tx.gas.toLocaleString('en-US')}) is above the most a transaction may have on ${chainName(tx.chainId)} (${TRANSACTION_GAS_CAP.toLocaleString('en-US')}): the network will reject this transaction as it is.${gasUsed !== undefined && gasUsed <= TRANSACTION_GAS_CAP ? ` It used ${gasUsed.toLocaleString('en-US')} gas in the simulation, so a lower limit would do.` : ''}`);
   }
 
-  // The network fee: gas used at the price the transaction would pay now (Arbitrum: the base fee, plus L1 data gas).
+  // The network fee: gas used at the price the transaction would pay now (Arbitrum: plus the L1 data gas).
   let l1Gas = 0n;
   if (l1) { try { l1Gas = (decodeAbiParameters([{ type: 'uint64' }, { type: 'uint256' }, { type: 'uint256' }], l1 as Hex) as [bigint, bigint, bigint])[0]; } catch { l1Gas = 0n; } }
-  const priority = arbitrum ? 0n : tx.maxPriorityFeePerGas ?? (tx.gasPrice !== undefined && baseFee !== undefined ? (tx.gasPrice > baseFee ? tx.gasPrice - baseFee : 0n) : tip !== undefined ? BigInt(tip) : 0n);
+  const priority = tx.maxPriorityFeePerGas ?? (tx.gasPrice !== undefined && baseFee !== undefined ? (tx.gasPrice > baseFee ? tx.gasPrice - baseFee : 0n) : tip !== undefined ? BigInt(tip) : 0n);
   let price = baseFee !== undefined ? baseFee + priority : tx.gasPrice;
   if (price !== undefined && cap !== undefined && price > cap) price = cap;
   // OP Stack: the L1 data fee, at the L1 prices the chain last took in, charged on top of the gas.

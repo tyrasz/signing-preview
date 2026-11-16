@@ -346,8 +346,6 @@ const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
 /** The simulated bundler when no other is known (simulateHandleOp doesn't check its caller; paymasters can check tx.origin, see recentBundlers). */
 const BUNDLER = '0x0000000000000000000000000000000000004337';
 const BUNDLER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
-/** Chains whose transactions pay the base fee and no tip (Arbitrum): tx.gasprice is the base fee. */
-const NO_TIPS = new Set([42161, 421614]);
 
 /**
  * Bundlers that recently submitted operations this paymaster paid for (at most five), which its operations are
@@ -2760,14 +2758,14 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   clearTimeout(timer);
   const first = soon[0] ?? BUNDLER;
   // The price the bundle's transaction pays (tx.gasprice), taken as what the operation pays its bundler: the base fee
-  // plus its priority fee, up to its fee cap (the base fee alone on Arbitrum, which takes no tips). Contracts read it:
+  // plus its priority fee, up to its fee cap (on Arbitrum too, which now charges tips: tx-checks). Contracts read it:
   // a Base DEX's pools add a "MEV tax" to a swap's fee by the transaction's priority fee, and an operation simulated
   // at no price showed a swap that on-chain, taxed, missed its minimum and reverted. An operation paying less than
   // the base fee (a gasless one, its fee cap zero: its bundler pays) still rides in a transaction that pays the
   // market's price: the base fee plus the node's suggested tip. Left out when the base fee isn't known.
-  const tip = NO_TIPS.has(op.chainId) ? 0n : op.maxPriorityFeePerGas;
+  const tip = op.maxPriorityFeePerGas;
   const price = fee === undefined ? undefined : op.maxFeePerGas >= fee ? (op.maxFeePerGas < fee + tip ? op.maxFeePerGas : fee + tip)
-    : fee + (NO_TIPS.has(op.chainId) ? 0n : await suggestedTip(deps, op.chainId));
+    : fee + await suggestedTip(deps, op.chainId);
   // An account whose deployment, or validation, checks the bundler sending it (tx.origin), as a paymaster can: OKX
   // Wallet's accounts that one of its factories deploys (0x335e…9fe3 on Ethereum) only initialize when the bundler is
   // on OKX's list (isWhitelistedBundler), else InvalidBundler() (AA13), and the operation was shown as one bundlers

@@ -112,6 +112,12 @@ export interface ChainProfile {
    */
   tipsTo?: string;
   /**
+   * Who is paid a transaction's base fee, where it isn't burnt: OP Stack's BaseFeeVault, which a later call in a batch
+   * may read (on OP Mainnet, 2026-11-16, a priced call's 21,000 gas at the base fee were in it on the node and not in
+   * the local EVM; in block 159,602,470 the vault gained exactly its 33 transactions' base fee).
+   */
+  baseFeeTo?: string;
+  /**
    * EIPs the chain runs that its fork doesn't have. HyperEVM, on Cancun's rules, follows an EIP-7702 delegation: a
    * call into an account whose code is 0xef0100 and an address runs that address's code (measured on its node with
    * such code given to an account; it mined no EIP-7702 transaction in 400 blocks, so whether an account there
@@ -319,13 +325,27 @@ const POLYGON_PRECOMPILES = {
   2537: { bls12381G1AddGas: 1_050, bls12381G1MulGas: 73_200, bls12381G2AddGas: 1_620, bls12381G2MulGas: 144_000, bls12381PairingBaseGas: 109_330, bls12381PairingPerPairGas: 94_540, bls12381MapG1Gas: 15_400, bls12381MapG2Gas: 66_640 },
 };
 
+/** EIP-2935's history contract and EIP-4788's beacon roots contract, which a block's start writes into (run). */
+const HISTORY_STORAGE = '0x0000f90827f1c53a10cb7a02335b175320002935', BEACON_ROOTS = '0x000f3df6d732807ef1319fb7b8bb8522d0beac02';
+/** OP Stack's BaseFeeVault predeploy (ChainProfile.baseFeeTo). */
+const BASE_FEE_VAULT = '0x4200000000000000000000000000000000000019';
+/**
+ * Where Arbitrum One pays a transaction's fee, none of it to COINBASE. Measured on its node, 2026-11-16, a call priced
+ * at the base fee (20,012,000) and a tip of 1 gwei, 21,000 gas of L2 and 9 of L1: its infrastructure fee account was
+ * paid the L2 gas at ArbOS's minimum gas price (20,000,000, ArbGasInfo.getMinimumGasPrice), its network fee account
+ * the L2 gas at the rest of the price (the base fee over the minimum, and the tip), and the L1 pricer's pool the L1
+ * gas at the whole price. The chain charges every tip a transaction names, up to its fee cap.
+ */
+const ARBITRUM_FEES = { infra: '0xbf5041fc07e1c866d15c749156657b8eed0fb649', network: '0x32e7af5a8151934f3787d0cd59eb6edd0a736b1d', l1: '0xa4b00000000000000000000000000000000000f6' };
+const ARB_GAS_INFO = '0x000000000000000000000000000000000000006c';
+
 export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   1: { hardfork: 'osaka', checked: { forkId: '0x07c9462e', on: '2026-11-10' }, ...NEXT_BLOCK[1] },
   // Sepolia runs Amsterdam (Glamsterdam) since 2026-10-06: its blocks say so, and run under those rules (see ETHEREUM_RULES).
   11155111: { hardfork: 'osaka', checked: { forkId: '0x6c1d9423', on: '2026-11-11' }, ...NEXT_BLOCK[11155111] },
   42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, precompileGas: arbosGas, revertsKeepGas: ARBOS, missingOpcodes: [0x4a] },
-  8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453] },
-  10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10] },
+  8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453], baseFeeTo: BASE_FEE_VAULT },
+  10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10], baseFeeTo: BASE_FEE_VAULT },
   // Polygon prices storage its own way. Measured on its node with code overrides (2026-11-10): a cold SLOAD costs
   // 5,460; a cold SSTORE adds 2,940 (setting an empty slot 22,940, changing a set one 5,000 as on Ethereum, writing
   // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and
@@ -612,6 +632,15 @@ class StateSource {
     let c: unknown;
     try { await this.send([{ method: 'eth_config', params: [], done: r => { c = r; } }], RULES); } catch { return undefined; }
     return c;
+  }
+  /** Arbitrum: ArbOS's minimum gas price, which its infrastructure fee account is paid at (ARBITRUM_FEES). */
+  private minimumGasPrice?: Promise<bigint | undefined>;
+  arbMinimumGasPrice(): Promise<bigint | undefined> {
+    return this.minimumGasPrice ??= (async () => {
+      let v: bigint | undefined;
+      try { await this.send([{ method: 'eth_call', params: [{ to: ARB_GAS_INFO, data: '0xf918379a' }, this.block], done: r => { if (typeof r === 'string' && /^0x[0-9a-f]{64}$/i.test(r)) v = BigInt(r); } }]); } catch { v = undefined; }
+      return v;
+    })();
   }
   /** The node's runs of calls handed to it (nodeRun), by what was asked: a speculative round asks again. */
   private nodeRuns = new Map<string, Promise<NodeCallResult[][]>>();
@@ -1228,6 +1257,9 @@ class LazyState extends SimpleStateManager {
    */
   override async deleteAccount(address: Address): Promise<void> {
     await super.deleteAccount(address);
+    // (Its code goes with it: SimpleStateManager keeps code apart from accounts, and a contract destroyed in the
+    // transaction that made it read as having its code still, EXTCODESIZE 2, while its hash read as no account's.)
+    this.topCodeStack().set(address.toString(), new Uint8Array(0));
     if (!this.misses || this.source.accounts.has(address.toString())) await this.clearStorage(address);
   }
 }
@@ -1905,8 +1937,10 @@ export class ForkSimulator implements Simulator {
     for (const t of tokens) first.accounts.add(t);
     if (tokens.size) first.accounts.add(ZERO);
     const fixed = at?.header ?? this.opts.header?.(chainId);
-    const tipped = profile.arbitrum ? undefined : profile.tipsTo ?? fixed?.coinbase;
-    if (tipped && reqs.some(r => r.gas !== undefined && r.gasPrice)) first.accounts.add(hexOf(tipped));
+    const tipped = profile.arbitrum ? Object.values(ARBITRUM_FEES) : [profile.tipsTo ?? fixed?.coinbase, profile.baseFeeTo];
+    if (reqs.some(r => r.gas !== undefined && r.gasPrice)) for (const a of tipped) if (a) first.accounts.add(hexOf(a));
+    // (And the contracts a block's start writes into, and the parent's hash it writes: run.)
+    if (!profile.arbitrum) { first.accounts.add(HISTORY_STORAGE); first.accounts.add(BEACON_ROOTS); if (fixed && fixed.number > 0n) first.blocks.add(Number(fixed.number - 1n)); }
     // And what the node says the calls will touch (eth_createAccessList), read with them: the local EVM then needs
     // fewer rounds of reads, each a wait on the node, longer where it rate limits, and each a run of every call again.
     // Asked in one batch for up to eight calls: the first four and the last four, where a replay's own transaction is
@@ -2088,7 +2122,7 @@ export class ForkSimulator implements Simulator {
     // a block time later, with opcode 0x44 as the chain answers it (src/block.ts).
     const next = headerAfter(source.chainId, await source.header(tag));
     return { header: { number: next.number, coinbase: createAddressFromString(next.coinbase), timestamp: next.timestamp, difficulty: 0n, prevRandao: hexToBytes(next.prevRandao),
-      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n, ...(next.slotNumber !== undefined && { slotNumber: next.slotNumber }), ...(next.milliseconds !== undefined && { milliseconds: next.milliseconds }) }, arbBlockNumber: next.arbBlockNumber ?? next.number, amsterdam: next.amsterdam };
+      gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n, ...(next.slotNumber !== undefined && { slotNumber: next.slotNumber }), ...(next.milliseconds !== undefined && { milliseconds: next.milliseconds }), ...(next.beaconRoot && { beaconRoot: next.beaconRoot }) }, arbBlockNumber: next.arbBlockNumber ?? next.number, amsterdam: next.amsterdam };
   }
 
   /**
@@ -2160,8 +2194,13 @@ export class ForkSimulator implements Simulator {
       if (made && turnedAway(address, selector, made)) {
         return address === ARB_FILTERED_TRANSACTIONS && input.gasLimit >= 1_600n ? { executionGasUsed: 1_600n, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.REVERT) } : burnt(input.gasLimit, EVMError.errorMessages.REVERT);
       }
-      // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet.
-      if (profile.arbitrum && address === ARBSYS && selector === '0xa3b1b31d') return { executionGasUsed: profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      // ArbSys.arbBlockNumber(): the simulated block's own number, which the chain can't be asked for yet. (Given less
+      // than its price, it fails as any of ArbOS's calls does, burning all it was given: 802 gas on Arbitrum One's node.)
+      if (profile.arbitrum && address === ARBSYS && selector === '0xa3b1b31d') {
+        const price = profile.precompileGas?.(4, 32, '0xa3b1b31d') ?? 2000n;
+        if (price > input.gasLimit) return burnt(input.gasLimit);
+        return { executionGasUsed: price, returnValue: hexToBytes(`0x${block.arbBlockNumber.toString(16).padStart(64, '0')}`) };
+      }
       // (Run here only in the transaction's own EVM, whose messages are followed; the views read around it never send.)
       if (profile.arbitrum && address === ARBSYS && (selector === SEND_TX_TO_L1 || selector === WITHDRAW_ETH) && input._EVM === evm) {
         const sent = await arbSysSend(input);
@@ -2672,6 +2711,27 @@ export class ForkSimulator implements Simulator {
     const keeps = !!misses && !this.opts.trace && chainId !== BASE;
     let snapshot: RunSnapshot | undefined;
     const start = resume?.at ?? 0;
+    // What a block's start writes before its first transaction, as the chain's node does in its simulated block too:
+    // EIP-2935's history (from Prague: the parent's hash, at slot (number - 1) % 8191) and EIP-4788's beacon root (at
+    // the block's time: slot time % 8191 holds the time, the slot 8,191 after it the root), where their contracts have
+    // code. Before, the local EVM wrote neither: on Ethereum, the history contract answered the block before with the
+    // hash of the one 8,191 before it, and a read of the root at the block's own time reverted, so EigenLayer's
+    // EigenPod.startCheckpoint failed (InvalidEIP4788Response) where the node's run succeeded (2026-11-16). Not on
+    // Arbitrum, whose node's simulated block writes neither (ArbOS keeps its own history, which the chain's blocks
+    // write); HyperEVM has neither contract.
+    if (!resume && !profile.arbitrum) {
+      const write = async (contract: string, slot: bigint, value: Uint8Array) => {
+        const at = createAddressFromString(contract);
+        if (!(await state.getCode(at)).length) return;
+        await state.putStorage(at, setLengthLeft(hexToBytes(`0x${slot.toString(16)}`), 32), unpadBytes(value));
+      };
+      const n = block.header.number as bigint, time = block.header.timestamp as bigint, root = (block.header as { beaconRoot?: Hex }).beaconRoot;
+      if (!BEFORE_PRAGUE.has(profile.hardfork) && n > 0n) await write(HISTORY_STORAGE, (n - 1n) % 8191n, (await blockchain.getBlock(Number(n - 1n))).hash());
+      if (root !== undefined) {
+        await write(BEACON_ROOTS, time % 8191n, hexToBytes(`0x${time.toString(16).padStart(64, '0')}`));
+        await write(BEACON_ROOTS, time % 8191n + 8191n, hexToBytes(root));
+      }
+    }
     // From the request that reaches a Stylus program on, the calls are the chain's node's (rounds' `nodeFrom`, or a
     // request whose own target is one, found below).
     let onNode = nodeFrom;
@@ -2770,6 +2830,26 @@ export class ForkSimulator implements Simulator {
         results.push({ status: 'reverted', source: source_, revertReason: `insufficient funds: the account holds ${units(chainId, nativeBefore)} and the call sends ${units(chainId, req.value)}`, transfers: [], basis: 'fork' });
         continue;
       }
+      // A transaction the network refuses before it runs, as every chain's node refuses it (with its validation off
+      // too), so it fails here without running, as on the node's path (rejection, src/simulation.ts): a gas limit
+      // under what it pays before its call, or (from Prague, Arbitrum aside, and under Amsterdam) under EIP-7623's
+      // calldata floor; initcode over the most a creation may carry (EIP-3860; Amsterdam's EIP-7954); a creation with
+      // EIP-7702 authorizations; a sender that can't pay for its gas at its price and what it sends. The local EVM ran
+      // them (2026-11-16): a transfer on 20,999 gas succeeded at 21,000, 1,000 nonzero bytes on 60,999 at 61,000, a
+      // 49,153-byte creation reverted burning all it had, an unaffordable priced call succeeded; on HyperEVM, where it
+      // is the simulator, the preview said "success" for a transaction the chain refuses.
+      {
+        const amsterdam = profile.hardfork === 'amsterdam', { intrinsic, floor } = intrinsicGas(req, amsterdam);
+        const floored = amsterdam || (!BEFORE_PRAGUE.has(profile.hardfork) && !profile.arbitrum);
+        const blobs = BigInt(req.blobVersionedHashes?.length ?? 0) * 131_072n * (req.at?.header.blobBaseFee ?? 1n);
+        const refused = req.gas !== undefined && req.gas < intrinsic ? `out of gas: the gas limit (${req.gas.toLocaleString('en-US')}) is below the ${intrinsic.toLocaleString('en-US')} any transaction with this calldata pays before it runs (the network refuses it: intrinsic gas too low)`
+          : req.gas !== undefined && floored && req.gas < floor ? `out of gas: the gas limit (${req.gas.toLocaleString('en-US')}) is below the ${floor.toLocaleString('en-US')} a transaction with this calldata pays at least (EIP-7623's floor: the network refuses it)`
+          : !req.to && (req.data.length - 2) / 2 > Number(common.param('maxInitCodeSize')) ? `max initcode size exceeded: the creation carries ${((req.data.length - 2) / 2).toLocaleString('en-US')} bytes, over the ${Number(common.param('maxInitCodeSize')).toLocaleString('en-US')} a creation may (the network refuses it)`
+          : !req.to && (req.authorizationList?.length || req.unsignedAuthorizations?.length) ? 'a transaction with EIP-7702 authorizations can\'t create a contract: the network refuses it'
+          : req.gas !== undefined && req.gasPrice && req.gas * req.gasPrice + blobs + req.value > await native(caller) ? `insufficient funds: the account holds ${units(chainId, await native(caller))}, and the gas limit at its price and what the call sends come to ${units(chainId, req.gas * req.gasPrice + blobs + req.value)}`
+          : undefined;
+        if (refused) { results.push({ status: 'reverted', source: source_, revertReason: refused, transfers: [], basis: 'fork' }); continue; }
+      }
       // As at the start of a transaction: nothing warm but the sender, the target, the fee recipient, the precompiles
       // and the access list (EIP-2929, EIP-3651), and "original" storage values taken afresh (EIP-2200).
       await evm.journal.cleanup();
@@ -2830,6 +2910,18 @@ export class ForkSimulator implements Simulator {
       byRequest[i] = [...reached];
       if (bought) { const account = (await state.getAccount(sender)) ?? new Account(); account.balance += bought; await state.putAccount(sender, account); }
       const ex = res.execResult;
+      // An account the transaction destroyed (SELFDESTRUCT) goes at its end, as the chain's VM removes it: from Cancun
+      // (EIP-6780) only one it created too; before, any. Under Amsterdam (EIP-8246) its code, nonce and storage go and
+      // its balance stays. The local EVM runs calls, not transactions, and kept them: the next call of a batch found
+      // the contract's code (EXTCODESIZE 2 where the node read 0), a CREATE2 to its address collided (104,337 gas
+      // where the node's succeeded at 88,335), and the trace listed it as created (2026-11-16, on every chain).
+      if (!ex.exceptionError) for (const [hex] of ex.selfdestruct ?? []) {
+        const gone = createAddressFromString(hex);
+        if (common.isActivatedEIP(6780) && !ex.createdAddresses?.has(gone.toString())) continue;
+        const kept = common.isActivatedEIP(8246) ? (await state.getAccount(gone))?.balance ?? 0n : 0n;
+        await state.deleteAccount(gone);
+        if (kept > 0n) { const left = new Account(); left.balance = kept; await state.putAccount(gone, left); }
+      }
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
       // What the call spent, and under Amsterdam what its state took from the reservoir (less what it gave back to it).
       const spent = ex.executionGasUsed + authState + (metered ? reservoir - metered.stateGasReservoir : 0n);
@@ -2842,13 +2934,28 @@ export class ForkSimulator implements Simulator {
       // that has been tipped (the price over the base fee), as on the chain.
       const settle = async () => {
         if (!bought || !req.gasPrice) return;
-        const paid = gasUsed * req.gasPrice + (bought - req.gas! * req.gasPrice), base = (block.header as { baseFeePerGas?: bigint }).baseFeePerGas ?? 0n;
+        // (On Arbitrum the chain charges the L1 gas too, where a replay's receipt says what it was: gasForL1.)
+        const l1Gas = profile.arbitrum ? req.gasForL1 ?? 0n : 0n;
+        const paid = (gasUsed + l1Gas) * req.gasPrice + (bought - req.gas! * req.gasPrice), base = (block.header as { baseFeePerGas?: bigint }).baseFeePerGas ?? 0n;
         const payer = (await state.getAccount(sender)) ?? new Account();
         payer.balance = payer.balance > paid ? payer.balance - paid : 0n;
         await state.putAccount(sender, payer);
+        const pay = async (who: string | Address, amount: bigint) => {
+          if (amount <= 0n) return;
+          const at = typeof who === 'string' ? createAddressFromString(who) : who, account = (await state.getAccount(at)) ?? new Account();
+          account.balance += amount;
+          await state.putAccount(at, account);
+        };
+        if (profile.arbitrum) {
+          const least = await source.arbMinimumGasPrice() ?? base, floor = least < req.gasPrice ? least : req.gasPrice;
+          await pay(ARBITRUM_FEES.infra, gasUsed * floor);
+          await pay(ARBITRUM_FEES.network, gasUsed * (req.gasPrice - floor));
+          await pay(ARBITRUM_FEES.l1, l1Gas * req.gasPrice);
+          return;
+        }
         const tip = req.gasPrice > base ? gasUsed * (req.gasPrice - base) : 0n;
-        const to = profile.arbitrum ? undefined : profile.tipsTo ? createAddressFromString(profile.tipsTo) : block.header.coinbase;
-        if (tip > 0n && to) { const recipient = (await state.getAccount(to)) ?? new Account(); recipient.balance += tip; await state.putAccount(to, recipient); }
+        await pay(profile.tipsTo ?? block.header.coinbase, tip);
+        if (profile.baseFeeTo) await pay(profile.baseFeeTo, gasUsed * (req.gasPrice < base ? req.gasPrice : base));
       };
       if (ex.exceptionError) {
         const data = bytesToHex(ex.returnValue) as Hex;
