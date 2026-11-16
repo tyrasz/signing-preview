@@ -471,6 +471,7 @@ export function clearForkCaches(): void {
   GUESS_ACCOUNTS.clear();
   GUESS_STORAGE.clear();
   GUESS_CALLS.clear();
+  WITHOUT_ACCESS_LISTS.clear();
 }
 
 /** Writes the shared caches to `file` (atomically: a temporary file, then a rename). */
@@ -524,6 +525,18 @@ const CODE_READER_CODE = '0x600035803b8060006000843c6000f3';
 const REVERT_METER = '0x00000000000000000000000000000000a4b0ca11', METERED_GAS = 1_000_000n, METER_OVERHEAD = 122n;
 const revertMeterCode = (precompile: string): Hex => `0x3660006000375a60006000366000600073${precompile.slice(2)}62${METERED_GAS.toString(16).padStart(6, '0')}f15a90602052900360005260406000f3`;
 
+/** One JSON-RPC request of a batch, and what to do with its answer (`answers`: its error is one too, not a failure). */
+type Job = { method: string; params: unknown[]; answers?: boolean; done: (result: unknown, error?: { code?: number; message?: string; data?: Hex }) => void };
+/** How a request is sent: how long it may take (15 seconds), and whether one that gets no answer is left at that. */
+type Asking = { timeoutMs?: number; once?: boolean };
+/**
+ * What is only asked to read ahead (the node's access lists) is left after 4 seconds without an answer, or refused
+ * for a rate limit: Sepolia's public node left one replay's eth_createAccessList unanswered for the 15 seconds a
+ * state read may take, in three of six tries, and the replay waited (2026-11-15). Its rules (eth_config) are asked
+ * again sooner too.
+ */
+const AHEAD: Asking = { timeoutMs: 4000, once: true }, RULES: Asking = { timeoutMs: 4000 };
+
 /** Fetches accounts, storage and forwarded calls from the RPC, in batches, and keeps them for the simulation. */
 class StateSource {
   accounts = new Map<string, AccountData>();
@@ -554,21 +567,37 @@ class StateSource {
   coldRead = 2_100;
   /** Forwarded precompiles whose reverts are metered (ChainProfile.revertsKeepGas): what each was charged is asked with the answer. */
   metered = new Set<string>();
+  /** What the simulation ran: calls (in all its rounds) and the views around them (StateSource.spent's answered none). */
+  ran = { calls: 0, views: 0 };
+  /** Views that spent half their gas and answered no word, by contract and selector, with the code they ran (viewCall). */
+  spent = new Map<string, { code: Uint8Array; out: Uint8Array | undefined }>();
 
   /**
-   * What the node says a call will touch (eth_createAccessList, on the block the reads are of): the accounts and
-   * slots to read before the first run. Undefined where it won't say (no such method, an error).
+   * What the node says each call will touch (eth_createAccessList, on the block the reads are of), asked in one
+   * batch: the accounts and slots to read before the first run. Undefined for a call it won't say for (no such
+   * method, an error).
    */
-  async accessList(call: Record<string, unknown>): Promise<{ address: string; storageKeys: string[] }[] | undefined> {
-    let out: { accessList?: { address: string; storageKeys: string[] }[] } | undefined;
-    try { await this.send([{ method: 'eth_createAccessList', params: [call, this.block], done: r => { out = r as typeof out; } }]); } catch { return undefined; }
-    return Array.isArray(out?.accessList) ? out.accessList : undefined;
+  async accessLists(calls: Record<string, unknown>[]): Promise<{ lists: ({ address: string; storageKeys: string[] }[] | undefined)[]; /** The node has no such method. */ none: boolean }> {
+    const lists: ({ address: string; storageKeys: string[] }[] | undefined)[] = calls.map(() => undefined);
+    let absent = 0;
+    try {
+      await this.sendAll(calls.map((call, i) => ({ method: 'eth_createAccessList', params: [call, this.block], answers: true,
+        done: (r: unknown, e?: { code?: number; message?: string }) => {
+          const list = (r as { accessList?: unknown } | null)?.accessList;
+          if (!e && Array.isArray(list)) lists[i] = list as { address: string; storageKeys: string[] }[];
+          // (Only the method being missing: JSON-RPC's -32601, or an error that says so of a method. Not the state
+          // the call needs: Sepolia's public node answers "historical state … is not available" for every call from
+          // a backend that has pruned the block, and the next simulation's backend may have it.)
+          if (e && (e.code === -32601 || /\bmethod\b[^.]*\b(not found|does not exist|not available|not supported|unsupported)\b|unsupported method/i.test(e.message ?? ''))) absent++;
+        } })), AHEAD);
+    } catch { /* none to read ahead */ }
+    return { lists, none: calls.length > 0 && absent === calls.length };
   }
 
   /** The node's own account of the rules it runs (eth_config, EIP-7910); undefined where it gives none. */
   async config(): Promise<unknown> {
     let c: unknown;
-    try { await this.send([{ method: 'eth_config', params: [], done: r => { c = r; } }]); } catch { return undefined; }
+    try { await this.send([{ method: 'eth_config', params: [], done: r => { c = r; } }], RULES); } catch { return undefined; }
     return c;
   }
   /** The node's runs of calls handed to it (nodeRun), by what was asked: a speculative round asks again. */
@@ -781,8 +810,33 @@ class StateSource {
     return isAddress(owner) ? `0xdd62ed3e${owner.slice(2)}${key.slice(2)}` : undefined; // allowance(owner, spender)
   }
 
-  private async fetchAt(m: Misses): Promise<void> {
-    type Job = { method: string; params: unknown[]; done: (result: unknown, error?: { message?: string; data?: Hex }) => void };
+  /**
+   * Reads in flight, by key (`a:` an account, a slot's key, `c:` a forwarded call, `b:` a block's hash): a read
+   * another fetch asked for while this one is out (the reads around the calls being found while the node's access
+   * lists are read: ForkSimulator.warmViews) waits for it instead of asking again.
+   */
+  private inflight = new Map<string, Promise<void>>();
+
+  private async fetchAt(wanted: Misses): Promise<void> {
+    const waits = new Set<Promise<void>>();
+    const m = newMisses();
+    const mine = (k: string) => { const p = this.inflight.get(k); if (p) waits.add(p); return !p; };
+    for (const a of wanted.accounts) if (mine(`a:${a}`)) m.accounts.add(a);
+    for (const k of wanted.storage) if (mine(k)) m.storage.add(k);
+    for (const k of wanted.calls) if (mine(`c:${k}`)) m.calls.add(k);
+    for (const n of wanted.blocks) if (mine(`b:${n}`)) m.blocks.add(n);
+    const keys = [...[...m.accounts].map(a => `a:${a}`), ...m.storage, ...[...m.calls].map(k => `c:${k}`), ...[...m.blocks].map(n => `b:${n}`)];
+    let finished!: () => void;
+    const own = new Promise<void>(r => { finished = r; });
+    for (const k of keys) this.inflight.set(k, own);
+    try { if (keys.length) await this.fetchFresh(m); } finally {
+      for (const k of keys) if (this.inflight.get(k) === own) this.inflight.delete(k);
+      finished();
+    }
+    await Promise.all(waits);
+  }
+
+  private async fetchFresh(m: Misses): Promise<void> {
     const jobs: Job[] = [];
     const pending: [string, AccountData][] = [];
     for (const a of m.accounts) {
@@ -797,7 +851,7 @@ class StateSource {
       } });
       // Most contracts are proxies: their implementation is the next thing a call reads. Only for an account not seen
       // before: one seen before is known to have no code, or its slots are guessed and fetched only if read.
-      if (!GUESS_ACCOUNTS.get(`${this.chainId}:${a}`)) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`) && !m.storage.has(`${a}_${slot}`)) {
+      if (!GUESS_ACCOUNTS.get(`${this.chainId}:${a}`)) for (const slot of PROXY_SLOTS) if (!this.storage.has(`${a}_${slot}`) && !m.storage.has(`${a}_${slot}`) && !this.inflight.has(`${a}_${slot}`)) {
         jobs.push({ method: 'eth_getStorageAt', params: [a, slot, this.block], done: r => { this.setStorage(`${a}_${slot}`, unpadBytes(hexToBytes(r as Hex))); } });
       }
     }
@@ -851,12 +905,12 @@ class StateSource {
   }
 
   /** The jobs in batches of the source's size, a few at a time. */
-  private async sendAll(jobs: { method: string; params: unknown[]; done: (r: unknown, e?: { message?: string; data?: Hex }) => void }[]) {
-    const batches: (typeof jobs)[] = [];
+  private async sendAll(jobs: Job[], ask?: Asking) {
+    const batches: Job[][] = [];
     for (let i = 0; i < jobs.length; i += this.batchSize) batches.push(jobs.slice(i, i + this.batchSize));
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(this.concurrency, batches.length) }, async () => {
-      while (next < batches.length) await this.send(batches[next++]);
+      while (next < batches.length) await this.send(batches[next++], ask);
     }));
   }
 
@@ -876,37 +930,53 @@ class StateSource {
   guessStorage(k: string) { return GUESS_STORAGE.get(`${this.chainId}:${k}`); }
   guessCall(k: string) { return GUESS_CALLS.get(`${this.chainId}:${k}`); }
 
-  private async send(batch: { method: string; params: unknown[]; done: (r: unknown, e?: { message?: string; data?: Hex }) => void }[]) {
+  private async send(batch: Job[], ask: Asking = {}) {
     let throttled = false;
     for (let attempt = 0; ; attempt++) {
       // (Said as a rate limit where the node was refusing for one: a caller can tell it from a slow EVM.)
       if (Date.now() > this.deadline) throw new ForkTimeout(`the simulation ran out of time fetching chain state${throttled ? ' (the node rate limited its reads)' : ''}`);
       this.requests += batch.length;
-      const res = await this.fetchImpl(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify(batch.map((j, i) => ({ jsonrpc: '2.0', id: i, method: j.method, params: j.params }))) });
-      const body = res.ok ? await res.json() as unknown : undefined;
-      // Rate limits, and load-balanced nodes a block behind ("invalid block height") are worth retrying.
-      const transient = /rate limit|too many requests|invalid block height|header not found|unknown block/i;
-      const text = Array.isArray(body) ? '' : JSON.stringify(body ?? '');
-      const limited = res.status === 429 || transient.test(text);
-      throttled = res.status === 429 || /rate limit|too many requests/i.test(text);
       // Public RPCs rate-limit per IP: back off (as long as the node asks, else twice as long each time, up to 4 s
       // between tries), within the simulation's deadline. (Waiting a rate limit out for all of a replay's minute
       // rescued no trace on Arbitrum One's public node, which refused for longer: eight tries, some twenty seconds.)
-      const asked = Number(res.headers?.get?.('retry-after'));
+      let asked = 0;
       const wait = () => Math.min(asked > 0 ? asked * 1000 : 300 * 2 ** attempt, 4000);
-      if ((limited || res.status >= 500) && attempt < 8) { await new Promise(r => setTimeout(r, wait())); continue; }
+      let res: Response;
+      try {
+        // (No longer than the time left, nor 15 seconds: a request the node never answers is asked again.)
+        res = await this.fetchImpl(this.url, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(Math.max(1000, Math.min(ask.timeoutMs ?? 15_000, this.deadline - Date.now()))),
+          body: JSON.stringify(batch.map((j, i) => ({ jsonrpc: '2.0', id: i, method: j.method, params: j.params }))) });
+      } catch (e) {
+        // The request itself failed: it timed out (BNB Chain's public node left eleven of a run's replays without an
+        // answer for 15 seconds, 2026-11-14, and each failed the whole simulation), or the connection was reset.
+        // Asked again, like an HTTP 5xx, while there is time.
+        if (!ask.once && attempt < 8 && Date.now() < this.deadline) { await new Promise(r => setTimeout(r, wait())); continue; }
+        // (Cut short as the simulation's time ran out, the request no longer than that: said so, as a read asked past
+        // it is. A caller can then keep an answer it had: an extra run's, with a later-seen token watched.)
+        if (Date.now() >= this.deadline) throw new ForkTimeout(`the simulation ran out of time fetching chain state${throttled ? ' (the node rate limited its reads)' : ''}`);
+        throw new Error(`state fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const body = res.ok ? await res.json().catch(() => undefined) as unknown : undefined;
+      // Rate limits, and load-balanced nodes a block behind ("invalid block height", reth's "block not found") are
+      // worth retrying.
+      const transient = /rate limit|too many requests|invalid block height|header not found|unknown block|block not found/i;
+      const text = Array.isArray(body) ? '' : JSON.stringify(body ?? '');
+      const limited = res.status === 429 || transient.test(text);
+      throttled = res.status === 429 || /rate limit|too many requests/i.test(text);
+      asked = Number(res.headers?.get?.('retry-after'));
+      if ((limited || res.status >= 500 || (res.ok && body === undefined)) && attempt < 8 && !ask.once) { await new Promise(r => setTimeout(r, wait())); continue; }
       if (!Array.isArray(body)) throw new Error(`state fetch failed: HTTP ${res.status} ${text.slice(0, 160)}`);
       const byId = new Map((body as { id: number; result?: unknown; error?: { code?: number; message?: string; data?: Hex } }[]).map(r => [r.id, r]));
-      const retry = batch.filter((_, i) => transient.test(byId.get(i)?.error?.message ?? ''));
+      // (A request the answer left out is asked again too: its value is not known.)
+      const retry = batch.filter((_, i) => !byId.has(i) || transient.test(byId.get(i)?.error?.message ?? ''));
       batch.forEach((j, i) => {
         const r = byId.get(i);
         if (!r || transient.test(r.error?.message ?? '')) return;
         // eth_call reverts are answers (a forwarded precompile can revert); a failed state read is not.
-        if (r.error && j.method !== 'eth_call') throw new Error(`${j.method} failed: ${r.error.message}`);
+        if (r.error && j.method !== 'eth_call' && !j.answers) throw new Error(`${j.method} failed: ${r.error.message}`);
         j.done(r.result, r.error);
       });
-      if (!retry.length) return;
+      if (!retry.length || ask.once) return;
       if (attempt >= 8) throw new Error('state fetch: rate limited');
       batch = retry;
       await new Promise(r => setTimeout(r, wait()));
@@ -916,12 +986,68 @@ class StateSource {
 
 /** Chains whose RPC has no eth_createAccessList (HyperEVM's answers eth_call and state reads only). */
 const NO_ACCESS_LIST = new Set([999, 998]);
+/** RPCs that said they have no eth_createAccessList, for every call they were asked it for (Arbitrum One's public one). */
+const WITHOUT_ACCESS_LISTS = new Set<string>();
 
 /** Arbitrum's Stylus programs: WASM, compressed, behind the prefix 0xEFF000 (then the compression dictionary's byte). */
 export const isStylus = (code: Uint8Array) => code.length > 3 && code[0] === 0xef && code[1] === 0xf0 && code[2] === 0x00;
 
 /** An address in the range chains keep for precompiles and their own contracts (under 0x10000): its proxy slots aren't read ahead. */
 const lowAddress = (a: string) => BigInt(a) < 0x10000n;
+
+/** A run's state between two of its calls (LazyState.snapshot). */
+interface StateSnapshot { accounts: Map<Hex, Account | undefined>; code: Map<Hex, Uint8Array>; storage: Map<string, Uint8Array>; cleared: Set<string> }
+const copyAccounts = (m: Map<Hex, Account | undefined>) => new Map([...m].map(([k, a]) => [k, a && Object.assign(Object.create(Object.getPrototypeOf(a)), a) as Account]));
+
+/**
+ * Code that can't return data, whatever it is sent: no byte of it is RETURN (0xf3), nor a call to other code that
+ * could (CALL, CALLCODE, DELEGATECALL, STATICCALL), counting push data too. (Not an EIP-7702 delegation or a marker
+ * the chain's node runs itself, whose code isn't what runs.)
+ */
+const answersNothing = (code: Uint8Array) => code.length > 0 && code[0] !== 0xef && !code.some(b => b === 0xf3 || b === 0xf1 || b === 0xf2 || b === 0xf4 || b === 0xfa);
+
+// A view (a balance, an allowance) gets 10 million gas: a token whose balanceOf works out what an account holds can
+// take more than a million (Open Genesis, on BNB Chain: 1.37 million), and with less the read fails and the token's
+// events stand, which for that one netted to a unit where the balance went down by 4.56e18.
+const VIEW_GAS = 10_000_000n;
+
+/**
+ * A view (a balance, an allowance, an interface asked for) on `on`: its return data, undefined where it failed.
+ * The contracts read so are each call's target and the addresses in its calldata as well as tokens, so some aren't:
+ * Sepolia's blocks carry transactions to a contract that loops on whatever it is sent until its gas is spent
+ * (0x4a65…3441, 2.5 million gas a transaction), and every view of it burnt all of its 10 million. A replay of one of
+ * them behind three others read it 36 times, 35 of its 39 seconds (2026-11-15). So a view that spent half its gas
+ * and answered no word is remembered for the simulation (StateSource.spent), by contract and function, with the
+ * code it ran: asked again, while that code is there, it answers as it did, without running. (Only from a run that
+ * has read nothing it had to guess, this view included: a value guessed earlier in the run is guessed again when the
+ * view reads it, and what a call wrote from one is no fresher, and either could be what sent the view looping. A
+ * token's view that answers takes a sliver of that: Open Genesis's 1.37 million is the most seen.) And code with no
+ * RETURN in it, and no call to other code, can't answer at all: not run (that contract's 33 bytes are such).
+ * `memo` is where such views are kept: the run's own (StateSource.spent), or warmViews' (whose EVM has none of the
+ * chain's precompiles and hooks: a B20 token's marker code, run there, burns all it is given).
+ */
+async function viewCall(on: EVM, source: StateSource, misses: Misses | null, to: string, data: Uint8Array, block: unknown, memo = source.spent): Promise<Uint8Array | undefined> {
+  const address = createAddressFromString(to), key = `${hexOf(to)}_${bytesToHex(data.subarray(0, 4))}`;
+  const code = await on.stateManager.getCode(address), kept = memo.get(key);
+  if (kept && kept.code === code) return kept.out;
+  if (answersNothing(code)) return undefined;
+  source.ran.views++;
+  const r = await on.runCall({ caller: createAddressFromString(ZERO), to: address, data, gasLimit: VIEW_GAS, isStatic: true, block: block as never });
+  const ex = r.execResult, out = ex.exceptionError ? undefined : ex.returnValue;
+  if (ex.returnValue.length < 32 && ex.executionGasUsed * 2n >= VIEW_GAS && (!misses || !missCount(misses))) memo.set(key, { code, out });
+  return out;
+}
+
+/**
+ * Where a speculative run got to on fetched values alone: the calls before `at` read nothing they had to guess, so
+ * their results and the state they left are what every later run would come to. What a run starts from instead of
+ * running them again (ForkSimulator.rounds): the state, the accounts touched (EIP-161: the next call's start removes
+ * the empty ones), the results and what they saw.
+ */
+interface RunSnapshot {
+  at: number; state: StateSnapshot; touched: string[]; results: SimulationResult[]; byRequest: string[][]; seenTokens: string[]; seenApprovals: SimulatedApproval[];
+  touchedApprovals: [string, SimulatedApproval][]; rerun: boolean; grewAt: number[]; nft: [string, boolean][];
+}
 
 /**
  * SimpleStateManager whose missing values come from the StateSource. With `misses` set (a speculative run), a value
@@ -1026,6 +1152,20 @@ class LazyState extends SimpleStateManager {
   override async clearStorage(address: Address): Promise<void> {
     await super.clearStorage(address);
     this.cleared.add(address.toString());
+  }
+
+  /** What this state holds between two calls of a run (one layer: no call is open), for a later run to start from. */
+  snapshot(): StateSnapshot | undefined {
+    if (this.accountStack.length !== 1) return undefined;
+    return { accounts: copyAccounts(this.topAccountStack()), code: new Map(this.topCodeStack()), storage: new Map(this.topStorageStack()), cleared: new Set(this.cleared) };
+  }
+
+  /** Starts from a snapshot's state (copied: a run changes what it starts from). */
+  restore(s: StateSnapshot): void {
+    this.accountStack = [copyAccounts(s.accounts)];
+    this.codeStack = [new Map(s.code)];
+    this.storageStack = [new Map(s.storage)];
+    this.cleared = new Set(s.cleared);
   }
 
   /**
@@ -1581,7 +1721,7 @@ export class ForkSimulator implements Simulator {
   private noSimulate = new Set<number>();
   private opts: Required<Omit<ForkSimulatorOptions, 'profiles' | 'block' | 'header' | 'onRound'>> & Pick<ForkSimulatorOptions, 'block' | 'header' | 'onRound'> & { profiles: Record<number, ChainProfile> };
   /** Counters from the last simulation, for tuning and tests. */
-  last?: { rounds: number; requests: number; ms: number; trace?: StorageStep[] };
+  last?: { rounds: number; requests: number; ms: number; /** Calls the EVM ran, in all the rounds (a round resumed past one doesn't run it again). */ calls?: number; /** Views run around them (a balance, an allowance), in all the rounds. */ views?: number; trace?: StorageStep[] };
   /** Tokens that simulations still running have seen in their Transfer logs so far, by request (see discovered()). */
   private seen = new Map<string, Set<string>>();
   /** Values loaded from the cache file when the simulator was created. */
@@ -1692,52 +1832,6 @@ export class ForkSimulator implements Simulator {
       // Storage set for the simulation: read before the chain's value, never cached as the chain's.
       for (const [slot, value] of Object.entries(o.stateDiff ?? {})) source.storage.set(slotKey(a, slot), unpadBytes(hexToBytes(value as Hex)));
     }
-    // The senders and targets are certain to be read: fetch them before the first run.
-    const first = newMisses();
-    for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
-    // And what the node says the calls will touch (eth_createAccessList, for the first few), read with them: the
-    // local EVM then needs fewer rounds of reads, each a wait on the node, longer where it rate limits. (Not Base's
-    // native contracts, whose storage is read their own way after a block's earlier transactions; not a chain whose
-    // RPC has no such method, HyperEVM's.)
-    // (Both at once: the senders and targets are read while the node is asked, then what it named. Not after a
-    // block's earlier transactions, which each read runs again on the node first: there, one read of it all.)
-    const together = !!source.after;
-    const known = together ? Promise.resolve() : source.fetch(first);
-    const listed = this.opts.prefetch === false || NO_ACCESS_LIST.has(chainId) ? (together ? source.fetch(first) : Promise.resolve()) : (async () => {
-      const hex = (v: bigint) => `0x${v.toString(16)}`;
-      const named = newMisses();
-      const lists = await Promise.all(reqs.slice(0, 4).map(r => source.accessList({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
-        ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) })));
-      for (const e of lists.flat()) {
-        if (!e?.address) continue;
-        const a = hexOf(e.address);
-        if (chainId === BASE && (B20_PRECOMPILE.test(a) || a in BASE_REGISTRIES || a === B20_FACTORY)) continue;
-        if (!first.accounts.has(a)) named.accounts.add(a);
-        if (!lowAddress(a)) for (const k of e.storageKeys ?? []) named.storage.add(slotKey(a, k));
-      }
-      if (together) { for (const a of named.accounts) first.accounts.add(a); for (const k of named.storage) first.storage.add(k); await source.fetch(first); }
-      else if (named.accounts.size || named.storage.size) await source.fetch(named);
-    })();
-    const prefetch = Promise.all([known, listed]);
-    const fixed = at?.header ?? this.opts.header?.(chainId);
-    const [block, , rules] = await Promise.all([fixed ? { header: { ...fixed, timestamp: at?.header.ownTimestamp ?? fixed.timestamp, ...(at?.header.ownTimestamp !== undefined && at.header.ownMilliseconds !== undefined && { milliseconds: at.header.ownMilliseconds }), coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam }
-      : this.blockContext(source, tag, profile), prefetch, this.rulesOf(chainId, source)]);
-    // Ethereum's past blocks run under the rules of their time; every other chain's under today's (see rulesNote).
-    // A block of Amsterdam's (Glamsterdam: its header says so) runs Amsterdam's rules, on Ethereum and its testnet.
-    const amsterdam = ETHEREUM_RULES.has(chainId) && !!block.amsterdam;
-    const hardfork = amsterdam ? 'amsterdam' : chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
-    if (hardfork !== profile.hardfork) profile = { ...profile, hardfork };
-    const common = createCustomCommon({ chainId }, Mainnet, { hardfork: profile.hardfork as never, ...(profile.eips && { eips: profile.eips }) });
-    source.time = block.header.timestamp;
-    // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
-    const own = getActivePrecompiles(common), forwards = new Set([...(profile.forwardedPrecompiles ?? []), ...Object.keys(profile.ownPrecompiles ?? {})].map(hexOf));
-    // (The chain's own precompiles a fork adds the local EVM has on both sides of it, an empty account before: none
-    // is refused, whatever the node's current fork lists.)
-    for (const p of profile.timedPrecompiles ?? []) forwards.add(p.address);
-    // (Base's NonceManager and TxContext the local EVM runs from Base's upgrade of 2026-11-05 on: BASE_AA_PRECOMPILES.)
-    for (const a of chainPrecompilesAt(chainId, block.header.timestamp)) forwards.add(a);
-    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !hasReference(chainId, address)) source.nodeOnly.set(address, name);
-    const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     // Tokens and approvals to read around each call: those the calls name (targets, calldata, decoder hints) and the
     // chain's well-known tokens, then those the logs reveal. Named ones matter: WETH-style wrappers emit Deposit and
     // Withdrawal, not Transfer, so logs alone miss the wrapped token. The accounts whose balances are read aren't
@@ -1749,6 +1843,68 @@ export class ForkSimulator implements Simulator {
       ...reqs.flatMap(r => [...(r.watch ?? []), ...(r.to ? [r.to] : []), ...calldataCandidates(r.data).addresses]).map(hexOf).slice(0, 40),
       ...builtinTokens(chainId).map(t => hexOf(t.address)),
     ] : reqs.flatMap(r => r.watch ?? []).map(hexOf)).filter(a => !skip(a)));
+    // The senders and targets are certain to be read, and so are the tokens read around each call (and the address
+    // 0, which reads them), and the account a replay's priced calls tip: fetch them before the first run.
+    const first = newMisses();
+    for (const r of reqs) { first.accounts.add(hexOf(r.from)); if (r.account) first.accounts.add(hexOf(r.account)); if (r.to) first.accounts.add(hexOf(r.to)); }
+    for (const t of tokens) first.accounts.add(t);
+    if (tokens.size) first.accounts.add(ZERO);
+    const fixed = at?.header ?? this.opts.header?.(chainId);
+    const tipped = profile.arbitrum ? undefined : profile.tipsTo ?? fixed?.coinbase;
+    if (tipped && reqs.some(r => r.gas !== undefined && r.gasPrice)) first.accounts.add(hexOf(tipped));
+    // And what the node says the calls will touch (eth_createAccessList), read with them: the local EVM then needs
+    // fewer rounds of reads, each a wait on the node, longer where it rate limits, and each a run of every call again.
+    // Asked in one batch for up to eight calls: the first four and the last four, where a replay's own transaction is
+    // (asked for the first four only, a Sepolia replay's own transaction behind four of its block's earlier ones went
+    // without, and its reads took nine rounds, 2026-11-15). (Not Base's native contracts, whose storage is read their
+    // own way after a block's earlier transactions; not a chain whose RPC has no such method, HyperEVM's.)
+    // (Both at once: the senders and targets are read while the node is asked, then what it named. Not after a
+    // block's earlier transactions, which each read runs again on the node first: there, one read of it all.)
+    const together = !!source.after;
+    const known = together ? Promise.resolve() : source.fetch(first);
+    const listed = this.opts.prefetch === false || NO_ACCESS_LIST.has(chainId) || WITHOUT_ACCESS_LISTS.has(url) ? (together ? source.fetch(first) : Promise.resolve()) : (async () => {
+      const named = newMisses();
+      const { lists, none } = await source.accessLists((reqs.length <= 8 ? reqs : [...reqs.slice(0, 4), ...reqs.slice(-4)]).map(nodeCall));
+      // (A node without the method isn't asked again: Arbitrum One's public node, which rate-limits by request.)
+      if (none) WITHOUT_ACCESS_LISTS.add(url);
+      for (const e of lists.flat()) {
+        if (!e?.address) continue;
+        const a = hexOf(e.address);
+        if (chainId === BASE && (B20_PRECOMPILE.test(a) || a in BASE_REGISTRIES || a === B20_FACTORY)) continue;
+        if (!first.accounts.has(a)) named.accounts.add(a);
+        if (!lowAddress(a)) for (const k of e.storageKeys ?? []) named.storage.add(slotKey(a, k));
+      }
+      if (together) { for (const a of named.accounts) first.accounts.add(a); for (const k of named.storage) first.storage.add(k); await source.fetch(first); }
+      else if (named.accounts.size || named.storage.size) await source.fetch(named);
+    })();
+    const context = fixed ? Promise.resolve({ header: { ...fixed, timestamp: at?.header.ownTimestamp ?? fixed.timestamp, ...(at?.header.ownTimestamp !== undefined && at.header.ownMilliseconds !== undefined && { milliseconds: at.header.ownMilliseconds }), coinbase: createAddressFromString(fixed.coinbase), difficulty: 0n, prevRandao: hexToBytes(fixed.prevRandao), getBlobGasPrice: () => fixed.blobBaseFee ?? 1n }, arbBlockNumber: fixed.arbBlockNumber ?? fixed.number, amsterdam: fixed.amsterdam })
+      : this.blockContext(source, tag, profile);
+    // Ethereum's past blocks run under the rules of their time; every other chain's under today's (see rulesNote).
+    // A block of Amsterdam's (Glamsterdam: its header says so) runs Amsterdam's rules, on Ethereum and its testnet.
+    const rulesAt = (b: Awaited<typeof context>) => {
+      const amsterdam = ETHEREUM_RULES.has(chainId) && !!b.amsterdam;
+      const hardfork = amsterdam ? 'amsterdam' : chainId === 1 && at?.required ? mainnetForkAt(at.header, profile.hardfork) : profile.hardfork;
+      const p = hardfork !== profile.hardfork ? { ...profile, hardfork } : profile;
+      return { profile: p, common: createCustomCommon({ chainId }, Mainnet, { hardfork: p.hardfork as never, ...(p.eips && { eips: p.eips }) }) };
+    };
+    // Meanwhile, what the reads around each call need (a token behind a proxy: its implementation, then the owner's
+    // slot in it), found by running those reads alone (warmViews): each such round is a wait on the node, where as
+    // part of the calls' rounds it is a run of every call too. (Not where the calls run after a block's earlier
+    // transactions on the node, whose every read runs those again.)
+    const warmed = together || !tokens.size ? undefined : Promise.all([known, context]).then(([, b]) => { const r = rulesAt(b); return this.warmViews(reqs, source, r.common, b, r.profile, tokens, deadline); }).catch(() => { /* only reading ahead */ });
+    const [block, , rules] = await Promise.all([context, Promise.all([known, listed, warmed]), this.rulesOf(chainId, source)]);
+    let common: ReturnType<typeof createCustomCommon>;
+    ({ profile, common } = rulesAt(block));
+    source.time = block.header.timestamp;
+    // Precompiles the node lists that this EVM neither has nor forwards (Base's own since November 2026): refused.
+    const own = getActivePrecompiles(common), forwards = new Set([...(profile.forwardedPrecompiles ?? []), ...Object.keys(profile.ownPrecompiles ?? {})].map(hexOf));
+    // (The chain's own precompiles a fork adds the local EVM has on both sides of it, an empty account before: none
+    // is refused, whatever the node's current fork lists.)
+    for (const p of profile.timedPrecompiles ?? []) forwards.add(p.address);
+    // (Base's NonceManager and TxContext the local EVM runs from Base's upgrade of 2026-11-05 on: BASE_AA_PRECOMPILES.)
+    for (const a of chainPrecompilesAt(chainId, block.header.timestamp)) forwards.add(a);
+    for (const [address, name] of rules?.precompiles ?? []) if (!own.has(address.slice(2)) && !forwards.has(address) && !hasReference(chainId, address)) source.nodeOnly.set(address, name);
+    const rulesNote = rulesNoteOf(chainId, profile, rules, at);
     const approvals = new Map<string, SimulatedApproval>();
     const key = requestKey(reqs);
     this.seen.set(key, new Set());
@@ -1774,18 +1930,57 @@ export class ForkSimulator implements Simulator {
     return [...(this.seen.get(requestKey(reqs)) ?? [])];
   }
 
+  /**
+   * The reads a run makes around each call (each account's balance of each token watched, whether a token is an
+   * NFT contract, the fee recipient), run alone on the state the calls start from, a few rounds while they find
+   * something new to fetch. A token behind a proxy takes three: the token, its implementation, the owner's slot in
+   * it. Found as part of the calls' rounds, each of those is a run of every call again: four of the nine rounds of a
+   * Sepolia replay behind three of its block's 2.5-million-gas transactions were USDC's (2026-11-15). Only finding
+   * what to fetch: whatever these reads come to, the calls' own runs read again.
+   */
+  private async warmViews(reqs: SimulationRequest[], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>, profile: ChainProfile, tokens: Set<string>, deadline: number): Promise<void> {
+    const owners = [...new Set(reqs.map(r => hexOf(r.account ?? r.from)))];
+    const reads: [string, Uint8Array][] = [];
+    for (const t of tokens) {
+      for (const o of owners) reads.push([t, hexToBytes(`0x70a08231${o.slice(2).padStart(64, '0')}`)]);
+      reads.push([t, hexToBytes(`0x01ffc9a780ac58cd${'00'.repeat(28)}`)]);
+    }
+    source.time ??= block.header.timestamp;
+    // (The views that burn their gas answering nothing, as this EVM runs them: kept apart from the run's own. This one
+    // has none of the chain's precompiles or hooks, so a view here can fail where the run's answers: a B20 token's,
+    // whose marker code the run's EVM swaps for its reference, or one that asks ArbSys.)
+    const memo: StateSource['spent'] = new Map();
+    for (let round = 0; round < 6 && Date.now() < deadline; round++) {
+      const misses = newMisses();
+      const state = new LazyState(source, misses, { common });
+      const evm = await createEVM({ common, stateManager: state, ...storagePricing(profile) });
+      try { await state.getAccount(block.header.coinbase); } catch { /* see below */ }
+      for (const [to, data] of reads) {
+        try { await viewCall(evm, source, misses, to, data, block, memo); } catch { /* a read the calls' runs will make, and say why it fails */ }
+      }
+      if (!missCount(misses)) return;
+      await source.fetch(misses);
+    }
+  }
+
   private async rounds(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
     profile: ChainProfile, tokens: Set<string>, approvals: Map<string, SimulatedApproval>, chainId: number, started: number, deadline: number, key: string, reportedFrom = 0): Promise<SimulationResult[]> {
     let watched = 0, answer: Awaited<ReturnType<ForkSimulator['run']>> | undefined;
+    // Where the last runs got to on fetched values alone (RunSnapshot): the next starts there, while the tokens and
+    // approvals watched are the same.
+    let resume: (RunSnapshot & { watching: string }) | undefined;
+    const watching = () => `${[...tokens].join()}|${[...approvals.keys()].join()}`;
     for (let round = 1; ; round++) {
       const misses = round <= this.opts.maxRounds ? newMisses() : null;
+      const now = watching();
       let run: Awaited<ReturnType<ForkSimulator['run']>>;
       try {
-        run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId);
+        run = await this.run(reqs, auths, source, misses, common, block, profile, tokens, approvals, chainId, resume?.watching === now ? resume : undefined);
+        if (run.snapshot) resume = { ...run.snapshot, watching: now };
       } catch (e) {
         // (An extra run, with a later-seen token watched, out of time: the answer it was to improve stands.)
         if (e instanceof ForkTimeout && answer) {
-          this.last = { rounds: round - 1, requests: source.requests, ms: Date.now() - started, ...(answer.trace && { trace: answer.trace }) };
+          this.last = { rounds: round - 1, requests: source.requests, ms: Date.now() - started, ...source.ran, ...(answer.trace && { trace: answer.trace }) };
           return answer.results;
         }
         if (e instanceof ForkTimeout || e instanceof ForkUnsupported || !misses || !missCount(misses)) throw e;
@@ -1806,7 +2001,7 @@ export class ForkSimulator implements Simulator {
         continue;
       }
       if (run && (!misses || (!missCount(misses) && !grew))) {
-        this.last = { rounds: round, requests: source.requests, ms: Date.now() - started, ...(run.trace && { trace: run.trace }) };
+        this.last = { rounds: round, requests: source.requests, ms: Date.now() - started, ...source.ran, ...(run.trace && { trace: run.trace }) };
         return run.results;
       }
       if (run) {
@@ -1826,10 +2021,14 @@ export class ForkSimulator implements Simulator {
       gasLimit: next.gasLimit > GAS ? next.gasLimit : GAS, baseFeePerGas: next.baseFeePerGas, getBlobGasPrice: () => 1n, ...(next.slotNumber !== undefined && { slotNumber: next.slotNumber }), ...(next.milliseconds !== undefined && { milliseconds: next.milliseconds }) }, arbBlockNumber: next.arbBlockNumber ?? next.number, amsterdam: next.amsterdam };
   }
 
-  /** One run of the calls, in order, on a fresh state over `source`. */
+  /**
+   * One run of the calls, in order, on a fresh state over `source`; or, given `resume`, of the calls from where an
+   * earlier run got to on fetched values alone, on the state it had there (RunSnapshot).
+   */
   private async run(reqs: SimulationRequest[], auths: Authorization[][], source: StateSource, misses: Misses | null, common: ReturnType<typeof createCustomCommon>, block: Awaited<ReturnType<ForkSimulator['blockContext']>>,
-    profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number) {
+    profile: ChainProfile, tokens: Set<string>, watchedApprovals: Map<string, SimulatedApproval>, chainId: number, resume?: RunSnapshot) {
     const state = new LazyState(source, misses, { common });
+    if (resume) state.restore(resume.state);
     // The point-evaluation precompile (EIP-4844's, at 0x0a) needs a KZG library and trusted setup this package doesn't
     // carry. It is a pure function of its input, so the chain's node answers it, at the precompile's fixed price.
     const pointEvaluation = getActivePrecompiles(common).has(POINT_EVALUATION.slice(2)) && !profile.noPointEvaluation ? [POINT_EVALUATION] : [];
@@ -2007,6 +2206,9 @@ export class ForkSimulator implements Simulator {
     const ownAa = aa.length ? baseAaPrecompiles(on => origins.get(on as object)) : [];
     const precompiles = [...scaled, ...timed, ...forwarded, ...chainOwn, ...moved, ...absent, ...ownAa];
     const evm: EVM = await createEVM({ common, stateManager: state, customPrecompiles: precompiles, blockchain, ...storagePricing(profile) });
+    // (What the calls before touched, for the empty accounts among them that the next call's start removes, EIP-161.)
+    const journal = evm.journal as unknown as { touched: Set<string> };
+    if (resume) journal.touched = new Set(resume.touched);
     if (ownAa.length) evm.events!.on('beforeMessage', baseAaHook(origins, evm));
     if (profile.arbitrum) evm.events!.on('beforeMessage', (m: { to?: Address; _codeAddress?: Address; caller: Address; value: bigint; isStatic: boolean; delegatecall: boolean }, next?: () => void) => {
       // (A delegate call or callcode runs the precompile's code as the calling account: `to` isn't the precompile.)
@@ -2353,13 +2555,8 @@ export class ForkSimulator implements Simulator {
       }
       return [...out.values()];
     };
-    // A view (a balance, an allowance) gets 10 million gas: a token whose balanceOf works out what an account holds
-    // can take more than a million (Open Genesis, on BNB Chain: 1.37 million), and with less the read fails and the
-    // token's events stand, which for that one netted to a unit where the balance went down by 4.56e18.
-    const viewOn = async (on: EVM, to: string, data: Hex) => {
-      const r = await on.runCall({ caller: createAddressFromString(ZERO), to: createAddressFromString(to), data: hexToBytes(data), gasLimit: 10_000_000n, isStatic: true, block });
-      return r.execResult.exceptionError ? undefined : r.execResult.returnValue;
-    };
+    // (A view gets 10 million gas, and one that burns it answering nothing isn't run again: viewCall.)
+    const viewOn = (on: EVM, to: string, data: Hex) => viewCall(on, source, misses, to, hexToBytes(data), block);
     const view = (to: string, data: Hex) => viewOn(evm, to, data);
     const balanceOf = async (token: string, owner: string) => { const r = await view(token, `0x70a08231${owner.slice(2).padStart(64, '0')}` as Hex); return r ? word(r) : undefined; };
     // The state before the first call is the chain's own: a token its logs reveal can be read there afterwards, on a
@@ -2381,20 +2578,36 @@ export class ForkSimulator implements Simulator {
       return r ? word(r) : undefined;
     };
     const native = async (a: string) => (await state.getAccount(createAddressFromString(a)))?.balance ?? 0n;
-    const nft = new Map<string, boolean>();
+    const nft = new Map<string, boolean>(resume?.nft);
     const isNft = async (t: string) => {
       if (!nft.has(t)) { const r = await view(t, `0x01ffc9a780ac58cd${'00'.repeat(28)}` as Hex); nft.set(t, !!r && word(r) === 1n); }
       return nft.get(t)!;
     };
 
-    const results: SimulationResult[] = [], byRequest: string[][] = [];
-    const seenTokens = new Set<string>(), seenApprovals: SimulatedApproval[] = [];
+    const results: SimulationResult[] = [...resume?.results ?? []], byRequest: string[][] = [...resume?.byRequest ?? []];
+    const seenTokens = new Set<string>(resume?.seenTokens), seenApprovals: SimulatedApproval[] = [...resume?.seenApprovals ?? []];
     // A token or approval first seen in a later call of a batch must be read around the calls before it too.
-    let rerun = false;
-    const grewAt: number[] = [];
-    const touched = new Map<string, SimulatedApproval>(watchedApprovals);
+    let rerun = resume?.rerun ?? false;
+    const grewAt: number[] = [...resume?.grewAt ?? []];
+    const touched = new Map<string, SimulatedApproval>(resume?.touchedApprovals ?? watchedApprovals);
     const source_ = `local EVM over chain ${chainId} state (the RPC has no eth_simulateV1)`;
-    for (const [i, req] of reqs.entries()) {
+    // Between two calls of a speculative run that has read nothing it had to guess yet, the calls before are what
+    // they will be in every later run, on the state they left: kept (RunSnapshot), so that the next round starts at
+    // the first call that guessed instead of running them all again. A replay's earlier transactions can be most of
+    // the time (a Sepolia block's that each loop through 2.5 million gas: a third of a second to over a second each
+    // in this EVM), and a round is needed for each read that only an earlier one shows. (Not with storage steps
+    // recorded, which number the calls of one run; not on Base, whose B20 tokens' bookkeeping runs across a run's
+    // calls.)
+    const keeps = !!misses && !this.opts.trace && chainId !== BASE;
+    let snapshot: RunSnapshot | undefined;
+    const start = resume?.at ?? 0;
+    for (let i = start; i < reqs.length; i++) {
+      const req = reqs[i];
+      if (keeps && i > start && !missCount(misses!)) {
+        const kept = state.snapshot();
+        if (kept) snapshot = { at: i, state: kept, touched: [...journal.touched], results: [...results], byRequest: [...byRequest], seenTokens: [...seenTokens], seenApprovals: [...seenApprovals],
+          touchedApprovals: [...touched], rerun, grewAt: [...grewAt], nft: [...nft] };
+      }
       // `from` is the account whose balances are reported; `caller` sends the call (the same, unless the request
       // names another account, e.g. a smart account the EntryPoint calls into).
       const caller = hexOf(req.from), from = hexOf(req.account ?? req.from), target = req.to ? hexOf(req.to) : ZERO;
@@ -2481,6 +2694,7 @@ export class ForkSimulator implements Simulator {
       // (A run that stopped inside a B20 token's call leaves nothing behind for this one.)
       if (charging) { evm.events!.removeListener('step', chargeStep); charging = undefined; }
       opened.length = 0; reached.clear();
+      source.ran.calls++;
       const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
@@ -2574,7 +2788,7 @@ export class ForkSimulator implements Simulator {
     }
     // Each result with the contracts the node runs itself that its own run reached, of those run from a reference.
     results.forEach((r, i) => { const own = byRequest[i]?.filter(a => source.standIns.has(a)); if (own?.length) r.standIns = own; });
-    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, grewAt, trace };
+    return { results, tokens: [...seenTokens], approvals: seenApprovals, rerun, grewAt, trace, snapshot };
   }
 
   /**

@@ -49,7 +49,8 @@ export class JsonRpcClient implements RpcClient {
   /**
    * Public RPCs (HyperEVM's in particular) rate-limit; a throttled call is retried a few times, briefly (after
    * the wait the node names, if it names one). So is one answered by a load-balanced node a block behind the others
-   * ("invalid block height", "header not found").
+   * ("invalid block height", "header not found", and reth's "block not found": publicnode's Ethereum and Sepolia
+   * endpoints answered so, now and then, for the parent of the newest block they had just served).
    */
   async call(chainId: number, method: string, params: unknown[]): Promise<unknown> {
     const url = this.urls[chainId];
@@ -59,7 +60,7 @@ export class JsonRpcClient implements RpcClient {
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
       const limited = res.status === 429;
       const body = limited ? undefined : res.ok ? await res.json() as { result?: unknown; error?: { code?: number; message?: string } } : undefined;
-      if ((limited || /rate limit|too many requests|invalid block height|header not found/i.test(body?.error?.message ?? '')) && attempt < this.retries) {
+      if ((limited || /rate limit|too many requests|invalid block height|header not found|block not found/i.test(body?.error?.message ?? '')) && attempt < this.retries) {
         // As long as the node asks (Retry-After, up to 30 seconds), else twice as long each time; spread by a
         // quarter either way, so that callers refused together don't all come back together.
         const asked = Number(res.headers?.get?.('retry-after'));

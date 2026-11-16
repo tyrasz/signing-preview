@@ -37,6 +37,7 @@ import { recoverAuthorizationAddress } from 'viem/utils';
 import { encodeFunctionData, parseAbi } from 'viem';
 import { chainName, OP_STACK, rpcUrlFor } from '../src/chains.ts';
 import { l1FeeInput } from '../src/evm/tx-checks.ts';
+import { blockReceipts, retryingTransport } from './replay-reads.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1'));
@@ -55,11 +56,12 @@ const UNSIGNED = process.argv.includes('--unsigned-7702');
 // eth_simulateV1,fork: it runs each chain's EVM rules, with what the chain adds around them (ArbOS's precompiles,
 // answered by the chain; the L1 data fees, charged outside the EVM) left to the comparison below.
 const ONLY_TYPE = arg('only-type', ''), SIMULATORS = arg('simulators', CHAIN === 1 ? 'eth_simulateV1,fork' : 'eth_simulateV1').split(',');
-const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 20_000, retries: CHAIN === 42161 ? 8 : 4, retryDelayMs: CHAIN === 42161 ? 1000 : 400 });
+// (A read that timed out, or got no answer otherwise, is asked again once: scripts/replay-reads.ts.)
+const rpc = retryingTransport(new JsonRpcClient({ [CHAIN]: URL_ }, { timeoutMs: 20_000, retries: CHAIN === 42161 ? 8 : 4, retryDelayMs: CHAIN === 42161 ? 1000 : 400 }));
 type Hex = `0x${string}`;
 type Auth = { address: Hex; chainId: Hex; nonce: Hex; r: Hex; s: Hex; yParity: Hex };
 type T = { hash: string; from: string; to: string | null; input: Hex; value: string; transactionIndex: string; type: string; gas: string; gasPrice: string; nonce: string; maxFeePerGas?: string; maxPriorityFeePerGas?: string; accessList?: { address: string; storageKeys: string[] }[]; authorizationList?: Auth[] };
-type B = { number: Hex; timestamp: Hex; miner: string; mixHash: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: T[] };
+type B = { number: Hex; hash: Hex; timestamp: Hex; miner: string; mixHash: Hex; gasLimit: Hex; baseFeePerGas: Hex; transactions: T[] };
 type R = { transactionHash: string; status: string; gasUsed: string; gasUsedForL1?: string; l1Fee?: string; operatorFeeScalar?: string; operatorFeeConstant?: string; effectiveGasPrice: string; logs: { address: string; topics: string[]; data: string }[] };
 /** What the sender paid beyond gas × price: an OP Stack chain's L1 data fee and operator fee (Isthmus). */
 const extraFee = (r: R) => BigInt(r.l1Fee ?? 0) + (r.operatorFeeScalar || r.operatorFeeConstant ? BigInt(r.gasUsed) * BigInt(r.operatorFeeScalar ?? 0) / 1_000_000n + BigInt(r.operatorFeeConstant ?? 0) : 0n);
@@ -108,6 +110,16 @@ const net = (transfers: { asset: string; from: string; to: string; raw: bigint }
 };
 
 const rows: Record<string, unknown>[] = [];
+/**
+ * What the run left out, and why: a block whose receipts the node didn't have, or a transaction a read of which
+ * failed (after the client's retries). Logged as each happens, and counted in the summary.
+ */
+const skipped: { block: number; hash?: string; why: string }[] = [];
+const skip = (block: number, e: unknown, hash?: string) => {
+  const why = (e instanceof Error ? e.message : String(e)).slice(0, 160);
+  skipped.push({ block, ...(hash && { hash }), why });
+  console.log(`  ${hash ? `transaction ${hash} of block ${block}` : `block ${block}`} skipped: ${why}`);
+};
 /** Replays one block's eligible transactions. `seen`: in follow mode, senders seen before this block (left out). */
 async function replay(b: B, seen?: Set<string>) {
   const n = Number(b.number), parent = '0x' + (n - 1).toString(16);
@@ -122,7 +134,8 @@ async function replay(b: B, seen?: Set<string>) {
   // 0x44 with it (src/block.ts). Elsewhere 0x44 is PREVRANDAO, the block's mixHash.
   const difficulty = (b as B & { difficulty?: Hex }).difficulty ?? '0x0';
   const randomness: Record<string, string> = CHAIN === 56 ? { difficulty } : CHAIN === 137 ? { prevRandao: b.mixHash, difficulty } : { prevRandao: b.mixHash };
-  const receipts = await rpc.call(CHAIN, 'eth_getBlockReceipts', [b.number]) as R[];
+  // Every transaction's receipt, waited for while the node's view lags the block's (scripts/replay-reads.ts).
+  const receipts = await blockReceipts<R>(rpc, CHAIN, b);
   // The local EVM's block: opcode 0x44 as the chain answers it (above; 1 on Arbitrum), and on Arbitrum NUMBER as the
   // L1 block the chain had seen, with the chain's own number for ArbSys.
   const word32 = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}` as Hex;
@@ -141,13 +154,14 @@ async function replay(b: B, seen?: Set<string>) {
     ['fork', forkAt()],
   ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name));
   let taken = 0;
-  for (const t of b.transactions) {
+  /** One transaction of the block: its row, unless it isn't one to replay. */
+  const transaction = async (t: T) => {
     const from = t.from.toLowerCase(), index = Number(t.transactionIndex);
     // Not the block's fee recipient: its balance also takes the block's fees, so its own change can't be told apart.
-    if (taken >= PER_BLOCK || !t.to || index > MAX_INDEX || txsBySender.get(from)! > 1 || seen?.has(from) || t.type === '0x3' || isSystem(t, b) || from === b.miner.toLowerCase() || (ONLY_TYPE && t.type !== ONLY_TYPE)) continue;
+    if (taken >= PER_BLOCK || !t.to || index > MAX_INDEX || txsBySender.get(from)! > 1 || seen?.has(from) || t.type === '0x3' || isSystem(t, b) || from === b.miner.toLowerCase() || (ONLY_TYPE && t.type !== ONLY_TYPE)) return;
     // Senders without code (EOAs; for type-4 transactions the code can be a delegation, which is what they set).
     const code = String(await rpc.call(CHAIN, 'eth_getCode', [from, parent]));
-    if (code !== '0x' && !code.startsWith('0xef0100')) continue;
+    if (code !== '0x' && !code.startsWith('0xef0100')) return;
     taken++;
     const r = receipts.find(x => x.transactionHash === t.hash)!;
     const logs = parseLogs(r.logs);
@@ -196,7 +210,7 @@ async function replay(b: B, seen?: Set<string>) {
       } catch (e) { row.l1Fee = { error: String(e).slice(0, 120) }; }
     }
     const unsigned = UNSIGNED && await selfSigned(t);
-    if (UNSIGNED && !unsigned) { taken--; continue; }
+    if (UNSIGNED && !unsigned) { taken--; return; }
     const target = await reqOf(t, parent, unsigned);
     row.type = t.type;
     for (const [name, sim] of simulators) {
@@ -286,10 +300,16 @@ async function replay(b: B, seen?: Set<string>) {
       }
     }
     rows.push(row);
+  };
+  for (const t of b.transactions) {
+    const takenBefore = taken;
+    // A read for this transaction that failed (a node a block behind for longer than the client waits, one that
+    // didn't answer twice) leaves out this transaction, not the rest of its block; another of the block is taken.
+    try { await transaction(t); } catch (e) { taken = takenBefore; skip(n, e, t.hash); }
   }
 }
 
-if (!FOLLOW) for (const b of blocks) { if (rows.length >= MAX) break; await replay(b); }
+if (!FOLLOW) for (const b of blocks) { if (rows.length >= MAX) break; try { await replay(b); } catch (e) { skip(Number(b.number), e); } }
 else {
   // Each new head block, as soon as it's there: its parent's state is then seconds old. A block that took too long
   // to get to is skipped (Arbitrum keeps about 30 seconds of state).
@@ -314,7 +334,7 @@ else {
     count(b);
     blocks.push(b);
     const before = rows.length;
-    try { await replay(b, seen); } catch (e) { console.log(`  block ${now} skipped: ${(e as Error).message.slice(0, 100)}`); }
+    try { await replay(b, seen); } catch (e) { skip(now, e); }
     for (const t of b.transactions) seen.add(t.from.toLowerCase());
     if (rows.length > before) console.log(`  block ${now}: ${rows.length - before} replayed (${rows.length} in all)`);
   }
@@ -376,6 +396,12 @@ const unread = rows.filter(r => SIMULATORS.some(n => (r[n] as Record<string, any
 if (unread) say(`  ${unread} whose balances the node didn't answer the reads of (a public node rate limiting): their token amounts${NATIVE_UNLOGGED.has(CHAIN) ? ' and native ones' : ''} are the events', reported and not judged`);
 if (notCharged) say(`  ${notCharged} whose receipt names an L1 data fee their sender's balance didn't pay`);
 const bumped = rows.filter(r => r.timeBumped).length;
+// What wasn't replayed, by why (a block number or hash in the reason left out, so that alike ones count together).
+if (skipped.length) {
+  const why = new Map<string, number>();
+  for (const s of skipped) { const k = `${s.hash ? 'transaction' : 'block'}: ${s.why.replace(/0x[0-9a-f]+/gi, '0x…')}`; why.set(k, (why.get(k) ?? 0) + 1); }
+  say(`  not replayed: ${[...why].map(([k, count]) => `${count} ${k.replace(/^(\w+)/, count > 1 ? '$1s' : '$1')}`).join('; ')}`);
+}
 if (bumped) say(`  ${bumped} run a second after their block, which shared its parent's second (the node refuses that): gas not judged for them`);
 const l1Rows = rows.map(r => r.l1Fee as { percent?: number } | undefined).filter(x => x?.percent !== undefined).map(x => x!.percent!);
 if (l1Rows.length) say(`  L1 data fee estimate, of ${l1Rows.length}: exact ${l1Rows.filter(x => x === 0).length}, within 1% ${l1Rows.filter(x => Math.abs(x) < 1).length}, within 5% ${l1Rows.filter(x => Math.abs(x) < 5).length}; never under the receipt's: ${l1Rows.every(x => x >= 0)}`);

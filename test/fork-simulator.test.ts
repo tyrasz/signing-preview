@@ -516,6 +516,9 @@ test('Base’s B20 tokens run in the local EVM from their Solidity reference, on
   assert.deepEqual(sent.logs!.map(l => [l.address, l.topics[0].slice(0, 10), `0x${l.topics[2].slice(26)}`, BigInt(l.data)]), [[TOKEN, '0xddf252ad', BOB, 250n]]);
   // The token, and the policy registry it asked whether the two may send and receive.
   assert.deepEqual(sent.standIns, [TOKEN, '0x8453000000000000000000000000000000000002']);
+  // Its balance read (the reads warmed up first run its marker code, which burns all it is given: not what the
+  // run's own reads, from the reference, then answer).
+  assert.deepEqual(sent.readAssets, ['native', TOKEN]);
   // What it reads is the chain's: its decimals (the asset variant's own slot) and symbol.
   const decimals = (await call(encodeFunctionData({ abi: erc20, functionName: 'decimals' })))!;
   assert.equal(BigInt(decimals.returnData!), 6n);
@@ -1492,4 +1495,230 @@ test('BNB Chain’s own precompiles at its node’s prices: secp256k1 run here, 
   } finally {
     for (const a of [0x66, 0x67, 0x68]) await chain.putCode(at(a), '0x');
   }
+});
+
+// Sepolia's gas burner (0x4a65…3441, in most of its blocks since November 2026): whatever it is sent, it loops until
+// less than 10,000 gas is left, then logs and stops. 2.5 million gas a transaction there; 300,000 here.
+const BURNER = '0x4a65000000000000000000000000000000003441', BURNER_CODE = '0x5f5a5f600e565b5f5260205fa1005b6127105a1060065760010161133750600e56';
+const SENDERS = ['0x5e00000000000000000000000000000000000001', '0x5e00000000000000000000000000000000000002', '0x5e00000000000000000000000000000000000003'];
+const burns = () => SENDERS.map(from => ({ chainId: 999, from, to: BURNER, data: '0x001e37cd' as Hex, value: 0n, gas: 300_000n }));
+const outcome = (rs: SimulationResult[]) => rs.map(r => [r.status, r.gasUsed, r.returnData, r.transfers.map(t => [t.asset, t.from, t.to, t.raw]), r.logs?.length]);
+
+test('A contract that burns the gas of any call it gets is read once, not before and after every call and in every round', async () => {
+  await chain.putCode(BURNER, BURNER_CODE);
+  for (const s of SENDERS) await chain.setBalance(s, E);
+  clearForkCaches();
+  // Each call's target is read as a token too (a wrapper that emits no Transfer). This one would burn all of a
+  // view's 10 million gas, three views a call (its balance before and after, the NFT interface) and every round, and
+  // can't answer any (no RETURN in its code): none is run.
+  const sim = fork({ watchTokens: false });
+  const reqs = burns().map(r => ({ ...r, watch: [BURNER] }));
+  const out = (await sim.simulateBatch(reqs))!;
+  assert.deepEqual(out.map(r => [r.status, r.gasUsed]), SENDERS.map(() => ['success', out[0].gasUsed]));
+  assert.ok(out[0].gasUsed! > 290_000n, String(out[0].gasUsed));
+  assert.deepEqual([sim.last!.views, sim.last!.calls, sim.last!.rounds], [0, 3, 1]);
+  // The same as a run that fetches each value as it goes, with no rounds.
+  assert.deepEqual(outcome(out), outcome((await fork({ watchTokens: false, maxRounds: 0 }).simulateBatch(reqs))!));
+  // One that could answer but spends all of a view's gas (here at once, growing its memory past it) is run once for
+  // each function asked of it, and then answers as it did.
+  const greedy = '0x6eed000000000000000000000000000000000001';
+  await chain.putCode(greedy, '0x5f622a0000525f5ff3');
+  clearForkCaches();
+  const watching = fork({ watchTokens: false });
+  const read = (await watching.simulateBatch(burns().map(r => ({ ...r, watch: [greedy] }))))!;
+  // (Once where the reads around the calls are warmed up, and once in the run: what the warm-up's EVM answered,
+  // without the chain's precompiles and hooks, isn't taken for the run's.)
+  assert.deepEqual([watching.last!.views, watching.last!.calls], [4, 3]);
+  assert.deepEqual(outcome(read), outcome(out));
+});
+
+test('A round starts where the last got to on fetched values alone: the calls before are not run again', async () => {
+  // Three burners first, as in a Sepolia replay, then a call that only a round a hop finds what it reads next.
+  let hop = '0x0000000000000000000000000000000000000000';
+  for (let i = 1; i <= 6; i++) hop = await chain.deploy('Hop', 'address,uint256', [hop, BigInt(i)]);
+  const batch = [...burns(), { chainId: 999, from: USER, to: hop, data: encodeFunctionData({ abi: parseAbi(['function total() view returns (uint256)']), functionName: 'total' }), value: 0n }];
+  clearForkCaches();
+  const sim = fork({ watchTokens: false });
+  const out = (await sim.simulateBatch(batch))!;
+  assert.equal(BigInt(out[3].returnData!), 21n);
+  const { rounds, calls } = sim.last!;
+  assert.ok(rounds >= 6, `${rounds} rounds`);
+  // The burners ran in the first round only; the last call in each.
+  assert.equal(calls, SENDERS.length + rounds);
+  assert.deepEqual(outcome(out), outcome((await fork({ watchTokens: false, maxRounds: 0 }).simulateBatch(batch))!));
+  // A token a later call shows is read around the calls before it too: those run again, as they must.
+  clearForkCaches();
+  const giver = '0x91fe000000000000000000000000000000000092';
+  await chain.putCode(giver, `0x6044602a6000396000600060446000600073${shares.slice(2)}5af15000${call('transfer', [USER, 101n]).slice(2)}` as Hex);
+  await chain.exec(shares, call('mintShares', [giver, 300n]));
+  const shown = [{ chainId: 999, from: USER, to: BOB, data: '0x' as Hex, value: 0n }, ...burns().slice(0, 1), { chainId: 999, from: USER, to: giver, data: '0x' as Hex, value: 0n }];
+  const got = (await fork({ watchTokens: false }).simulateBatch(shown))!;
+  assert.deepEqual(got[2].transfers.map(t => [t.asset, t.to, t.raw]), [[shares, USER, 100n]]);
+  assert.deepEqual(outcome(got), outcome((await fork({ watchTokens: false, maxRounds: 0 }).simulateBatch(shown))!));
+});
+
+test('A token behind a proxy is read ahead, not found a round at a time with every call run again', async () => {
+  // A delegating proxy (its implementation in the EIP-1967 slot) in front of a Token: its balanceOf reads the slot,
+  // then the implementation's code, then the balance in the proxy's storage. Watched around a call to the burner.
+  const proxy = '0x9100000000000000000000000000000000001967', impl = await chain.deploy('Token', 'string,uint8', ['PUSD', 6]);
+  const SLOT = '360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+  // CALLDATACOPY it all, DELEGATECALL the implementation with it, and RETURN (or REVERT) what came back.
+  await chain.putCode(proxy, `0x365f5f375f5f365f7f${SLOT}545af43d5f5f3e6036573d5ffd5b3d5ff3` as Hex);
+  const sm = chain.evm.stateManager;
+  await sm.putStorage(createAddressFromString(proxy), hexToBytes(`0x${SLOT}`), setLengthLeft(hexToBytes(impl as Hex), 32));
+  await chain.exec(proxy, call('mint', [SENDERS[0], 5_000_000n]));
+  clearForkCaches();
+  const sim = fork({ watchTokens: false });
+  const req = { ...burns()[0], watch: [proxy] };
+  const [r] = (await sim.simulateBatch([req]))!;
+  assert.equal(r.status, 'success');
+  assert.deepEqual(r.readAssets, ['native', proxy]);
+  // One round: the reads around the call found what they need on their own first (before: three, the call run in each).
+  assert.deepEqual([sim.last!.rounds, sim.last!.calls], [1, 1]);
+});
+
+test('The node is asked what the calls touch in one request, the last calls of a long batch among them', async () => {
+  const asked: { to?: string }[][] = [];
+  const recording = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string; params: { to?: string }[] }[];
+    if (Array.isArray(body) && body.some(r => r.method === 'eth_createAccessList')) asked.push(body.filter(r => r.method === 'eth_createAccessList').map(r => r.params[0]));
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  const to = (i: number) => `0x70${(100 + i).toString(16).padStart(38, '0')}`;
+  const batch = Array.from({ length: 10 }, (_, i) => ({ chainId: 1, from: USER, to: to(i), data: '0x' as Hex, value: 0n }));
+  // (The test chain has no eth_createAccessList: each is refused, and the run goes on without.)
+  const sim = new ForkSimulator({ 1: URL_ }, { fetchImpl: recording, watchTokens: false });
+  const out = (await sim.simulateBatch(batch))!;
+  assert.deepEqual(out.map(r => r.status), batch.map(() => 'success'));
+  assert.equal(asked.length, 1);
+  assert.deepEqual(asked[0].map(c => c.to), [0, 1, 2, 3, 6, 7, 8, 9].map(to));
+  // A node that said it has no such method isn't asked again (Arbitrum One's public node, which rate-limits by
+  // request), by this simulator or another.
+  await sim.simulateBatch(batch.slice(0, 2));
+  await new ForkSimulator({ 1: URL_ }, { fetchImpl: recording, watchTokens: false }).simulateBatch(batch.slice(0, 2));
+  assert.equal(asked.length, 1);
+  clearForkCaches();
+});
+
+test('A state read that got no answer is asked again: a timeout, a reset connection, a batch answered short, a node a block behind', async () => {
+  let n = 0;
+  const flaky = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { id: number; method: string }[];
+    if (!Array.isArray(body) || !body.some(r => r.method === 'eth_getBalance')) return chain.fetchImpl(u, init);
+    n++;
+    if (n === 1) throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+    if (n === 2) throw new TypeError('fetch failed');
+    const answer = await (await chain.fetchImpl(u, init)).json() as { id: number }[];
+    if (n === 3) return new Response(JSON.stringify(answer.slice(1)));
+    if (n === 4) return new Response(JSON.stringify(answer.map((a, i) => i === 0 ? { jsonrpc: '2.0', id: a.id, error: { code: -32000, message: 'block not found: 0x1932389' } } : a)));
+    return new Response(JSON.stringify(answer));
+  }) as typeof fetch;
+  const req = { chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 4n]), value: 0n };
+  clearForkCaches();
+  const [r] = (await fork({ fetchImpl: flaky }).simulateBatch([req]))!;
+  assert.ok(n >= 5, `${n} requests of balances`);
+  clearForkCaches();
+  const [clean] = (await fork().simulateBatch([req]))!;
+  assert.deepEqual(outcome([r]), outcome([clean]));
+  // A node that never answers fails the simulation once its time is up, saying so.
+  const silent = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string }[];
+    if (Array.isArray(body) && body.some(x => x.method === 'eth_getBalance')) throw new TypeError('fetch failed');
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  clearForkCaches();
+  await assert.rejects(fork({ fetchImpl: silent, timeoutMs: 1500 }).simulateBatch([req]), /state fetch failed: fetch failed|ran out of time/);
+});
+
+test('eth_simulateV1 answered by a node that has not the block yet is asked again', async () => {
+  // A load-balanced public node: one behind it hasn't the parent of the block just served (Ethereum, 2026-11-15).
+  let refused = 0;
+  const behind = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    if (!Array.isArray(body) && body.method === 'eth_simulateV1' && refused < 2) { refused++; return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, error: { code: -32000, message: 'block not found: 0x1932389' } })); }
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    const r = await new RpcSimulator({ 999: URL_ }, { fetchImpl: behind }).simulate({ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, 3n]), value: 0n });
+    assert.equal(refused, 2);
+    assert.equal(r?.status, 'success');
+    assert.deepEqual(r?.transfers.map(t => [t.asset, t.raw]), [[usdc, 3n]]);
+  } finally { chain.simulateV1 = false; }
+});
+
+test('The node not answering what the calls touch costs a few seconds, not the 15 a state read may wait', async () => {
+  // (Sepolia's public node left a replay's eth_createAccessList unanswered for 15 seconds, three times in six.)
+  const hanging = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string }[];
+    if (Array.isArray(body) && body.some(r => r.method === 'eth_createAccessList')) return new Promise<Response>((_, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason)));
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  const started = Date.now(), open = setInterval(() => {}, 1000); // (as a socket waiting would keep the process up)
+  try {
+    const [r] = (await new ForkSimulator({ 1: URL_ }, { fetchImpl: hanging, watchTokens: false }).simulateBatch([{ chainId: 1, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n }]))!;
+    assert.equal(r.status, 'success');
+    assert.ok(Date.now() - started < 10_000, `${Date.now() - started} ms`);
+  } finally { clearInterval(open); }
+});
+
+test('A view that burnt its gas on a value guessed earlier in the run is not remembered as answering nothing', async () => {
+  // A token whose balanceOf, once a call has set its slot 5, reads slot 7 and runs out of gas (expanding its memory)
+  // where that is 0; slot 7 is 1 on the chain. A call with no calldata reads slot 7 (not fetched yet: guessed, 0) and
+  // sets slot 5, so in the first round the balance read after it reads the guess again and burns all its gas.
+  const X = '0x6eed000000000000000000000000000000000007';
+  await chain.putCode(X, '0x36600e57600754506001600555005b60003560e01c6370a0823114601f57005b600554600114156036576007546036575f622a0000525b602a60005260206000f3');
+  await chain.evm.stateManager.putStorage(createAddressFromString(X), setLengthLeft(hexToBytes('0x07'), 32), hexToBytes('0x01'));
+  clearForkCaches();
+  const sim = fork({ watchTokens: false });
+  const [r] = (await sim.simulateBatch([{ chainId: 999, from: USER, to: X, data: '0x', value: 0n, watch: [X] }]))!;
+  assert.equal(r.status, 'success');
+  assert.ok(sim.last!.rounds >= 2, `${sim.last!.rounds} rounds`);
+  // Its balance is read in the round that has slot 7 (42 before, 42 after): not taken from the guess's burnt read.
+  assert.deepEqual(r.readAssets, ['native', X]);
+  clearForkCaches();
+  assert.deepEqual(outcome([r]), outcome((await fork({ watchTokens: false, maxRounds: 0 }).simulateBatch([{ chainId: 999, from: USER, to: X, data: '0x', value: 0n, watch: [X] }]))!));
+});
+
+test('A node whose backend has not the block’s state is asked what the calls touch again; one without the method is not', async () => {
+  const asked: number[] = [];
+  let refusal: { code: number; message: string } = { code: -32000, message: 'historical state 87db481a8b0f405e58c5366749e46006bfd5eae094504723bb8df83fe054e872 is not available' };
+  const pruned = (async (u: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { id: number; method: string }[];
+    if (Array.isArray(body) && body.some(r => r.method === 'eth_createAccessList')) {
+      asked.push(body.length);
+      return new Response(JSON.stringify(body.map(r => ({ jsonrpc: '2.0', id: r.id, error: refusal }))));
+    }
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  const req = { chainId: 1, from: USER, to: usdc, data: call('transfer', [BOB, 1n]), value: 0n };
+  clearForkCaches();
+  const url = 'http://pruned.invalid';
+  for (let i = 0; i < 2; i++) assert.equal((await new ForkSimulator({ 1: url }, { fetchImpl: pruned, watchTokens: false }).simulateBatch([req]))![0].status, 'success');
+  // (Sepolia's public node, 2026-11-15: one backend in four or five had pruned a block 300 old, the others not.)
+  assert.equal(asked.length, 2);
+  // JSON-RPC's "method not found" (Arbitrum One's: "the method eth_createAccessList does not exist/is not available").
+  refusal = { code: -32601, message: 'the method eth_createAccessList does not exist/is not available' };
+  for (let i = 0; i < 2; i++) await new ForkSimulator({ 1: url }, { fetchImpl: pruned, watchTokens: false }).simulateBatch([req]);
+  assert.equal(asked.length, 3);
+  clearForkCaches();
+});
+
+test('A state read the node answers only after the simulation’s time is up says it ran out of time', async () => {
+  // Every request takes 2 seconds, and the simulation has 2.5: the first round's reads are asked with half a second
+  // left, and cut at the deadline. (A read that ends past it is a timeout, which a caller can tell from a failed read,
+  // and which lets an extra run's earlier answer stand.)
+  const slow = (async (u: string, init: RequestInit) => {
+    await new Promise((answer, abort) => { const t = setTimeout(answer, 2000); init.signal?.addEventListener('abort', () => { clearTimeout(t); abort(init.signal!.reason); }); });
+    return chain.fetchImpl(u, init);
+  }) as typeof fetch;
+  let hop = '0x0000000000000000000000000000000000000000';
+  for (let i = 1; i <= 3; i++) hop = await chain.deploy('Hop', 'address,uint256', [hop, BigInt(i)]);
+  clearForkCaches();
+  const started = Date.now();
+  await assert.rejects(new ForkSimulator({ 999: URL_ }, { fetchImpl: slow, profiles, watchTokens: false, timeoutMs: 2500 })
+    .simulateBatch([{ chainId: 999, from: USER, to: hop, data: encodeFunctionData({ abi: parseAbi(['function total() view returns (uint256)']), functionName: 'total' }), value: 0n }]),
+  (e: Error) => e instanceof ForkTimeout && /ran out of time|needed more than/.test(e.message));
+  assert.ok(Date.now() - started < 8000, `${Date.now() - started} ms`);
+  clearForkCaches();
 });

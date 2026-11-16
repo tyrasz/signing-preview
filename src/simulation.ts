@@ -389,7 +389,10 @@ export class RpcSimulator implements Simulator {
 
   /**
    * One JSON-RPC request, retried when the node rate-limits: HTTP 429 or 5xx, or a rate-limit error inside an HTTP
-   * 200 (Arbitrum's and HyperEVM's public RPCs do both). A rate limit is never mistaken for an answer.
+   * 200 (Arbitrum's and HyperEVM's public RPCs do both). A rate limit is never mistaken for an answer. So is one
+   * answered by a load-balanced node that hasn't the block asked for yet ("block not found", "header not found"),
+   * three times: Ethereum's public node answered so for the parent of the block it had just served, and three
+   * replays at their block's pre-state failed (2026-11-15). (A block that isn't there still fails, 3.5 seconds on.)
    */
   private async post(url: string, method: string, params: unknown[]): Promise<{ result?: unknown; error?: { code?: number; message?: string; data?: Hex } }> {
     for (let attempt = 0; ; attempt++) {
@@ -403,6 +406,7 @@ export class RpcSimulator implements Simulator {
       }
       const body = await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
       if (body.error && (body.error.code === -32005 || body.error.code === 429 || /rate limit|too many requests|adjustable limit/i.test(body.error.message ?? '')) && await retry()) continue;
+      if (body.error && /block not found|header not found|unknown block/i.test(body.error.message ?? '') && attempt < 3 && await retry()) continue;
       return body;
     }
   }

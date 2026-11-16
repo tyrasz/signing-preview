@@ -8,13 +8,15 @@ test('The RPC client retries rate limits and lagging nodes, and reports other er
     { status: 200, body: { error: { code: -32005, message: 'rate limit exceeded' } } },
     // A load-balanced node a block behind (HyperEVM's public RPC does this).
     { status: 200, body: { error: { code: -32603, message: 'invalid block height: 50439414' } } },
+    // A reth node behind publicnode's endpoint that hasn't the block yet (Ethereum, Sepolia).
+    { status: 200, body: { error: { code: -32001, message: 'block not found: 0x193238a' } } },
     { status: 200, body: { result: '0x10' } },
   ];
   let calls = 0;
   const fetchImpl = (async () => { const a = answers[calls++]; return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, ...a.body }), { status: a.status }); }) as unknown as typeof fetch;
-  const rpc = new JsonRpcClient({ 999: 'http://rpc.invalid' }, { fetchImpl, retryDelayMs: 1 });
+  const rpc = new JsonRpcClient({ 999: 'http://rpc.invalid' }, { fetchImpl, retryDelayMs: 1, retries: 4 });
   assert.equal(await rpc.call(999, 'eth_blockNumber', []), '0x10');
-  assert.equal(calls, 4);
+  assert.equal(calls, 5);
   const failing = new JsonRpcClient({ 999: 'http://rpc.invalid' }, { retryDelayMs: 1, fetchImpl: (async () => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: 3, message: 'execution reverted' } }))) as unknown as typeof fetch });
   await assert.rejects(failing.call(999, 'eth_call', []), /execution reverted/);
 });
