@@ -197,7 +197,12 @@ async function replay(b: B, seen?: Set<string>) {
     // The block's earlier transactions, the chain's own left out, except an OP Stack block's L1 info deposit (its
     // first transaction, from the L1 attributes depositor to the L1Block predeploy): the L1 values it sets for the
     // block are what a contract pricing L1 data (a paymaster, a bridge) reads, and as a plain call it runs as on-chain.
-    const before = await Promise.all(b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type) || x.from.toLowerCase() === L1_INFO_DEPOSITOR).map(x => reqOf(x, parent)));
+    // (Arbitrum: each with the gas its receipt says the chain took for its L1 data before running it, which the local
+    // EVM takes out of its gas limit as the chain did: given none, a call ran on more gas than it had on-chain.)
+    const l1Of = (x: T) => { const rc = receipts.find(y => y.transactionHash === x.hash); return rc?.gasUsedForL1 !== undefined ? BigInt(rc.gasUsedForL1) : undefined; };
+    const withL1 = (q: SimulationRequest, x: T): SimulationRequest => (CHAIN === 42161 && l1Of(x) !== undefined ? { ...q, gasForL1: l1Of(x) } : q);
+    const beforeTxs = b.transactions.slice(0, index).filter(x => !SYSTEM.has(x.type) || x.from.toLowerCase() === L1_INFO_DEPOSITOR);
+    const before = await Promise.all(beforeTxs.map(async x => withL1(await reqOf(x, parent), x)));
     // OP Stack: the preview's L1 data fee for this transaction, at the block's L1 prices (set by its first, deposit
     // transaction, so read after the block), against the receipt's.
     if (OP_STACK.has(CHAIN) && r.l1Fee) {
@@ -211,7 +216,7 @@ async function replay(b: B, seen?: Set<string>) {
     }
     const unsigned = UNSIGNED && await selfSigned(t);
     if (UNSIGNED && !unsigned) { taken--; return; }
-    const target = await reqOf(t, parent, unsigned);
+    const target = withL1(await reqOf(t, parent, unsigned), t);
     row.type = t.type;
     for (const [name, sim] of simulators) {
       const t0 = Date.now();
@@ -221,6 +226,28 @@ async function replay(b: B, seen?: Set<string>) {
           if (!/timestamps must be in order/.test(String(e)) || time !== b.timestamp) throw e;
           time = `0x${(BigInt((await rpc.call(CHAIN, 'eth_getBlockByNumber', [parent, false]) as { timestamp: Hex }).timestamp) + 1n).toString(16)}` as Hex;
           out = (await sim.simulateBatch!([...before, target]))!;
+        }
+        // Arbitrum: the node works out each transaction's L1 gas itself (for its unsigned form, at its own estimate of
+        // the L1 price: 70-126% of the receipt's) and takes it out of the gas limit before the call runs, as the chain
+        // took the receipt's. A call that measures its own gas then gets a gas unit or two more or less than on-chain:
+        // a GMX keeper's execution fee (from gasleft(), less a 63rd of it) came out 2 gas at its price off the
+        // receipt's, now and then (2026-11-16, -17). Where what moved differs, the block is run again with each
+        // transaction's gas limit moved by what the node charged over its receipt's L1 gas, so that each call starts
+        // with the gas it had on-chain: of four such keeper transactions, three came out exact as they were and four
+        // so moved.
+        if (name === 'eth_simulateV1' && CHAIN === 42161 && r.gasUsedForL1) {
+          const first = net(out[out.length - 1].transfers, from);
+          let off = (first.get('native') ?? 0n) !== nativeActual;
+          for (const a of new Set([...logged.keys(), ...first.keys()])) if (!off && a !== 'native') off = (await actualOfThis(a)) !== (first.get(a) ?? 0n);
+          if (off) {
+            const shifted = [...before, target].map((q, i) => {
+              const x = i < beforeTxs.length ? beforeTxs[i] : t, rc = receipts.find(y => y.transactionHash === x.hash), used = out[i]?.gasUsed;
+              if (rc?.gasUsedForL1 === undefined || used === undefined || q.gas === undefined) return q;
+              const charged = used - (BigInt(rc.gasUsed) - BigInt(rc.gasUsedForL1)), own = BigInt(rc.gasUsedForL1);
+              return charged >= 0n && charged <= 2n * own ? { ...q, gas: q.gas + charged - own } : q;
+            });
+            try { const again = await sim.simulateBatch!(shifted); if (again?.length === out.length) { out = again; row.l1Shifted = true; } } catch { /* the first run stands */ }
+          }
         }
         // Run a second after its block (BNB Chain): what depends on the second (a pool's price observation, written
         // once a second; a reward accruing) can differ, so its gas isn't judged (see below).

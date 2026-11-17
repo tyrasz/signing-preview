@@ -97,6 +97,18 @@ test('An account behind OKX Wallet’s 797-byte proxy runs the implementation it
   }
 });
 
+test('An account behind the 845-byte ERC-1967 proxy of Modular Account v2’s accounts on Base runs the implementation its slot names; other code of that length doesn’t', async () => {
+  const fx = fixture('semi-modular-proxy.json');
+  const rpcWith = (code: string) => ({ has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getCode') return code;
+    if (method === 'eth_getStorageAt' && params[1] === '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc') return `0x${'00'.repeat(12)}${fx.implementation.slice(2)}`;
+    throw new Error(`unexpected ${method}`);
+  } });
+  assert.equal(await implementationOf({ rpc: rpcWith(fx.code) } as never, 8453, fx.account), fx.implementation);
+  // One byte changed (its metadata hash), the same length: not the proxy, so not followed.
+  assert.equal(await implementationOf({ rpc: rpcWith(`${fx.code.slice(0, -4)}0034`) } as never, 8453, fx.account), undefined);
+});
+
 test('OKX Wallet’s account whose key is OKX’s passkey verifier’s: the stand-in key’s passkey part and the verifier’s cosignature pass its real code', async () => {
   const fx = fixture('okx-passkey-verifier.json');
   await install(fx);

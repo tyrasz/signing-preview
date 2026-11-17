@@ -2294,6 +2294,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // on Arbitrum (checked there: it validates the shape as signed by its owner), but for Aave Labs' 2-of-2 validation
   // (see modularAccountStub).
   '0x000000000000c5a9089039570dd36455b5c07383': modularAccountStub, '0x00000000000002377b26b1eda7b0bc371c60dd4f': modularAccountStub,
+  // Its SemiModularAccountStorageOnly (verified on Sourcify, Base), behind SEMI_MODULAR_PROXY: the same form.
+  '0x0000000000006e2f9d80caec0da6500f005eb25a': modularAccountStub,
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
   '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
@@ -2343,9 +2345,15 @@ const ERC1967_IMPLEMENTATION_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076c
  */
 const OKX_LONG_PROXY = '0x3e5ad3de6e8de44f4a56d8784bd4b0257e51f4d05fc0dc06e79f8e92e1a775f9';
 /**
+ * An 845-byte ERC-1967 proxy (its code's keccak256; solc 0.8.15, unverified: it reads the slot and delegatecalls to
+ * what it names) in front of Alchemy's Modular Account v2 (SemiModularAccountStorageOnly) on Base: three accounts
+ * behind it were stood in for as no account in particular, and reverted on it (Panic(0x21)), 2026-11-16.
+ */
+const SEMI_MODULAR_PROXY = '0x0acbd632c56f6f227951f6c832b36177319145deddb8df3a12c3bcc91fbf49b3';
+/**
  * The code an account runs: the ERC-1967 implementation its proxy (or Biconomy Smart Account v2's proxy's) (or its EIP-7702 delegate, such as Coinbase's
  * EIP7702Proxy) runs, or the implementation an EIP-1167 minimal proxy's code names, else its EIP-7702 delegate. Undefined if neither, or unreadable. A proxy is short (up to 199
- * bytes), or OKX Wallet's 797-byte proxy (OKX_LONG_PROXY: the accounts on OP Mainnet and Ethereum behind it were stood
+ * bytes), or OKX Wallet's 797-byte proxy or another known one (SEMI_MODULAR_PROXY) (OKX_LONG_PROXY: the accounts on OP Mainnet and Ethereum behind it were stood
  * in for as no account in particular, and refused it). Other longer code isn't followed, whatever its slot holds:
  * naming the slot doesn't make code delegate to what is in it.
  */
@@ -2358,7 +2366,7 @@ export async function implementationOf(deps: Dependencies, chainId: number, acco
     // earlier delegation (Coinbase's EIP7702Proxy writes one) isn't what it runs now. Only a delegate that is itself
     // a proxy is followed to the implementation in the slot.
     if (delegate && STUB_SHAPES[delegate]) return delegate;
-    if (code === '0x' || (code.length > 400 && keccak256(code as Hex) !== OKX_LONG_PROXY)) return undefined;
+    if (code === '0x' || (code.length > 400 && ![OKX_LONG_PROXY, SEMI_MODULAR_PROXY].includes(keccak256(code as Hex)))) return undefined;
     // An EIP-1167 minimal proxy names its implementation in its code (Ambire's accounts are such clones).
     const clone = /^0x363d3d373d3d3d363d73([0-9a-f]{40})5af43d82803e903d91602b57fd5bf3$/i.exec(code);
     if (clone) return `0x${clone[1]}`.toLowerCase();
