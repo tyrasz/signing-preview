@@ -559,6 +559,8 @@ type StubContext = {
   entryPoint?: string;
   /** The operation's paymasterAndData (a multi-signer account's cosigners sign gas limits that name its paymaster). */
   paymasterAndData?: Hex;
+  /** The operation's callData (the function it calls on the account names the validation, in Modular Account v1). */
+  callData?: Hex;
   /** The operation's hash as the EntryPoint computes it (getUserOpHash): a passkey signs it as its challenge. */
   hash: () => Promise<Hex | undefined>;
   /** What the signer's wallet signs (OperationInput's digest). */
@@ -2293,6 +2295,46 @@ async function modularAccountStub(c: StubContext): Promise<Stub> {
       : `it validates through ${name}, which takes the signatures of the account's two signers, and they couldn't be read`, ...(!signers.length && { unsure: true }) };
 }
 
+// --- Alchemy's Modular Account v1 (UpgradeableModularAccount, verified on Sourcify; behind Solady's ERC-1967 proxy) ---
+// Each function an operation can call on it names the plugin function that validates the operation
+// (getExecutionFunctionConfig). Alchemy's MultiOwnerPlugin takes the owner's ECDSA signature as it is: the plain
+// stand-in. Exa, Exactly's wallet (origin https://web.exactly.app), validates the account's own functions through
+// Exactly's WebauthnOwnerPlugin (its source published, MIT; unverified, deployed at 0x9d65…d7d5 on Arbitrum One and
+// 0x8f49…4ca0 on OP Mainnet, so it is known by its answer to ownersPublicKeysOf): a signature is the signing owner's
+// index (one byte), then for a passkey owner webauthn-sol's WebAuthnAuth with abi.encode(toEthSignedMessageHash(
+// userOpHash)) as its challenge (checked by P256VERIFY, else FreshCryptoLib), for an address owner its signature over
+// that hash (ECDSA, or ERC-1271). STUB_SIGNATURE's first byte named no owner and validation reverted (AA23): an Exa
+// operation on Arbitrum One was simulated as calls only, without its paymaster's USDC fee.
+export const MODULAR_ACCOUNT_V1 = '0x0046000000000151008789797b54fdb500e2a61e';
+const MODULAR_ACCOUNT_V1_VIEWS = parseAbi(['function getExecutionFunctionConfig(bytes4 selector) view returns ((address plugin, bytes21 userOpValidationFunction, bytes21 runtimeValidationFunction))',
+  'function ownersPublicKeysOf(address account) view returns ((uint256 x, uint256 y)[])']);
+/** Exa's passkeys' relying party, whose origin their assertions name (https://web.exactly.app). */
+const EXA_RP_ID = 'web.exactly.app';
+async function modularAccountV1Stub(c: StubContext): Promise<Stub> {
+  const plain: Stub = { signature: STUB_SIGNATURE };
+  if (!c.callData || c.callData.length < 10 || !c.deps.rpc?.has(c.chainId)) return plain;
+  const call = (to: string, data: Hex) => c.deps.rpc!.call(c.chainId, 'eth_call', [{ to, data }, 'latest']) as Promise<Hex>;
+  let plugin: string, owners: readonly { x: bigint; y: bigint }[];
+  try {
+    const config = decodeFunctionResult({ abi: MODULAR_ACCOUNT_V1_VIEWS, functionName: 'getExecutionFunctionConfig',
+      data: await call(c.sender, encodeFunctionData({ abi: MODULAR_ACCOUNT_V1_VIEWS, functionName: 'getExecutionFunctionConfig', args: [c.callData.slice(0, 10) as Hex] })) });
+    plugin = `0x${config.userOpValidationFunction.slice(2, 42)}`.toLowerCase();
+    owners = decodeFunctionResult({ abi: MODULAR_ACCOUNT_V1_VIEWS, functionName: 'ownersPublicKeysOf',
+      data: await call(plugin, encodeFunctionData({ abi: MODULAR_ACCOUNT_V1_VIEWS, functionName: 'ownersPublicKeysOf', args: [c.sender as Hex] })) });
+  } catch { return plain; } // another plugin (Alchemy's MultiOwnerPlugin), or not read
+  const index = (i: number): Hex => `0x${i.toString(16).padStart(2, '0')}`;
+  const signer = BigInt(/^0x[0-9a-f]{40}$/i.test(c.signer) ? c.signer : 0), asked = c.signer.toLowerCase() === c.sender.toLowerCase();
+  const mine = owners.findIndex(o => o.y === 0n && o.x === signer);
+  if (mine >= 0 && mine < 256) return { signature: concatHex([index(mine), STUB_SIGNATURE]) };
+  // The account itself asked (a passkey wallet's way): its first passkey owner's assertion.
+  const k = owners.findIndex(o => o.y !== 0n);
+  const hash = k >= 0 && k < 256 && asked ? await c.hash() : undefined;
+  if (hash) return { signature: concatHex([index(k), encodeAbiParameters([WEBAUTHN_AUTH], [webAuthnAuth(hashMessage({ raw: hash }), EXA_RP_ID)])]), p256: true };
+  const address = Math.max(owners.findIndex(o => o.y === 0n), 0);
+  return { signature: concatHex([index(Math.min(address, 255)), STUB_SIGNATURE]),
+    ...(!asked && { why: `it validates through ${shortAddr(plugin)} (Exactly's WebauthnOwnerPlugin, named by the function the operation calls), whose owners for this account don't include the signer asked` }) };
+}
+
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
 const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 /**
@@ -2339,6 +2381,9 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   '0x000000000000c5a9089039570dd36455b5c07383': modularAccountStub, '0x00000000000002377b26b1eda7b0bc371c60dd4f': modularAccountStub,
   // Its SemiModularAccountStorageOnly (verified on Sourcify, Base), behind SEMI_MODULAR_PROXY: the same form.
   '0x0000000000006e2f9d80caec0da6500f005eb25a': modularAccountStub,
+  // Alchemy's Modular Account v1: the form of the plugin validating the function the operation calls (see
+  // modularAccountV1Stub).
+  [MODULAR_ACCOUNT_V1]: modularAccountV1Stub,
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
   '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
@@ -2809,7 +2854,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       [sender as Hex, op.nonce, keccak256(op.initCode), keccak256(op.callData), f.accountGasLimits, op.preVerificationGas, f.gasFees, keccak256(op.paymasterAndData)]));
     return keccak256(encodeAbiParameters(parseAbiParameters('bytes32, address, uint256'), [packed, entryPoint as Hex, 0n]));
   };
-  const context: StubContext = { deps, chainId: op.chainId, sender, signer, ...(op.signer !== undefined && { named: true }), nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, entryPoint, replayableHash, ...(op.digest && { digest: op.digest }), ...(op.supertransaction && { supertransaction: op.supertransaction }) };
+  const context: StubContext = { deps, chainId: op.chainId, sender, signer, ...(op.signer !== undefined && { named: true }), nonce: op.nonce, hash, paymasterAndData: op.paymasterAndData, callData: op.callData, entryPoint, replayableHash, ...(op.digest && { digest: op.digest }), ...(op.supertransaction && { supertransaction: op.supertransaction }) };
   const supplied: Stub | undefined = op.signature && op.signature !== '0x' ? { signature: op.signature, wallet: true, ...(op.cosigners?.length && { cosigners: op.cosigners }), ...(op.p256 && { p256: true }), ...(op.verifier && { verifier: op.verifier.toLowerCase() }), ...(op.warm?.length && { warm: op.warm }) } : undefined;
   // A supplied signature runs as it is, except a Kernel operation's in enable mode (its nonce's first byte 0x01): the
   // enable data it carries is kept, with stand-ins for the signatures in it (kernelEnableStub), which a dApp's SDK

@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getContractAddress, keccak256, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getContractAddress, hashMessage, keccak256, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
 import { p256 } from '@noble/curves/nist';
 import { createAddressFromString as at, hexToBytes, setLengthLeft, unpadBytes } from '@ethereumjs/util';
 import { previewRequest } from '../src/preview.ts';
@@ -405,4 +405,54 @@ test('A ZeroDev passkey account whose last operation is beyond the usual lookup:
   assert.ok(tried[0].stateOverrides?.['0xc2b78104907f722dabac4c69f826a522b2754de4'], 'Daimo’s verifier stood in for');
   // The usual lookup's windows first (10,000 blocks each, back to 100,000), then one wide read beyond them.
   assert.ok(windows.some(([from, to]) => to === HEAD - 1n - 100_000n && to - from + 1n === 10_000_000n), JSON.stringify(windows.map(w => w.map(String))));
+});
+
+test('Exa’s account (Modular Account v1, Exactly’s WebauthnOwnerPlugin): the owner’s index, then a passkey’s WebAuthn assertion or an address owner’s signature, which its real code checks', async () => {
+  // Its real code (Arbitrum One), set up as Exa's factory sets an account up: initialize([plugin], abi.encode(
+  // [manifest hash], [abi.encode(owners)])), owners sorted by address (a passkey's: its key's hash, high bytes).
+  // STUB_SIGNATURE's first byte names no owner: validation reverted (AA23), and the calls were simulated alone.
+  const fx = fixture('exa-mav1.json');
+  await install(fx);
+  const { MODULAR_ACCOUNT_V1, standInPasskey } = await import('../src/erc4337-sim.ts');
+  assert.equal(fx.implementation, MODULAR_ACCOUNT_V1);
+  const ACCOUNT = '0x00000000000000000000000000000000e0a0e0a1', KEY = '0x00000000000000000000000000000000e0a0e0b2';
+  await chain.putCode(ACCOUNT, fx.proxy);
+  await chain.evm.stateManager.putStorage(at(ACCOUNT), hexToBytes('0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'), hexToBytes(fx.implementation));
+  const run = async (to: string, data: Hex, from = BOB) => {
+    const res = await chain.evm.runCall({ caller: at(from), origin: at(from), to: at(to), data: hexToBytes(data), gasLimit: 10_000_000n });
+    assert.ok(!res.execResult.exceptionError, `${data.slice(0, 10)} reverted`);
+    return `0x${Buffer.from(res.execResult.returnValue).toString('hex')}` as Hex;
+  };
+  const manifestHash = keccak256(await run(fx.plugin, '0xc7763130')); // pluginManifest()
+  const { x, y } = standInPasskey();
+  const passkey = { x: BigInt(x), y: BigInt(y) }, address = { x: BigInt(KEY), y: 0n };
+  const ownerAddress = (o: { x: bigint; y: bigint }) => o.y === 0n ? o.x : BigInt(keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [o.x, o.y])).slice(0, 42));
+  const owners = [passkey, address].sort((a, z) => (ownerAddress(a) < ownerAddress(z) ? -1 : 1));
+  const PUBLIC_KEYS = [{ type: 'tuple[]', components: [{ name: 'x', type: 'uint256' }, { name: 'y', type: 'uint256' }] }] as const;
+  const initialize = encodeFunctionData({ abi: parseAbi(['function initialize(address[] plugins, bytes pluginInitData)']), args: [[fx.plugin as Hex],
+    encodeAbiParameters([{ type: 'bytes32[]' }, { type: 'bytes[]' }], [[manifestHash], [encodeAbiParameters(PUBLIC_KEYS, [owners])]])] });
+  await run(ACCOUNT, initialize);
+  await funded(ACCOUNT);
+  assert.equal(await implementationOf(deps, 999, ACCOUNT), MODULAR_ACCOUNT_V1);
+  const callData = encodeFunctionData({ abi: parseAbi(['function executeBatch((address target, uint256 value, bytes data)[] calls)']), args: [[{ target: usdc as Hex, value: 0n, data: transfer }]] });
+  const op = operation({ sender: ACCOUNT, initCode: '0x', callData, paymasterAndData: '0x' });
+  // The account itself asked, as Exa's wallet asks: its passkey's assertion, under its index.
+  const request = await standInRequest(op, ACCOUNT, '0.6');
+  const signature = decodeFunctionData({ abi: parseAbi(['function simulateHandleOp((address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature) op, address target, bytes targetCallData)']), data: request.data as Hex }).args[0].signature;
+  assert.equal(signature.slice(0, 4), `0x0${owners.indexOf(passkey)}`);
+  const [auth] = decodeAbiParameters([{ type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' }, { name: 'typeIndex', type: 'uint256' }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }], `0x${signature.slice(4)}`);
+  const hash = userOpHash(readOperation(op, '0.6')!, EP6, 999, '0.6');
+  assert.equal(JSON.parse(auth.clientDataJSON).origin, 'https://web.exactly.app');
+  assert.equal(`0x${Buffer.from(JSON.parse(auth.clientDataJSON).challenge, 'base64url').toString('hex')}`, hashMessage({ raw: hash })); // abi.encode(toEthSignedMessageHash(userOpHash))
+  const p = await preview(op, ACCOUNT, '0.6');
+  assert.ok(whole(p) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  // An address owner asked: its index, then its signature (the ECDSA stand-in, recovered as it).
+  const k = await preview(op, KEY, '0.6');
+  assert.ok(whole(k) && /ecrecover attributes it to the signer\)/.test(whole(k)!) && !/doesn't accept/.test(whole(k)!), notes(k));
+  assert.deepEqual(usdcChange(k), ['out 50']);
+  // Someone who isn't an owner: refused, as it will be, and the preview says why.
+  const b = await preview(op, BOB, '0.6');
+  assert.ok(!whole(b) || /doesn't accept/.test(whole(b)!), notes(b));
+  assert.match(notes(b) + p.warnings.map(w => w.message).join(' ') + b.warnings.map(w => w.message).join(' '), /WebauthnOwnerPlugin/);
 });
