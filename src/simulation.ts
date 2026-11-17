@@ -218,6 +218,10 @@ function unavailableState(error: unknown, block: string): Error {
 
 /** A node's answer when it is turning requests away. */
 const RATE_LIMITED = /rate limit|too many requests|adjustable limit/i;
+/** An OP Stack node's refusal of a simulated block whose calls exceed its DA footprint (see daRoom). */
+const DA_FULL = /DA footprint exceeds/i;
+/** OP Stack's L1Block predeploy, the slot holding its daFootprintGasScalar, and the scalar's getter. */
+const L1_BLOCK = '0x4200000000000000000000000000000000000015', L1_BLOCK_DA_SLOT = `0x${'0'.repeat(63)}8`, DA_FOOTPRINT_GAS_SCALAR = '0xfe3d5710';
 
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
@@ -443,8 +447,35 @@ export class RpcSimulator implements Simulator {
       const body = await res.json() as { result?: unknown; error?: { code?: number; message?: string; data?: Hex } };
       if (body.error && (body.error.code === -32005 || body.error.code === 429 || /rate limit|too many requests|adjustable limit/i.test(body.error.message ?? '')) && await retry()) continue;
       if (body.error && /block not found|header not found|unknown block/i.test(body.error.message ?? '') && attempt < 3 && await retry()) continue;
+      // An OP Stack block's transactions count against its DA footprint (Jovian), and a simulated block's calls do
+      // too: a replay in a block that filled it can't fit the reads after its transaction ("transaction DA footprint
+      // exceeds available block DA footprint", OP Mainnet, 2026-11-16). Asked again with room for them (daRoom).
+      if (method === 'eth_simulateV1' && body.error && DA_FULL.test(body.error.message ?? '')) {
+        const roomy = await this.daRoom(url, params);
+        if (roomy) return this.post(url, method, roomy);
+      }
       return body;
     }
+  }
+  /**
+   * eth_simulateV1's params with room in the simulated block's DA footprint: L1Block's daFootprintGasScalar (16 bits
+   * of its slot 8, above the operator fee's scalar and constant, on OP Mainnet and Base) set to 0 for the run, the
+   * slot's other fields kept, so no call counts against it. Only where the slot holds the scalar the contract reports
+   * (read at the run's block), and its blocks don't already set that slot.
+   */
+  private async daRoom(url: string, params: unknown[]): Promise<unknown[] | null> {
+    const [opts, tag] = params as [{ blockStateCalls: { stateOverrides?: Record<string, { state?: Record<string, Hex>; stateDiff?: Record<string, Hex> }> }[] }, string];
+    const first = opts?.blockStateCalls?.[0];
+    if (!first || opts.blockStateCalls.some(b => { const o = b.stateOverrides?.[L1_BLOCK]; return !!o?.state || !!o?.stateDiff?.[L1_BLOCK_DA_SLOT]; })) return null;
+    try {
+      const [word, scalar] = await Promise.all([
+        this.post(url, 'eth_getStorageAt', [L1_BLOCK, L1_BLOCK_DA_SLOT, tag]), this.post(url, 'eth_call', [{ to: L1_BLOCK, data: DA_FOOTPRINT_GAS_SCALAR }, tag])]);
+      const w = BigInt(String(word.result)), s = BigInt(String(scalar.result));
+      if (!s || ((w >> 96n) & 0xffffn) !== s) return null;
+      const kept = `0x${(w & ~(0xffffn << 96n)).toString(16).padStart(64, '0')}` as Hex;
+      const at = first.stateOverrides?.[L1_BLOCK];
+      return [{ ...opts, blockStateCalls: [{ ...first, stateOverrides: { ...first.stateOverrides, [L1_BLOCK]: { ...at, stateDiff: { ...at?.stateDiff, [L1_BLOCK_DA_SLOT]: kept } } } }, ...opts.blockStateCalls.slice(1)] }, ...params.slice(1)];
+    } catch { return null; }
   }
 
   private async withoutSimulateV1(url: string, chainId: number, reqs: SimulationRequest[]): Promise<SimulationResult[]> {

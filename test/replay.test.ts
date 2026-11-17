@@ -749,3 +749,42 @@ test('A replay’s trace is checked against what the block’s access list says 
   const before = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, { trace: true }, { ...d, simulator: { simulate: async () => ran(), trace: async () => [{ ...ran({ source: 'local' }), trace: root, stateChanges: [] }] } });
   assert.equal(before.trace!.stateAgrees, undefined);
 });
+
+test('An OP Stack block whose DA footprint the replayed block filled: asked again with room in it, L1Block’s DA scalar set to 0 for the run', async () => {
+  // OP Mainnet counts each simulated call as 40,000 of its block's DA footprint (40,000,000): a replay of a block of
+  // a thousand transactions, with the reads after its own, is refused, as 1,001 calls were (2026-11-17).
+  const L1_BLOCK = '0x4200000000000000000000000000000000000015', SLOT8 = `0x${'0'.repeat(63)}8`;
+  const word = `0x${'0'.repeat(36)}0190${'0'.repeat(8)}0000000500000007`; // daFootprintGasScalar 400, then an operator fee scalar and constant
+  const sent: { method: string; params: any[] }[] = [];
+  const fetchImpl = (async (_u: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { method: string; params: any[] };
+    sent.push(body);
+    const reply = (x: object) => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, ...x }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (body.method === 'eth_getStorageAt') return reply({ result: body.params[0] === L1_BLOCK && body.params[1] === SLOT8 ? word : `0x${'0'.repeat(64)}` });
+    if (body.method === 'eth_call') return reply({ result: body.params[0].data === '0xfe3d5710' ? `0x${'0'.repeat(61)}190` : '0x' });
+    if (body.method === 'eth_simulateV1') {
+      const diff = body.params[0].blockStateCalls[0].stateOverrides?.[L1_BLOCK]?.stateDiff?.[SLOT8];
+      if (diff === undefined) return reply({ error: { code: -38015, message: 'transaction DA footprint exceeds available block DA footprint. transaction_da_footprint: 40000, available_block_da_footprint: 0' } });
+      return reply({ result: [{ calls: body.params[0].blockStateCalls[0].calls.map(() => ({ status: '0x1', gasUsed: '0x5208', returnData: `0x${'0'.repeat(64)}`, logs: [] })) }] });
+    }
+    return reply({ error: { code: -32601, message: `unexpected ${body.method}` } });
+  }) as unknown as typeof fetch;
+  const simulator = new RpcSimulator({ 10: 'http://rpc.invalid' }, { fetchImpl });
+  const res = await simulator.simulate({ chainId: 10, from: ALICE, to: BOB, data: '0x', value: 1n });
+  assert.equal(res?.status, 'success');
+  const asked = sent.filter(s => s.method === 'eth_simulateV1');
+  assert.ok(asked.length >= 2);
+  // The scalar's 16 bits zeroed, the operator fee's kept; read at the block the run is on.
+  assert.equal(asked.at(-1)!.params[0].blockStateCalls[0].stateOverrides[L1_BLOCK].stateDiff[SLOT8], `0x${'0'.repeat(48)}0000000500000007`);
+  assert.ok(sent.some(s => s.method === 'eth_getStorageAt' && s.params[2] === asked[0].params[1]));
+  // Where the slot doesn't hold the scalar the contract reports (another layout), no room is made: the refusal stands.
+  const other = new RpcSimulator({ 10: 'http://rpc.invalid' }, { fetchImpl: (async (u: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { method: string };
+    if (body.method === 'eth_call') return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: `0x${'0'.repeat(61)}191` }), { status: 200 });
+    return fetchImpl(u, init as never);
+  }) as unknown as typeof fetch });
+  sent.length = 0;
+  const refused = await other.simulate({ chainId: 10, from: ALICE, to: BOB, data: '0x', value: 1n }).catch((e: Error) => e);
+  assert.ok(refused instanceof Error || refused?.status !== 'success');
+  assert.ok(sent.filter(s => s.method === 'eth_simulateV1').every(s => !s.params[0].blockStateCalls[0].stateOverrides?.[L1_BLOCK]));
+});
