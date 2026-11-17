@@ -2918,6 +2918,14 @@ export class ForkSimulator implements Simulator {
         const upfront = req.gas * req.gasPrice + blobs, account = await state.getAccount(sender);
         if (account && account.balance >= upfront + req.value) { account.balance -= upfront; await state.putAccount(sender, account); bought = upfront; }
       }
+      // (The authorities as the transaction found them: under Amsterdam, one that can't pay for the state its
+      // authorizations add runs out of gas, and they don't apply. Below.)
+      const found = new Map<string, { nonce: bigint; balance: bigint; code: Uint8Array } | null>();
+      if (profile.hardfork === 'amsterdam' && req.gas !== undefined) for (const a of auths[i]) {
+        if (!a.authority || found.has(a.authority)) continue;
+        const at = createAddressFromString(a.authority), account = await state.getAccount(at);
+        found.set(a.authority, account ? { nonce: account.nonce, balance: account.balance, code: await state.getCode(at) } : null);
+      }
       const authorized = await this.authorize(state, evm, auths[i], chainId, caller);
       // Amsterdam charges an applied authorization for the state it adds, out of the transaction's gas, not as a refund.
       const authRefund = profile.hardfork === 'amsterdam' ? 0n : authorized.refund, authState = profile.hardfork === 'amsterdam' ? authorized.state : 0n;
@@ -2926,6 +2934,20 @@ export class ForkSimulator implements Simulator {
       // the calldata's cost higher here than there, 2026-11-16. The other nodes give their own caps, 32 to 160 million,
       // which code reading gasleft() alone sees; a call that burns all it is given would take that much longer here.)
       let gasLimit = req.gas ? req.gas - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState - (profile.arbitrum ? req.gasForL1 ?? 0n : 0n) : GAS - intrinsicGas(req, profile.hardfork === 'amsterdam').intrinsic - authState;
+      // Under Amsterdam, a transaction whose gas, after what it pays before its call, can't pay for the state its
+      // authorizations add runs out of gas: all its gas used, nothing run, and its authorizations not applied (its
+      // nonce still taken). On Sepolia (2026-11-16) a delegation sent on 29,724 gas, 19,816 of it paid before its call
+      // and the delegation's state 35,190, failed using all 29,724, the account left without code; the local EVM had
+      // applied it and reported 55,006 gas, over the transaction's own limit.
+      const exhausted = profile.hardfork === 'amsterdam' && req.gas !== undefined && gasLimit < 0n;
+      if (exhausted) for (const [a, was] of found) {
+        const at = createAddressFromString(a);
+        if (!was) { await state.deleteAccount(at); continue; }
+        const account = (await state.getAccount(at)) ?? new Account();
+        account.nonce = was.nonce; account.balance = was.balance;
+        await state.putAccount(at, account);
+        await state.putCode(at, was.code);
+      }
       // Amsterdam meters new state apart from the rest (EIP-8037). What a transaction's gas limit holds over the cap
       // on ordinary gas (EIP-7825's 16,777,216, less what it pays before its call) is a reservoir for state alone;
       // state gas is drawn from it first, then from the call's gas, and state gas given back (a slot set and cleared
@@ -2947,7 +2969,10 @@ export class ForkSimulator implements Simulator {
       opened.length = 0; reached.clear();
       source.ran.calls++;
       state.at.call = true;
-      const res = await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
+      // (Its trace is its one call, failed before it ran.)
+      if (exhausted && req.trace) root = { call: { type: req.to ? 'call' : 'create', from: caller, to: req.to?.toLowerCase() ?? null, value: req.value, input: req.data, gas: 0n, gasUsed: 0n, error: 'out of gas' }, context: req.to?.toLowerCase() ?? '', isStatic: false, own: [], under: new Set() };
+      const res = exhausted ? { execResult: { executionGasUsed: 0n, returnValue: new Uint8Array(0), exceptionError: new EVMError(EVMError.errorMessages.OUT_OF_GAS), logs: [], gasRefund: 0n, selfdestruct: new Map(), createdAddresses: new Set() } } as unknown as Awaited<ReturnType<typeof evm.runCall>>
+        : await evm.runCall({ caller: sender, origin: sender, ...(req.to && { to: createAddressFromString(req.to) }), skipNonceIncrement: true,
         data: hexToBytes(req.data as Hex), value: req.value, gasLimit: gasLimit > 0n ? gasLimit : 0n, gasPrice: req.gasPrice ?? 0n, block, ...(req.blobVersionedHashes?.length && { blobVersionedHashes: req.blobVersionedHashes as Hex[] }) });
       recording = false;
       state.at.call = false;
@@ -2968,7 +2993,7 @@ export class ForkSimulator implements Simulator {
       }
       const traced = req.trace ? { trace: traceOf(ex.logs ?? []), stateChanges: await changesOf() } : undefined;
       // What the call spent, and under Amsterdam what its state took from the reservoir (less what it gave back to it).
-      const spent = ex.executionGasUsed + authState + (metered ? reservoir - metered.stateGasReservoir : 0n);
+      const spent = exhausted ? req.gas! - intrinsicGas(req, true).intrinsic : ex.executionGasUsed + authState + (metered ? reservoir - metered.stateGasReservoir : 0n);
       // EIP-7623's calldata floor from Prague on, but not on Arbitrum, whose node charges none (1,000 bytes of calldata
       // to an empty account: 37,000 gas there, the floor's 61,000 on Ethereum, Base, OP Mainnet, Polygon and BNB
       // Chain; 2026-11-15).

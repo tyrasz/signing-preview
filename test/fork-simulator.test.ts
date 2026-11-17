@@ -1454,6 +1454,25 @@ test('Amsterdam (Glamsterdam) blocks run Amsterdam’s rules: what Sepolia’s n
   const [failed] = (await new ForkSimulator({ 11155111: URL_ }, { fetchImpl: chain.fetchImpl }).trace([{ chainId: 11155111, from: FROM, to: REVERTS, data: '0x', value: 0n, at: { block: '0x10', header: amsterdam },
     stateOverrides: { [REVERTS]: { code: '0x60006000fd' } }, authorizationList: [await authorization(KEPT, 0)] }]))!;
   assert.deepEqual([failed.status, failed.stateChanges], ['reverted', [{ address: privateKeyToAccount(KEPT).address.toLowerCase(), nonce: { before: 0n, after: 1n }, code: true }]]);
+  // A transaction whose gas, after the 19,816 it pays before its call, can't pay for its authorization's state
+  // (here 35,190) runs out of gas: all its gas used, and its authorization not applied, the sender's nonce alone
+  // taken. Sepolia's 0xeb79d200… (2026-11-16): 29,724 gas, the account left without code, its nonce up by one.
+  const SHORT = `0x${'f4'.repeat(32)}` as Hex, short = privateKeyToAccount(SHORT).address.toLowerCase();
+  await chain.setBalance(short, E);
+  // (To an address with no code, so the call itself runs nothing.)
+  const nowhere = async (key: Hex, nonce: number) => {
+    const a = await privateKeyToAccount(key).signAuthorization({ address: '0x00000000000000000000000000000000000d0e5e', chainId: 11155111, nonce });
+    return { address: '0x00000000000000000000000000000000000d0e5e', chainId: toHex(11155111), nonce: toHex(nonce), r: a.r, s: a.s, yParity: toHex(a.yParity!) };
+  };
+  const self = async (gas: bigint) => (await new ForkSimulator({ 11155111: URL_ }, { fetchImpl: chain.fetchImpl }).trace([{ chainId: 11155111, from: short, to: short, data: '0x', value: 0n, gas,
+    at: { block: '0x10', header: amsterdam }, authorizationList: [await nowhere(SHORT, 1)] }]))![0];
+  const exhausted = await self(29_724n);
+  // (What a transaction changes is counted from after its sender's nonce goes up: here, nothing.)
+  assert.deepEqual([exhausted.status, exhausted.gasUsed, exhausted.revertReason?.startsWith('out of gas'), exhausted.stateChanges], ['reverted', 29_724n, true, undefined]);
+  assert.deepEqual([exhausted.trace?.error, exhausted.trace?.gasUsed], ['out of gas', 0n]);
+  // Given enough, it applies: 19,816, the 35,190, and 3,000 to reach the delegate's code (a cold account).
+  const applied = await self(60_000n);
+  assert.deepEqual([applied.status, applied.gasUsed, applied.stateChanges], ['success', 19_816n + 35_190n + 3_000n, [{ address: short, nonce: { before: 1n, after: 2n }, code: true }]]);
   // Gas over the cap on ordinary gas (16,777,216) pays for new state only: a call given 20 million has the cap, less
   // what the transaction pays first, to run on; a new account's state comes out of the rest, and is counted.
   await chain.putCode('0x00000000000000000000000000000000000c0de8', '0x5a60005260206000f3');
