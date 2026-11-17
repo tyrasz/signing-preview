@@ -54,6 +54,8 @@ jobs:
           - { name: 'Arbitrum One, EntryPoint v0.6', chain: '42161', entrypoint: '0.6', backfill: '0' }
           - { name: 'OP Mainnet, EntryPoint v0.7', chain: '10', entrypoint: '0.7', backfill: '0' }
           - { name: 'Arbitrum One, EntryPoint v0.9', chain: '42161', entrypoint: '0.9', backfill: '0' }
+          # OP Mainnet's v0.6 operations: Exa's wallets (Modular Account v1 with Exactly's passkey plugin) among them.
+          - { name: 'OP Mainnet, EntryPoint v0.6', chain: '10', entrypoint: '0.6', backfill: '0' }
           # Ethereum's testnet, where Glamsterdam's rules are live: its blocks carry their access lists, so each
           # operation is replayed on the exact state it met.
           - { name: 'Ethereum Sepolia, EntryPoint v0.7', chain: '11155111', entrypoint: '0.7', backfill: '80' }
