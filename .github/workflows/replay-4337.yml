@@ -57,6 +57,10 @@ jobs:
           # Ethereum's testnet, where Glamsterdam's rules are live: its blocks carry their access lists, so each
           # operation is replayed on the exact state it met.
           - { name: 'Ethereum Sepolia, EntryPoint v0.7', chain: '11155111', entrypoint: '0.7', backfill: '80' }
+          # The same operations as a wallet asks them to be signed, its gas-estimation stub in place (each operation's
+          # own signature, the ECDSA signatures in it replaced by a dummy): the preview stands in in the stub's form
+          # (src/erc4337-sim.ts, walletForm).
+          - { name: 'Base, EntryPoint v0.7, wallet stubs', chain: '8453', entrypoint: '0.7', backfill: '100', extra: '--wallet-stub', suffix: '-wallet-stub' }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,16 +84,17 @@ jobs:
           CHAIN: ${{ matrix.chain }}
           ENTRYPOINT: ${{ matrix.entrypoint }}
           BACKFILL: ${{ matrix.backfill }}
+          EXTRA: ${{ matrix.extra }}
         run: |
           set -o pipefail
           [[ "$MINUTES" =~ ^[0-9]+$ ]] || { echo "minutes must be a number"; exit 1; }
           npm run accuracy:4337 -- --chain "$CHAIN" --entrypoint "$ENTRYPOINT" --follow $((MINUTES * 60)) --backfill "$BACKFILL" \
-            --max 600 --concurrency 3 --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report.json --differing differing 2>&1 | tee replay.log
+            --max 600 --concurrency 3 --strict $EXTRA --summary-md "$GITHUB_STEP_SUMMARY" --out report.json --differing differing 2>&1 | tee replay.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: replay-${{ matrix.chain }}-v${{ matrix.entrypoint }}
+          name: replay-${{ matrix.chain }}-v${{ matrix.entrypoint }}${{ matrix.suffix }}
           path: |
             report.json
             report.skipped.json

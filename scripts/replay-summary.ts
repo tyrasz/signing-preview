@@ -27,7 +27,9 @@ const differing: string[] = [], fallbacks: string[] = [], warned: string[] = [],
 const skips = new Map<string, number>();
 let total = 0, wrongTotal = 0;
 for (const name of readdirSync(dir).sort()) {
-  const m = /^replay-(\d+)-v([\d.]+)$/.exec(name);
+  // (A job run with --wallet-stub is named so: replay-<chain>-v<entrypoint>-wallet-stub.)
+  const m = /^replay-(\d+)-v([\d.]+)(-wallet-stub)?$/.exec(name);
+  if (m?.[3]) m[2] = `${m[2]} (wallet stubs)`;
   const file = join(dir, name, 'report.json');
   if (!m || !existsSync(file)) continue;
   const rows = JSON.parse(readFileSync(file, 'utf8')) as Row[];
