@@ -17,7 +17,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { CHAIN_PROFILES, ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, implementationOf, simulateOperation, STUB_SIGNATURE, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, simulateOperation, STUB_SIGNATURE, walletForm, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
 import type { Dependencies, Preview, SimulationRequest } from '../src/types.ts';
 import { NOW } from './helpers.ts';
 import { compiled, testChain } from './evm-chain.ts';
@@ -80,6 +80,30 @@ test('Ambire’s account, an EIP-1167 clone: the stand-in in its Standard mode, 
   // A key the account gives no privilege to: its validation fails, as it will once that key signs.
   const q = await preview(operation({ sender: ACCOUNT, callData }), BOB);
   assert.ok(!whole(q) || /doesn't accept/.test(whole(q)!), notes(q));
+  // The wallet supplies its own gas-estimation stub, a dummy no key signed in Ambire's Standard mode: the account
+  // refuses it as it is, and takes the stand-in put in its place (the wallet's form kept).
+  const dummy = `0x${'11'.repeat(32)}${'22'.repeat(32)}1b01` as Hex;
+  const w = await preview(operation({ sender: ACCOUNT, callData, signature: dummy }), KEY);
+  assert.ok(whole(w) && /in the form of the wallet's own, its ECDSA signature replaced by one ecrecover attributes to the signer\)/.test(whole(w)!), notes(w));
+  assert.deepEqual(usdcChange(w), ['out 50']);
+});
+
+test('The ECDSA signatures in a wallet’s supplied signature, and the stand-in in their place', () => {
+  const sig = (r: string, s: string, v: string) => `${r.repeat(32)}${s.repeat(32)}${v}`;
+  const ecdsa = sig('11', '22', '1b');
+  // Bare, behind a type byte, with a mode byte after, and ABI-wrapped beside an empty part.
+  assert.deepEqual(ecdsaOffsets(`0x${ecdsa}`), [0]);
+  assert.deepEqual(walletForm(`0x01${ecdsa}`), [`0x01${STUB_SIGNATURE.slice(2)}`]);
+  assert.deepEqual(walletForm(`0x${ecdsa}01`), [`${STUB_SIGNATURE}01`]);
+  const wrapped = `0x01${'00'.repeat(31)}40${'00'.repeat(31)}c0${'00'.repeat(31)}41${ecdsa}${'00'.repeat(31)}${'00'.repeat(32)}` as Hex;
+  assert.deepEqual(ecdsaOffsets(wrapped), [1 + 96]);
+  // Two signatures, owner's and cosigner's: both found, last first, one stand-in each.
+  assert.deepEqual(ecdsaOffsets(`0x${ecdsa}${sig('33', '44', '1c')}`), [65, 0]);
+  // Not a signature: s in the upper half, v not 27 or 28, r zero; and the stand-in itself gives nothing to replace.
+  assert.deepEqual(ecdsaOffsets(`0x${sig('11', 'ff', '1b')}`), []);
+  assert.deepEqual(ecdsaOffsets(`0x${sig('11', '22', '02')}`), []);
+  assert.deepEqual(ecdsaOffsets(`0x${sig('00', '22', '1b')}`), []);
+  assert.deepEqual(walletForm(STUB_SIGNATURE), []);
 });
 
 test('An account behind OKX Wallet’s 797-byte proxy runs the implementation its ERC-1967 slot names', async () => {

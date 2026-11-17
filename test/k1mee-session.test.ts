@@ -147,8 +147,9 @@ test('The operation’s hash signed by a K1MeeValidator session’s key: the pla
   const bare = gasUsed(await preview({ ...op, signature: concatHex(['0x00', ID, await key.sign({ hash })]) }, KEY, 'eth_sign'));
   const once = bare + priced(1) - gasUsed(e);
   assert.ok(once >= 150n && once <= 220n, `${bare} ${gasUsed(e)}`);
-  // The key's signature over another hash: refused.
-  assert.match(wholeNote(await preview({ ...op, signature: concatHex(['0x00', ID, await key.signMessage({ message: { raw: keccak256(hash) } })]) }, KEY)), /doesn't accept/);
+  // The key's signature over another hash, supplied with the operation: refused as it is, so the preview stands in in
+  // its form for what the key signs when asked (the operation's hash), which the session takes.
+  assert.match(wholeNote(await preview({ ...op, signature: concatHex(['0x00', ID, await key.signMessage({ message: { raw: keccak256(hash) } })]) }, KEY)), /in the form of the wallet's own/);
 
   // Asked by someone else: the session's check runs on the stand-in, refuses it, and the note names the key.
   const b = await preview(op, BOB);

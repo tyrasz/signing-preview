@@ -52,7 +52,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
@@ -62,6 +62,17 @@ import { compareTokens, movedAlike, TRANSFER, type Compared } from './userop-tok
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
+// --wallet-stub: each operation previewed with its own signature in place, the ECDSA signatures in it replaced by a
+// dummy no key signed, as a wallet's gas-estimation stub carries one (the preview then stands in in that form:
+// src/erc4337-sim.ts, walletForm).
+const WALLET_STUB = process.argv.includes('--wallet-stub');
+const DUMMY_ECDSA = `${'11'.repeat(32)}${'22'.repeat(32)}1b`;
+/** The signature with DUMMY_ECDSA in place of each ECDSA signature in it (ecdsaOffsets). */
+function dummyForm(sig: Hex): Hex {
+  let out = sig.slice(2).toLowerCase();
+  for (const i of ecdsaOffsets(sig)) out = `${out.slice(0, i * 2)}${DUMMY_ECDSA}${out.slice(i * 2 + 130)}`;
+  return `0x${out}` as Hex;
+}
 const PREFIX = !process.argv.includes('--no-prefix'), STRICT = process.argv.includes('--strict'), ENABLE_DUMMIES = process.argv.includes('--enable-dummies');
 const CONCURRENCY = Math.max(1, Number(arg('concurrency', '1'))), BACKFILL = Number(arg('backfill', '0'));
 /** --sessions: only bundles with an operation whose nonce names SmartSession (smartSessionOf), read from its UserOperationEvent. */
@@ -539,6 +550,9 @@ async function replay(item: string): Promise<void> {
   try { slot = await readFallback().catch(async () => { await new Promise(r => setTimeout(r, 1000)); return readFallback(); }); } catch { return skip('a read of its state failed'); }
   const fallback = code === '0x' && safeSetupOf(op.initCode) ? safeSetupOf(op.initCode)!.fallbackHandler : `0x${String(slot).slice(-40)}`.toLowerCase();
   const module = SAFE_EXECUTE.includes(op.callData.slice(0, 10)) && SAFE_4337_MODULES[fallback]?.entryPoint === EP ? SAFE_4337_MODULES[fallback] : undefined;
+  // (--wallet-stub: an operation signed over its hash only; a SafeOp's or a supertransaction's signature is another's.)
+  const walletStub = !supplied && WALLET_STUB && !module && !supertransaction && ecdsaOffsets(op.signature).length ? dummyForm(op.signature) : undefined;
+  if (walletStub) supplied = walletStub;
   let request: (signer: string) => { method: string; params: unknown[] }, digest: Hex, kind: string;
   let ctx: Record<string, unknown> = context;
   if (module) {
@@ -840,8 +854,8 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
-    ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
     ...(nodeFailed && { nodeFailed: true }),

@@ -430,7 +430,9 @@ test('A typed operation validates with the wallet’s own stub when context.user
   const run = (operation: Record<string, unknown>) => previewRequest({ method: 'eth_signTypedData_v4', params: [OWNER, typed] }, { now: NOW, userOperation: { entryPoint: EP8, operation } }, deps);
   const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated/.test(n)) ?? p.decoding.notes.join(' | ');
   const stubbed = await run({ sender: account8, nonce: '0x0', callData: sendUsdc, signature });
-  assert.match(whole(stubbed), /with the wallet's stand-in signature/);
+  // (Signed by a key the account doesn't name, the stub is refused as it is; the stand-in in its form, for the signer
+  // asked, is taken.)
+  assert.match(whole(stubbed), /with a stand-in for the signature in the form of the wallet's own/);
   assert.deepEqual(usdcChange(stubbed), ['out 50']);
   // Another operation's (another nonce, or other calls): the wallet's stub isn't for this one, and the stand-in is used.
   for (const other of [{ sender: account8, nonce: '0x1', signature }, { sender: account8, nonce: '0x0', callData: '0x', signature }]) {

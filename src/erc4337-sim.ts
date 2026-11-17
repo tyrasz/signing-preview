@@ -507,6 +507,8 @@ interface Stub {
   madeUp?: boolean;
   /** The signature the wallet supplied with the operation, run as it is. */
   wallet?: boolean;
+  /** The wallet's supplied signature with the stand-in in place of the ECDSA signature it carries (walletForm). */
+  walletForm?: boolean;
   /** Kernel's enable mode: the operation's own enable data, with stand-ins for its two signatures (kernelEnableStub). */
   enable?: boolean;
   /** Storage slots of the account set for the run (a stand-in key registered as one of its own stands). */
@@ -2273,6 +2275,28 @@ async function modularAccountStub(c: StubContext): Promise<Stub> {
 }
 
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
+const SECP256K1_N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
+/**
+ * The ECDSA signatures a supplied signature carries (65 bytes: r and s nonzero, r below the group order, s in its
+ * lower half, v 27 or 28): their byte offsets, from the end, two at most and none overlapping.
+ */
+export function ecdsaOffsets(sig: Hex): number[] {
+  const hex = sig.slice(2).toLowerCase(), out: number[] = [];
+  for (let i = hex.length / 2 - 65; i >= 0 && out.length < 2; i--) {
+    const v = hex.slice((i + 64) * 2, (i + 65) * 2);
+    if (v !== '1b' && v !== '1c') continue;
+    const r = BigInt(`0x${hex.slice(i * 2, i * 2 + 64)}`), sv = BigInt(`0x${hex.slice(i * 2 + 64, i * 2 + 128)}`);
+    if (!r || !sv || r >= SECP256K1_N || sv > SECP256K1_N / 2n) continue;
+    out.push(i);
+    i -= 64;
+  }
+  return out;
+}
+/** The signature with STUB_SIGNATURE in place of each ECDSA signature it carries (ecdsaOffsets), one at a time; none where it is there already. */
+export function walletForm(sig: Hex): Hex[] {
+  const hex = sig.slice(2).toLowerCase(), stub = STUB_SIGNATURE.slice(2);
+  return ecdsaOffsets(sig).filter(i => hex.slice(i * 2, i * 2 + 130) !== stub).map(i => `0x${hex.slice(0, i * 2)}${stub}${hex.slice(i * 2 + 130)}` as Hex);
+}
 // --- Ambire's account (AmbireAccount, verified source on Sourcify; EIP-1167 clones of it, Ethereum and Base) ---
 // validateUserOp recovers the signer with SignatureValidator.recoverAddr, which reads the signature's last byte as its
 // mode: {r}{s}{v}{mode}, Standard (1) recovering over the EIP-712 digest of AmbireOperation(address account, bytes32
@@ -2625,6 +2649,8 @@ export interface OperationRun {
    * (Kernel's enable mode) the operation's own enable data with stand-ins for the owner's and the new key's signatures.
    */
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
+  /** The ECDSA stand-in took the form of the wallet's supplied signature (Stub's `walletForm`). */
+  walletForm?: boolean;
   /** The passkey's stand-in is a real assertion by a passkey made up for the run, its key set as the account's (Stub's `madeUp`). */
   madeUp?: boolean;
   /** Why the account may not take the stand-in as the signer's (Stub's `why`): said where it rejects it. */
@@ -2770,7 +2796,11 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   // enable data it carries is kept, with stand-ins for the signatures in it (kernelEnableStub), which a dApp's SDK
   // leaves as dummies until they're signed. It runs as it is only if those can't be made.
   const enable = supplied && op.nonce >> 248n === 1n && readKernelEnable(supplied.signature) ? (await stubFor({ ...context, signature: supplied.signature }, op.delegate, op.initCode)).filter(s => s.enable) : [];
-  const stubs: Stub[] = supplied ? [...enable, supplied] : await stubFor(context, op.delegate, op.initCode);
+  // Where the account refuses the supplied signature as it is (a gas-estimation stub's dummy, signed by no one), the
+  // same signature with the ECDSA stand-in in place of the one it carries: the account then reads the form its
+  // owner's signature will take (a type byte, a wrapper) and runs that path, as the plain stand-in may not (an
+  // account on Sepolia took a bare 65-byte signature by a path 29,000 gas cheaper than its wallet's own form).
+  const stubs: Stub[] = supplied ? [...enable, supplied, ...walletForm(supplied.signature).map(signature => ({ signature, walletForm: true }))] : await stubFor(context, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2818,7 +2848,9 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   for (const stub of stubs) {
     const ran = await withStub(stub);
     if (ran && !ran.account?.signatureFailed && !ran.rejected?.startsWith('AA23')) return ran;
-    if (ran && (!result || rank(ran) >= rank(result))) result = ran;
+    // (The stand-in in the wallet's form is kept only where the account takes it: refused too, the wallet's own stub's
+    // run says so.)
+    if (ran && !stub.walletForm && (!result || rank(ran) >= rank(result))) result = ran;
   }
   return result;
 
@@ -2948,7 +2980,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
   const unpaid = stub.unpaid || (stub.wallet && result?.rejected?.startsWith('AA21') && await refusesUnpaid());
-  return result && { ...result, standIn, ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
+  return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
   }
 }
 
