@@ -27,12 +27,16 @@ concurrency:
 
 jobs:
   rules:
+    # One job a chain, side by side. Run one after another, the chains took 39 minutes on 2026-11-15, and two hours on
+    # 2026-11-16 once the audit's programs (about 900 more a chain) were added: Arbitrum One's part alone went from
+    # 3.7 to 14.5 minutes (its public RPC rate-limits GitHub's runners), near the job's limit then of 150.
+    name: rules (${{ matrix.chain }})
     runs-on: ubuntu-latest
-    # Arbitrum's public RPC rate-limits GitHub's runners: its part took 14 minutes in the first scheduled run, which
-    # was cancelled at 30 before reaching the last chain. The whole run took 39 minutes on 2026-11-15; the programs
-    # added from the audit of 2026-11-16 (about 900 more a chain) took Arbitrum One from 3.7 to 14.5 minutes here, and
-    # Ethereum to 2.5.
-    timeout-minutes: 150
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        chain: [1, 10, 56, 137, 999, 8453, 42161, 11155111]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,7 +59,7 @@ jobs:
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
         run: |
           set -o pipefail
-          npm run rules -- --chain all --strict --fuzz 48 --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee rules.log
+          npm run rules -- --chain ${{ matrix.chain }} --strict --fuzz 48 --summary-md "$GITHUB_STEP_SUMMARY" --out report.json 2>&1 | tee rules.log
       - name: The same at each chain's scheduled fork
         if: success() || failure()
         shell: bash
@@ -70,30 +74,35 @@ jobs:
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
         run: |
           set -o pipefail
-          npm run rules -- --chain all --next --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report-next.json 2>&1 | tee rules-next.log
+          npm run rules -- --chain ${{ matrix.chain }} --next --strict --summary-md "$GITHUB_STEP_SUMMARY" --out report-next.json 2>&1 | tee rules-next.log
+      - name: Mark the chain as failed
+        # (A job past its time limit is cancelled, not failed.)
+        if: failure() || cancelled()
+        run: echo failed > failed.txt
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: rules-check
+          name: rules-check-${{ matrix.chain }}
           path: |
             report.json
             rules.log
             report-next.json
             rules-next.log
+            failed.txt
           if-no-files-found: ignore
           retention-days: 30
 
   report-failure:
     needs: rules
-    if: failure() && github.event_name == 'schedule'
+    if: always() && github.event_name == 'schedule' && (needs.rules.result == 'failure' || needs.rules.result == 'cancelled')
     runs-on: ubuntu-latest
     permissions:
       issues: write
     steps:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: rules-check
+          pattern: rules-check-*
           path: report
       - name: Open or update an issue
         env:
@@ -106,12 +115,20 @@ jobs:
           {
             echo "The scheduled rules check found a chain whose node and the local EVM no longer agree, or whose fork is not the one the local EVM was last checked against: $RUN_URL. The node's own simulation is unaffected; call traces, and simulations on RPCs without eth_simulateV1, run in the local EVM. What the run said:"
             echo
-            echo '```'
-            grep -a -v '^> \|^$\|UNDICI\|trace-warnings' report/rules.log | tail -n 80 || echo "(No log.)"
-            echo
-            echo 'At each scheduled fork (--next):'
-            grep -a -v '^> \|^$\|UNDICI\|trace-warnings' report/rules-next.log | tail -n 40 || echo "(No log.)"
-            echo '```'
+            # Each chain's job leaves its own logs (report/rules-check-<chain>/), and failed.txt where it failed.
+            for dir in report/rules-check-*; do
+              if [ -f "$dir/failed.txt" ] || [ ! -f "$dir/rules.log" ]; then
+                echo
+                echo "Chain ${dir##*-}:"
+                echo
+                echo '```'
+                grep -a -v '^> \|^$\|UNDICI\|trace-warnings' "$dir/rules.log" | tail -n 60 || echo "(No log.)"
+                echo
+                echo 'At its scheduled fork (--next):'
+                grep -a -v '^> \|^$\|UNDICI\|trace-warnings' "$dir/rules-next.log" | tail -n 30 || echo "(No log.)"
+                echo '```'
+              fi
+            done
           } > body.md
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body-file body.md
