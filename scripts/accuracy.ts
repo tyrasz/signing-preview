@@ -233,8 +233,9 @@ async function replay(b: B, seen?: Set<string>) {
         // a GMX keeper's execution fee (from gasleft(), less a 63rd of it) came out 2 gas at its price off the
         // receipt's, now and then (2026-11-16, -17). Where what moved differs, the block is run again with each
         // transaction's gas limit moved by what the node charged over its receipt's L1 gas, so that each call starts
-        // with the gas it had on-chain: of four such keeper transactions, three came out exact as they were and four
-        // so moved.
+        // with the gas it had on-chain. Of eight such keeper transactions caught live (2026-11-17), the node came out
+        // exact on seven, five of them after this second run, and the local EVM, given the receipt's L1 gas, on all
+        // eight.
         if (name === 'eth_simulateV1' && CHAIN === 42161 && r.gasUsedForL1) {
           const first = net(out[out.length - 1].transfers, from);
           let off = (first.get('native') ?? 0n) !== nativeActual;
