@@ -52,7 +52,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { BULLBIT_IMPLEMENTATION, implementationOf, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { safeSetupOf } from '../src/safe-sim.ts';
@@ -602,6 +602,17 @@ async function replay(item: string): Promise<void> {
     try {
       const a = (await recoverAddress({ hash: okxDigest(digest, BigInt(`0x${op.signature.slice(66, 78)}`)), signature: `0x${op.signature.slice(78)}` })).toLowerCase();
       if (keccak256(a as Hex) === op.signature.slice(0, 66).toLowerCase()) { const i = signers.indexOf(a); if (i >= 0) signers.splice(i, 1); signers.unshift(a); }
+    } catch { /* not that form */ }
+  }
+  // Ambire's account, signed in its Standard mode ({r}{s}{v}, then 0x01): over the EIP-712 digest of
+  // AmbireOperation(account, the operation's hash) (src/erc4337-sim.ts, AMBIRE_IMPLEMENTATION). Who signed is a key
+  // the account gives a privilege to, which it names in no other way.
+  if (!module && op.signature.length === 2 + 132 && op.signature.endsWith('01') && await implementationOf(deps, CHAIN, sender) === AMBIRE_IMPLEMENTATION) {
+    try {
+      const ambire = hashTypedData({ domain: { name: 'Ambire', version: '1', chainId: CHAIN, verifyingContract: sender as Hex, salt: `0x${'00'.repeat(32)}` },
+        types: { AmbireOperation: [{ name: 'account', type: 'address' }, { name: 'hash', type: 'bytes32' }] }, primaryType: 'AmbireOperation', message: { account: sender as Hex, hash: digest } });
+      const a = (await recoverAddress({ hash: ambire, signature: op.signature.slice(0, 132) as Hex })).toLowerCase();
+      const i = signers.indexOf(a); if (i >= 0) signers.splice(i, 1); signers.unshift(a);
     } catch { /* not that form */ }
   }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));

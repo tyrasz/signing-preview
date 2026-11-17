@@ -17,7 +17,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { CHAIN_PROFILES, ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { implementationOf, simulateOperation, STUB_SIGNATURE, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, implementationOf, simulateOperation, STUB_SIGNATURE, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
 import type { Dependencies, Preview, SimulationRequest } from '../src/types.ts';
 import { NOW } from './helpers.ts';
 import { compiled, testChain } from './evm-chain.ts';
@@ -60,6 +60,27 @@ async function install(fx: { codes: Record<string, Hex>; storage?: Record<string
   for (const [a, code] of Object.entries(fx.codes)) await chain.putCode(a, code);
   for (const [a, slots] of Object.entries(fx.storage ?? {})) for (const [slot, v] of Object.entries(slots)) await chain.evm.stateManager.putStorage(at(a), setLengthLeft(hexToBytes(slot as Hex), 32), unpadBytes(hexToBytes(v)));
 }
+
+test('Ambire’s account, an EIP-1167 clone: the stand-in in its Standard mode, which its own code recovers over its digest of the operation’s hash', async () => {
+  // Its real code (Base). A bare 65-byte stand-in ends in v (27 or 28), which it reads as the Unprotected mode and
+  // refuses (SV_USED_UNBOUND), as on Ethereum and Base: the operation's calls were simulated alone.
+  const fx = fixture('ambire.json');
+  await install(fx);
+  const ACCOUNT = '0x00000000000000000000000000000000a3b1e0a1', KEY = '0x00000000000000000000000000000000a3b1e0b2';
+  await chain.putCode(ACCOUNT, `0x363d3d373d3d3d363d73${AMBIRE_IMPLEMENTATION.slice(2)}5af43d82803e903d91602b57fd5bf3`);
+  const privilege = (a: string) => hexToBytes(keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [a as Hex, 0n])));
+  await chain.evm.stateManager.putStorage(at(ACCOUNT), privilege(EP), hexToBytes('0x7171'));
+  await chain.evm.stateManager.putStorage(at(ACCOUNT), privilege(KEY), hexToBytes('0x01'));
+  await funded(ACCOUNT);
+  assert.equal(await implementationOf(deps, 999, ACCOUNT), AMBIRE_IMPLEMENTATION);
+  const callData = encodeFunctionData({ abi: parseAbi(['function executeBySender((address to, uint256 value, bytes data)[] calls)']), args: [[{ to: usdc as Hex, value: 0n, data: transfer }]] });
+  const p = await preview(operation({ sender: ACCOUNT, callData }), KEY);
+  assert.ok(whole(p) && /ecrecover attributes it to the signer\)/.test(whole(p)!) && !/doesn't accept/.test(whole(p)!), notes(p));
+  assert.deepEqual(usdcChange(p), ['out 50']);
+  // A key the account gives no privilege to: its validation fails, as it will once that key signs.
+  const q = await preview(operation({ sender: ACCOUNT, callData }), BOB);
+  assert.ok(!whole(q) || /doesn't accept/.test(whole(q)!), notes(q));
+});
 
 test('An account behind OKX Wallet’s 797-byte proxy runs the implementation its ERC-1967 slot names', async () => {
   const fx = fixture('okx-passkey-verifier.json');

@@ -2273,6 +2273,13 @@ async function modularAccountStub(c: StubContext): Promise<Stub> {
 }
 
 const shaped = (prefix: string) => (): Stub => ({ signature: `${prefix}${STUB_SIGNATURE.slice(2)}` as Hex });
+// --- Ambire's account (AmbireAccount, verified source on Sourcify; EIP-1167 clones of it, Ethereum and Base) ---
+// validateUserOp recovers the signer with SignatureValidator.recoverAddr, which reads the signature's last byte as its
+// mode: {r}{s}{v}{mode}, Standard (1) recovering over the EIP-712 digest of AmbireOperation(address account, bytes32
+// hash) for the operation's hash (domain Ambire, version 1, the chain, the account, a zero salt). A bare 65-byte
+// signature ends in v, 27 or 28, beyond the modes: read as Unprotected, which recoverAddr refuses (SV_USED_UNBOUND),
+// as STUB_SIGNATURE was on Ethereum and Base. The signer is a key the account gives a privilege to.
+export const AMBIRE_IMPLEMENTATION = '0x0f2aa7bcda3d9d210df69a394b6965cb2566c828';
 /**
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
  * delegate or ERC-1967 implementation). Others get STUB_SIGNATURE as is, unless the wallet supplies its own stub.
@@ -2320,6 +2327,8 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   [SHRINCS_IMPLEMENTATION]: shrincsStub, [SHRINCS_IMPLEMENTATION_2]: shrincsStub, [BULLBIT_IMPLEMENTATION]: bullbitStub,
   // Splits' Smart Vault (see splitsVaultStub).
   [SPLITS_VAULT_IMPLEMENTATION]: splitsVaultStub,
+  // Ambire's account: the stand-in in Standard mode (see AMBIRE_IMPLEMENTATION).
+  [AMBIRE_IMPLEMENTATION]: () => ({ signature: `${STUB_SIGNATURE}01` as Hex }),
   // Send's account (see sendStub).
   [SEND_IMPLEMENTATION]: sendStub,
   // Biconomy's Nexus 1.2, its default validator K1MeeValidator (see nexusStub).
@@ -2335,7 +2344,7 @@ const ERC1967_IMPLEMENTATION_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076c
 const OKX_LONG_PROXY = '0x3e5ad3de6e8de44f4a56d8784bd4b0257e51f4d05fc0dc06e79f8e92e1a775f9';
 /**
  * The code an account runs: the ERC-1967 implementation its proxy (or Biconomy Smart Account v2's proxy's) (or its EIP-7702 delegate, such as Coinbase's
- * EIP7702Proxy) runs, else its EIP-7702 delegate. Undefined if neither, or unreadable. A proxy is short (up to 199
+ * EIP7702Proxy) runs, or the implementation an EIP-1167 minimal proxy's code names, else its EIP-7702 delegate. Undefined if neither, or unreadable. A proxy is short (up to 199
  * bytes), or OKX Wallet's 797-byte proxy (OKX_LONG_PROXY: the accounts on OP Mainnet and Ethereum behind it were stood
  * in for as no account in particular, and refused it). Other longer code isn't followed, whatever its slot holds:
  * naming the slot doesn't make code delegate to what is in it.
@@ -2350,6 +2359,9 @@ export async function implementationOf(deps: Dependencies, chainId: number, acco
     // a proxy is followed to the implementation in the slot.
     if (delegate && STUB_SHAPES[delegate]) return delegate;
     if (code === '0x' || (code.length > 400 && keccak256(code as Hex) !== OKX_LONG_PROXY)) return undefined;
+    // An EIP-1167 minimal proxy names its implementation in its code (Ambire's accounts are such clones).
+    const clone = /^0x363d3d373d3d3d363d73([0-9a-f]{40})5af43d82803e903d91602b57fd5bf3$/i.exec(code);
+    if (clone) return `0x${clone[1]}`.toLowerCase();
     // Biconomy Smart Account v2's proxy keeps its implementation in the slot numbered by its own address.
     const own = code.toLowerCase().startsWith(BICONOMY_PROXY);
     const slot = String(await deps.rpc.call(chainId, 'eth_getStorageAt', [account, own ? `0x${account.slice(2).toLowerCase().padStart(64, '0')}` : ERC1967_IMPLEMENTATION_SLOT, 'latest']));
