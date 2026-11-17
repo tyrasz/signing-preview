@@ -640,7 +640,7 @@ const LAST_SIGNED_REACH = 100_000n, LAST_SIGNED_WINDOW = 10_000n;
  * 10,000,000 blocks (about 29 days) of one sender's logs at once; publicnode's (the other chains' here) refuse the
  * read as an archive request, which ends the lookup there (November 2026).
  */
-const LAST_SIGNED_WIDE = 10_000_000n;
+const LAST_SIGNED_WIDE = 10_000_000n, LAST_SIGNED_CAPPED = 50_000n;
 /** A node's answer that the blocks asked for are older than it serves (Ethereum's public node): the reach ends there. */
 const BEYOND_REACH = /archive|pruned|missing trie node|not available|header not found/i;
 /**
@@ -668,13 +668,28 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
   // `wide`: beyond the usual reach (see LAST_SIGNED_WIDE), as far as the node takes in a few reads.
   let signature: Hex | undefined, failed = false, window = c.wide ? LAST_SIGNED_WIDE : LAST_SIGNED_WINDOW, reached = c.wide ? LAST_SIGNED_REACH : 0n, fetched = 0;
   const reach = c.wide ? LAST_SIGNED_REACH + LAST_SIGNED_WIDE : LAST_SIGNED_REACH;
+  // (Wide, on a node that caps a read's range: 40 reads, four at a time ahead of the one awaited. Base's public node
+  // takes 50,000 blocks a read, and a ZeroDev passkey account there had last signed 935,000 blocks back (22 days),
+  // beyond the 300,000 that four reads reached: its wallet's flag, read as the chain's default, put its gas 57% low.)
+  const pending = new Map<bigint, Promise<{ transactionHash: string }[]>>();
+  const read = (to: bigint) => {
+    let got = pending.get(to);
+    if (!got) {
+      const from = to >= window ? to - window + 1n : 0n;
+      got = rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
+        fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
+      got.catch(() => undefined);
+      pending.set(to, got);
+    }
+    return got;
+  };
   try {
-    for (let reads = 0; reached < reach && head - reached > 0n && reads < (c.wide ? 4 : 16); reads++) {
+    for (let reads = 0; reached < reach && head - reached > 0n && reads < (c.wide ? 40 : 16); reads++) {
       const to = head - reached, from = to >= window ? to - window + 1n : 0n;
+      if (c.wide && window < LAST_SIGNED_WIDE) for (let k = 1n; k < 4n && reached + k * window < reach && to - k * window > 0n; k++) read(to - k * window);
       let logs: { transactionHash: string }[];
       try {
-        logs = await rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
-          fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }]) as { transactionHash: string }[];
+        logs = await read(to);
       } catch (e) {
         const why = capMessage(e) || String((e as Error)?.message ?? e);
         if (RANGE_CAPPED.test(why)) {
@@ -682,8 +697,12 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
           const m = why.match(/(\d[\d,]{2,})/); const named = m ? BigInt(m[1].replace(/,/g, '')) : window / 2n;
           if (named <= 0n || named >= window) { failed = true; break; }
           window = named;
+          pending.clear();
           continue;
         }
+        // A wide read refused some other way (Base's public node answers one of 10,000,000 blocks with HTTP 403, and
+        // one of 100,000 with its cap, 50,000): asked again in windows of 50,000, a cap most public nodes take.
+        if (c.wide && window > LAST_SIGNED_CAPPED && !BEYOND_REACH.test(why)) { window = LAST_SIGNED_CAPPED; pending.clear(); continue; }
         if (!BEYOND_REACH.test(why)) failed = true;
         break;
       }
