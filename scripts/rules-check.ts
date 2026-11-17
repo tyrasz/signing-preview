@@ -2453,7 +2453,18 @@ class Chain {
       // later each time. Four tries in a row had once reached only those.)
       if (hadSimulate !== this.simulateV1) continue;
       if (!node && attempt < 6) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
-      const local = await this.locally(placed, overrides, given && at ? { ...at, state } : at, price);
+      // The accounts the programs give reach the local EVM as the pinned block's own state. No block pinned (the node
+      // didn't answer for its latest: Arbitrum's public RPC rate-limiting GitHub's runners), they would reach it not at
+      // all, where the node has them as overrides: in a scheduled run 15 of Arbitrum One's delegation programs ran on
+      // accounts with no code and nothing in them, and differed (2026-11-17). Asked again; past that, those programs
+      // aren't compared (as overrides the local EVM takes them otherwise: an authority's code and nonce aren't the
+      // state an authorization is checked against, and 9 of 73 then differed).
+      // (So too a priced program, whose price is the pinned block's base fee and a tip.)
+      const needsPin = (p: Program) => !!p.state || !!p.fees;
+      const unpinned = this.simulateV1 && !pinned && placed.some(needsPin);
+      if (unpinned && attempt < 6) { await new Promise(r => setTimeout(r, 2000 * (attempt + 1))); continue; }
+      const local = (await this.locally(placed, overrides, given && at ? { ...at, state } : at, price))
+        .map((o, i) => (unpinned && needsPin(placed[i]) ? { kind: 'refused' as const, returns: '', logs: '', why: "no block pinned (the node didn't answer for its latest: a rate limit), so the accounts the program gives couldn't be its state, nor its price the block's" } : o));
       // The same for the local EVM's reads: a backend that hasn't the named block yet, or no longer its state.
       if (attempt < 6 && local.some(l => l.kind === 'refused' && /block not found|header not found|unknown block|not available|missing trie node/i.test(l.why ?? ''))) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
       // And a public RPC turning the local EVM's reads away (HTTP 429: Arbitrum's, from GitHub's runners, for four
