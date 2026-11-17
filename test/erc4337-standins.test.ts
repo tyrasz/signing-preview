@@ -203,3 +203,35 @@ test('A Nexus account’s session operation whose nonce’s first byte is 0x01 (
   assert.doesNotMatch(wholeNote(p), /doesn't accept/);
   assert.deepEqual(usdcChange(p), ['out 50']);
 });
+
+test('A Kernel v3 account another factory deploys with deployWithFactory and a deployer’s signature (BNB Chain, Base): its root passkey validator’s stand-in, from the initialize call it hands on', async () => {
+  // Factory 0xf928…7053's deployWithFactory(factory, createData, salt, signature): createData is Kernel's
+  // initialize, whose root validator here is a passkey's in webauthn-sol's form (0xbbbe…5b1e). With the plain
+  // stand-in, validation refused it and the passkey's check didn't run.
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt, bytes signature)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)']);
+  const PASSKEY_VALIDATOR = '0xbbbe97d3d0e926231975e0b69acb54d534d35b1e', FACTORY = '0xf928242559279b7666ab9c9810b2ce53eac77053';
+  const tried: SimulationRequest[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_call' && (params[0] as { to: string }).to === EP) return `0x${'4a'.repeat(32)}`; // getUserOpHash
+    throw new Error(`unexpected ${method}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const initialize = (root: Hex) => encodeFunctionData({ abi: DEPLOY, functionName: 'initialize', args: [root, `0x${'00'.repeat(20)}`, `0x${'ab'.repeat(96)}`, '0x', []] });
+  const initCode = (createData: Hex) => concatHex([FACTORY, encodeFunctionData({ abi: DEPLOY, functionName: 'deployWithFactory', args: ['0x43d08cc6b19dd9ef558b3f5162fcb13fca18b9c0', createData, `0x${'9f'.repeat(32)}`, `0x${'65'.repeat(65)}`] })]);
+  const op = { chainId: 56, entryPoint: EP, sender: '0x918c61660419e4f45d1584f2f83c9eb7f768036a', nonce: 0n, initCode: initCode(initialize(`0x01${PASSKEY_VALIDATOR.slice(2)}`)), callData: '0x' as Hex,
+    callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
+  const signatureOf = (q: SimulationRequest) => (decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature;
+  const { webAuthnStub } = await import('../src/erc4337-sim.ts');
+  await simulateOperation({ ...op, signer: op.sender }, { rpc: node, simulator } as never);
+  assert.equal(signatureOf(tried[0]), webAuthnStub(`0x${'4a'.repeat(32)}`));
+  assert.ok(tried[0].stateOverrides?.['0x0000000000000000000000000000000000000100'], 'P256VERIFY stood in for');
+  // createData that isn't Kernel's initialize: the plain stand-in.
+  tried.length = 0;
+  await simulateOperation({ ...op, initCode: initCode('0x12345678'), signer: op.sender }, { rpc: node, simulator } as never);
+  assert.equal(signatureOf(tried[0]), STUB_SIGNATURE);
+});

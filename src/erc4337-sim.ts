@@ -817,7 +817,7 @@ export const cosigningOwner = (data: Hex): string | undefined => {
 };
 /** ZeroDev's WebAuthnSigner, a Kernel permission's signer (source verified on Sourcify, Ethereum): its signature is zeroDevWebAuthnStub's form. */
 const ZERODEV_WEBAUTHN_SIGNERS = new Set(['0x65deec8fee717dc044d0cfd63ccf55f02ccac2b3']);
-const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
+const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function deployWithFactory(address factory, bytes createData, bytes32 salt, bytes signature)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
 /** What a Kernel v3 account being deployed is set up with: its root validator, and each validation its initialize() installs, with its install data. */
 export type KernelSetup = { root: Hex; installs: Map<string, Hex>; /** The Kernel implementation its factory deploys (implementation()). */ implementation?: string };
 /**
@@ -831,7 +831,16 @@ function setupPermissionSigner(setup: KernelSetup, pId: string): { module: strin
   try { const [items] = decodeAbiParameters([{ type: 'bytes[]' }], data); const last = items.at(-1); return last && last.length >= 2 + 44 ? { module: `0x${last.slice(6, 46)}`.toLowerCase(), data: `0x${last.slice(46)}` } : undefined; } catch { return undefined; }
 }
 /**
- * A Kernel v3 account ZeroDev's FactoryStaker is deploying: kernelV3Stub, with the root validator its initialize()
+ * deployWithFactory's selectors: ZeroDev's FactoryStaker's, and another's (0xf928…7053, unverified; on BNB Chain and
+ * Base, 72 of 2,541 and 69 of 14,735 EntryPoint v0.7 deployments in 200,000 blocks to 2026-11-17, none on Ethereum,
+ * Polygon or Arbitrum One) that takes a deployer's signature after the salt, deploying Kernel v3.3 accounts whose root
+ * validator is a passkey's (0xbbbe…5b1e, webauthn-sol's form): with no stand-in in its form, their deployments'
+ * validation refused the plain one, and the passkey's check didn't run.
+ */
+export const KERNEL_DEPLOY_SELECTORS = new Set(['0xc5265d5d', '0x05160ab7']);
+/**
+ * A Kernel v3 account ZeroDev's FactoryStaker (or another deployWithFactory: KERNEL_DEPLOY_SELECTORS) is deploying:
+ * kernelV3Stub, with the root validator its initialize()
  * sets and the validations it installs (the root's own install data, and installValidations among its initConfig
  * calls): a permission the operation validates through can be installed there (on Base: a passkey's, ZeroDev's
  * WebAuthn signer, with an execution hook).
@@ -2474,6 +2483,9 @@ const CODE_SHAPES: Record<string, (c: StubContext) => Promise<Stub[]>> = { [BARZ
 async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promise<Stub[]> {
   const factory = initCode && initCode.length >= 42 ? `0x${initCode.slice(2, 42)}`.toLowerCase() : undefined;
   if (factory && FACTORY_STUBS[factory]) return [await FACTORY_STUBS[factory](c, `0x${initCode!.slice(42)}`)].flat();
+  // Another factory's deployWithFactory, deploying a Kernel v3 account (kernelDeployStub, which reads its createData
+  // as Kernel's initialize: anything else gets the plain stand-in).
+  if (factory && !delegate && KERNEL_DEPLOY_SELECTORS.has(`0x${initCode!.slice(42, 50).toLowerCase()}`)) return kernelDeployStub(c, `0x${initCode!.slice(42)}`);
   // Another factory deploying a copy of Coinbase Smart Wallet (see coinbaseCopyStub). (Not a factory on 0x7702, an
   // EIP-7702 account's initialization.)
   if (factory && !delegate && !/^0x7702(00)*$/i.test(factory)) { const copy = await coinbaseCopyStub(c, undefined, factory, `0x${initCode!.slice(42)}`); if (copy) return copy; }

@@ -52,7 +52,7 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, KERNEL_DEPLOY_SELECTORS, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { deployedFallbackHandler, safeSetupOf } from '../src/safe-sim.ts';
@@ -524,7 +524,7 @@ async function replay(item: string): Promise<void> {
   if (BigInt(op.nonce) >> 248n === 1n) {
     // (Or an account delegating to Kernel v3.3 (EIP-7702), which its bundle can delegate first: then it has no code
     // to answer rootValidator() on the state before.)
-    const kernel = code === '0x' ? op.initCode.slice(0, 42).toLowerCase() === '0xd703aae79538628d27099b8c4f621be4ccd142d5'
+    const kernel = code === '0x' ? op.initCode.slice(0, 42).toLowerCase() === '0xd703aae79538628d27099b8c4f621be4ccd142d5' || KERNEL_DEPLOY_SELECTORS.has(`0x${op.initCode.slice(42, 50).toLowerCase()}`)
       : code.toLowerCase() === '0xef0100d6cedde84be40893d153be9d467cd6ad37875b28'
       || /^0x[0-9a-f]{64}$/i.test(String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: encodeFunctionData({ abi: KERNEL, functionName: 'rootValidator' }) }, 'latest']).catch(() => '0x')));
     const enable = kernel ? readKernelEnable(op.signature) : undefined;
