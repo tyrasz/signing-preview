@@ -55,7 +55,7 @@ import { readOperation, userOpHash } from '../src/userop-hash.ts';
 import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
-import { safeSetupOf } from '../src/safe-sim.ts';
+import { deployedFallbackHandler, safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
 import { chainName, EVM_RPCS, OP_STACK, rpcUrlFor } from '../src/chains.ts';
 import { compareTokens, movedAlike, TRANSFER, type Compared } from './userop-tokens.ts';
@@ -548,7 +548,11 @@ async function replay(item: string): Promise<void> {
   const readFallback = () => atParent.call(CHAIN, 'eth_getStorageAt', [sender, FALLBACK_SLOT, 'latest']);
   let slot: unknown;
   try { slot = await readFallback().catch(async () => { await new Promise(r => setTimeout(r, 1000)); return readFallback(); }); } catch { return skip('a read of its state failed'); }
-  const fallback = code === '0x' && safeSetupOf(op.initCode) ? safeSetupOf(op.initCode)!.fallbackHandler : `0x${String(slot).slice(-40)}`.toLowerCase();
+  // (Zeal's router sets the module up itself, its setup naming none: deployedFallbackHandler reads the one it will.
+  // Taken as none, Zeal's deploying SafeOps on Base were replayed as hash-signed operations, which the Safe rejects.)
+  const fallback = code === '0x' && safeSetupOf(op.initCode)
+    ? await deployedFallbackHandler(op.initCode, (to, data) => atParent.call(CHAIN, 'eth_call', [{ to, data }, 'latest'])) ?? safeSetupOf(op.initCode)!.fallbackHandler
+    : `0x${String(slot).slice(-40)}`.toLowerCase();
   const module = SAFE_EXECUTE.includes(op.callData.slice(0, 10)) && SAFE_4337_MODULES[fallback]?.entryPoint === EP ? SAFE_4337_MODULES[fallback] : undefined;
   // (--wallet-stub: an operation signed over its hash only; a SafeOp's or a supertransaction's signature is another's.)
   const walletStub = !supplied && WALLET_STUB && !module && !supertransaction && ecdsaOffsets(op.signature).length ? dummyForm(op.signature) : undefined;

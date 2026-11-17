@@ -227,14 +227,21 @@ export function zealSignerStandIn(): Hex {
 /** The form of a Zeal passkey's assertion: its authenticator data, and clientDataJSON with the challenge (43 characters, base64url) at challengeOffset. */
 export interface ZealForm { authenticatorData: Hex; clientDataJSON: string; challengeOffset: number }
 /**
- * Zeal's browser extension's form, for an owner with no earlier assertion to go by. Its origin is the third of the
- * six the signer's origin check looks through: each one listed before the one found costs a scan of clientDataJSON
- * (twice, about 80,000 gas each), so the operation's gas can be 250,000 high (the first origin's, Zeal's Android app)
- * to 290,000 low (the fifth's) where the wallet signs elsewhere; the middle keeps the gap least.
+ * The form of a Zeal passkey's assertion from the origin https://passkey.zealwallet.com, for an owner with no earlier
+ * assertion to go by. The signer's origin check looks through six origins (the same on every chain here, November
+ * 2026), scanning clientDataJSON for each until one is found (twice), so the form's origin and length set its gas:
+ * a Zeal signer's isValidSignature on Arbitrum One took 369,817 gas in the form of Zeal's Android app (the first
+ * origin), 385,898 in this one (the second) and 609,038 in its browser extension's (the third, the default before):
+ * an Arbitrum One SafeOp signed in the Android app, by a Safe whose operation before it was over a year back, came out
+ * 52% high in the extension's form. Of 144 Zeal signers created on Arbitrum One (174 days) and Base (139 days) to
+ * 2026-11-17, 71 signed their first operation from this origin (67 in this form), 71 from the Android app's, 2 from
+ * the extension's. A browser's clientDataJSON can be longer (Chrome sometimes adds a member,
+ * other_keys_can_be_added_here, to it), and every origin's scan with it: a Base deploy so signed (1 of the 144)
+ * came out 24% low in this form.
  */
-export const ZEAL_EXTENSION_FORM: ZealForm = {
+export const ZEAL_DEFAULT_FORM: ZealForm = {
   authenticatorData: concatHex([sha256(stringToHex('passkey.zealwallet.com')), '0x1d', '0x00000000']),
-  clientDataJSON: `{"type":"webauthn.get","challenge":"${'A'.repeat(43)}","origin":"chrome-extension://heamnjbnflcikcggoiplibfommfbkjpj","crossOrigin":false}`, challengeOffset: 36,
+  clientDataJSON: `{"type":"webauthn.get","challenge":"${'A'.repeat(43)}","origin":"https://passkey.zealwallet.com"}`, challengeOffset: 36,
 };
 const ZEAL_SIGNATURE = [{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' }, { type: 'uint256[2]' }] as const;
 /**
@@ -242,7 +249,7 @@ const ZEAL_SIGNATURE = [{ type: 'bytes' }, { type: 'bytes' }, { type: 'uint256' 
  * challengeOffset, [r, s])), by the stand-in passkey: signed over sha256(authenticatorData || sha256(clientDataJSON)),
  * as WebAuthn signs, in `form` with the challenge put in.
  */
-export function zealAssertion(challenge: Hex, form: ZealForm = ZEAL_EXTENSION_FORM): Hex {
+export function zealAssertion(challenge: Hex, form: ZealForm = ZEAL_DEFAULT_FORM): Hex {
   const clientDataJSON = `${form.clientDataJSON.slice(0, form.challengeOffset)}${base64url(challenge)}${form.clientDataJSON.slice(form.challengeOffset + 43)}`;
   const signed = sha256(concatHex([form.authenticatorData, sha256(stringToHex(clientDataJSON))]));
   const { r, s } = p256.sign(hexToBytes(signed), STAND_IN_PASSKEY);
@@ -276,7 +283,7 @@ export function zealFormIn(signatures: Hex, owner: string): ZealForm | undefined
 /**
  * The stand-in for a Zeal passkey owner (see ZEAL_SIGNERS) signing `hash` for the Safe: the owner's data among the
  * Safe's signatures, an assertion by the stand-in passkey in the form its wallet last signed in (from the Safe's latest
- * earlier operation through one of `entryPoints`, its signatures `signaturesAt` bytes in; else ZEAL_EXTENSION_FORM),
+ * earlier operation through one of `entryPoints`, its signatures `signaturesAt` bytes in; else ZEAL_DEFAULT_FORM),
  * and what the run needs: zealSignerStandIn at the signer's implementation, its real code moved, warm as a
  * moved precompile is (the implementation itself stays cold, as on-chain). The challenge is what the owner is asked
  * about: Safe 1.5.0 passes the hash itself (isValidSignature(bytes32), whose challenge is its keccak256), earlier
@@ -404,6 +411,22 @@ const SAFE_SETUP = parseAbi(['function setup(address[] owners, uint256 threshold
 export function safeSetupOf(initCode: string): { owners: string[]; threshold: bigint; fallbackHandler: string } | null {
   const setup = setupOf(initCode);
   return setup && { owners: setup.owners, threshold: setup.threshold, fallbackHandler: setup.fallbackHandler };
+}
+/** Zeal's factory's getter for the 4337 module its router enables in a Safe's setup (Safe4337Module v0.2.0 on every chain here, November 2026). */
+const ZEAL_MODULE = '0x12e6c710';
+/**
+ * The fallback handler a Safe this initCode deploys ends up with: its setup's own, or, where the setup has Zeal's
+ * router set the Safe up (setupSafe enables the 4337 module Zeal's factory names and makes it the fallback handler;
+ * the setup itself names none), that module, read with `call`. Null if the initCode isn't a Safe's, or the read fails.
+ */
+export async function deployedFallbackHandler(initCode: string, call: (to: string, data: Hex) => Promise<unknown>): Promise<string | null> {
+  const setup = setupOf(initCode);
+  if (!setup) return null;
+  if (setup.to !== ZEAL_DEPLOYMENT_ROUTER || !setup.data.toLowerCase().startsWith(SETUP_SAFE)) return setup.fallbackHandler;
+  try {
+    const out = String(await call(ZEAL_FACTORY, ZEAL_MODULE));
+    return /^0x[0-9a-f]{64}$/i.test(out) ? `0x${out.slice(-40)}`.toLowerCase() : null;
+  } catch { return null; }
 }
 /** safeSetupOf, with the singleton the factory is given and the call the setup delegatecalls (`to`, `data`). */
 function setupOf(initCode: string): { owners: string[]; threshold: bigint; fallbackHandler: string; singleton: string; to: string; data: Hex } | null {

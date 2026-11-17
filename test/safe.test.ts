@@ -350,7 +350,7 @@ test('A Zeal passkey owner’s stand-in: a real P-256 assertion by a passkey mad
   const { createPublicKey, verify } = await import('node:crypto');
   const { decodeAbiParameters, hexToString, sha256 } = await import('viem');
   const { base64url, STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
-  const { safeSignatures, standInPasskey, zealAssertion, zealFormIn, ZEAL_EXTENSION_FORM } = await import('../src/safe-sim.ts');
+  const { safeSignatures, standInPasskey, zealAssertion, zealFormIn, ZEAL_DEFAULT_FORM } = await import('../src/safe-sim.ts');
   const { x, y } = standInPasskey();
   const key = createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: Buffer.from(x.slice(2), 'hex').toString('base64url'), y: Buffer.from(y.slice(2), 'hex').toString('base64url') }, format: 'jwk' });
   // What Zeal's signer checks (FreshCryptoLib's WebAuthn_format): the challenge in clientDataJSON at challengeOffset,
@@ -365,11 +365,13 @@ test('A Zeal passkey owner’s stand-in: a real P-256 assertion by a passkey mad
     return { authenticatorData, json, offset: Number(offset) };
   };
   const challenge = sha256('0x01');
-  // No earlier assertion to go by: Zeal's browser extension's form (its challenge at 0x24, where the origin check wants it).
-  const ext = check(zealAssertion(challenge), challenge);
-  assert.equal(ext.offset, 0x24);
-  assert.equal(ext.json, `{"type":"webauthn.get","challenge":"${base64url(challenge)}","origin":"chrome-extension://heamnjbnflcikcggoiplibfommfbkjpj","crossOrigin":false}`);
-  assert.equal(ext.authenticatorData, ZEAL_EXTENSION_FORM.authenticatorData);
+  // No earlier assertion to go by: the form of origin https://passkey.zealwallet.com, as Zeal's wallets sign there
+  // (its challenge at 0x24, where the origin check wants it; the rpId hash of passkey.zealwallet.com, flags 0x1d).
+  const site = check(zealAssertion(challenge), challenge);
+  assert.equal(site.offset, 0x24);
+  assert.equal(site.json, `{"type":"webauthn.get","challenge":"${base64url(challenge)}","origin":"https://passkey.zealwallet.com"}`);
+  assert.equal(site.authenticatorData, ZEAL_DEFAULT_FORM.authenticatorData);
+  assert.equal(site.authenticatorData, '0xacb1764ad8b97c3d25829c27cda7f041206c01e7aafbb89a7da02856f414854b1d00000000');
   // The form of an earlier assertion, from among a Safe's signatures (Zeal's Android app's, as on Ethereum, Nov 2026):
   // its authenticator data and clientDataJSON kept, only the challenge replaced, so the origin check scans as it will.
   const OWNER = '0x9cea6f7fb7cb7e4e8a9eff0c3a29813ce69f39f6', OTHER = '0x97c09d1d3f757bbdacdeea4e8c31e5b6ce10b319';
@@ -450,6 +452,17 @@ test('A Zeal passkey owner is recognized deployed (its proxy’s implementation)
   assert.deepEqual(deploying?.stateOverrides, deployed?.stateOverrides);
   assert.ok(!seen.includes('eth_getStorageAt') && !seen.includes('eth_getLogs'), 'nothing read of the owner or the Safe’s past');
   assert.equal(await zealStandIn(deps(ZERO), 1, OWNER, { safe: SAFE, hash, initCode: initCode(BOB) }), null);
+  // The fallback handler the deployed Safe ends up with: Zeal's router enables the module Zeal's factory names (its
+  // setup names none); another setup's own.
+  const { deployedFallbackHandler } = await import('../src/safe-sim.ts');
+  const MODULE = '0xa581c4a4db7175302464ff3c06380bc3270b4037', asked: [string, string][] = [];
+  const read = async (to: string, data: Hex) => { asked.push([to, data]); return `0x${MODULE.slice(2).padStart(64, '0')}`; };
+  assert.equal(await deployedFallbackHandler(initCode('0xf2230dc5924b7cb5757c86dbd658515a8894b493'), read), MODULE);
+  assert.deepEqual(asked, [['0xf2b940e16b93a78f8884f80b89fa691460069bd1', '0x12e6c710']]);
+  assert.equal(await deployedFallbackHandler(initCode(BOB), read), ZERO);
+  assert.equal(await deployedFallbackHandler(initCode('0xf2230dc5924b7cb5757c86dbd658515a8894b493'), async () => { throw new Error('down'); }), null);
+  assert.equal(await deployedFallbackHandler('0x1234', read), null);
+  assert.equal(asked.length, 1);
 });
 
 test('A SafeTx signed by a Zeal passkey owner: its assertion as the owner’s contract signature, and its signer stood in for', async () => {
