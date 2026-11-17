@@ -334,7 +334,7 @@ async function replay(item: string): Promise<void> {
   const r = await call<Receipt>('eth_getTransactionReceipt', [hash]).catch(async () => (await call<Receipt[]>('eth_getBlockReceipts', [tx.blockNumber])).find(x => x.transactionHash.toLowerCase() === hash.toLowerCase())!);
   if (!r) return skip('its receipt could not be read');
   const n = Number(r.blockNumber), parent = hex(BigInt(n - 1));
-  const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; difficulty?: Hex; gasLimit: Hex; baseFeePerGas: Hex; blockAccessListHash?: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
+  const block = await call<{ number: Hex; timestamp: Hex; miner: string; mixHash: Hex; difficulty?: Hex; gasLimit: Hex; baseFeePerGas: Hex; blockAccessListHash?: Hex; transactions: { hash: string; from: string; to: string | null; input: Hex; value: Hex; gas: Hex; type: string; authorizationList?: unknown[]; accessList?: { address: string; storageKeys: string[] }[] }[] }>('eth_getBlockByNumber', [r.blockNumber, PREFIX]);
   // Arbitrum's public RPC keeps about 30 seconds of state, OP Mainnet's and Polygon's about two minutes: an operation
   // whose block is older by the time its turn comes would lose its state partway through the replay (the stand-in's
   // shape, the operation's hash, the simulation itself), and is skipped rather than replayed on part of it.
@@ -347,14 +347,20 @@ async function replay(item: string): Promise<void> {
   const earlier = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR).slice(-400) : [];
   const before: SimulationRequest[] = earlier
     .map(t => ({ chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), ...(t.authorizationList?.length && { authorizationList: t.authorizationList as SimulationRequest['authorizationList'] }) }));
-  // The same, each at the price it paid (its receipt's), with a gas limit a little over what it used (its own limits
-  // would add up to more than a node's cap for a simulated block): what an earlier transaction does can depend on its
-  // price (a bot sizing its trade by it), and three Ethereum swaps came out 0.01-0.02% off after ones run at no price.
-  // A bundle keeps its own gas limit: the EntryPoint refuses one whose gas left is under an operation's limits (AA95),
-  // whatever the operation goes on to use. Given a little over what they used, earlier bundles reverted in the
-  // replay, and what they did was missing: on Arbitrum One a keeper's operation then showed fulfilling a request
-  // that another keeper's bundle, four transactions earlier in its block, had fulfilled (six of 150 operations).
-  let pricedBefore: SimulationRequest[] | undefined;
+  // The same as they ran: each at the price it paid (its receipt's), with its own gas limit and access list. What an
+  // earlier transaction does can depend on its price (a bot sizing its trade by it: three Ethereum swaps came out
+  // 0.01-0.02% off after ones run at no price) and on the gas it is given: on Base three operations of an arbitrage
+  // bot's (2026-11-16) showed succeeding, 8-13% over in gas, where on-chain they had failed short of their profit
+  // (Unprofitable(3,999,986, 4,000,001)), after the block's earlier transactions ran on a little over what each used;
+  // on their own limits all three came out as their receipts, within 0.05% (ownBefore). A node holds each to what
+  // the block has left when it starts, as the chain did, not to the sum of their limits (on Base 78 million in a
+  // block of 40 ran so). Where a node refuses the block so (a cap of its own on a simulated block's gas, under the
+  // chain's), each runs on a little over what it used (pricedBefore). A bundle keeps its own gas limit there too: the EntryPoint refuses one whose
+  // gas left is under an operation's limits (AA95), whatever the operation goes on to use. Given a little over what
+  // they used, earlier bundles reverted in the replay, and what they did was missing: on Arbitrum One a keeper's
+  // operation then showed fulfilling a request that another keeper's bundle, four transactions earlier in its block,
+  // had fulfilled (six of 150 operations).
+  let pricedBefore: SimulationRequest[] | undefined, ownBefore: SimulationRequest[] | undefined;
   if (earlier.length) {
     try {
       const receipts = new Map((await blockReceipts(r.blockNumber)).map(x => [x.transactionHash.toLowerCase(), x]));
@@ -365,7 +371,12 @@ async function replay(item: string): Promise<void> {
         const roomy = BigInt(rc.gasUsed) * 13n / 10n + 30_000n;
         return { ...before[i], gas: roomy < BigInt(t.gas) && !bundle(t) ? roomy : BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice) };
       });
-    } catch { pricedBefore = undefined; }
+      ownBefore = earlier.map((t, i) => {
+        const rc = receipts.get(t.hash.toLowerCase());
+        if (!rc?.effectiveGasPrice || SYSTEM.has(t.type)) return before[i];
+        return { ...before[i], gas: BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice), ...(t.accessList?.length && { accessList: t.accessList }) };
+      });
+    } catch { pricedBefore = ownBefore = undefined; }
   }
   // An account the bundle itself delegates (EIP-7702, in the bundle transaction's own authorizations): the
   // authorizations apply first, as they do on-chain, and the account's code reads as the delegation.
@@ -410,6 +421,7 @@ async function replay(item: string): Promise<void> {
   }), ...essential];
   before.push(...essential);
   pricedBefore?.push(...essential);
+  ownBefore?.push(...essential);
   // Reads on the parent block, and the block itself for its header (the base fee the operation's gas is priced at).
   const atParent = { has: (c: number) => c === CHAIN, call: (c: number, m: string, ps: unknown[]) => m === 'eth_getBlockByNumber' ? rpc.call(c, m, [r.blockNumber, false])
     : m === 'eth_getCode' && delegation && String(ps[0]).toLowerCase() === sender ? Promise.resolve(delegation) : rpc.call(c, m, ps.map(x => x === 'latest' ? parent : x)) };
@@ -420,7 +432,7 @@ async function replay(item: string): Promise<void> {
   // itself does first is run: on Sepolia, 12 of 30 operations had been replayed without their block's earlier
   // transactions, which the node's gas allowance for one simulation couldn't hold.
   const state = PREFIX && block.blockAccessListHash !== undefined ? await stateBefore(rpc, CHAIN, r.blockNumber, Number(tx.transactionIndex)) : undefined;
-  let prefix = state ? essential : pricedBefore ?? before; // at no price, then dropped, if the node refuses the block with it (see below)
+  let prefix = state ? essential : ownBefore ?? pricedBefore ?? before; // on less gas, at no price, then dropped, if the node refuses the block with it (see below)
   // The block's own time; BNB Chain's node refuses a simulated block in its parent's second (its blocks come faster
   // than one a second), which then runs a second later, and its gas isn't judged (what writes once a second costs
   // more). The block's DIFFICULTY as each node takes it: BNB Chain's and Polygon's from a difficulty override (BNB
@@ -610,7 +622,8 @@ async function replay(item: string): Promise<void> {
   for (const signer of signers.slice(0, 3)) {
     tried++;
     p = await previewOf(request(signer));
-    if (!ran(p) && prefix === pricedBefore) { prefix = before; p = await previewOf(request(signer)); }
+    if (!ran(p) && prefix === ownBefore && pricedBefore) { prefix = pricedBefore; p = await previewOf(request(signer)); }
+    if (!ran(p) && (prefix === pricedBefore || prefix === ownBefore)) { prefix = before; p = await previewOf(request(signer)); }
     // Then with only the account's own and the other bundles among them, then with none.
     const narrow = async (why: string) => {
       if (related.length > essential.length && related.length < prefix.length) { prefix = related; prefixDropped = `${why}: only the account's own and the other bundles ran first`; p = await previewOf(request(signer)); return; }
@@ -622,6 +635,8 @@ async function replay(item: string): Promise<void> {
     // 50M, under Ethereum's 60M blocks), leaving the operation too little: the EntryPoint runs out of gas (AA95),
     // which on-chain it didn't. Then without them.
     const outOfGas = (q: Preview) => q.warnings.some(w => w.code === 'userop_rejected' && /\bAA95\b/.test(w.message));
+    // (First on less gas each, where they ran on their own limits.)
+    if (outOfGas(p) && prefix === ownBefore && pricedBefore) { prefix = pricedBefore; p = await previewOf(request(signer)); }
     if (outOfGas(p) && prefix.length > essential.length) await narrow("they left too little of the node's gas cap for the operation");
     if (outOfGas(p) && prefix.length > essential.length) await narrow("they left too little of the node's gas cap for the operation");
     // The whole operation didn't run and nothing says why (no rejection, no validation revert): the node failed the
@@ -750,16 +765,17 @@ async function replay(item: string): Promise<void> {
   // the balance as much; a receipt logging none for them says nothing of the run) and the account's operation fared
   // as it did, its balance change is what happened, and is compared in place of the events'.
   let byReplay = 0;
+  // (Its gas limit the bundle's, and what the warm access list costs to name on top: EIP-2930's 2,400 an address and 1,900 a slot.)
+  const naming = warm.reduce((sum, w) => sum + 2_400n + (typeof w === 'string' ? 0n : 1_900n * BigInt(w.storageKeys.length)), 0n);
+  const mined: SimulationRequest = { chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, gas: BigInt(tx.gas) + naming, ...(bundlePrice !== undefined && { gasPrice: bundlePrice }),
+    data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [[op] as never, beneficiary] }) };
+  const opEvent = (logs: { address: string; topics: string[]; data: string }[]) => logs.find(l => l.address === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender && BigInt(l.data.slice(0, 66)) === BigInt(op.nonce));
   if (tokenMatch === 'other') {
     const differing = tokens.filter(x => x.actual !== x.simulated);
     const reads: SimulationRequest[] = differing.map(t => ({ chainId: CHAIN, from: '0x0000000000000000000000000000000000000000', to: t.token, data: `0x70a08231${(t.account ?? sender).slice(2).padStart(64, '0')}` as Hex, value: 0n }));
-    // (Its gas limit the bundle's, and what the warm access list costs to name on top: EIP-2930's 2,400 an address and 1,900 a slot.)
-    const naming = warm.reduce((sum, w) => sum + 2_400n + (typeof w === 'string' ? 0n : 1_900n * BigInt(w.storageKeys.length)), 0n);
-    const mined: SimulationRequest = { chainId: CHAIN, from: tx.from.toLowerCase(), to: EP, value: 0n, gas: BigInt(tx.gas) + naming, ...(bundlePrice !== undefined && { gasPrice: bundlePrice }),
-      data: encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [[op] as never, beneficiary] }) };
     const out = await node.simulateBatch([...reads, mined, ...reads]).catch(() => null);
     const minedRun = out?.[reads.length];
-    const replayed = minedRun?.status === 'success' ? (minedRun.logs ?? []).find(l => l.address === EP && l.topics[0] === UOE && `0x${l.topics[2].slice(26)}` === sender && BigInt(l.data.slice(0, 66)) === BigInt(op.nonce)) : undefined;
+    const replayed = minedRun?.status === 'success' ? opEvent(minedRun.logs ?? []) : undefined;
     if (replayed && (BigInt(`0x${replayed.data.slice(66, 130)}`) === 1n) === succeeded) {
       differing.forEach((t, i) => {
         const before = out![i]?.status === 'success' ? out![i].returnData : undefined, after = out![reads.length + 1 + i]?.status === 'success' ? out![reads.length + 1 + i].returnData : undefined;
@@ -770,6 +786,16 @@ async function replay(item: string): Promise<void> {
       });
     }
     if (byReplay) tokenMatch = matchOf();
+  }
+  // An outcome the receipt doesn't share: the operation as it was mined (its own signature, its bundle's gas limit and
+  // price) is run on the state the preview ran on. Where it fares as the preview did, that state, or the run, isn't
+  // the chain's: the stand-in and the preview's own price and limits aren't the cause. Where it fares as on the
+  // chain, the preview's difference is its own. (Reported with the outcome; nothing is judged by it.)
+  let minedOutcome: string | undefined;
+  if (whole && succeeded === reverts) {
+    const run = (await node.simulateBatch([mined]).catch(() => null))?.[0], own = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
+    minedOutcome = !run ? 'not run' : run.status !== 'success' ? `its bundle reverted here: ${String(run.revertReason ?? '').slice(0, 80)}`
+      : !own ? 'its operation not run here' : (BigInt(`0x${own.data.slice(66, 130)}`) === 1n) === succeeded ? 'as on the chain' : `as the preview did, ${succeeded ? 'failing' : 'succeeding'}: the state or the run isn't the chain's`;
   }
   // The native coin: what the preview shows the account's calls moving (its EntryPoint deposit counted as its own,
   // without the gas: src/erc4337-sim.ts withoutGas), against what its balance and its deposit together did across the
@@ -803,7 +829,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
@@ -950,7 +976,7 @@ say(`  the native coin its calls move (reported, not judged), of ${count(r => !!
 if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's contract (${count(r => !!r.relayedBy)}), gas reported but not judged: of ${count(r => !!bg(r))}, within 0.5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) < 0.5)}, 5% ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 0.5 && Math.abs(bg(r)!.percent) < 5)}, more ${count(r => !!bg(r) && Math.abs(bg(r)!.percent) >= 5)}`);
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
-  const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}`, !r.whole && `${r.nodeFailed ? 'not whole, the node failed it' : 'calls only'}: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
+  const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}${r.minedOutcome ? ` (as mined: ${r.minedOutcome})` : ''}`, !r.whole && `${r.nodeFailed ? 'not whole, the node failed it' : 'calls only'}: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
     r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`,
     nat(r)?.match === 'other' && `native coin: simulated ${nat(r)!.simulated}, actual ${nat(r)!.actual}${nat(r)!.mixed ? ` (${nat(r)!.mixed})` : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
