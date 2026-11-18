@@ -97,6 +97,11 @@ test('The gas prefund: the account’s deposit plus balance, or the paymaster’
   // At most (100,000 + 200,000 + 50,000) gas × 3 gwei = 0.00105 ETH.
   assert.ok(codes(await sign(userOp(), ALICE, { ...deps, rpc: rpc(0n, 10n ** 15n) })).includes('userop_cannot_prefund'));
   assert.ok(!codes(await sign(userOp(), ALICE, { ...deps, rpc: rpc(10n ** 15n, 10n ** 14n) })).includes('userop_cannot_prefund'));
+  // A balance the caller's state overrides set is the one the operation is simulated with, and checked against.
+  const overridden = (balance: bigint) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(userOp())] },
+    { now: NOW, stateOverrides: { [ALICE]: { balance: `0x${balance.toString(16)}` } } }, { ...deps, rpc: rpc(0n, 0n) });
+  assert.ok(!codes(await overridden(10n ** 18n)).includes('userop_cannot_prefund'));
+  assert.ok(codes(await overridden(10n ** 14n)).includes('userop_cannot_prefund'));
 });
 
 test('Transactions to an EntryPoint: a bundle of UserOperations, and gas deposits', async () => {

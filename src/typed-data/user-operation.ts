@@ -64,14 +64,16 @@ export function gasDetails(b: PreviewBuilder, g: OpGas, chainId: number | null):
  * The prefund a bundler requires before including the operation: the account's EntryPoint deposit plus its balance
  * (it pays the shortfall during validation), or the paymaster's deposit, must cover the most the gas can cost.
  */
-export async function prefundCheck(b: PreviewBuilder, deps: TypedEnv['deps'], chainId: number | null, entryPoint: string, sender: string, paymaster: string | null, maxCost: bigint): Promise<void> {
+export async function prefundCheck(b: PreviewBuilder, deps: TypedEnv['deps'], chainId: number | null, entryPoint: string, sender: string, paymaster: string | null, maxCost: bigint, overrides?: SimulationRequest['stateOverrides']): Promise<void> {
   if (chainId === null || maxCost === 0n || !deps.rpc?.has(chainId)) return;
   const native = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}`;
   const payer = paymaster ?? sender;
   const deposit = await entryPointDeposit(deps, chainId, entryPoint, payer);
   if (deposit === undefined) return;
   let balance = 0n;
-  if (!paymaster) { try { balance = BigInt(String(await deps.rpc.call(chainId, 'eth_getBalance', [sender, 'latest']))); } catch { return; } }
+  // (The account's balance as the caller's state overrides set it, where they do: the simulation runs with it.)
+  const set = overrides?.[sender.toLowerCase()]?.balance;
+  if (!paymaster) { try { balance = BigInt(String(set ?? await deps.rpc.call(chainId, 'eth_getBalance', [sender, 'latest']))); } catch { return; } }
   if (deposit + balance < maxCost) b.warn('caution', 'userop_cannot_prefund', paymaster
     ? `The paymaster's EntryPoint deposit (${native(deposit)}) is less than the up to ${native(maxCost)} this operation may cost: bundlers will reject it unless the deposit is topped up.`
     : `The account has ${native(balance)} and ${native(deposit)} deposited in the EntryPoint, less than the up to ${native(maxCost)} this operation may cost in gas: bundlers will reject it.`);
@@ -346,7 +348,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   }
 
   // Gas: the most the operation can cost the account (or its paymaster), at the highest fee it allows.
-  if (u.gas) await prefundCheck(b, env.deps, chainId, entryPoint, sender, u.paymaster, gasDetails(b, u.gas, chainId));
+  if (u.gas) await prefundCheck(b, env.deps, chainId, entryPoint, sender, u.paymaster, gasDetails(b, u.gas, chainId), callerOverrides(env.context));
 
   b.note('This is an off-chain signature; it costs no gas now. Any bundler holding it can submit the operation, which then runs its calls from the account.');
   // An operation with no calls (empty callData) still runs: the account's validation, its deployment where it has a

@@ -1000,6 +1000,59 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
   }
   return ecdsa;
 }
+/**
+ * ZeroDev Kernel v2.3 and v2.4: a 4-byte mode, then the validator's signature; mode 0x00000000 (sudo) validates through
+ * the account's default validator (getDefaultValidator(), or for an account its factory deploys, initialize's
+ * `_defaultValidator`). Frak's passkey validator gets its own form (frakStub); any other, the ECDSA validator's: the
+ * owner's signature after the mode (checked on v2.3: it validates the shape as signed by its owner).
+ */
+const KERNEL_V2 = parseAbi(['function getDefaultValidator() view returns (address)', 'function createAccount(address _implementation, bytes _data, uint256 _index)', 'function initialize(address _defaultValidator, bytes _data)']);
+async function kernelV2Stub(c: StubContext, setup?: { validator: string; data: Hex }): Promise<Stub[]> {
+  let validator = setup?.validator.toLowerCase();
+  if (!validator && c.deps.rpc?.has(c.chainId)) {
+    try {
+      const out = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: KERNEL_V2, functionName: 'getDefaultValidator' }) }, 'latest']));
+      if (/^0x0{24}[0-9a-f]{40}$/i.test(out)) validator = `0x${out.slice(26)}`.toLowerCase();
+    } catch { /* not readable: the ECDSA form */ }
+  }
+  if (validator === FRAK_WEBAUTHN_VALIDATOR) { const frak = await frakStub(c, setup?.data).catch(() => undefined); if (frak) return frak; }
+  return [shaped('0x00000000')()];
+}
+/** Frak's MultiWebAuthNValidatorV2 (verified on Sourcify, Arbitrum One): a Kernel v2 validator for passkeys. */
+const FRAK_WEBAUTHN_VALIDATOR = '0x0000000000fb9604350a25e826b050d859fe7b77';
+/** The P-256 verifier contract it calls for a signature that doesn't ask for the precompile (its constructor's, in its code). */
+const FRAK_P256_VERIFIER = '0x00e4005a00007384000000b0a8a0f300dd9fcafa';
+const FRAK = parseAbi(['function getPasskey(address _smartWallet) view returns (bytes32, (uint256 x, uint256 y))']);
+/**
+ * Frak's passkey validator (its source: MultiWebAuthNSignatureLib, WebAuthnVerifier): after Kernel's mode, a byte (1:
+ * the P256 precompile, 0: its verifier contract), the passkey's authenticator id hash (the account's main one,
+ * getPasskey(account); for an account being deployed, the first word of its enable data), then the challenge's offset
+ * in clientDataJSON (32 bytes), r, s, the lengths of authenticatorData and clientDataJSON (3 bytes each) and the two.
+ * It checks the user-present flag and that the challenge is base64url(userOpHash), then P-256 over
+ * sha256(authenticatorData ‖ sha256(clientDataJSON)); no origin or type. The stand-in: Frak's own (origin
+ * https://frak.id, its rpId's hash, flags 0x1d, as its wallet signs), with the precompile byte as the account's last
+ * signature had it (lastSignature), else the precompile. A deploying Frak wallet on Arbitrum One refused the plain
+ * stand-in (4.4% low).
+ */
+async function frakStub(c: StubContext, enableData?: Hex): Promise<Stub[] | undefined> {
+  const hash = await c.hash();
+  if (!hash) return undefined;
+  let id: Hex | undefined = enableData && enableData.length >= 66 ? `0x${enableData.slice(2, 66)}` as Hex : undefined;
+  if (!id && c.deps.rpc?.has(c.chainId)) {
+    const out = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: FRAK_WEBAUTHN_VALIDATOR, data: encodeFunctionData({ abi: FRAK, functionName: 'getPasskey', args: [c.sender as Hex] }) }, 'latest']));
+    if (/^0x[0-9a-f]{64,}$/i.test(out)) id = out.slice(0, 66) as Hex;
+  }
+  if (!id || /^0x0{64}$/.test(id)) return undefined;
+  const last = await lastSignature({ deps: c.deps, chainId: c.chainId, sender: c.sender, entryPoint: c.entryPoint, key: 'frak',
+    match: sig => sig.length > 2 + 2 * 140 && sig.startsWith('0x00000000') && /^0[01]$/.test(sig.slice(10, 12)) && sig.slice(12, 76).toLowerCase() === id!.slice(2).toLowerCase() });
+  const precompiled = last ? last.slice(10, 12) === '01' : true;
+  const clientDataJSON = `{"type":"webauthn.get","challenge":"${base64url(hash)}","origin":"https://frak.id"}`;
+  const authenticatorData = concatHex([sha256(stringToHex('frak.id')), '0x1d', '0x00000000']);
+  const u24 = (n: number) => `0x${n.toString(16).padStart(6, '0')}` as Hex;
+  const signature = concatHex(['0x00000000', precompiled ? '0x01' : '0x00', id, numberToHex(clientDataJSON.indexOf('"challenge":"') + 13, { size: 32 }), P256_STUB.r, P256_STUB.s,
+    u24(37), u24(clientDataJSON.length), authenticatorData, stringToHex(clientDataJSON)]);
+  return [precompiled ? { signature, p256: true } : { signature, verifier: FRAK_P256_VERIFIER }];
+}
 /** ZeroDev's WeightedECDSAValidator 0.0.3 (verified on Sourcify, Sepolia): guardians with weights, and a threshold. */
 const ZERODEV_WEIGHTED_VALIDATOR = '0xed89244160cfe273800b58b1b534031699dfeeee';
 const WEIGHTED = parseAbi(['function weightedStorage(address kernel) view returns (uint24 totalWeight, uint24 threshold, uint48 delay, address firstGuardian)',
@@ -1430,6 +1483,19 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
   // createSemiModularAccount sign in Modular Account v2's 0xff00 form (its verified source); a WebAuthn account isn't
   // given a passkey's here.
   '0x00000000000017c61b5bee81050ec8efc9c6fecd': async (_c, factoryData) => ['0xafa63a10', '0x8b4e464e'].includes(factoryData.slice(0, 10)) ? shaped('0xff00')() : { signature: STUB_SIGNATURE },
+  // ZeroDev's KernelFactory for Kernel v2 (createAccount(implementation, initialize(defaultValidator, data), index)): the
+  // default validator the account is set up with (kernelV2Stub). Taken as an account with no code, a Frak wallet's
+  // deployment on Arbitrum One got the plain stand-in, which its passkey validator refused.
+  '0x5de4839a76cf55d0c90e2061ef4386d962e15ae3': async (c, factoryData) => {
+    try {
+      const create = decodeFunctionData({ abi: KERNEL_V2, data: factoryData });
+      if (create.functionName === 'createAccount') {
+        const init = decodeFunctionData({ abi: KERNEL_V2, data: create.args[1] });
+        if (init.functionName === 'initialize') return kernelV2Stub(c, { validator: init.args[0], data: init.args[1] });
+      }
+    } catch { /* another call */ }
+    return { signature: STUB_SIGNATURE };
+  },
   // Alchemy's LightAccountFactory v2.0.0 and MultiOwnerLightAccountFactory v2.0.0: accounts that sign with the 0x00
   // type byte (above), as one deployed in an operation on Ethereum did.
   '0x0000000000400cdfef5e2714e63d8040b700bc24': async () => shaped('0x00')(), '0x000000000019d2ee9f2729a65afe20bb0020aefc': async () => shaped('0x00')(),
@@ -2523,7 +2589,7 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   [SESSION_KEY_ACCOUNT]: () => [{ signature: STUB_SIGNATURE }, { signature: concatHex(['0x01', encodeAbiParameters(parseAbiParameters('bytes, bytes32[]'), [STUB_SIGNATURE, []])]) }],
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
-  '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
+  '0xd3082872f8b06073a021b4602e022d5a070d7cfc': c => kernelV2Stub(c), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': c => kernelV2Stub(c),
   // Uniswap's Calibur (an EIP-7702 delegate): its wallet's signature as Calibur decodes it, the key's hash (0: the
   // root key, the account's own), the signature and no hook data, which costs a little more to validate than the
   // bare signature it also accepts (its verified source; seen so on Ethereum).

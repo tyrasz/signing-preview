@@ -421,3 +421,53 @@ test('Kresus’s KresusVault: the 0x00 type byte before the owner’s signature,
   await simulateOperation({ ...op, sender: NEW, initCode: concatHex([FACTORY, '0x5fbfb9cf', `0x${owner.slice(2).padStart(64, '0')}${'00'.repeat(32)}`]), signer: owner }, { rpc: node, simulator } as never);
   assert.equal(tried[0], concatHex(['0x00', STUB_SIGNATURE]));
 });
+
+test('Frak’s passkey wallets (Kernel v2.4, MultiWebAuthNValidatorV2 as default validator): its WebAuthn form with the main passkey, deployed or deploying', async () => {
+  // Arbitrum One, 2026-11-18: a deploying Frak wallet got the plain stand-in, which its validator refused (4.4% low).
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature)';
+  const EP6 = '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const ABI = parseAbi(['function createAccount(address _implementation, bytes _data, uint256 _index)', 'function initialize(address _defaultValidator, bytes _data)']);
+  const FRAK = '0x0000000000fb9604350a25e826b050d859fe7b77', FACTORY = '0x5de4839a76cf55d0c90e2061ef4386d962e15ae3', KERNEL_V24 = '0xd3082872f8b06073a021b4602e022d5a070d7cfc';
+  const EXISTING = '0xc1a80f97637164e16ae4fc67f2972ffd17a65b33', NEW = '0xe6fec47dadb9203a4c31549d8b514631310c0fb7';
+  const id = `0x${'cc'.repeat(32)}` as Hex, hash = `0x${'4a'.repeat(32)}` as Hex;
+  const tried: { signature: Hex; overrides: string[] }[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return (params[0] as string).toLowerCase() === NEW ? '0x' : `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}${KERNEL_V24.slice(2)}`;
+    if (method === 'eth_call') {
+      const { to, data } = params[0] as { to: string; data: Hex };
+      if (to === EP6) return hash; // getUserOpHash
+      if (to === EXISTING && data.startsWith('0x0b3dc354')) return `0x${'00'.repeat(12)}${FRAK.slice(2)}`; // getDefaultValidator()
+      if (to === FRAK) return `${id}${'11'.repeat(32)}${'22'.repeat(32)}`; // getPasskey(account)
+    }
+    throw new Error(`unexpected ${method} ${JSON.stringify(params)}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => {
+    tried.push({ signature: (decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature, overrides: Object.keys(q.stateOverrides ?? {}) });
+    return { status: 'reverted' as const, returnData: failed, transfers: [] };
+  } };
+  const op = { chainId: 42161, entryPoint: EP6, nonce: 0n, callData: '0x' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
+  const frakForm = (sig: Hex) => {
+    const s = sig.slice(2);
+    const offset = Number(BigInt(`0x${s.slice(74, 138)}`)), adl = parseInt(s.slice(266, 272), 16), cdl = parseInt(s.slice(272, 278), 16);
+    const clientDataJSON = Buffer.from(s.slice(278 + adl * 2, 278 + adl * 2 + cdl * 2), 'hex').toString();
+    return { mode: s.slice(0, 8), precompile: s.slice(8, 10), id: `0x${s.slice(10, 74)}`, challenge: clientDataJSON.slice(offset, offset + 43), clientDataJSON, adl };
+  };
+  await simulateOperation({ ...op, sender: EXISTING, initCode: '0x', signer: EXISTING }, { rpc: node, simulator } as never);
+  const deployed = frakForm(tried[0].signature);
+  assert.deepEqual({ mode: deployed.mode, precompile: deployed.precompile, id: deployed.id, adl: deployed.adl }, { mode: '00000000', precompile: '01', id, adl: 37 });
+  assert.equal(deployed.challenge, Buffer.from(hash.slice(2), 'hex').toString('base64url'));
+  assert.match(deployed.clientDataJSON, /"origin":"https:\/\/frak\.id"/);
+  assert.ok(tried[0].overrides.includes('0x0000000000000000000000000000000000000100'), 'the P256 precompile stood in for');
+  // Deploying: the passkey's id from the validator's enable data (id ‖ x ‖ y).
+  tried.length = 0;
+  const other = `0x${'dd'.repeat(32)}` as Hex;
+  const data = encodeFunctionData({ abi: ABI, functionName: 'initialize', args: [FRAK, concatHex([other, `0x${'11'.repeat(32)}`, `0x${'22'.repeat(32)}`])] });
+  await simulateOperation({ ...op, sender: NEW, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: [KERNEL_V24, data, 0n] })]), signer: NEW }, { rpc: node, simulator } as never);
+  assert.equal(frakForm(tried[0].signature).id, other);
+});
