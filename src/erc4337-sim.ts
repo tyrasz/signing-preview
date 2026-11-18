@@ -509,6 +509,8 @@ interface Stub {
   wallet?: boolean;
   /** The wallet's supplied signature with the stand-in in place of the ECDSA signature it carries (walletForm). */
   walletForm?: boolean;
+  /** A stand-in in the account's own form (stubFor), tried after the wallet's supplied stub and its wallet form were both refused. */
+  fallback?: boolean;
   /** Kernel's enable mode: the operation's own enable data, with stand-ins for its two signatures (kernelEnableStub). */
   enable?: boolean;
   /** Storage slots of the account set for the run (a stand-in key registered as one of its own stands). */
@@ -2727,6 +2729,8 @@ export interface OperationRun {
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
   /** The ECDSA stand-in took the form of the wallet's supplied signature (Stub's `walletForm`). */
   walletForm?: boolean;
+  /** The wallet's supplied stub was refused, and a stand-in in the account's own form ran instead (Stub's `fallback`). */
+  fallback?: boolean;
   /** The passkey's stand-in is a real assertion by a passkey made up for the run, its key set as the account's (Stub's `madeUp`). */
   madeUp?: boolean;
   /** Why the account may not take the stand-in as the signer's (Stub's `why`): said where it rejects it. */
@@ -2928,6 +2932,18 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
     // run says so.)
     if (ran && !stub.walletForm && (!result || rank(ran) >= rank(result))) result = ran;
   }
+  // A wallet's stub the account refused, in its own form and with the stand-in in it: then the stand-ins of the
+  // account's own form, as for an operation with no signature, so that a stub (a dummy, or one its ECDSA part isn't
+  // found in) leaves the preview no worse off than none would. On Base, 2026-11-18, operations previewed with their
+  // own signatures' ECDSA parts dummied reverted in validation (Panic(0x41), InvalidSignature) or were refused, 35-38%
+  // low, where with no signature their stand-ins validated. Such a run replaces the stub's only where it got further.
+  if (supplied && !enable.length) {
+    for (const stub of (await stubFor(context, op.delegate, op.initCode)).map(s => ({ ...s, fallback: true }))) {
+      const ran = await withStub(stub);
+      if (ran && !ran.account?.signatureFailed && !ran.rejected?.startsWith('AA23')) return ran;
+      if (ran && (!result || rank(ran) > rank(result))) result = ran;
+    }
+  }
   return result;
 
   async function withStub(stub: Stub): Promise<OperationRun | null> {
@@ -3056,7 +3072,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
   const unpaid = stub.unpaid || (stub.wallet && result?.rejected?.startsWith('AA21') && await refusesUnpaid());
-  return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
+  return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.fallback && { fallback: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
   }
 }
 

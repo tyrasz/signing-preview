@@ -438,6 +438,11 @@ test('A typed operation validates with the wallet’s own stub when context.user
   for (const other of [{ sender: account8, nonce: '0x1', signature }, { sender: account8, nonce: '0x0', callData: '0x', signature }]) {
     assert.match(whole(await run(other)), /with a stand-in for the signature/, JSON.stringify(other));
   }
+  // A stub with no ECDSA signature in it to put the stand-in in place of (the account reverts on it): the stand-in of
+  // the account's own form, as with no stub at all, and the preview says the wallet's was refused.
+  const odd = await run({ sender: account8, nonce: '0x0', callData: sendUsdc, signature: '0xdeadbeef' });
+  assert.match(whole(odd), /with a stand-in for the signature in the account's own form, the wallet's stand-in signature refused, which doesn't exist until it's signed: ecrecover attributes it to the signer\)/);
+  assert.deepEqual(usdcChange(odd), ['out 50']);
 });
 
 test('A passkey stand-in: a WebAuthn assertion over the operation hash, and a P256 verifier that accepts only it', async () => {
@@ -857,10 +862,10 @@ test('An EIP-7702 delegate in Biconomy Smart Account v2’s form with a cosigner
   const whole = (p: Preview) => p.decoding.notes.find(n => /whole operation was simulated as EntryPoint v0\.6/.test(n));
   const gasUsed = (p: Preview) => BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
 
-  // Before: the bare stand-in isn't the form the account decodes, so its validation reverts and only the calls run.
+  // Before: the bare stand-in isn't the form the account decodes, so its validation reverted and only the calls ran.
+  // Supplied as the wallet's stub, it still reverts, and the stand-in of the account's own form (below) is taken.
   let p = await preview({ ...op, signature: STUB_SIGNATURE }, user, '0.6');
-  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23/);
-  assert.equal(whole(p), undefined);
+  assert.match(whole(p) ?? notes(p), /in the account's own form, the wallet's stand-in signature refused/);
 
   // The stand-in: the account asked to sign, its cosigner listed. Validated, and the calls run.
   p = await preview(op, user, '0.6');
@@ -886,9 +891,10 @@ test('An EIP-7702 delegate in Biconomy Smart Account v2’s form with a cosigner
   // charges 3,000): otherwise the stand-in uses the gas the signed operation does.
   const real = gasUsed(p), priced = 2n * BigInt(ecrecoverPrice(999) - 3000);
   assert.ok(real + priced - standIn >= 350n && real + priced - standIn <= 450n, `${real} ${standIn}`);
-  // A cosignature over another hash: refused.
+  // A cosignature over another hash: the supplied signature refused, and the preview says so; the stand-ins of the
+  // account's own form (the signer's and its cosigner's) run instead, as they would with no signature supplied.
   const miscosigned = { ...op, signature: encodeAbiParameters(parseAbiParameters('bytes, address'), [encodeAbiParameters(parseAbiParameters('bytes, bytes'), [await cosigner.signMessage({ message: { raw: keccak256(hash) } }), owner]), '0xd88b687ba4237e6b9893020285103f45d8949ea3']) };
-  assert.match(whole(await preview(miscosigned, user, '0.6')) ?? '', /doesn't accept/);
+  assert.match(whole(await preview(miscosigned, user, '0.6')) ?? '', /in the account's own form, the wallet's stand-in signature refused/);
 
   // A real operation of the delegate's (BNB Chain), its validateUserOp run here as the EntryPoint calls it, with the
   // hash it was signed over: its cosignature is the stand-in's cosigner's, and its form is the one the stand-in takes.
@@ -1000,9 +1006,10 @@ test('The cosigned EIP-7702 delegate’s second deployment: its registry’s sig
   assert.equal(onChainRoot, keccak256(encodePacked(['uint48', 'uint48', 'bytes32'], [until, after, onChain.userOpHash])));
   assert.equal(await validate(onChain.userOpHash), (BigInt(after) << 208n) | (BigInt(until) << 160n));
   assert.equal(await validate(keccak256(onChain.userOpHash)), 1n);
-  // The bare stand-in, which the account got before: its validation reverts, so only the calls would run.
+  // The bare stand-in, which the account got before: supplied as the wallet's stub its validation reverts, and the
+  // stand-in of the account's own form is taken instead.
   p = await preview({ ...op, signature: STUB_SIGNATURE }, user, '0.6');
-  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23/);
+  assert.match(whole(p) ?? notes(p), /in the account's own form, the wallet's stand-in signature refused/);
 
   // Another key asked: the account takes only its own.
   p = await preview(op, OWNER, '0.6');
@@ -1068,9 +1075,10 @@ test('Modular Account v2 validating through Aave Labs’ 2-of-2 multisig module:
   }
   assert.ok(gas[0] + priced - standIn >= 350n && gas[0] + priced - standIn <= 450n, `${gas[0]} ${standIn}`);
   assert.ok(gas[1] - gas[0] >= 100n && gas[1] - gas[0] <= 250n, `${gas}`);
-  // Modular Account v2's own form, which the account got before: the module reverts on its length (AA23).
+  // Modular Account v2's own form, which the account got before: supplied as the wallet's stub the module reverts on
+  // its length (AA23), and the stand-in of the account's own form (the multisig's, above) is taken instead.
   p = await preview({ ...op, signature: cat(['0xff00', a]) }, user.address.toLowerCase());
-  assert.match(notes(p), /validation reverts on a stand-in for the signature \(AA23/);
+  assert.match(whole(p) ?? notes(p), /in the account's own form, the wallet's stand-in signature refused/);
 
   // A real operation of such an account (Arbitrum One), its validateUserOp run here as the EntryPoint calls it, with
   // the hash it was signed over and its signers as the module has them: 0xff, then each signer's signature in turn.

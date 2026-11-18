@@ -858,7 +858,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
