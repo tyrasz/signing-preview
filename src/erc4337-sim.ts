@@ -1433,6 +1433,9 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
   // Alchemy's LightAccountFactory v2.0.0 and MultiOwnerLightAccountFactory v2.0.0: accounts that sign with the 0x00
   // type byte (above), as one deployed in an operation on Ethereum did.
   '0x0000000000400cdfef5e2714e63d8040b700bc24': async () => shaped('0x00')(), '0x000000000019d2ee9f2729a65afe20bb0020aefc': async () => shaped('0x00')(),
+  // KresusVaultFactory (createAccount; the KresusVault it deploys in its constructor, above): the same form. A Base
+  // account it deployed in the operation reverted on the plain stand-in (InvalidSignatureType).
+  '0x594304fa9eb2b90f866fc212dbede58fba887017': async () => shaped('0x00')(),
   // Biconomy's SmartAccountFactory v2 (deployCounterFactualAccount, deployAccount): a Smart Account v2 (its
   // basicImplementation, the same on both chains here) set up with the ECDSA ownership module signs in its form.
   '0x000000a56aaca3e9a4c479ea6b6cd0dbcb6634f5': async (_c, factoryData) => {
@@ -2532,6 +2535,10 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // A later LightAccount implementation, seen with EntryPoint v0.8: the same type byte, then the owner's signature
   // over the operation's hash (its verified source).
   '0x2c53d0bd33a60db8881c7b049df6fd762a1f059c': shaped('0x00'),
+  // Kresus's KresusVault (a LightAccount build, verified on Sourcify; Ethereum and Base): the same 0x00 type byte for
+  // an EOA owner, then its signature over the personal_sign form of the hash; the plain stand-in's first byte reverted
+  // (InvalidSignatureType).
+  '0xf9c0176ebc83816187729d0b160a700ba4bfc4d0': shaped('0x00'),
   '0x000100abaad02f1cfc8bbe32bd5a564817339e72': coinbaseStub, '0x00000110dcdedc9581cb5ecb8467282f2926534d': coinbaseStub,
   // Biconomy Smart Account v2: abi.encode(the module's signature, the validation module), with its ECDSA ownership
   // module, which recovers the owner over the personal_sign form of the hash (or the hash itself); seen so on

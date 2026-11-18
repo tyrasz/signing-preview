@@ -395,3 +395,29 @@ test('Kernel v3 on ZeroDev’s weighted ECDSA validator: other guardians’ appr
   await simulateOperation({ ...op, sender: NEW, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: [data, `0x${'00'.repeat(32)}`] })]), signer: g1 }, { rpc: node, simulator } as never);
   assert.equal(tried[0], concatHex([stubSignature(1), stubSignature(2), STUB_SIGNATURE]));
 });
+
+test('Kresus’s KresusVault: the 0x00 type byte before the owner’s signature, for an existing account and one its factory deploys', async () => {
+  // Base, 2026-11-18: an account the factory deployed in the operation reverted on the plain stand-in (InvalidSignatureType).
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const FACTORY = '0x594304fa9eb2b90f866fc212dbede58fba887017', EXISTING = '0x6dbedfcfdb6979e6bca6fd5bf1eb4144833d52bb', NEW = '0xe6fec47dadb9203a4c31549d8b514631310c0fb7';
+  const tried: Hex[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return (params[0] as string).toLowerCase() === NEW ? '0x' : `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}f9c0176ebc83816187729d0b160a700ba4bfc4d0`;
+    if (method === 'eth_call') return `0x${'4a'.repeat(32)}`; // getUserOpHash
+    throw new Error(`unexpected ${method}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const op = { chainId: 8453, entryPoint: EP, nonce: 0n, callData: '0x' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
+  const owner = '0x9d289fdc5c274d74727f320c39c8d76c838ab197';
+  await simulateOperation({ ...op, sender: EXISTING, initCode: '0x', signer: owner }, { rpc: node, simulator } as never);
+  assert.equal(tried[0], concatHex(['0x00', STUB_SIGNATURE]));
+  tried.length = 0;
+  await simulateOperation({ ...op, sender: NEW, initCode: concatHex([FACTORY, '0x5fbfb9cf', `0x${owner.slice(2).padStart(64, '0')}${'00'.repeat(32)}`]), signer: owner }, { rpc: node, simulator } as never);
+  assert.equal(tried[0], concatHex(['0x00', STUB_SIGNATURE]));
+});
