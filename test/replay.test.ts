@@ -827,3 +827,27 @@ test('A replay in a full OP Stack block: the L1-attributes deposit before it set
   assert.equal(BigInt(reads!.params[0].blockStateCalls[0].blockOverrides.gasLimit), 40_000_000n + BigInt(calls - 2) * 200_000n); // past the deposit and the call
   assert.equal(reads!.params[0].blockStateCalls[0].blockOverrides.number, '0x64', "the replay's header kept");
 });
+
+test('An Arbitrum replay whose call measures its gas: run again on the node with its limit moved by the node’s L1 charge over the receipt’s', async () => {
+  // The receipt: 51,234 gas on L2 and 1,000 for L1. The node charges its own estimate, 1,300, out of the limit, so the
+  // call starts with 300 gas less than on-chain and a keeper's fee (here the transfer's amount) comes out otherwise.
+  const { rpc } = chain();
+  const receipt = { ...RECEIPT, gasUsed: hex(52_234), gasUsedForL1: hex(1_000) };
+  const arb = { has: rpc.has, call: async (c: number, method: string, params: unknown[]) => method === 'eth_getTransactionReceipt' && params[0] === TXS[3].hash ? receipt : rpc.call(c, method, params) } as unknown as NonNullable<Dependencies['rpc']>;
+  const asked: (bigint | undefined)[] = [];
+  const off = { ...LOG, data: pad(hex(200_000_001n)) };
+  const simulator = {
+    simulate: async (r: SimulationRequest) => { asked.push(r.gas); return r.gas === 100_300n ? ran({ gasUsed: 52_534n }) : ran({ gasUsed: 52_534n, logs: [off], ...parseLogs([off]) }); },
+    trace: async () => null,
+  };
+  const p = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: arb, simulator } as unknown as Dependencies);
+  assert.equal(p.replay?.matches, true, JSON.stringify(p.replay));
+  assert.deepEqual(asked.slice(0, 2), [100_000n, 100_300n]);
+  assert.match(p.decoding.notes.join(' '), /Run again with the gas limit moved by what the node charged over the receipt's L1 gas \(300 gas\), so that the call started with the gas it had on-chain, it came out as its receipt says\./);
+  // A charge outside what the node can have charged (more than twice the receipt's): no second run.
+  asked.length = 0;
+  const far = { ...simulator, simulate: async (r: SimulationRequest) => { asked.push(r.gas); return ran({ gasUsed: 51_234n + 2_001n, logs: [off], ...parseLogs([off]) }); } };
+  const q = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: arb, simulator: far } as unknown as Dependencies);
+  assert.equal(q.replay?.matches, false);
+  assert.deepEqual(asked, [100_000n]);
+});

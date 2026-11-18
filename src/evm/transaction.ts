@@ -246,6 +246,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         // failed on a 70,000,000 limit used 16,777,216 on the chain and 50,000,000 in the node's simulation).
         if (replay && outcome.result && deps.simulator.trace) {
           const nodes = compareWithReceipt(outcome.result, replay.receipt);
+          let shifted: { request: SimulationRequest; result: SimulationResult } | null = null;
           // A block in its parent's second: first the node again, at the right time, with the second's earlier
           // blocks merged into one (ReplayContext.sameSecond).
           const second = !nodes.matches && replay.sameSecond ? await replay.sameSecond().catch(() => undefined) : undefined;
@@ -254,6 +255,9 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
           if (second && together && merged && compareWithReceipt(merged, replay.receipt).matches) {
             outcome = { result: merged }; ran = [together];
             localRun = `${SAME_SECOND} It was run instead with the ${second.before.length} transactions before it in that second (${second.blocks === 1 ? 'those of the block before and' : `those of the ${second.blocks} blocks before and`} its own block's), as one block at the block's own time on the state of block ${(second.at.header.number - 1n).toLocaleString('en-US')}, and came out as its receipt says (there the block's number reads ${second.at.header.number.toLocaleString('en-US')}).`;
+          } else if (!nodes.matches && (shifted = await l1Shifted(request, outcome.result, replay.receipt, deps))) {
+            outcome = { result: shifted.result }; ran = [shifted.request];
+            localRun = `${L1_SHIFTED} Run again with the gas limit moved by what the node charged over the receipt's L1 gas (${(shifted.request.gas! - request.gas!).toLocaleString('en-US')} gas), so that the call started with the gas it had on-chain, it came out as its receipt says.`;
           } else if (!nodes.matches) {
             const exact: SimulationRequest = replay.ownTimestamp !== undefined ? { ...request, at: { ...request.at!, header: { ...request.at!.header, ownTimestamp: replay.ownTimestamp } } } : request;
             const own = (await deps.simulator.trace([exact], { budgetMs: REPLAY_TRACE_MS }).catch(() => null))?.[0];
@@ -380,6 +384,24 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 }
 
 /** A simulated block given a later second than the real one had (src/block.ts, afterParent). */
+const L1_SHIFTED = "On Arbitrum the chain's node works out the transaction's L1 gas itself (at its own estimate of the L1 price) and takes it out of the gas limit before the call runs, as the chain took the receipt's: a call that measures its own gas (a keeper's fee) started with a little more or less than on-chain, and didn't come out as its receipt says.";
+/**
+ * Arbitrum: the replay run again on the node with its gas limit moved by what the node charged for L1 gas over the
+ * receipt's (its run's gas used, less the receipt's L2 part), where that charge is between none and twice the receipt's and
+ * the run then comes out as the receipt says. The node estimates the L1 gas (70-126% of the receipt's) and takes it out
+ * of the limit, so a call measuring its gas left (GMX's keepers: their execution fee) started off by that difference:
+ * a MultichainOrderRouter call on 2026-11-18 paid its keeper a fee in WETH the receipt's didn't.
+ */
+async function l1Shifted(request: SimulationRequest, first: SimulationResult, receipt: NonNullable<PreviewContext['replay']>['receipt'], deps: Dependencies): Promise<{ request: SimulationRequest; result: SimulationResult } | null> {
+  const own = receipt.gasForL1;
+  if (!own || request.gas === undefined || first.gasUsed === undefined || !deps.simulator) return null;
+  // (The receipt's gasUsed here is its L2 part: the node's run used that and its own L1 charge.)
+  const charged = first.gasUsed - receipt.gasUsed;
+  if (charged < 0n || charged > 2n * own || charged === own) return null;
+  const again: SimulationRequest = { ...request, gas: request.gas + charged - own };
+  const result = await deps.simulator.simulate(again).catch(() => null);
+  return result && compareWithReceipt(result, receipt).matches ? { request: again, result } : null;
+}
 const SAME_SECOND = "The block shares its second with the one before it, which this chain's node won't simulate: run a second later there, the transaction didn't come out as its receipt says.";
 const OWN_TIME = "The block shares its second with the one before it, which this chain's node won't simulate: run a second later there, the transaction didn't come out as its receipt says. The run shown is the local EVM's, at the block's own time.";
 /** EIP-7825: the most ordinary gas one transaction has; from Amsterdam on, what its gas limit holds beyond pays for new state only. */
