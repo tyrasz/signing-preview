@@ -235,3 +235,44 @@ test('A Kernel v3 account another factory deploys with deployWithFactory and a d
   await simulateOperation({ ...op, initCode: initCode('0x12345678'), signer: op.sender }, { rpc: node, simulator } as never);
   assert.equal(signatureOf(tried[0]), STUB_SIGNATURE);
 });
+
+test('ZeroDev passkey accounts: deployed by the KernelFactory’s own createAccount, and on its passkey validator 0.0.2, both stood in for in its WebAuthn form', async () => {
+  // Arbitrum One, 2026-11-18: both got the plain stand-in, and their validation reverted (AA23).
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const ABI = parseAbi(['function createAccount(bytes data, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)']);
+  const WEBAUTHN = '0x7ab16ff354acb328452f1d445b3ddee9a91e9e69', V002 = '0xba45a2bfb8de3d24ca9d7f1b551e14dff5d690fd', FACTORY = '0xaac5d4240af87249b3f71bc8e4a2cae074a3e419';
+  const SENDER = '0xe6fec47dadb9203a4c31549d8b514631310c0fb7';
+  const tried: SimulationRequest[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return (params[0] as string).toLowerCase() === SENDER ? '0x' : `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}bac849bb641841b44e965fb01a4bf5f074f84b4d`;
+    if (method === 'eth_call') {
+      const { to, data } = params[0] as { to: string; data: string };
+      if (to === EP) return `0x${'4a'.repeat(32)}`; // getUserOpHash
+      if (data === '0xf1f7f0f9') return `0x01${V002.slice(2)}${'00'.repeat(11)}`; // rootValidator()
+    }
+    throw new Error(`unexpected ${method}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const signatureOf = (q: SimulationRequest) => (decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature;
+  const webAuthn = (sig: Hex) => decodeAbiParameters([{ type: 'bytes' }, { type: 'string' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'bool' }], sig);
+  const op = { chainId: 42161, entryPoint: EP, nonce: 0n, callData: '0x' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
+  // Deployed by the factory's createAccount, its root ZeroDev's WebAuthn validator.
+  const data = encodeFunctionData({ abi: ABI, functionName: 'initialize', args: [`0x01${WEBAUTHN.slice(2)}`, `0x${'00'.repeat(20)}`, `0x${'ab'.repeat(96)}`, '0x', []] });
+  await simulateOperation({ ...op, sender: SENDER, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: [data, `0x${'00'.repeat(32)}`] })]), signer: SENDER }, { rpc: node, simulator } as never);
+  assert.equal(JSON.parse(webAuthn(signatureOf(tried[0]))[1]).type, 'webauthn.get');
+  // An existing account whose root is ZeroDev's passkey validator 0.0.2.
+  tried.length = 0;
+  const EXISTING = '0x7cdbc9592aa39df3e659e8d5fc498af3e9060817';
+  await simulateOperation({ ...op, sender: EXISTING, initCode: '0x', signer: EXISTING }, { rpc: node, simulator } as never);
+  assert.equal(JSON.parse(webAuthn(signatureOf(tried[0]))[1]).type, 'webauthn.get');
+  // Another factory's createAccount whose data isn't Kernel's initialize: not taken for Kernel's.
+  tried.length = 0;
+  await simulateOperation({ ...op, sender: SENDER, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: ['0x12345678', `0x${'00'.repeat(32)}`] })]), signer: SENDER }, { rpc: node, simulator } as never);
+  assert.equal(signatureOf(tried[0]), STUB_SIGNATURE);
+});

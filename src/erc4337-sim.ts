@@ -847,7 +847,7 @@ export const cosigningOwner = (data: Hex): string | undefined => {
 };
 /** ZeroDev's WebAuthnSigner, a Kernel permission's signer (source verified on Sourcify, Ethereum): its signature is zeroDevWebAuthnStub's form. */
 const ZERODEV_WEBAUTHN_SIGNERS = new Set(['0x65deec8fee717dc044d0cfd63ccf55f02ccac2b3']);
-const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function deployWithFactory(address factory, bytes createData, bytes32 salt, bytes signature)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
+const KERNEL_DEPLOY = parseAbi(['function deployWithFactory(address factory, bytes createData, bytes32 salt)', 'function deployWithFactory(address factory, bytes createData, bytes32 salt, bytes signature)', 'function createAccount(bytes data, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)', 'function installValidations(bytes21[] vIds, (uint32 nonce, address hook)[] configs, bytes[] validationData, bytes[] hookData)']);
 /** What a Kernel v3 account being deployed is set up with: its root validator, and each validation its initialize() installs, with its install data. */
 export type KernelSetup = { root: Hex; installs: Map<string, Hex>; /** The Kernel implementation its factory deploys (implementation()). */ implementation?: string };
 /**
@@ -869,16 +869,25 @@ function setupPermissionSigner(setup: KernelSetup, pId: string): { module: strin
  */
 export const KERNEL_DEPLOY_SELECTORS = new Set(['0xc5265d5d', '0x05160ab7']);
 /**
+ * A KernelFactory's own createAccount(data, salt), called straight (ZeroDev's v3.1 factory, 0xaac5…e419, on Arbitrum
+ * One, 2026-11-18: a passkey account's deployment got the plain stand-in, and its validation reverted, AA23); data is
+ * Kernel's initialize, which kernelDeployStub reads as from deployWithFactory's createData.
+ */
+export const KERNEL_FACTORY_CREATE = '0xea6d13ac';
+/**
  * A Kernel v3 account ZeroDev's FactoryStaker (or another deployWithFactory: KERNEL_DEPLOY_SELECTORS) is deploying:
  * kernelV3Stub, with the root validator its initialize()
  * sets and the validations it installs (the root's own install data, and installValidations among its initConfig
  * calls): a permission the operation validates through can be installed there (on Base: a passkey's, ZeroDev's
  * WebAuthn signer, with an execution hook).
  */
-async function kernelDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> {
+async function kernelDeployStub(c: StubContext, factoryData: Hex, kernelFactory?: string): Promise<Stub[]> {
   try {
-    // deployWithFactory hands createData to the KernelFactory's createAccount, which calls the new account with it.
-    const { args: [factory, createData] } = decodeFunctionData({ abi: KERNEL_DEPLOY, data: factoryData });
+    // deployWithFactory hands createData to the KernelFactory's createAccount, which calls the new account with it;
+    // the KernelFactory's own createAccount (`kernelFactory`, called straight) takes it as its data.
+    const call = decodeFunctionData({ abi: KERNEL_DEPLOY, data: factoryData });
+    const [factory, createData] = call.functionName === 'createAccount' ? [kernelFactory!, call.args[0]] : call.functionName === 'deployWithFactory' ? [call.args[0], call.args[1]] : [];
+    if (!factory || !createData) return [{ signature: STUB_SIGNATURE }];
     const init = decodeFunctionData({ abi: KERNEL_DEPLOY, data: createData as Hex });
     if (init.functionName !== 'initialize') return [{ signature: STUB_SIGNATURE }];
     const [root, , validatorData, , initConfig] = init.args as unknown as [Hex, Hex, Hex, Hex, readonly Hex[]];
@@ -934,7 +943,9 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
       type = root.slice(2, 4); id = root.slice(4, 44);
     } catch { return ecdsa; }
   }
-  if (type === '01' && ZERODEV_WEBAUTHN_VALIDATORS.has(`0x${id}`.toLowerCase())) {
+  // (ZeroDev's passkey validators 0.0.1 to 0.0.3 and its WebAuthn validator, all in this form: an account on 0.0.2,
+  // Arbitrum One, 2026-11-18, got the plain stand-in, and its validation reverted, AA23.)
+  if (type === '01' && ZERODEV_PASSKEY_VALIDATORS.has(`0x${id}`.toLowerCase())) {
     const hash = await c.hash();
     if (!hash) return ecdsa;
     const precompiled = await zeroDevPrecompiled(c);
@@ -2516,6 +2527,15 @@ async function stubFor(c: StubContext, delegate?: string, initCode?: Hex): Promi
   // Another factory's deployWithFactory, deploying a Kernel v3 account (kernelDeployStub, which reads its createData
   // as Kernel's initialize: anything else gets the plain stand-in).
   if (factory && !delegate && KERNEL_DEPLOY_SELECTORS.has(`0x${initCode!.slice(42, 50).toLowerCase()}`)) return kernelDeployStub(c, `0x${initCode!.slice(42)}`);
+  // A KernelFactory's createAccount, called straight: a Kernel v3 account where its data is Kernel's initialize.
+  if (factory && !delegate && initCode!.slice(42, 50).toLowerCase() === KERNEL_FACTORY_CREATE.slice(2)) {
+    let kernel = false;
+    try {
+      const create = decodeFunctionData({ abi: KERNEL_DEPLOY, data: `0x${initCode!.slice(42)}` });
+      kernel = create.functionName === 'createAccount' && decodeFunctionData({ abi: KERNEL_DEPLOY, data: create.args[0] }).functionName === 'initialize';
+    } catch { /* another factory's createAccount */ }
+    if (kernel) return kernelDeployStub(c, `0x${initCode!.slice(42)}`, factory);
+  }
   // Another factory deploying a copy of Coinbase Smart Wallet (see coinbaseCopyStub). (Not a factory on 0x7702, an
   // EIP-7702 account's initialization.)
   if (factory && !delegate && !/^0x7702(00)*$/i.test(factory)) { const copy = await coinbaseCopyStub(c, undefined, factory, `0x${initCode!.slice(42)}`); if (copy) return copy; }
