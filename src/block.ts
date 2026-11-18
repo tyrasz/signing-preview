@@ -47,6 +47,12 @@ export interface BlockAt {
      */
     ownTimestamp?: bigint;
     /**
+     * The gas limit the chain's node is to run the block on (nodeOverrides), where it isn't the one the block had: a
+     * replay's block merged with the earlier blocks of its second (src/replay.ts, sameSecond) holds their
+     * transactions too, and is given their limits together.
+     */
+    nodeGasLimit?: bigint;
+    /**
      * The beacon slot the block is in (SLOTNUM, EIP-7843), from Amsterdam on. A block simulated after another is
      * taken to be in the next slot, as the chain's node takes it whatever time it is given.
      */
@@ -386,5 +392,6 @@ export function nodeOverrides(h: BlockAt['header']): Record<string, string> {
     time: `0x${h.timestamp.toString(16)}`, feeRecipient: h.coinbase, ...(h.arbBlockNumber === undefined && h.milliseconds === undefined && { prevRandao: h.prevRandao }), baseFeePerGas: `0x${h.baseFeePerGas.toString(16)}`,
     ...(h.difficulty !== undefined && { difficulty: `0x${h.difficulty.toString(16)}` }),
     ...(h.beaconRoot !== undefined && { beaconRoot: h.beaconRoot }),
+    ...(h.nodeGasLimit !== undefined && { gasLimit: `0x${h.nodeGasLimit.toString(16)}` }),
   };
 }

@@ -91,7 +91,10 @@ async function sameSecond(chainId: number, block: RpcBlock, index: number, heade
     const used = txs.map(t => { const r = byHash.get(t.hash.toLowerCase()); return r && BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0); });
     return used.every(u => u !== undefined) ? used as bigint[] : undefined;
   });
-  const at: BlockAt = { block: base, header: { ...header, number: n + 1n }, required: true, beforeUsed };
+  // (Their transactions in one block: on the gas limits of the blocks it stands for, together. On one block's, the
+  // node refused a block of 162 transactions from three, BNB Chain, 2026-11-18: "Block gas limit exceeded".)
+  const limit = [...earlierBlocks, block].reduce((sum, b) => sum + BigInt(b.gasLimit ?? header.gasLimit), 0n);
+  const at: BlockAt = { block: base, header: { ...header, number: n + 1n, gasLimit: limit, nodeGasLimit: limit }, required: true, beforeUsed };
   const before = await Promise.all(txs.map(async t => ({ ...await requestOf(chainId, t, base, deps), at })));
   return { at, before, blocks: earlierBlocks.length };
 }

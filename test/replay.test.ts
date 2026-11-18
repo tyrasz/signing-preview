@@ -350,6 +350,8 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   const header = { number: 100n, timestamp: 5n, coinbase: BOB, gasLimit: 1n, baseFeePerGas: 2n, prevRandao: H(1) as `0x${string}` };
   assert.deepEqual(nodeOverrides(header), { time: '0x5', feeRecipient: BOB, prevRandao: H(1), baseFeePerGas: '0x2' });
   assert.deepEqual(nodeOverrides({ ...header, arbBlockNumber: 7n }), { time: '0x5', feeRecipient: BOB, baseFeePerGas: '0x2' });
+  // A replay's block merged with the earlier blocks of its second (sameSecond): their gas limits together.
+  assert.deepEqual(nodeOverrides({ ...header, nodeGasLimit: 210_000_000n }), { time: '0x5', feeRecipient: BOB, prevRandao: H(1), baseFeePerGas: '0x2', gasLimit: '0xc845880' });
   // A block in the same second as its parent (BNB Chain's often are) is one no node will simulate: it runs a second
   // later, and says so. Arbitrum's node takes the same second, and so does Base's (most of its blocks share one).
   assert.deepEqual(afterParent(56, header, 5n), { header: { ...header, timestamp: 6n }, shifted: true });
