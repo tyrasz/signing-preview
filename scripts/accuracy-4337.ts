@@ -195,7 +195,13 @@ function innerSignatures(sig: Hex): Hex[] {
       if (ecdsa.length) return ecdsa.reverse();
     } catch { /* not a vault's */ }
   }
-  return [...(sig.length === 2 + 131 * 2 ? [`0x${sig.slice(4, 4 + 130)}` as Hex] : []), ...(sig.length >= 132 ? [`0x${sig.slice(-130)}` as Hex] : [])];
+  const found: Hex[] = [...(sig.length === 2 + 131 * 2 ? [`0x${sig.slice(4, 4 + 130)}` as Hex] : []), ...(sig.length >= 132 ? [`0x${sig.slice(-130)}` as Hex] : [])];
+  // Where neither looks like an ECDSA signature, any that sits elsewhere in it (ecdsaOffsets): a Sepolia account's
+  // session key signs after a type byte, in an ABI wrapper with a Merkle proof after it; not found, its operations were
+  // replayed as signed by its owner, whose bare signature the account takes by a cheaper path (7-16% low).
+  if (found.some(part => ecdsaOffsets(part).includes(0))) return found;
+  for (const i of ecdsaOffsets(sig)) { const part = `0x${sig.slice(2 + i * 2, 2 + i * 2 + 130)}` as Hex; if (!found.includes(part)) found.push(part); }
+  return found;
 }
 /**
  * The Merkle roots a Splits Smart Vault's type-1 signature is signed over, in place of the operation's hash: its last
@@ -858,7 +864,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),

@@ -509,6 +509,8 @@ interface Stub {
   wallet?: boolean;
   /** The wallet's supplied signature with the stand-in in place of the ECDSA signature it carries (walletForm). */
   walletForm?: boolean;
+  /** With walletForm: the signer's own last signature on the account, not one supplied (see simulateOperation). */
+  lastForm?: boolean;
   /** A stand-in in the account's own form (stubFor), tried after the wallet's supplied stub and its wallet form were both refused. */
   fallback?: boolean;
   /** Kernel's enable mode: the operation's own enable data, with stand-ins for its two signatures (kernelEnableStub). */
@@ -637,6 +639,8 @@ const ZERODEV_WEBAUTHN_SIGNATURE = [{ type: 'bytes' }, { type: 'string' }, { typ
 /** What each account's latest earlier operation showed (see zeroDevPrecompiled), for ten minutes. */
 /** Each account's latest earlier operation's signature (see lastSignature), as of the block `head`. */
 const LAST_SIGNED = new Map<string, { at: number; head: bigint; signature: Hex | undefined }>();
+/** A UserOperationEvent as eth_getLogs returns it: its transaction, and its topics (the operation's hash second). */
+type Logged = { transactionHash: string; topics: Hex[] };
 /** How far back an account's earlier operation is looked for, and in windows of at most how many blocks. */
 const LAST_SIGNED_REACH = 100_000n, LAST_SIGNED_WINDOW = 10_000n;
 /**
@@ -652,12 +656,13 @@ const BEYOND_REACH = /archive|pruned|missing trie node|not available|header not 
  * handleOps): its last UserOperationEvent up to the block before the latest, looked for back from there in windows
  * of 10,000 blocks (or the node's cap, from its refusal: Polygon's public node takes 10,000, BNB Chain's fewer) to
  * 100,000 back, or as far as the node serves. A wallet signs the same way each time, so what it chose then (a flag,
- * a key's id) it chooses now. With `match`, the latest that matches, of the account's last six operations (`key` names the match, for
+ * a key's id) it chooses now. With `match` (given each operation's signature and hash, its UserOperationEvent's), the
+ * latest that matches, of the account's last six operations (`key` names the match, for
  * remembering). Undefined with none, or unreadable. Remembered ten minutes (a minute when none was found), for previews
  * at that block or later; a lookup any of whose reads failed is not remembered, and one at an earlier block (a
  * replay) reads again, so an operation never sees one after it.
  */
-export async function lastSignature(c: { deps: Dependencies; chainId: number; sender: string; entryPoint?: string; match?: (signature: Hex) => boolean; key?: string; wide?: boolean }): Promise<Hex | undefined> {
+export async function lastSignature(c: { deps: Dependencies; chainId: number; sender: string; entryPoint?: string; match?: (signature: Hex, userOpHash: Hex) => boolean | Promise<boolean>; key?: string; wide?: boolean }): Promise<Hex | undefined> {
   const rpc = c.deps.rpc;
   if (!rpc?.has(c.chainId) || !c.entryPoint) return undefined;
   let head: bigint;
@@ -686,12 +691,12 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
     if (head - known.head <= LAST_SIGNED_WINDOW) {
       try {
         const logs = await rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
-          fromBlock: `0x${(known.head + 1n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as { transactionHash: string }[];
+          fromBlock: `0x${(known.head + 1n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as Logged[];
         let since: Hex | undefined, read = true;
         for (const log of [...logs].reverse().slice(0, c.match ? 6 : 1)) {
           const found = await signatureIn(log.transactionHash);
           if (found === null) { read = false; break; }
-          if (!c.match || (found && c.match(found))) { since = found; break; }
+          if (!c.match || (found && await c.match(found, log.topics[1]))) { since = found; break; }
         }
         if (read) {
           LAST_SIGNED.set(key, since ? { at: Date.now(), head, signature: since } : { ...known, head });
@@ -706,13 +711,13 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
   // (Wide, on a node that caps a read's range: 40 reads, four at a time ahead of the one awaited. Base's public node
   // takes 50,000 blocks a read, and a ZeroDev passkey account there had last signed 935,000 blocks back (22 days),
   // beyond the 300,000 that four reads reached: its wallet's flag, read as the chain's default, put its gas 57% low.)
-  const pending = new Map<bigint, Promise<{ transactionHash: string }[]>>();
+  const pending = new Map<bigint, Promise<Logged[]>>();
   const read = (to: bigint) => {
     let got = pending.get(to);
     if (!got) {
       const from = to >= window ? to - window + 1n : 0n;
       got = rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
-        fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }]) as Promise<{ transactionHash: string }[]>;
+        fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` }]) as Promise<Logged[]>;
       got.catch(() => undefined);
       pending.set(to, got);
     }
@@ -722,7 +727,7 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
     for (let reads = 0; reached < reach && head - reached > 0n && reads < (c.wide ? 40 : 16); reads++) {
       const to = head - reached, from = to >= window ? to - window + 1n : 0n;
       if (c.wide && window < LAST_SIGNED_WIDE) for (let k = 1n; k < 4n && reached + k * window < reach && to - k * window > 0n; k++) read(to - k * window);
-      let logs: { transactionHash: string }[];
+      let logs: Logged[];
       try {
         logs = await read(to);
       } catch (e) {
@@ -747,7 +752,7 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
         if (fetched++ >= (c.match ? 6 : 1)) { done = true; break; }
         const found = await signatureIn(log.transactionHash);
         if (found === null) { failed = done = true; break; }
-        if (!c.match || (found && c.match(found))) { signature = found; done = true; break; }
+        if (!c.match || (found && await c.match(found, log.topics[1]))) { signature = found; done = true; break; }
       }
       if (done) break;
       reached += to - from + 1n;
@@ -2408,6 +2413,20 @@ export function walletForm(sig: Hex): Hex[] {
   const hex = sig.slice(2).toLowerCase(), stub = STUB_SIGNATURE.slice(2);
   return ecdsaOffsets(sig).filter(i => hex.slice(i * 2, i * 2 + 130) !== stub).map(i => `0x${hex.slice(0, i * 2)}${stub}${hex.slice(i * 2 + 130)}` as Hex);
 }
+/**
+ * Whether `signer` signed an operation with this signature: an ECDSA signature in it (ecdsaOffsets) recovers as the
+ * signer over the operation's hash or its EIP-191 form (personal_sign).
+ */
+export async function signedBy(signature: Hex, userOpHash: Hex, signer: string): Promise<boolean> {
+  const hex = signature.slice(2), who = signer.toLowerCase();
+  for (const i of ecdsaOffsets(signature)) {
+    const part = `0x${hex.slice(i * 2, i * 2 + 130)}` as Hex;
+    for (const h of [hashMessage({ raw: userOpHash }), userOpHash]) {
+      try { if ((await recoverAddress({ hash: h, signature: part })).toLowerCase() === who) return true; } catch { /* not a signature */ }
+    }
+  }
+  return false;
+}
 // --- Ambire's account (AmbireAccount, verified source on Sourcify; EIP-1167 clones of it, Ethereum and Base) ---
 // validateUserOp recovers the signer with SignatureValidator.recoverAddr, which reads the signature's last byte as its
 // mode: {r}{s}{v}{mode}, Standard (1) recovering over the EIP-712 digest of AmbireOperation(address account, bytes32
@@ -2415,6 +2434,8 @@ export function walletForm(sig: Hex): Hex[] {
 // signature ends in v, 27 or 28, beyond the modes: read as Unprotected, which recoverAddr refuses (SV_USED_UNBOUND),
 // as STUB_SIGNATURE was on Ethereum and Base. The signer is a key the account gives a privilege to.
 export const AMBIRE_IMPLEMENTATION = '0x0f2aa7bcda3d9d210df69a394b6965cb2566c828';
+/** An unpublished account implementation with session keys, on Sepolia (see STUB_SHAPES). */
+export const SESSION_KEY_ACCOUNT = '0x7e92fa838fd4c3c7602094f0a9c70ec81f8991c7';
 /**
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
  * delegate or ERC-1967 implementation). Others get STUB_SIGNATURE as is, unless the wallet supplies its own stub.
@@ -2434,6 +2455,14 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // Alchemy's Modular Account v1: the form of the plugin validating the function the operation calls (see
   // modularAccountV1Stub).
   [MODULAR_ACCOUNT_V1]: modularAccountV1Stub,
+  // An unpublished account implementation on Sepolia (behind ERC-1967 proxies; with session-key, social-recovery and
+  // freeze modules), its checks read from its operations' validation in a local EVM: its owner's signature is the bare
+  // one over the operation hash's EIP-191 form; a session key's comes after a 0x01 type byte, as abi.encode(signature,
+  // bytes32[] proof): an OpenZeppelin Merkle proof that the key may make the call, against the root the account keeps
+  // for the key (leaves keccak256(keccak256(target ‖ selector))), empty where the key may make that call alone. Bare
+  // first, then a session key's with an empty proof; a key whose root has more leaves takes the proof of its own last
+  // signature (simulateOperation). Taken as its owner's, its session keys' operations came out 7-16% low.
+  [SESSION_KEY_ACCOUNT]: () => [{ signature: STUB_SIGNATURE }, { signature: concatHex(['0x01', encodeAbiParameters(parseAbiParameters('bytes, bytes32[]'), [STUB_SIGNATURE, []])]) }],
   // ZeroDev Kernel v2.4 and v2.3: validation mode 0x00000000 (its default validator, the owner's ECDSA), then the
   // signature (checked on v2.3: it validates the shape as signed by its owner).
   '0xd3082872f8b06073a021b4602e022d5a070d7cfc': shaped('0x00000000'), '0xd3f582f6b4814e989ee8e96bc3175320b5a540ab': shaped('0x00000000'),
@@ -2777,6 +2806,8 @@ export interface OperationRun {
   standIn?: 'wallet' | 'ecdsa' | 'passkey' | 'enable';
   /** The ECDSA stand-in took the form of the wallet's supplied signature (Stub's `walletForm`). */
   walletForm?: boolean;
+  /** With walletForm: the form of the signer's own last signature on the account (Stub's `lastForm`). */
+  lastForm?: boolean;
   /** The wallet's supplied stub was refused, and a stand-in in the account's own form ran instead (Stub's `fallback`). */
   fallback?: boolean;
   /** The passkey's stand-in is a real assertion by a passkey made up for the run, its key set as the account's (Stub's `madeUp`). */
@@ -2992,6 +3023,20 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
       if (ran && (!result || rank(ran) > rank(result))) result = ran;
     }
   }
+  // Refused every way so far, a named signer's own last signature on this account (the latest of its last six
+  // operations with an ECDSA signature in it that recovers as the signer: lastSignature), with the stand-in in place of
+  // that signature: the form its wallet signs in, whatever it wraps the signature in and carries with it. An account on
+  // Sepolia (an unpublished implementation with session keys, 0x7e92…91c7) takes a session key's signature after a
+  // type byte, with a Merkle proof that the key may make the call, which no other stand-in has; its owner's bare
+  // signature takes another path. Taken as its owner's, its session keys' operations came out 7-16% low. Kept only
+  // where the account accepts it.
+  if (!enable.length && context.named && signer !== sender) {
+    const last = await lastSignature({ deps, chainId: op.chainId, sender, entryPoint, key: `signer:${signer}`, match: (s, h) => signedBy(s, h, signer) });
+    for (const signature of last ? walletForm(last) : []) {
+      const ran = await withStub({ signature, walletForm: true, lastForm: true });
+      if (ran && !ran.account?.signatureFailed && !ran.rejected?.startsWith('AA23')) return ran;
+    }
+  }
   return result;
 
   async function withStub(stub: Stub): Promise<OperationRun | null> {
@@ -3120,7 +3165,7 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
   const unpaid = stub.unpaid || (stub.wallet && result?.rejected?.startsWith('AA21') && await refusesUnpaid());
-  return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.fallback && { fallback: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
+  return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.lastForm && { lastForm: true }), ...(stub.fallback && { fallback: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
   }
 }
 

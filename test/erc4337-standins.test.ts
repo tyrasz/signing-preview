@@ -276,3 +276,68 @@ test('ZeroDev passkey accounts: deployed by the KernelFactory’s own createAcco
   await simulateOperation({ ...op, sender: SENDER, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: ['0x12345678', `0x${'00'.repeat(32)}`] })]), signer: SENDER }, { rpc: node, simulator } as never);
   assert.equal(signatureOf(tried[0]), STUB_SIGNATURE);
 });
+
+test('An account with session keys (Sepolia): its owner’s bare signature, a session key’s after a 0x01 type byte with an empty proof, else the proof of that key’s own last signature', async () => {
+  // Sepolia, 2026-11-18: its session keys' operations were replayed as signed by its owner, 7-16% low.
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const HANDLE_OPS = parseAbi([`function handleOps(${OP}[] ops, address beneficiary)`]);
+  const SENDER = '0x0cc1e0744bdfa58760669727daba167cc47a1fdb', UOE = '0x49628fd1471006c1482da88028e9ce4dbb080b815c9b0344d39e5a8e6ec1419f';
+  const key = privateKeyToAccount('0x5555555555555555555555555555555555555555555555555555555555555555');
+  const sessionForm = (sig: Hex, proof: Hex[]) => concatHex(['0x01', encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes32[]' }], [sig, proof])]);
+  // The key's earlier operation: its signature over that operation's hash (EIP-191), with a one-leaf proof.
+  const leaf = `0x${'68'.repeat(32)}` as Hex, earlierHash = `0x${'4b'.repeat(32)}` as Hex;
+  const earlier = sessionForm(await key.signMessage({ message: { raw: earlierHash } }), [leaf]);
+  const word = (v: bigint) => v.toString(16).padStart(64, '0');
+  const fields = { nonce: 0n, initCode: '0x' as Hex, callData: '0x' as Hex, accountGasLimits: `0x${word(1n)}` as Hex, preVerificationGas: 0n, gasFees: `0x${word(1n)}` as Hex, paymasterAndData: '0x' as Hex };
+  const input = encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [[{ sender: SENDER, ...fields, signature: earlier }], SENDER] });
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x100', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') {
+      const topics = (params[0] as { topics: (string | null)[] }).topics;
+      return topics[0] === UOE && topics[2]?.endsWith(SENDER.slice(2)) ? [{ transactionHash: `0x${'aa'.repeat(32)}`, topics: [UOE, earlierHash, topics[2], `0x${'00'.repeat(32)}`] }] : [];
+    }
+    if (method === 'eth_getTransactionByHash') return { input };
+    if (method === 'eth_getCode') return `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}7e92fa838fd4c3c7602094f0a9c70ec81f8991c7`;
+    if (method === 'eth_call' && (params[0] as { to: string }).to === EP) return `0x${'4a'.repeat(32)}`; // getUserOpHash
+    throw new Error(`unexpected ${method}`);
+  } };
+  // The account takes one signature (validation data 0), and refuses the rest (1: the signature failed).
+  let accepted: Hex = '0x';
+  const tried: Hex[] = [];
+  const signatureOf = (q: SimulationRequest) => (decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature;
+  const simulator = { simulate: async (q: SimulationRequest) => {
+    const signature = signatureOf(q);
+    tried.push(signature);
+    const returnData = encodeAbiParameters([{ type: 'tuple', components: [{ name: 'a', type: 'uint256' }, { name: 'b', type: 'uint256' }, { name: 'c', type: 'uint256' }, { name: 'd', type: 'uint256' }, { name: 'e', type: 'bool' }, { name: 'f', type: 'bytes' }] }],
+      [{ a: 0n, b: 1n, c: signature === accepted ? 0n : 1n, d: 0n, e: true, f: '0x' }]);
+    const event = { address: EP, topics: [UOE, `0x${'4a'.repeat(32)}`, `0x${'00'.repeat(12)}${SENDER.slice(2)}`, `0x${'00'.repeat(32)}`], data: encodeAbiParameters([{ type: 'uint256' }, { type: 'bool' }, { type: 'uint256' }, { type: 'uint256' }], [0n, true, 1n, 1n]) };
+    return { status: 'success' as const, returnData, transfers: [], logs: [event] };
+  } };
+  const op = { chainId: 11155111, entryPoint: EP, sender: SENDER, ...fields, callGasLimit: 100_000n, verificationGasLimit: 500_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n };
+  // Its owner: the bare stand-in.
+  accepted = STUB_SIGNATURE;
+  let run = await simulateOperation({ ...op, signer: '0x478702d5736489c0b9eb608a750fa9683166b266' }, { rpc: node, simulator } as never);
+  assert.equal(run?.account?.signatureFailed, false);
+  assert.deepEqual([...new Set(tried)], [STUB_SIGNATURE]);
+  // A session key whose root is the call's leaf: refused bare, then taken with an empty proof.
+  tried.length = 0;
+  accepted = sessionForm(STUB_SIGNATURE, []);
+  run = await simulateOperation({ ...op, signer: key.address }, { rpc: node, simulator } as never);
+  assert.equal(run?.account?.signatureFailed, false);
+  assert.ok(!run?.lastForm);
+  // One whose root has other leaves: refused both ways, then in the form of its own last signature, its proof kept.
+  tried.length = 0;
+  accepted = sessionForm(STUB_SIGNATURE, [leaf]);
+  run = await simulateOperation({ ...op, signer: key.address }, { rpc: node, simulator } as never);
+  assert.equal(run?.account?.signatureFailed, false);
+  assert.equal(run?.lastForm, true);
+  assert.equal(tried.at(-1), accepted);
+  // A key with no earlier operation on the account: refused, and its run says so.
+  tried.length = 0;
+  run = await simulateOperation({ ...op, signer: '0x1111111111111111111111111111111111111111' }, { rpc: node, simulator } as never);
+  assert.equal(run?.account?.signatureFailed, true);
+  assert.ok(!tried.includes(accepted));
+});
