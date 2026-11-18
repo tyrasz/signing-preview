@@ -218,10 +218,14 @@ function unavailableState(error: unknown, block: string): Error {
 
 /** A node's answer when it is turning requests away. */
 const RATE_LIMITED = /rate limit|too many requests|adjustable limit/i;
+/** What the read pass allows each read of gas, where the block's limit is raised for them (see readState). */
+const READ_GAS_ROOM = 200_000n;
 /** An OP Stack node's refusal of a simulated block whose calls exceed its DA footprint (see daRoom). */
 const DA_FULL = /DA footprint exceeds/i;
 /** OP Stack's L1Block predeploy, the slot holding its daFootprintGasScalar, and the scalar's getter. */
 const L1_BLOCK = '0x4200000000000000000000000000000000000015', L1_BLOCK_DA_SLOT = `0x${'0'.repeat(63)}8`, DA_FOOTPRINT_GAS_SCALAR = '0xfe3d5710';
+/** The L1-attributes deposit's call (Jovian): 178 bytes of packed fields, the DA footprint scalar the last two. */
+const SET_L1_BLOCK_VALUES_JOVIAN = '0x3db6be2b';
 
 export class RpcSimulator implements Simulator {
   private urls: Record<number, string>;
@@ -392,7 +396,7 @@ export class RpcSimulator implements Simulator {
     // block it simulated).
     const ranOn = this.at(chainId, reqs).tag === 'latest' && body.result?.[0]?.number ? `0x${(BigInt(body.result[0].number) - 1n).toString(16)}` : undefined;
     // Whatever stops the reads, the event-based values stand, and the results say why.
-    try { await this.readState(url, reqs, parsed, ranOn); } catch (e) { for (const p of parsed) p.stateReadError ??= String((e as Error)?.message ?? e).slice(0, 200); }
+    try { await this.readState(url, reqs, parsed, ranOn, fitted); } catch (e) { for (const p of parsed) p.stateReadError ??= String((e as Error)?.message ?? e).slice(0, 200); }
     // (After the reads, which match the calls' gas to the node's own figure.)
     await this.amsterdamStandIns(url, reqs, parsed, ranOn ?? this.at(chainId, reqs).tag, body.result?.[0] as { blockAccessListHash?: string } | undefined);
     return parsed;
@@ -460,8 +464,10 @@ export class RpcSimulator implements Simulator {
   /**
    * eth_simulateV1's params with room in the simulated block's DA footprint: L1Block's daFootprintGasScalar (16 bits
    * of its slot 8, above the operator fee's scalar and constant, on OP Mainnet and Base) set to 0 for the run, the
-   * slot's other fields kept, so no call counts against it. Only where the slot holds the scalar the contract reports
-   * (read at the run's block), and its blocks don't already set that slot.
+   * slot's other fields kept, so no call counts against it. A replay's block starts with its L1-attributes deposit
+   * (setL1BlockValuesJovian, whose calldata ends with the scalar), which would write it back before the calls after
+   * it: its last two bytes are set to 0 too. Only where the slot holds the scalar the contract reports (read at the
+   * run's block), and its blocks don't already set that slot.
    */
   private async daRoom(url: string, params: unknown[]): Promise<unknown[] | null> {
     const [opts, tag] = params as [{ blockStateCalls: { stateOverrides?: Record<string, { state?: Record<string, Hex>; stateDiff?: Record<string, Hex> }> }[] }, string];
@@ -473,8 +479,11 @@ export class RpcSimulator implements Simulator {
       const w = BigInt(String(word.result)), s = BigInt(String(scalar.result));
       if (!s || ((w >> 96n) & 0xffffn) !== s) return null;
       const kept = `0x${(w & ~(0xffffn << 96n)).toString(16).padStart(64, '0')}` as Hex;
-      const at = first.stateOverrides?.[L1_BLOCK];
-      return [{ ...opts, blockStateCalls: [{ ...first, stateOverrides: { ...first.stateOverrides, [L1_BLOCK]: { ...at, stateDiff: { ...at?.stateDiff, [L1_BLOCK_DA_SLOT]: kept } } } }, ...opts.blockStateCalls.slice(1)] }, ...params.slice(1)];
+      const at = first.stateOverrides?.[L1_BLOCK], tail = s.toString(16).padStart(4, '0');
+      const deposit = (c: { to?: string; data?: string }) => c.to?.toLowerCase() === L1_BLOCK && typeof c.data === 'string' && c.data.length === 2 + 178 * 2
+        && c.data.toLowerCase().startsWith(SET_L1_BLOCK_VALUES_JOVIAN) && c.data.toLowerCase().endsWith(tail) ? { ...c, data: `${c.data.slice(0, -4)}0000` } : c;
+      const blocks = opts.blockStateCalls.map(b => ({ ...b, ...((b as { calls?: unknown[] }).calls && { calls: (b as { calls: { to?: string; data?: string }[] }).calls.map(deposit) }) }));
+      return [{ ...opts, blockStateCalls: [{ ...blocks[0], stateOverrides: { ...first.stateOverrides, [L1_BLOCK]: { ...at, stateDiff: { ...at?.stateDiff, [L1_BLOCK_DA_SLOT]: kept } } } }, ...blocks.slice(1)] }, ...params.slice(1)];
     } catch { return null; }
   }
 
@@ -554,7 +563,8 @@ export class RpcSimulator implements Simulator {
    * token the logs show moving for a sender that fail, and a re-run whose outcomes differ, are asked again in a lean
    * pass (leanReads).
    */
-  private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], tag = this.at(reqs[0].chainId, reqs).tag) {
+  /** (`fitted`: the earlier transactions on the gas the run gave them, where the node wouldn't take their own: fitGas.) */
+  private async readState(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], tag = this.at(reqs[0].chainId, reqs).tag, fitted?: SimulationRequest[]) {
     const owners = [...new Set(reqs.map(r => (r.account ?? r.from).toLowerCase()))];
     const touched = new Map<string, SimulatedApproval>();
     const after: SimulatedApproval[][] = [];
@@ -594,7 +604,7 @@ export class RpcSimulator implements Simulator {
     });
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
-    const before = await this.before(reqs[0].chainId, reqs);
+    const before = await this.before(reqs[0].chainId, reqs, fitted);
     // The native coin: what the balance moved beyond the logged transfers (and the gas a priced run's sender paid,
     // exactly its gas used at its price on every node, 2026-11-12, an EIP-7702 call's too as priceFields prices it,
     // 2026-11-15) is added as a transfer of its own, the logged ones kept for whom they name. Not for a blob call
@@ -617,7 +627,8 @@ export class RpcSimulator implements Simulator {
     // (On a node that caps the calls it runs, the reads between calls go packed: packReads.)
     const pack = PACKED_READS.has(reqs[0].chainId) ? packReads(calls) : undefined;
     const sentOverrides = pack ? { ...stateOverrides, [VIEW_READER]: { code: VIEW_READER_CODE } } : stateOverrides;
-    const ask = () => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...(pack?.calls ?? calls)], ...(blockOverrides && { blockOverrides }), ...(sentOverrides && { stateOverrides: sentOverrides }) }], validation: false }, tag]);
+    // (`roomier`: the block's gas limit raised by what the reads use, where the node refused it for its gas: below.)
+    const ask = (roomier?: Record<string, string>) => this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...(pack?.calls ?? calls)], ...((roomier ?? blockOverrides) && { blockOverrides: roomier ?? blockOverrides }), ...(sentOverrides && { stateOverrides: sentOverrides }) }], validation: false }, tag]);
     // (A public node that rate-limits for longer than post's quick retries, as Arbitrum One's does GitHub's runners:
     // asked once more after a pause, since without these reads the amounts are only the events'. It says so in an
     // error or with HTTP 429, which post throws once its own retries are spent. Once only: a preview waits on it.)
@@ -625,6 +636,17 @@ export class RpcSimulator implements Simulator {
     const patiently = () => ask().catch((e: Error) => { if (busy(e.message)) return { error: { message: e.message } }; throw e; });
     let reply = await patiently();
     if (busy(reply.error?.message)) { await new Promise(r => setTimeout(r, 3000)); reply = await patiently(); }
+    // The node refuses a call where the block's gas used so far and the call's own limit pass the block's limit
+    // (go-ethereum's simulation), and the reads before a replayed transaction use gas its block didn't: in a full
+    // block its own limit no longer fits (OP Mainnet, 2026-11-18: "Block gas limit exceeded by the block's
+    // transactions", 9 replays of 80). Asked again with the limit raised by the reads' gas: only GASLIMIT reads it,
+    // and a call that went otherwise than in the run (its status or gas) has its reads asked again apart (below).
+    if (/block gas limit exceeded/i.test(reply.error?.message ?? '') && before.length) {
+      // (The simulated block's limit is its base block's, unless the replay names its own header.)
+      const limit = reqs[0]?.at?.header.gasLimit ?? await this.post(url, 'eth_getBlockByNumber', [tag, false]).then(b => BigInt((b.result as { gasLimit: string }).gasLimit), () => undefined);
+      const reads = BigInt((pack?.calls ?? calls).length - callIndex.length);
+      if (limit !== undefined) reply = await ask({ ...blockOverrides, gasLimit: `0x${(limit + reads * READ_GAS_ROOM).toString(16)}` }).catch((e: Error) => ({ error: { message: e.message } }));
+    }
     const body = reply as { result?: { calls: RawCallResult[] }[] };
     const answered = body.result?.[0]?.calls?.slice(before.length), out = answered && pack ? pack.expand(answered) : answered;
     // Where the re-run didn't run, or didn't go the same way (its reads would describe a different execution), the
@@ -643,7 +665,7 @@ export class RpcSimulator implements Simulator {
       // the operation's preview counts as the account's coin: withoutGas, in src/erc4337-sim.ts.)
       const deposits = reqs.filter(r => r.account && r.account.toLowerCase() !== r.from.toLowerCase() && r.to && r.watch?.some(w => w.toLowerCase() === r.to!.toLowerCase())).map(r => r.to!.toLowerCase());
       const pairs = owners.flatMap(owner => [...[...new Set([...logged, ...deposits])].filter(t => !skip(t) && !nftCollections.has(t)), 'native'].map(token => ({ owner, token })));
-      const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs, tag).catch(() => undefined) : undefined;
+      const again = starved && pairs.length ? await this.leanReads(url, reqs, parsed, pairs, tag, fitted).catch(() => undefined) : undefined;
       if (!again) {
         if (!out) { const why = (body as { error?: { message?: string } }).error?.message ?? 'no answer'; for (const p of parsed) p.stateReadError = why; }
         return;
@@ -714,7 +736,7 @@ export class RpcSimulator implements Simulator {
    * set none (BNB Chain's) gives the few reads a large share. Every call must come out as it did the first time: the same
    * outcome and the same gas used, or nothing is read. The values by `${callsBefore}:${owner}:${token}`.
    */
-  private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[], tag: string): Promise<Map<string, bigint> | undefined> {
+  private async leanReads(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], pairs: { owner: string; token: string }[], tag: string, fitted?: SimulationRequest[]): Promise<Map<string, bigint> | undefined> {
     const max = (a: bigint, b: bigint) => (a > b ? a : b);
     const calls: SimCall[] = [], where: { key: string; index: number }[] = [], callIndex: number[] = [];
     const reads = (at: number) => { for (const { owner, token } of pairs) { where.push({ key: `${at}:${owner}:${token}`, index: calls.length }); calls.push(token === 'native' ? { from: READER, to: MULTICALL3, data: `0x4d2301cc${owner.slice(2).padStart(64, '0')}` } : { from: READER, to: token, data: `0x70a08231${owner.slice(2).padStart(64, '0')}` }); } };
@@ -729,7 +751,7 @@ export class RpcSimulator implements Simulator {
     });
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
-    const before = await this.before(reqs[0].chainId, reqs);
+    const before = await this.before(reqs[0].chainId, reqs, fitted);
     const pack = PACKED_READS.has(reqs[0].chainId) ? packReads(calls) : undefined;
     const sentOverrides = pack ? { ...stateOverrides, [VIEW_READER]: { code: VIEW_READER_CODE } } : stateOverrides;
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...(pack?.calls ?? calls)], ...(blockOverrides && { blockOverrides }), ...(sentOverrides && { stateOverrides: sentOverrides }) }], validation: false }, tag]) as { result?: { calls: RawCallResult[] }[] };

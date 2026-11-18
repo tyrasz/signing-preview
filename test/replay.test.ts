@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import { readFileSync } from 'node:fs';
-import { encodeAbiParameters, encodeFunctionData, parseAbi } from 'viem';
+import { encodeAbiParameters, encodeFunctionData, parseAbi, type Hex } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
 import { compareWithAccessList } from '../src/evm/trace.ts';
@@ -787,4 +787,41 @@ test('An OP Stack block whose DA footprint the replayed block filled: asked agai
   const refused = await other.simulate({ chainId: 10, from: ALICE, to: BOB, data: '0x', value: 1n }).catch((e: Error) => e);
   assert.ok(refused instanceof Error || refused?.status !== 'success');
   assert.ok(sent.filter(s => s.method === 'eth_simulateV1').every(s => !s.params[0].blockStateCalls[0].stateOverrides?.[L1_BLOCK]));
+});
+
+test('A replay in a full OP Stack block: the L1-attributes deposit before it set to write no DA scalar, and its reads given gas room past the block’s limit', async () => {
+  const L1_BLOCK = '0x4200000000000000000000000000000000000015', SLOT8 = `0x${'0'.repeat(63)}8`;
+  const word = `0x${'0'.repeat(36)}0190${'0'.repeat(24)}`;
+  // setL1BlockValuesJovian: 178 bytes of packed fields, the DA footprint scalar (400) the last two.
+  const deposit = `0x3db6be2b${'11'.repeat(172)}0190` as Hex;
+  const before: SimulationRequest[] = [{ chainId: 10, from: '0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001', to: L1_BLOCK, data: deposit, value: 0n, gas: 1_000_000n }];
+  const sent: { method: string; params: any[] }[] = [];
+  const fetchImpl = (async (_u: string, init: { body: string }) => {
+    const body = JSON.parse(init.body) as { method: string; params: any[] };
+    sent.push(body);
+    const reply = (x: object) => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, ...x }), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (body.method === 'eth_getStorageAt') return reply({ result: word });
+    if (body.method === 'eth_call') return reply({ result: `0x${'0'.repeat(61)}190` });
+    if (body.method === 'eth_getBlockByNumber') return reply({ result: { gasLimit: '0x2625a00', number: '0x63' } }); // 40,000,000
+    if (body.method === 'eth_simulateV1') {
+      const block = body.params[0].blockStateCalls[0], calls = block.calls as { data?: string }[];
+      // The node: a deposit that writes the scalar back counts every call after it; reads past the block's gas.
+      if (calls[0]?.data?.endsWith('0190')) return reply({ error: { code: -38015, message: 'transaction DA footprint exceeds available block DA footprint. transaction_da_footprint: 40000, available_block_da_footprint: 0' } });
+      if (!body.params[0].traceTransfers && block.blockOverrides?.gasLimit === undefined) return reply({ error: { code: -38015, message: "Block gas limit exceeded by the block's transactions" } });
+      return reply({ result: [{ calls: calls.map(() => ({ status: '0x1', gasUsed: '0x5208', returnData: `0x${'0'.repeat(64)}`, logs: [] })) }] });
+    }
+    return reply({ error: { code: -32601, message: `unexpected ${body.method}` } });
+  }) as unknown as typeof fetch;
+  const simulator = new RpcSimulator({ 10: 'http://rpc.invalid' }, { fetchImpl, replay: () => ({ block: '0x63', blockOverrides: { number: '0x64' }, before }) });
+  const res = await simulator.simulate({ chainId: 10, from: ALICE, to: BOB, data: '0x', value: 1n });
+  assert.equal(res?.status, 'success');
+  assert.equal(res?.stateReadError, undefined, 'the reads were answered');
+  const simulated = sent.filter(s => s.method === 'eth_simulateV1');
+  const answered = simulated.filter(s => !s.params[0].blockStateCalls[0].calls[0].data.endsWith('0190'));
+  assert.ok(answered.every(s => s.params[0].blockStateCalls[0].calls[0].data === `${deposit.slice(0, -4)}0000`), 'the deposit writes no scalar');
+  const reads = answered.find(s => !s.params[0].traceTransfers && s.params[0].blockStateCalls[0].blockOverrides?.gasLimit);
+  assert.ok(reads, 'the reads asked again with gas room');
+  const calls = reads!.params[0].blockStateCalls[0].calls.length;
+  assert.equal(BigInt(reads!.params[0].blockStateCalls[0].blockOverrides.gasLimit), 40_000_000n + BigInt(calls - 2) * 200_000n); // past the deposit and the call
+  assert.equal(reads!.params[0].blockStateCalls[0].blockOverrides.number, '0x64', "the replay's header kept");
 });
