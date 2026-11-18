@@ -667,8 +667,39 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
   } catch { return undefined; }
   if (head <= 0n) return undefined;
   const key = `${c.chainId}:${c.entryPoint}:${c.sender}${c.key ? `:${c.key}` : ''}`;
+  // The operation's signature for the account in a bundle (v0.7's packed form, else v0.6's).
+  const signatureIn = async (hash: string): Promise<Hex | undefined | null> => {
+    const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [hash]) as { input?: Hex } | null;
+    if (!tx?.input) return null;
+    let found: Hex | undefined;
+    try { found = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* not v0.7's handleOps */ }
+    if (!found) try { found = decodeFunctionData({ abi: HANDLE_OPS_V06, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* nor v0.6's */ }
+    return found;
+  };
   const known = LAST_SIGNED.get(key);
-  if (known && head >= known.head && Date.now() - known.at < (known.signature ? FOUND_FOR : EMPTY_FOR)) return known.signature;
+  if (known && head >= known.head && Date.now() - known.at < (known.signature ? FOUND_FOR : EMPTY_FOR)) {
+    if (head === known.head) return known.signature;
+    // What the account signed since (an operation previewed a moment ago, then sent): the blocks after the lookup are
+    // read too, so that a remembered answer is never older than the latest block. Remembered as it was, a deployment's
+    // "none" stood for its account's next operation (Arbitrum One, 2026-11-18, 351 blocks later: a ZeroDev passkey
+    // account taken to sign with the precompile, which it didn't, 49% low).
+    if (head - known.head <= LAST_SIGNED_WINDOW) {
+      try {
+        const logs = await rpc.call(c.chainId, 'eth_getLogs', [{ address: c.entryPoint, topics: [USER_OPERATION_EVENT, null, `0x${'00'.repeat(12)}${c.sender.slice(2).toLowerCase()}`],
+          fromBlock: `0x${(known.head + 1n).toString(16)}`, toBlock: `0x${head.toString(16)}` }]) as { transactionHash: string }[];
+        let since: Hex | undefined, read = true;
+        for (const log of [...logs].reverse().slice(0, c.match ? 6 : 1)) {
+          const found = await signatureIn(log.transactionHash);
+          if (found === null) { read = false; break; }
+          if (!c.match || (found && c.match(found))) { since = found; break; }
+        }
+        if (read) {
+          LAST_SIGNED.set(key, since ? { at: Date.now(), head, signature: since } : { ...known, head });
+          return since ?? known.signature;
+        }
+      } catch { /* looked for again in full, below */ }
+    }
+  }
   // `wide`: beyond the usual reach (see LAST_SIGNED_WIDE), as far as the node takes in a few reads.
   let signature: Hex | undefined, failed = false, window = c.wide ? LAST_SIGNED_WIDE : LAST_SIGNED_WINDOW, reached = c.wide ? LAST_SIGNED_REACH : 0n, fetched = 0;
   const reach = c.wide ? LAST_SIGNED_REACH + LAST_SIGNED_WIDE : LAST_SIGNED_REACH;
@@ -714,11 +745,8 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
       let done = false;
       for (const log of [...logs].reverse()) {
         if (fetched++ >= (c.match ? 6 : 1)) { done = true; break; }
-        const tx = await rpc.call(c.chainId, 'eth_getTransactionByHash', [log.transactionHash]) as { input?: Hex } | null;
-        if (!tx?.input) { failed = done = true; break; }
-        let found: Hex | undefined;
-        try { found = decodeFunctionData({ abi: HANDLE_OPS, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* not v0.7's handleOps */ }
-        if (!found) try { found = decodeFunctionData({ abi: HANDLE_OPS_V06, data: tx.input }).args[0].find(o => o.sender.toLowerCase() === c.sender.toLowerCase())?.signature; } catch { /* nor v0.6's */ }
+        const found = await signatureIn(log.transactionHash);
+        if (found === null) { failed = done = true; break; }
         if (!c.match || (found && c.match(found))) { signature = found; done = true; break; }
       }
       if (done) break;

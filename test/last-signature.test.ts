@@ -32,3 +32,32 @@ test('A wide look for an account’s earlier operation, on a node that refuses a
   assert.ok(windows.every(([, t]) => t <= HEAD - 1n - 100_000n), JSON.stringify(windows.map(w => w.map(String))));
   assert.ok(windows.some(([f, t]) => f <= SIGNED_AT && SIGNED_AT <= t));
 });
+
+test('A remembered lookup catches up with the blocks since: an account’s first operation, deployed a moment ago, is the next one’s to go by', async () => {
+  // The deployment's preview found none; a minute later, 351 blocks on, its next operation's preview reads only the
+  // blocks since that lookup, and finds the deployment's signature (Arbitrum One, 2026-11-18).
+  const ACCOUNT = '0x00000000000000000000000000000000000c47c4', SIGNATURE = '0x01ab' as Hex;
+  const input = encodeFunctionData({ abi: HANDLE_OPS, functionName: 'handleOps', args: [[{ sender: ACCOUNT as Hex, nonce: 0n, initCode: '0x', callData: '0x', accountGasLimits: word, preVerificationGas: 0n, gasFees: word, paymasterAndData: '0x', signature: SIGNATURE }], ACCOUNT as Hex] });
+  let head = 1_000_001n;
+  const MINED = 1_000_200n, asked: [bigint, bigint][] = [];
+  const rpc = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: `0x${head.toString(16)}` };
+    if (method === 'eth_getTransactionByHash') return { input };
+    if (method !== 'eth_getLogs') throw new Error(`unexpected ${method}`);
+    const { fromBlock, toBlock } = params[0] as { fromBlock: Hex; toBlock: Hex };
+    const from = BigInt(fromBlock), to = BigInt(toBlock);
+    asked.push([from, to]);
+    return from <= MINED && MINED <= to ? [{ transactionHash: `0x${'22'.repeat(32)}` }] : [];
+  } };
+  const look = () => lastSignature({ deps: { rpc } as never, chainId: 42161, sender: ACCOUNT, entryPoint: EP });
+  assert.equal(await look(), undefined);
+  const full = asked.length;
+  head = 1_000_352n;
+  assert.equal(await look(), SIGNATURE);
+  // One read, of the blocks after the first lookup's.
+  assert.deepEqual(asked.slice(full), [[1_000_001n, 1_000_351n]]);
+  // Then remembered as found, with nothing newer.
+  head = 1_000_400n;
+  assert.equal(await look(), SIGNATURE);
+  assert.deepEqual(asked.slice(full + 1), [[1_000_352n, 1_000_399n]]);
+});
