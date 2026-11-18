@@ -341,3 +341,57 @@ test('An account with session keys (Sepolia): its owner’s bare signature, a se
   assert.equal(run?.account?.signatureFailed, true);
   assert.ok(!tried.includes(accepted));
 });
+
+test('Kernel v3 on ZeroDev’s weighted ECDSA validator: other guardians’ approvals to the threshold, then the signer’s; read from the validator, or a deploying account’s install data', async () => {
+  // Sepolia, 2026-11-18: three accounts whose operations carry two signatures were refused the plain stand-in (3.9% low).
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const ABI = parseAbi(['function createAccount(bytes data, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)',
+    'function weightedStorage(address kernel)', 'function guardian(address guardian, address kernel)']);
+  const WEIGHTED = '0xed89244160cfe273800b58b1b534031699dfeeee', FACTORY = '0xaac5d4240af87249b3f71bc8e4a2cae074a3e419';
+  const SENDER = '0x0a8a9d981b3de935e86ed6de35cdeeaafaa93093', NEW = '0xe6fec47dadb9203a4c31549d8b514631310c0fb7', END = `0x${'ff'.repeat(20)}`;
+  // Three guardians (by ascending address, the validator's list), weights 1, 1 and 2; threshold 2.
+  const [g1, g2, g3] = ['0x1111111111111111111111111111111111111111', '0x2222222222222222222222222222222222222222', '0x3333333333333333333333333333333333333333'] as const;
+  const weights: Record<string, [number, string]> = { [g1]: [1, g2], [g2]: [1, g3], [g3]: [2, END] };
+  const word = (v: bigint | string) => BigInt(v).toString(16).padStart(64, '0');
+  const tried: Hex[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return (params[0] as string).toLowerCase() === NEW ? '0x' : `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}d6cedde84be40893d153be9d467cd6ad37875b28`; // Kernel v3.3
+    if (method === 'eth_call') {
+      const { to, data } = params[0] as { to: string; data: Hex };
+      if (to === EP) return `0x${'4a'.repeat(32)}`; // getUserOpHash
+      if (data === '0xf1f7f0f9') return `0x01${WEIGHTED.slice(2)}${'00'.repeat(11)}`; // rootValidator()
+      if (to === WEIGHTED) {
+        const d = decodeFunctionData({ abi: ABI, data });
+        if (d.functionName === 'weightedStorage') return `0x${word(4n)}${word(2n)}${word(0n)}${word(g1)}`;
+        if (d.functionName === 'guardian') { const [w, next] = weights[(d.args[0] as string).toLowerCase()]; return `0x${word(BigInt(w))}${word(next)}`; }
+      }
+    }
+    throw new Error(`unexpected ${method}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const op = { chainId: 11155111, entryPoint: EP, nonce: 0n, callData: '0xe9ae5c53' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
+  // g1 signs (weight 1): g2's approval (weight 1) reaches the threshold, then g1's own.
+  await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: g1 }, { rpc: node, simulator } as never);
+  assert.equal(tried[0], concatHex([stubSignature(1), STUB_SIGNATURE]));
+  // g3 (weight 2) reaches it alone: its own signature only.
+  tried.length = 0;
+  await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: g3 }, { rpc: node, simulator } as never);
+  assert.equal(tried[0], STUB_SIGNATURE);
+  // Someone who isn't a guardian: guardians to the threshold (g1 and g2), then the signer's, which the validator refuses.
+  tried.length = 0;
+  const run = await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: '0x4444444444444444444444444444444444444444' }, { rpc: node, simulator } as never);
+  assert.equal(tried[0], concatHex([stubSignature(1), stubSignature(2), STUB_SIGNATURE]));
+  assert.match(run?.why ?? '', /weighted ECDSA validator .* the signer asked isn't one of them/);
+  // A deploying account: its guardians from the install data (by descending address), threshold 3: g1 signs, g2 and g3 approve.
+  tried.length = 0;
+  const validatorData = encodeAbiParameters([{ type: 'address[]' }, { type: 'uint24[]' }, { type: 'uint24' }, { type: 'uint48' }], [[g3, g2, g1], [2, 1, 1], 3, 0]);
+  const data = encodeFunctionData({ abi: ABI, functionName: 'initialize', args: [`0x01${WEIGHTED.slice(2)}`, `0x${'00'.repeat(20)}`, validatorData, '0x', []] });
+  await simulateOperation({ ...op, sender: NEW, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: [data, `0x${'00'.repeat(32)}`] })]), signer: g1 }, { rpc: node, simulator } as never);
+  assert.equal(tried[0], concatHex([stubSignature(1), stubSignature(2), STUB_SIGNATURE]));
+});
