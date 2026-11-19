@@ -26,7 +26,7 @@
 import { createPublicClient, http, formatUnits, toFunctionSelector, encodeFunctionData, decodeEventLog, decodeErrorResult, encodeAbiParameters, keccak256, pad as padHex, parseAbi, parseAbiItem, parseUnits, toHex, type Hex, type Address } from 'viem';
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
-import { builtinTokens, CHAINS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
+import { builtinTokens, CHAINS, EVM_RPCS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
 import type { RpcClient } from '../src/rpc.ts';
@@ -636,6 +636,45 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
         `${name}: approve + HyperLend supply`.padEnd(34), `${batch.simulation?.status}: ${moved(batch)}${await why(batch)}`);
     } else console.log('skip USDC checks: no recent EOA holding 2 USDC');
   }
+}
+
+// Decoders read from a contract's calldata layout and receipts (its code unpublished), or from typed data a contract
+// checks: the code they were read from is still the code there. A changed implementation, facet or domain means the
+// decoder's reading has to be checked again.
+console.log('\n# Contracts read from their layout or signed types: still the code that was checked');
+{
+  const urlOf = (id: number) => process.env[EVM_RPCS[id].env] ?? EVM_RPCS[id].public;
+  const rpcCall = async (id: number, method: string, params: unknown[]) => (await jsonRpc(urlOf(id), { jsonrpc: '2.0', id: 1, method, params }))?.result as string | undefined;
+  const word = (r: string | undefined) => (r && r.length >= 66 ? `0x${r.slice(26, 66)}` : String(r));
+  // The BNB Chain fee router (src/evm/bsc-fee-router.ts): its EIP-1967 implementation.
+  const impl = word(await rpcCall(56, 'eth_getStorageAt', ['0xd36b6d646ac6e23672e9eedec558164c7f2d6deb', '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', 'latest']));
+  check(impl === '0x3f3e9aa26467e4f99bf00f8564b620b8647b92fe', 'BNB Chain fee router implementation'.padEnd(34), impl);
+  // Binance Web3 Wallet's router (src/evm/binance-wallet.ts): the facet behind its entry point, on each chain read.
+  const FACETS: Record<number, string> = { 1: '0xf4351fe8260d9a4dd58f687379e9ae1ebc68f277', 56: '0xb415f8f4ee87219fa26c6795e31217ea05b7fc8d', 42161: '0xefb6c460dc0f27ca8cd3fcea0774de177b539552', 8453: '0xeee23de5d28d40502ab1dbbe9e33ffed73a003e6', 137: '0xfdb1e637f5173d5f87b984d4b3b0268bff0c8db6', 10: '0xc120386ff338a960080b7458a67b269f8f3ef032' };
+  for (const [id, facet] of Object.entries(FACETS)) {
+    const now = word(await rpcCall(Number(id), 'eth_call', [{ to: '0xb300000b72deaeb607a12d5f54773d1c19c7028d', data: `0xcdffacc6810c705b${'0'.repeat(56)}` }, 'latest']));
+    check(now === facet, `Binance Web3 Wallet facet, ${CHAINS[Number(id)].name}`.padEnd(34), now);
+  }
+  // predict.fun's exchange (src/typed-data/polymarket.ts): its EIP-712 domain, and its fee module still naming it.
+  const exchange = word(await rpcCall(56, 'eth_call', [{ to: '0xdcffeb0c30263888a48485a664ec9563a54891a1', data: '0xd2f7265a' }, 'latest']));
+  const domain = await rpcCall(56, 'eth_call', [{ to: '0x8bc070bedab741406f4b1eb65a72bee27894b689', data: '0x84b0196e' }, 'latest']);
+  const name = domain && domain.length > 2 ? Buffer.from(domain.slice(2 + 64 * 7 + 64, 2 + 64 * 8 + 64).replace(/(00)+$/, ''), 'hex').toString() : '';
+  check(exchange === '0x8bc070bedab741406f4b1eb65a72bee27894b689' && /predict\.fun CTF Exchange/.test(name), 'predict.fun exchange and domain'.padEnd(34), `${exchange} "${name}"`);
+  // Gelato's relays (src/typed-data/meta-transaction.ts): each domain separator as its name, version "1", the chain and itself make it.
+  const GELATO: [string, string][] = [['0xd8253782c45a12053594b9deb72d8e8ab2fca54c', 'GelatoRelay1BalanceERC2771'], ['0xb539068872230f20456cf38ec52ef2f91af4ae49', 'GelatoRelayERC2771'], ['0xc65d82ece367ef06bf2ab791b3f3cf037dc0e816', 'GelatoRelay1BalanceConcurrentERC2771'], ['0x8598806401a63ddf52473f1b3c55bc9e33e2d73b', 'GelatoRelayConcurrentERC2771']];
+  for (const [relay, relayName] of GELATO) {
+    const expected = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }],
+      [keccak256(toHex('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)')), keccak256(toHex(relayName)), keccak256(toHex('1')), 137n, relay as Address]));
+    const got = await rpcCall(137, 'eth_call', [{ to: relay, data: '0x3644e515' }, 'latest']);
+    check(got === expected, `Gelato ${relayName}`.slice(0, 34).padEnd(34), got ?? 'no answer');
+  }
+  // OKX's routers (src/evm/aggregators.ts) and Velora's Delta adapter (src/typed-data/orders.ts) are still there.
+  for (const [id, router] of [[56, '0x5994814f2c4040b863a0125a45de152a8c2a4dec'], [8453, '0x67d03631fe51b741c0c00c4e16eb662ac84381df'], [137, '0x3c4829196bfadff4394726b45159aeaac6fcd41c']] as const) {
+    const code = await rpcCall(id, 'eth_getCode', [router, 'latest']);
+    check(!!code && code.length > 2, `OKX DEX router, ${CHAINS[id].name}`.padEnd(34), `${code ? (code.length - 2) / 2 : 0} bytes`);
+  }
+  const modules = await rpcCall(42161, 'eth_call', [{ to: '0x0000000000bbf5c5fd284e657f01bd000933c96d', data: '0xb2494df3' }, 'latest']);
+  check(!!modules && modules.length > 130, 'Velora Delta adapter modules'.padEnd(34), modules ? `${(modules.length - 2) / 2} bytes` : 'no answer');
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
