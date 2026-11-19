@@ -362,7 +362,11 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   else if (!caveats.length) b.warn('danger', 'delegation_unrestricted', `It has no caveats: ${anyCall}, at any time, as often as wanted: move every token and coin it holds, approve spenders, change its owners. This is full control of the account. Don't sign it unless you mean to hand the account over.`);
   else if (full && !scopes.length) b.warn('danger', 'delegation_unrestricted', `None of its caveats restricts what is called: ${anyCall}${limits.length ? `, within these limits only: ${limits.join('; ')}` : ''}${unless}: move its other tokens and coin, approve spenders, change its owners.`);
   else if (full) b.warn('danger', 'delegation_unrestricted', `Its caveats let calls reach ${p.control![0]} (${p.control![1]}): through it, ${anyCall}${unless}: move every token and coin it holds, approve spenders, change its owners.`);
+  // Whether what it allows is only fixed: a transfer whose recipient and amount are pinned, once, and nothing else open.
+  let fixedOnly = false;
   if (root && !self && !full) {
+    // (Coin sent with a call to a contract named counts only where it lands: in a plain transfer or an EOA, below.)
+    fixedOnly = !p.native && !p.permit2 && !p.anyFunction?.length && !p.unsimulated?.length;
     // Tokens moved or approved: on any token is the account's every token.
     if (p.tokens) {
       const to = p.tokens.recipient ? ` to ${shortAddress(p.tokens.recipient)} only` : ' to anyone';
@@ -375,6 +379,7 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
         // A recipient and an amount pinned, once: a fixed transfer, in effect.
         b.warn('info', 'delegation_fixed_transfer', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, for ${units(p.tokens.amount)}, once.`);
       } else {
+        fixedOnly = false;
         const amount = p.tokens.amount === null ? 'for any amount' : `for ${units(p.tokens.amount)} each time${bounded ? `, up to ${count === 1n ? 'once' : `${count} times`} (${units(p.tokens.amount * (count ?? 1n))} in all)` : ', as many times as wanted'}`;
         if (!p.tokens.on) b.warn(open ? 'danger' : 'caution', 'delegation_any_contract', `Its caveats don't limit which contract is called: ${who} can call ${fns} on any token your account holds${to}, ${amount}${open ? ': all of every token' : ''}${unless}.`);
         else b.warn('caution', 'delegation_any_function', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, ${amount}: if ${p.tokens.on.length === 1 ? 'it is a token' : 'they are tokens'}, ${p.tokens.amount === null ? `all of your balance of ${p.tokens.on.length === 1 ? 'it' : 'them'}` : 'that much of it each time'}${unless}.`);
@@ -411,6 +416,7 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
         const limit = limitOf(r.perCall);
         if ((limit === undefined || limit >= (balance ?? NO_CAP)) && (r.plain || await eoa(r.target))) reach.push(r);
       }
+      if (reach.length) fixedOnly = false;
       if (reach.length) b.warn('caution', 'delegation_native_unlimited', `${who} can send your account's ${native} to ${reach.map(r => shortAddress(r.target)).join(', ')}${each(reach.some(r => r.perCall === null) ? null : reach[0].perCall)}${often}: nothing caps the total below what you hold, so all of it${unless}.`);
     }
     // Fixed calls through the account's own execute that aren't simulated: what they are, read as the account's calls.
@@ -430,7 +436,7 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   }
   if (unknown.length) b.warn('caution', 'delegation_caveat_unknown', `${unknown.length} of its caveats ${unknown.length === 1 ? 'is' : 'are'} enforced by ${unknown.length === 1 ? 'a contract' : 'contracts'} this preview doesn't know (${unknown.map(c => shortAddress(c.enforcer)).join(', ')}): ${unknown.length === 1 ? 'its' : 'their'} rules aren't read, so what they allow or forbid isn't shown.`);
   if (anyone && redeemers) b.warn('info', 'delegation_any_delegate', `Its delegate is ANY_DELEGATE, but a RedeemerEnforcer caveat lets only ${redeemers.map(shortAddress).join(', ')} redeem it.`);
-  else if (anyone) b.warn(exact ? 'caution' : 'danger', 'delegation_any_delegate', `Its delegate is ANY_DELEGATE: anyone who gets this signature can redeem it, not one address you chose${exact ? ', for the exact calls shown' : ''}.`);
+  else if (anyone) b.warn(exact || (fixedOnly && p.tokens) ? 'caution' : 'danger', 'delegation_any_delegate', `Its delegate is ANY_DELEGATE: anyone who gets this signature can redeem it, not one address you chose${exact ? ', for the exact calls shown' : fixedOnly && p.tokens ? ', for the fixed transfer shown' : ''}.`);
   // When it is usable: its time window, else none (an end in the far future is none).
   const window = known.find(r => r.window)?.window;
   const nowS = BigInt(Math.floor(env.now / 1000));

@@ -379,3 +379,15 @@ test('Fifth review: exact calls inside an OR, a search past 256 OR combinations,
   const fixedTransfer = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB, 1n] }).slice(2).padEnd(4100 * 2, '0');
   assert.notEqual((await run([calldata(0, fixedTransfer), zero])).attention, 'danger');
 });
+
+test('ANY_DELEGATE for a fixed transfer only, once: a caution, not a danger (as MetaMask redeems some on Ethereum)', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  const fixed = [{ enforcer: E.limitedCalls, terms: `0x${word(1n)}` }, { enforcer: E.targets, terms: USDC }, calldata(0, '0xa9059cbb'), calldata(4, `${BOB.slice(2).padStart(64, '0')}${word(884_738n)}`), until];
+  const p = await sign(delegation(ANY, fixed));
+  assert.equal(p.warnings.find(w => w.code === 'delegation_fixed_transfer')?.severity, 'info');
+  assert.equal(p.warnings.find(w => w.code === 'delegation_any_delegate')?.severity, 'caution');
+  // Without the amount pinned, anyone may move any amount: still a danger.
+  const open = await sign(delegation(ANY, [fixed[0], fixed[1], fixed[2], calldata(4, BOB.slice(2).padStart(64, '0')), until]));
+  assert.equal(open.warnings.find(w => w.code === 'delegation_any_delegate')?.severity, 'danger');
+});
