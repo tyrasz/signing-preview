@@ -196,24 +196,53 @@ export async function previewTypedSupertransaction(method: string, data: TypedDa
   if (keccak256(concatHex(['0x1901', domainSeparator, structHash])) !== digest) return null;
   const itemHashes = items.map(x => x.hash);
 
-  // The wallet's operations, hashed as their EntryPoints hash them, each matched to the item with its hash.
-  const supplied = context.meeOperations ?? [];
+  const opItems = items.flatMap((x, i) => x.type === 'MeeUserOp' ? [i] : []);
+  // (A SuperTx with no operations among its items isn't a supertransaction of operations: previewed as typed data.)
+  if (!opItems.length) return null;
+  // Each item's time bounds as signed (they make its hash), and as the validator takes them: it returns each cut to
+  // 48 bits (SimpleValidatorLib: uint48), and its signature packs each in 128 bits (unpackUints), so an item whose
+  // bounds don't fit there is never found among the items. (Taken whole, an item's 2^48 + now was shown as never
+  // runnable, where it ran at once.)
+  const PACKED = (1n << 128n) - 1n;
+  const boundsOf = (i: number) => {
+    const raw = { lowerBoundTimestamp: BigInt(items[i].value.lowerBoundTimestamp as string), upperBoundTimestamp: BigInt(items[i].value.upperBoundTimestamp as string) };
+    return { raw, taken: { lowerBoundTimestamp: raw.lowerBoundTimestamp & UINT48, upperBoundTimestamp: raw.upperBoundTimestamp & UINT48 }, packs: raw.lowerBoundTimestamp <= PACKED && raw.upperBoundTimestamp <= PACKED };
+  };
   const nowS = BigInt(Math.floor((context.now ?? Date.now()) / 1000));
-  const matched = new Map<number, Prepared>(), unmatched: number[] = [];
+  const validNow = (i: number) => { const { taken, packs } = boundsOf(i); return packs && taken.lowerBoundTimestamp <= nowS && (taken.upperBoundTimestamp === 0n || taken.upperBoundTimestamp >= nowS); };
+  const byHash = new Map<string, number[]>();
+  for (const i of opItems) { const h = String(items[i].value.userOpHash).toLowerCase(); byHash.set(h, [...(byHash.get(h) ?? []), i]); }
+  // The wallet's operations, hashed as their EntryPoints hash them, each matched to the items with its hash: an
+  // operation can be an item more than once (with other bounds), and runs under any of them, so it is simulated under
+  // one valid now where one is, and every one is its own.
+  const supplied = context.meeOperations ?? [];
+  const matched = new Map<number, Prepared>(), covered = new Map<number, number>(), unmatched: { k: number; why: string }[] = [];
+  const seen = new Map<string, number>();
   for (const [k, o] of supplied.entries()) {
     const entryPoint = o.entryPoint.toLowerCase(), ep = HASH_ENTRY_POINTS[entryPoint];
-    const op = ep && Number.isSafeInteger(o.chainId) && o.chainId > 0 ? readOperation(o.operation, ep.version) : null;
+    const chainOk = Number.isSafeInteger(o.chainId) && o.chainId > 0;
+    const op = ep && chainOk ? readOperation(o.operation, ep.version) : null;
     let hash: Hex | null = null;
     try { hash = op && ep ? userOpHash(op, entryPoint, o.chainId, ep.version) : null; } catch { hash = null; }
-    const i = hash ? items.findIndex(x => x.type === 'MeeUserOp' && String(x.value.userOpHash).toLowerCase() === hash) : -1;
-    if (i < 0 || matched.has(i) || !op || !ep || !hash) { unmatched.push(k); continue; }
-    const bounds = { lowerBoundTimestamp: BigInt(items[i].value.lowerBoundTimestamp as string), upperBoundTimestamp: BigInt(items[i].value.upperBoundTimestamp as string) };
-    matched.set(i, { chainId: o.chainId, entryPoint, ep, op, hash, bounds, supertransaction: { root: digest, proof: [], bounds, typed: { outerTypeHash, itemHashes, itemIndex: i } },
-      details: [['Item', `${i + 1} of ${items.length} (${items[i].label}): MEE's hash of it and its time bounds`, items[i].hash]] });
+    if (!hash || !op || !ep) {
+      unmatched.push({ k, why: !ep ? `its EntryPoint (${shortAddress(entryPoint)}) is not v0.6 or v0.7, whose operations' hashes are computed here, so it can't be matched to an item` : !chainOk ? `its chain ID (${o.chainId}) isn't a chain's` : 'it is malformed (its hash can\'t be computed)' });
+      continue;
+    }
+    if (seen.has(hash)) { unmatched.push({ k, why: `it is the same operation as context.meeOperations[${seen.get(hash)}]` }); continue; }
+    seen.set(hash, k);
+    const at = byHash.get(hash) ?? [];
+    if (!at.length) { unmatched.push({ k, why: "its hash isn't one of its items, so this signature doesn't authorize it" }); continue; }
+    const i = at.find(validNow) ?? at.find(j => boundsOf(j).packs) ?? at[0];
+    const { raw, taken } = boundsOf(i);
+    for (const j of at) covered.set(j, i);
+    matched.set(i, { chainId: o.chainId, entryPoint, ep, op, hash, bounds: taken, supertransaction: { root: digest, proof: [], bounds: raw, typed: { outerTypeHash, itemHashes, itemIndex: i } },
+      details: [['Item', `${at.length === 1 ? `${i + 1}` : `${at.map(j => j + 1).join(', ')} (simulated under ${i + 1})`} of ${items.length} (${items[i].label}): MEE's hash of it and its time bounds`, items[i].hash]] });
   }
-  const opItems = items.flatMap((x, i) => x.type === 'MeeUserOp' ? [i] : []);
-  const unshown = opItems.filter(i => !matched.has(i)), others = items.flatMap((x, i) => x.type === 'MeeUserOp' ? [] : [i]);
-  const ops = [...matched.entries()].sort(([a], [b]) => a - b).map(([, p]) => p);
+  const unshown = opItems.filter(i => !covered.has(i)), others = items.flatMap((x, i) => x.type === 'MeeUserOp' ? [] : [i]);
+  const order = [...matched.keys()].sort((a, b) => a - b);
+  const ops = order.map(i => matched.get(i)!);
+  const labelOf = (i: number) => `Operation ${order.indexOf(i) + 1} (${chainName(matched.get(i)!.chainId)})`;
+  const when = (t: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint }) => `${t.lowerBoundTimestamp > 0n ? `from ${formatTimestamp(Number(t.lowerBoundTimestamp) * 1000)} ` : ''}${t.upperBoundTimestamp === 0n ? 'with no expiry' : `until ${formatTimestamp(Number(t.upperBoundTimestamp) * 1000)}`}`;
 
   const b = new PreviewBuilder();
   const chains = [...new Set(ops.map(o => o.chainId))];
@@ -225,20 +254,33 @@ export async function previewTypedSupertransaction(method: string, data: TypedDa
   const count = (n: number) => `${n} operation${n === 1 ? '' : 's'}`;
   if (!unshown.length && !others.length && ops.length) b.warn('info', 'mee_supertransaction_verified', `The wallet supplied the ${count(ops.length)} this supertransaction covers, on ${chains.map(chainName).join(', ')}, and ${ops.length === 1 ? 'its hash is its only item' : 'their hashes are its items exactly'}: the signature authorizes ${ops.length === 1 ? 'it' : 'these'} and nothing else. ${ops.length === 1 ? 'It' : 'Each'} can run once submitted with the items (by Biconomy's MEE node, or anyone else holding this signature and the operation), within its time bounds.`);
   else b.warn('danger', 'mee_supertransaction_partial', `This supertransaction covers ${unshown.length ? `${count(unshown.length)} ${ops.length ? 'besides the ones supplied, ' : ''}shown only by ${unshown.length === 1 ? 'its hash' : 'their hashes'} (${unshown.map(i => `item ${i + 1}`).join(', ')}): what ${unshown.length === 1 ? 'it does, and on which chain, isn\'t' : 'they do, and on which chains, isn\'t'} shown` : ''}${unshown.length && others.length ? '; and ' : ''}${others.length ? `${others.length} item${others.length === 1 ? '' : 's'} that ${others.length === 1 ? "isn't an operation" : "aren't operations"} (${others.map(i => `${items[i].label}: ${items[i].type}`).join(', ')}), which this preview doesn't read` : ''}. Every one of them is authorized with this one signature. Only sign it if your wallet shows everything in the supertransaction and you have checked each.`);
-  if (unmatched.length) b.warn('caution', 'mee_operation_not_in_supertransaction', `${unmatched.map(k => `Operation ${k + 1}`).join(', ')} supplied with it ${unmatched.length === 1 ? "isn't" : "aren't"} among its items (${unmatched.length === 1 ? 'its hash isn\'t' : 'their hashes aren\'t'} one of them): not previewed, and not authorized by this signature.`);
+  // Supplied operations not previewed, each by its place in context.meeOperations (the ones previewed are numbered by
+  // their items' order), and why.
+  for (const { k, why } of unmatched) b.warn('caution', 'mee_operation_not_in_supertransaction', `context.meeOperations[${k}] isn't previewed: ${why}.`);
+  // An operation that is several items, and items whose time bounds the validator takes otherwise than signed.
+  for (const i of order) {
+    const at = opItems.filter(j => covered.get(j) === i);
+    if (at.length > 1) b.warn('caution', 'mee_operation_repeated', `${labelOf(i)}: it is items ${at.map(j => j + 1).join(', ')} of the supertransaction, and can be submitted under any of them: ${at.map(j => `item ${j + 1} valid ${when(boundsOf(j).taken)}`).join('; ')}. It was simulated under item ${i + 1}'s.`);
+  }
+  for (const i of opItems) {
+    const { raw, taken, packs } = boundsOf(i);
+    const label = covered.has(i) ? `${labelOf(covered.get(i)!)}, item ${i + 1}` : `Item ${i + 1}`;
+    if (!packs) b.warn('info', 'mee_bounds_unusable', `${label}: its time bounds (${raw.lowerBoundTimestamp}, ${raw.upperBoundTimestamp}) don't fit in the 128 bits K1MeeValidator reads each from the signature, so it never finds this item among the items: the operation can't run under it.`);
+    else if (raw.lowerBoundTimestamp !== taken.lowerBoundTimestamp || raw.upperBoundTimestamp !== taken.upperBoundTimestamp) b.warn('caution', 'mee_bounds_truncated', `${label}: its time bounds as signed (${raw.lowerBoundTimestamp}, ${raw.upperBoundTimestamp}) are beyond 48 bits, which K1MeeValidator cuts them to: it runs ${when(taken)}, not as the numbers signed suggest.`);
+  }
   for (const i of unshown) {
-    const v = items[i].value, until = BigInt(v.upperBoundTimestamp as string);
-    b.detail(`Item ${i + 1} (${items[i].label})`, `an operation with hash ${String(v.userOpHash)}, valid ${until === 0n ? 'with no expiry' : `until ${formatTimestamp(Number(until) * 1000)}`}${until !== 0n && until < nowS ? ' (expired)' : ''}`, String(v.userOpHash));
+    const { taken } = boundsOf(i), until = taken.upperBoundTimestamp;
+    b.detail(`Item ${i + 1} (${items[i].label})`, `an operation with hash ${String(items[i].value.userOpHash)}, valid ${when(taken)}${until !== 0n && until < nowS ? ' (expired)' : ''}`, String(items[i].value.userOpHash));
   }
   const { titles, assetChanges } = ops.length ? await runOperations(ops, digest, signer, context, deps, b) : { titles: [], assetChanges: [] };
   if (signer && context.account && signer !== context.account.toLowerCase()) b.warn('danger', 'signer_mismatch', `The request asks ${signer} to sign, but the connected account is ${context.account}.`);
   b.detail('EIP-712 digest', digest);
   const hidden = unshown.length + others.length;
-  const many = titles.length === 1 ? titles[0] : titles.length ? `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}` : `${count(opItems.length)} not shown`;
+  const many = titles.length === 1 ? titles[0] : titles.length ? `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}` : `${count(unshown.length)} not shown${others.length ? `, and ${others.length} other item${others.length === 1 ? '' : 's'}` : ''}`;
   return {
     schema: 'signing-preview/1', method, kind: 'typed_data', network,
     title: `Sign a supertransaction: ${many}${titles.length && hidden ? ', and others not shown' : ''}`,
-    summary: `Authorizes ${hidden ? 'at least ' : ''}${titles.length ? `${count(titles.length)} of a Biconomy MEE supertransaction with one signature (typed data, MEE 3), on ${chains.map(chainName).join(', ')}: ${titles.join('; ')}` : `a Biconomy MEE supertransaction of ${count(opItems.length)} with one signature (typed data, MEE 3), none of which were supplied: only their hashes are shown`}${titles.length && hidden ? ' (and items not shown)' : ''}.`,
+    summary: `Authorizes ${hidden ? 'at least ' : ''}${titles.length ? `${count(titles.length)} of a Biconomy MEE supertransaction with one signature (typed data, MEE 3), on ${chains.map(chainName).join(', ')}: ${titles.join('; ')}` : `a Biconomy MEE supertransaction of ${count(unshown.length)}${others.length ? ` and ${others.length} other item${others.length === 1 ? '' : 's'}` : ''} with one signature (typed data, MEE 3), none of which were supplied: only their hashes are shown`}${titles.length && hidden ? ' (and items not shown)' : ''}.`,
     details: b.details, assetChanges, warnings: b.warnings, attention: attentionOf(b.warnings),
     decoding: { status: 'partial', decoder: 'mee_supertransaction', notes: b.notes },
     ...(b.trace && { trace: b.trace }),

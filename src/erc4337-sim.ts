@@ -2295,7 +2295,10 @@ export function k1meeOwnSimple(signature: Hex, tree: SupertransactionProof): Hex
 export function k1meeOwnTyped(signature: Hex, tree: SupertransactionProof & { typed: NonNullable<SupertransactionProof['typed']> }): Hex {
   const { outerTypeHash, itemHashes, itemIndex } = tree.typed;
   const w = (v: bigint) => v.toString(16).padStart(64, '0');
-  const lower = tree.bounds?.lowerBoundTimestamp ?? 0n, upper = tree.bounds?.upperBoundTimestamp ?? 0n;
+  // (Each bound in 128 bits, as the validator reads them: one that doesn't fit is never found among the items, and
+  // the layout stays the validator's.)
+  const mask = (1n << 128n) - 1n;
+  const lower = (tree.bounds?.lowerBoundTimestamp ?? 0n) & mask, upper = (tree.bounds?.upperBoundTimestamp ?? 0n) & mask;
   const sigAt = 0xa0n + 0x20n + 0x20n * BigInt(itemHashes.length);
   const sig = signature.slice(2), padded = sig.padEnd(Math.ceil(sig.length / 64) * 64, '0');
   return `0x177eee00${outerTypeHash.slice(2)}${w(BigInt(itemIndex))}${w(0xa0n)}${w(sigAt)}${w((lower << 128n) | upper)}${w(BigInt(itemHashes.length))}${itemHashes.map(h => h.slice(2)).join('')}${w(BigInt(sig.length / 2))}${padded}` as Hex;

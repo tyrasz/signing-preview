@@ -122,7 +122,35 @@ test('MEE 3: a supertransaction of two operations, one supplied: the other is sh
   assert.ok(codes(none).includes('mee_supertransaction_partial'));
   // An operation supplied that isn't one of the items.
   const stray = await signTyped(superTx([hashOf(one.op)]), one.address, [one.op, two.op]);
-  assert.match(stray.warnings.find(w => w.code === 'mee_operation_not_in_supertransaction')!.message, /^Operation 2 supplied with it isn't among its items/);
+  assert.equal(stray.warnings.find(w => w.code === 'mee_operation_not_in_supertransaction')!.message, "context.meeOperations[1] isn't previewed: its hash isn't one of its items, so this signature doesn't authorize it.");
+  // One that can't be hashed here (an EntryPoint other than v0.6 or v0.7): said so, not that it isn't an item.
+  const v08 = await previewRequest({ method: 'eth_signTypedData_v4', params: [one.address, JSON.stringify(superTx([hashOf(one.op)]))] },
+    { now: NOW, chainId: 999, meeOperations: [{ chainId: 999, entryPoint: '0x4337084d9e255ff0702461cf8895ce9e3b5ff108', operation: one.op }] }, deps);
+  assert.match(v08.warnings.find(w => w.code === 'mee_operation_not_in_supertransaction')!.message, /^context\.meeOperations\[0\] isn't previewed: its EntryPoint \(0x4337…f108\) is not v0\.6 or v0\.7/);
+});
+
+test('MEE 3: time bounds beyond 48 bits are what the validator cuts them to; an operation that is two items runs under either; typed data with no operation among its items isn’t a supertransaction', async () => {
+  const { address, op } = await account(6);
+  const now = BigInt(NOW / 1000), high = 1n << 48n;
+  const item = (lower: bigint, upper: bigint) => ({ userOpHash: hashOf(op), lowerBoundTimestamp: lower.toString(), upperBoundTimestamp: upper.toString() });
+  const typed = (meeUserOps: ReturnType<typeof item>[]) => ({ ...superTx([]), message: { meeUserOps } });
+  // 2^48 + now - 1 hour to 2^48 + now + 1 hour: the validator takes now - 1 hour to now + 1 hour, valid now.
+  const cut = await signTyped(typed([item(high + now - 3600n, high + now + 3600n)]), address, [op]);
+  assert.match(cut.warnings.find(w => w.code === 'mee_bounds_truncated')!.message, /beyond 48 bits, which K1MeeValidator cuts them to: it runs from .* until /);
+  assert.ok(!codes(cut).includes('mee_operation_not_yet_valid'), codes(cut).join());
+  assert.doesNotMatch(wholeNote(cut, 1), /doesn't accept/);
+  // Bounds beyond 128 bits: never found among the items.
+  const huge = await signTyped(typed([item(1n << 130n, 0n)]), address, [op]);
+  assert.ok(codes(huge).includes('mee_bounds_unusable'), codes(huge).join());
+  // The same operation twice, expired and with no expiry: simulated under the one valid now, both its own.
+  const twice = await signTyped(typed([item(0n, now - 86400n), item(0n, 0n)]), address, [op]);
+  assert.match(twice.warnings.find(w => w.code === 'mee_operation_repeated')!.message, /^Operation 1 \(HyperEVM\): it is items 1, 2 of the supertransaction, and can be submitted under any of them: .* It was simulated under item 2's\.$/);
+  assert.ok(!codes(twice).includes('mee_supertransaction_partial'), codes(twice).join());
+  assert.ok(!codes(twice).includes('mee_operation_expired'), codes(twice).join());
+  // A SuperTx struct with no MeeUserOp among its items: previewed as any typed data.
+  const none = await signTyped({ domain: { name: 'Nexus' }, primaryType: 'SuperTx', types: { EIP712Domain: [{ name: 'name', type: 'string' }], SuperTx: [{ name: 'entry0', type: 'Note' }], Note: [{ name: 'text', type: 'string' }], MeeUserOp: MEE_USER_OP },
+    message: { entry0: { text: 'hello' } } }, address, []);
+  assert.notEqual(none.decoding.decoder, 'mee_supertransaction');
 });
 
 test('MEE 3: a supertransaction as a struct of items of other types too: the outer type hash is EIP-712’s, the operation validates, and the other item is said to be unread', async () => {
