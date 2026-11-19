@@ -871,25 +871,27 @@ Each chain had one or two transactions the node failed to answer (a backend lagg
 npm run coverage -- --hours 24 --eth 300 --arb 1500 --hyperevm 1500 --out report.json
 ```
 
-Run on 2026-11-06 at 08:10 UTC (pass 2 figures; "readable" is full + partial), with the run earlier the same day (03:41) in brackets:
+Run on 2026-11-19 at 08:30 UTC with smaller samples (`--eth 150 --arb 600 --hyperevm 600`; pass 2 figures; "readable" is full + partial), with the run of 2026-11-06 at 08:10 UTC in brackets:
 
 | | Ethereum | Arbitrum One | HyperEVM |
 |---|---|---|---|
-| Sample | 300 of 7,177 blocks: 83,194 txs | 1,500 of 313,219 blocks: 7,954 txs (1,509 ArbOS system txs excluded) | 1,500 of 87,840 blocks: 15,505 txs |
-| Full / partial / opaque | 72.1% / 20.1% / 7.8% (70.0 / 22.4 / 7.6) | 34.6% / 17.3% / 48.1% (36.4 / 17.7 / 46.0) | 61.4% / 11.4% / 27.2% (61.8 / 11.0 / 27.2) |
-| Readable without lookups (pass 1) | 78.3% (79.2%) | 28.6% (28.8%) | 62.3% (6.9%) |
-| Readable, standard ABI-encoded calldata only | 95.9% (95.9%) | 80.1% (81.5%) | 83.2% (83.5%) |
-| Readable, occasional senders only | 96.8% (96.7%) | 80.7% (80.0%) | 76.1% (74.5%) |
-| Share of the opaque rest sent by automated senders | 78.5% (76.7%) | 88.4% (87.4%) | 92.3% (91.2%) |
-| Crashes | 0 | 2, fixed since (0) | 0 |
+| Sample | 150 of 7,185 blocks: 38,431 txs (300: 83,194) | 600 of 290,133 blocks: 2,291 txs, 602 ArbOS system txs excluded (1,500: 7,954) | 600 of 87,840 blocks: 2,276 txs (1,500: 15,505) |
+| Full / partial / opaque | 70.3% / 21.5% / 8.1% (72.1 / 20.1 / 7.8) | 32.6% / 20.1% / 47.3% (34.6 / 17.3 / 48.1) | 11.4% / 26.4% / 62.2% (61.4 / 11.4 / 27.2) |
+| Readable without lookups (pass 1) | 78.1% (78.3%) | 23.8% (28.6%) | 14.0% (62.3%) |
+| Readable, standard ABI-encoded calldata only | 95.8% (95.9%) | 82.2% (80.1%) | 54.7% (83.2%) |
+| Readable, occasional senders only | 95.2% (96.8%) | 55.7% (80.7%) | 45.6% (76.1%) |
+| Share of the opaque rest sent by automated senders | 64.9% (78.5%) | 50.0% (88.4%) | 72.2% (92.3%) |
+| Crashes | 0 | 0 (2, fixed since) | 0 |
 
-Between the two runs, decoders were added for Relay's depository, Binance Web3 Wallet's router, HyperLend's isolated pools, Kinetiq's asxnHYPE, Universal Router 1.0 and Arbitrum-style inbox messages (and, outside any transaction sample, Safe's `SafeOp` and hash-signed v0.6/v0.7 UserOperations). Relay deposits and payouts are 0.4% of Ethereum's sample and 0.2% of Arbitrum's and HyperEVM's, and Binance Web3 Wallet's router, the busiest contract occasional senders called on Ethereum that was unreadable, has left that list. On HyperEVM, the inbox of an Arbitrum Orbit chain receives 56% of the sample: those calls were already readable through the verified ABI, and are now read offline with the child-chain transaction each carries, so pass 1 goes from 6.9% to 62.3%. Arbitrum's overall share is lower because this sample holds more bot traffic (`0x96da…ab73` sent 571 transactions against 370); among occasional senders it rose. The two crashes, both a nested multicall to The Graph's SubgraphService reaching the Uniswap-style reader, were fixed after the run (`test/mainnet-regressions.test.ts`).
+HyperEVM's figures are its traffic's, not its decoding's: on 2026-11-06 an Arbitrum Orbit chain's inbox received 56% of its sample, all decoded; on 2026-11-19 none of its 2,276 sampled transactions went there, and a block carried 3.8 transactions where it had carried 10.3. What is left is mostly contracts with no published source and selectors no signature database knows (the busiest eight, all unverified on Sourcify). With fewer blocks sampled, "automated" (a sender in 3 or more sampled blocks) catches fewer bots, which lowers the occasional senders' figures on Arbitrum and HyperEVM.
+
+Between 2026-11-06's two runs (03:41 and 08:10), decoders were added for Relay's depository, Binance Web3 Wallet's router, HyperLend's isolated pools, Kinetiq's asxnHYPE, Universal Router 1.0 and Arbitrum-style inbox messages (and, outside any transaction sample, Safe's `SafeOp` and hash-signed v0.6/v0.7 UserOperations). Relay deposits and payouts are 0.4% of Ethereum's sample and 0.2% of Arbitrum's and HyperEVM's, and Binance Web3 Wallet's router, the busiest contract occasional senders called on Ethereum that was unreadable, has left that list. On HyperEVM, the inbox of an Arbitrum Orbit chain receives 56% of the sample: those calls were already readable through the verified ABI, and are now read offline with the child-chain transaction each carries, so pass 1 goes from 6.9% to 62.3%. Arbitrum's overall share is lower because this sample holds more bot traffic (`0x96da…ab73` sent 571 transactions against 370); among occasional senders it rose. The two crashes, both a nested multicall to The Graph's SubgraphService reaching the Uniswap-style reader, were fixed after the run (`test/mainnet-regressions.test.ts`).
 
 "Automated" means the sender appears in 3 or more of the sampled blocks, which are minutes apart: bots, relayers and exchanges sending around the clock. What stays opaque is mostly:
 
-- **Packed calldata** (Ethereum 3,106, Arbitrum 2,179, HyperEVM 1,853 txs): any length other than selector + 32-byte words, a custom encoding no ABI describes, used by trading bots.
-- **Vanity selectors** (193 / 623 / 97): ABI-shaped, but with selectors mined to start with zero bytes to save gas, also bots.
-- **ABI-shaped calls to contracts with no published source** (3,210 / 1,020 / 2,275), and whose selectors aren't in a signature database. Two such contracts (`0x278d…f8d2`, `0x93c3…dd17`) are among the busiest on all three chains. Their senders are mostly bots (median nonces in the thousands). Some are verified only on Etherscan: setting `ETHERSCAN_API_KEY` reads those. Binance Web3 Wallet's router (`0xb300…028d`), whose facet is unpublished, now has a decoder read from its calldata layout and receipts.
+- **Packed calldata** (Ethereum 1,603, Arbitrum 593, HyperEVM 671 txs on 2026-11-19; 3,106, 2,179 and 1,853 in the larger samples of 2026-11-06): any length other than selector + 32-byte words, a custom encoding no ABI describes, used by trading bots.
+- **Vanity selectors** (17 / 229 / 35; 193 / 623 / 97): ABI-shaped, but with selectors mined to start with zero bytes to save gas, also bots.
+- **ABI-shaped calls to contracts with no published source** (1,498 / 261 / 709; 3,210 / 1,020 / 2,275), and whose selectors aren't in a signature database. Two such contracts (`0x278d…f8d2`, `0x93c3…dd17`) are among the busiest on all three chains. Their senders are mostly bots (median nonces in the thousands). Some are verified only on Etherscan: setting `ETHERSCAN_API_KEY` reads those. Binance Web3 Wallet's router (`0xb300…028d`), whose facet is unpublished, now has a decoder read from its calldata layout and receipts.
 
 The first run found and fixed 26 crashes (a "never expires" Permit2 approval and struct-item multicalls, now in `test/mainnet-regressions.test.ts`). It also showed that the busiest unreadable contract on Ethereum was Uniswap's current Universal Router 2.1.2, and that the busiest unreadable "contract" was an account with no code receiving text inscriptions. Both are decoded now.
 
@@ -898,7 +900,7 @@ Not covered, whatever the sample says:
 - **UserOperations for EntryPoint v0.6 and v0.7, on their own.** Their wallets sign the operation's hash as a bare 32-byte message (`personal_sign`), which says nothing about what the operation does. They are decoded when the caller supplies the operation ([how](#useroperations-signed-as-a-hash-entrypoint-v06-and-v07)). v0.8 and v0.9 operations, and Safe's `SafeOp`, are signed as typed data and decoded.
 - **Other DEX routers.** Those without a decoder of their own are shown through their verified ABI (function and arguments), or with a cautioned swap headline when they take Uniswap-shaped calls.
 - **Simulation on HyperEVM** runs in a local EVM over the chain's state (see [HyperEVM simulation](#contract-and-token-lookups)). When that takes longer than its budget (a first preview of a deep contract), the probe answers, and it reads balances rather than logs, so a token the transaction doesn't name, and no decoder adds, can be missing.
-- **Sample size**: about 4% of Ethereum's blocks, 0.5% of Arbitrum's and 1.7% of HyperEVM's in the day.
+- **Sample size**: about 2% of Ethereum's blocks, 0.2% of Arbitrum's and 0.7% of HyperEVM's in the day (4%, 0.5% and 1.7% on 2026-11-06).
 
 **Base, OP Mainnet, Polygon and BNB Chain** (`npm run coverage -- --chains 8453,10,137,56 --hours 6 --base 120 --op 120 --polygon 120 --bsc 120`; 120 blocks of each across six hours, pass 2 figures), run on 2026-11-19 at 07:00 UTC, with the first sample (2026-11-10) in brackets:
 
