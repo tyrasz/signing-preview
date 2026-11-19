@@ -854,6 +854,51 @@ Run on 2026-11-10, each chain followed for 20 minutes (up to 600 transactions fr
 
 Each chain had one or two transactions the node failed to answer (a backend lagging behind), counted apart. The two BNB Chain outcomes are transactions run a second after their block (below), and reported, not failed. Base's two native changes were the L1 fee its receipts name but its senders didn't pay (below), counted as right since. Arbitrum's one token movement is unexplained: the token logged a transfer of 7,984,000,100 base units from the sender and the sender's balance fell by 100, and the block's state was gone from the node before it could be looked at. The OP Stack L1 fee estimates, in later runs of 301 transactions each after the access-list fix (below): within 5% of the receipt's for all of them, from 1.5% under to 5% over (exact for most of OP Mainnet's, at the oracle's minimum size).
 
+**Base, OP Mainnet, Polygon and BNB Chain** (`--chain 8453|10|137|56`), and what replaying them took:
+- The chains' own transactions are skipped: OP Stack deposits (type `0x7e`, the block's L1 info and bridged funds) and BNB Chain's validator system transactions (the validator, at no gas price). So are transactions from a block's fee recipient, whose balance also takes the block's fees.
+- Base, Arbitrum and BNB Chain make blocks faster than one a second, so a block can share its parent's second. The replay uses the block's own time; BNB Chain's node refuses a simulated block that doesn't move time forward, and such a block runs a second later. Contracts that write once a second (a pool's price observation) can then cost more, and a reward accrues a second more: those transactions' gas isn't judged, their token movements are judged within a ten-thousandth, and an outcome that differs is reported, not failed (a deadline of the block's own second). Running every such block a second later, as a first version did, left 14 of 602 Base transactions differing (two failed on-chain and succeeded a second later; others paid 23,578–59,603 gas more for observations); with the block's own time, none.
+- BNB Chain's `DIFFICULTY` opcode gives the block's difficulty (2 for an in-turn validator), which MEV bots check: its node takes it from the `prevRandao` override (the block's `mixHash` there holds its milliseconds), Polygon's from a `difficulty` override.
+- What the block's other transactions moved for the sender is left out of its actual change: tokens from their receipts' Transfers (six BNB Chain swaps looked like they moved nothing, as the tokens came back later in the block), and, when the native change differs, native coin from simulating the block's earlier and later transactions too (an earlier transaction paid one sender through a contract). A chain that logs its native transfers (EIP-7708: Sepolia) has those in the receipts as well, a contract's included, and they are taken from there (a smart account handed back the wei its sender had just sent it, in a bundle later in the block). A token movement within a millionth is an interest-bearing token's accrual (an Aave debt balance measured at the block's end).
+- On Base and OP Mainnet the receipt's L1 data fee is part of what the sender paid, and the preview's estimate of it is compared with the receipt's. A request's access list is part of what's posted, and in the estimate (and in the simulation, where it costs gas and warms what it names): without it, three Base transactions with long access lists came out 24–83% under. A block's L1 info deposit (its first transaction) runs before its other transactions in the replay, as it does on-chain: a bundler's operation whose paymaster prices L1 data came out 0.47% low without the block's L1 values. Swaps through one Base contract (`0xcb98…d19e`) have receipts naming an L1 fee their sender's balance doesn't pay (it moves by the payout less the L2 gas, to the wei, as simulated): a native change off by exactly that fee is counted as right, and the summary says how many (4 of 301 in a later run).
+- On BNB Chain, one EIP-7702 transaction of five simulated 18,862 gas (5.3%) above its receipt with or without the block's earlier transactions: the node's own `eth_simulateV1` against its chain.
+
+## Coverage of real traffic
+
+`npm run coverage` previews every transaction in blocks sampled evenly across the last 24 hours, as if each were an `eth_sendTransaction` request, and reports how much is readable, what crashed, and what is left. Pass 1 uses only the built-in decoders and lists; pass 2 adds what `liveDependencies()` would look up (Sourcify for the busiest unreadable contracts, OpenChain for their selectors). It needs the three RPCs, `sourcify.dev` and `api.openchain.xyz`.
+
+```bash
+npm run coverage -- --hours 24 --eth 300 --arb 1500 --hyperevm 1500 --out report.json
+```
+
+Run on 2026-11-06 at 08:10 UTC (pass 2 figures; "readable" is full + partial), with the run earlier the same day (03:41) in brackets:
+
+| | Ethereum | Arbitrum One | HyperEVM |
+|---|---|---|---|
+| Sample | 300 of 7,177 blocks: 83,194 txs | 1,500 of 313,219 blocks: 7,954 txs (1,509 ArbOS system txs excluded) | 1,500 of 87,840 blocks: 15,505 txs |
+| Full / partial / opaque | 72.1% / 20.1% / 7.8% (70.0 / 22.4 / 7.6) | 34.6% / 17.3% / 48.1% (36.4 / 17.7 / 46.0) | 61.4% / 11.4% / 27.2% (61.8 / 11.0 / 27.2) |
+| Readable without lookups (pass 1) | 78.3% (79.2%) | 28.6% (28.8%) | 62.3% (6.9%) |
+| Readable, standard ABI-encoded calldata only | 95.9% (95.9%) | 80.1% (81.5%) | 83.2% (83.5%) |
+| Readable, occasional senders only | 96.8% (96.7%) | 80.7% (80.0%) | 76.1% (74.5%) |
+| Share of the opaque rest sent by automated senders | 78.5% (76.7%) | 88.4% (87.4%) | 92.3% (91.2%) |
+| Crashes | 0 | 2, fixed since (0) | 0 |
+
+Between the two runs, decoders were added for Relay's depository, Binance Web3 Wallet's router, HyperLend's isolated pools, Kinetiq's asxnHYPE, Universal Router 1.0 and Arbitrum-style inbox messages (and, outside any transaction sample, Safe's `SafeOp` and hash-signed v0.6/v0.7 UserOperations). Relay deposits and payouts are 0.4% of Ethereum's sample and 0.2% of Arbitrum's and HyperEVM's, and Binance Web3 Wallet's router, the busiest contract occasional senders called on Ethereum that was unreadable, has left that list. On HyperEVM, the inbox of an Arbitrum Orbit chain receives 56% of the sample: those calls were already readable through the verified ABI, and are now read offline with the child-chain transaction each carries, so pass 1 goes from 6.9% to 62.3%. Arbitrum's overall share is lower because this sample holds more bot traffic (`0x96da…ab73` sent 571 transactions against 370); among occasional senders it rose. The two crashes, both a nested multicall to The Graph's SubgraphService reaching the Uniswap-style reader, were fixed after the run (`test/mainnet-regressions.test.ts`).
+
+"Automated" means the sender appears in 3 or more of the sampled blocks, which are minutes apart: bots, relayers and exchanges sending around the clock. What stays opaque is mostly:
+
+- **Packed calldata** (Ethereum 3,106, Arbitrum 2,179, HyperEVM 1,853 txs): any length other than selector + 32-byte words, a custom encoding no ABI describes, used by trading bots.
+- **Vanity selectors** (193 / 623 / 97): ABI-shaped, but with selectors mined to start with zero bytes to save gas, also bots.
+- **ABI-shaped calls to contracts with no published source** (3,210 / 1,020 / 2,275), and whose selectors aren't in a signature database. Two such contracts (`0x278d…f8d2`, `0x93c3…dd17`) are among the busiest on all three chains. Their senders are mostly bots (median nonces in the thousands). Some are verified only on Etherscan: setting `ETHERSCAN_API_KEY` reads those. Binance Web3 Wallet's router (`0xb300…028d`), whose facet is unpublished, now has a decoder read from its calldata layout and receipts.
+
+The first run found and fixed 26 crashes (a "never expires" Permit2 approval and struct-item multicalls, now in `test/mainnet-regressions.test.ts`). It also showed that the busiest unreadable contract on Ethereum was Uniswap's current Universal Router 2.1.2, and that the busiest unreadable "contract" was an account with no code receiving text inscriptions. Both are decoded now.
+
+Not covered, whatever the sample says:
+
+- **UserOperations for EntryPoint v0.6 and v0.7, on their own.** Their wallets sign the operation's hash as a bare 32-byte message (`personal_sign`), which says nothing about what the operation does. They are decoded when the caller supplies the operation ([how](#useroperations-signed-as-a-hash-entrypoint-v06-and-v07)). v0.8 and v0.9 operations, and Safe's `SafeOp`, are signed as typed data and decoded.
+- **Other DEX routers.** Those without a decoder of their own are shown through their verified ABI (function and arguments), or with a cautioned swap headline when they take Uniswap-shaped calls.
+- **Simulation on HyperEVM** runs in a local EVM over the chain's state (see [HyperEVM simulation](#contract-and-token-lookups)). When that takes longer than its budget (a first preview of a deep contract), the probe answers, and it reads balances rather than logs, so a token the transaction doesn't name, and no decoder adds, can be missing.
+- **Sample size**: about 4% of Ethereum's blocks, 0.5% of Arbitrum's and 1.7% of HyperEVM's in the day.
+
 **Base, OP Mainnet, Polygon and BNB Chain** (`npm run coverage -- --chains 8453,10,137,56 --hours 6 --base 120 --op 120 --polygon 120 --bsc 120`; 120 blocks of each across six hours, pass 2 figures), run on 2026-11-19 at 07:00 UTC, with the first sample (2026-11-10) in brackets:
 
 | | Base | OP Mainnet | Polygon | BNB Chain |
