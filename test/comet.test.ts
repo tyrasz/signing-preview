@@ -65,3 +65,17 @@ test("Fourth review: a market's approve of the largest amount is allow", async (
   assert.equal(p.warnings.find(w => w.code === 'comet_authorize')!.severity, 'danger');
   assert.match((await send(approve(0n))).title, /^Remove 0xb0b0…0002 as a manager/);
 });
+
+test("Fifth review: a token that answers baseToken() but not CometExt's isAllowed keeps its approval", async () => {
+  const { encodeFunctionData, parseAbi } = await import('viem');
+  const TOKEN = '0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a';
+  const d: Dependencies = { rpc: { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getCode') return '0x';
+    const { data } = params[0] as { data: string };
+    return data.startsWith('0xc55dae63') ? `0x${word(0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48n)}` : '0x';
+  } } };
+  const data = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), args: [BOB, (1n << 256n) - 1n] });
+  const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: TOKEN, data, value: '0x0', chainId: '0x1' }] }, { now: NOW, chainId: 1, account: ALICE }, d);
+  assert.equal(p.decoding.decoder, 'erc20_approve');
+  assert.ok(codes(p).includes('unlimited_approval'));
+});

@@ -28,3 +28,9 @@ test('castVoteBySig: the proposal and the vote; a voter other than the signer', 
   assert.match(oz.title, /^Vote against on proposal 7/);
   assert.ok(codes(oz).includes('governance_other_voter'));
 });
+
+test('Fifth review: a token whose domain has no name is named by its address', async () => {
+  const OTHER = '0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a';
+  const p = await sign({ domain: { chainId: 1, verifyingContract: OTHER }, primaryType: 'Delegation', types: { EIP712Domain: [{ name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], Delegation: [{ name: 'delegatee', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'expiry', type: 'uint256' }] }, message: { delegatee: BOB, nonce: '0', expiry: String(NOW / 1000 + 3600) } });
+  assert.equal(p.title, 'Delegate your 0x5a5a…5a5a votes to 0xb0b0…0002');
+});

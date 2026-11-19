@@ -79,10 +79,11 @@ export const spendPermissionAdapter: TypedAdapter = async (data, env) => {
       total = p.allowance! * periods;
       if (periods > 1n) b.detail(`In all${label}`, `up to ${isUnlimited(total) ? `unlimited ${symbol}` : amount(total)} over ${end >= UINT48_MAX ? 'the next century' : 'its window'} (${amount(p.allowance!)} ${window}, ${periods.toLocaleString('en-US')} periods)`, total.toString());
     }
-    // What it could take now: the allowance against the balance (no ERC-20 approval is needed: the manager has the account give one each time).
+    // What it could take now (or, before it starts, once it does, from what the account holds now): the allowance
+    // against the balance (no ERC-20 approval is needed: the manager has the account give one each time).
     let held: bigint | undefined;
-    if (chainId !== null && start <= nowS && nowS < end) {
-      const name = `Can move now${label}`;
+    if (chainId !== null && nowS < end) {
+      const name = start <= nowS ? `Can move now${label}` : `Can move once it starts${label}`;
       if (isNative) {
         await nativeCanMoveNow(env, b, chainId, account, unlimited ? UINT160_MAX : p.allowance!, native, name);
         try { if (env.deps.rpc?.has(chainId)) held = BigInt(await env.deps.rpc.call(chainId, 'eth_getBalance', [account, 'latest']) as string); } catch { held = undefined; }

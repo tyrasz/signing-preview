@@ -27,7 +27,7 @@ export const governanceAdapter: TypedAdapter = async (data, env) => {
   const b = new PreviewBuilder();
   let info: { symbol: string } | undefined;
   try { info = chainId !== null && ADDRESS.test(contract) ? (await env.deps.tokens?.get(chainId, contract)) ?? undefined : undefined; } catch { info = undefined; }
-  const what = info?.symbol ?? name ?? shortAddress(contract);
+  const what = info?.symbol || name || shortAddress(contract);
   b.detail('Contract', `${name || 'unnamed'} (${contract})`, contract);
   if (kind === 'delegation') {
     const delegatee = str(m.delegatee).toLowerCase(), expiry = big(m.expiry);

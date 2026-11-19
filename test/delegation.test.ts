@@ -304,10 +304,14 @@ test('Fourth review: far pins, many OR groups, exact calldata on the account, un
   const EVIL = '0x0000000000000000000000000000000000e0e0e0';
   const many = Array.from({ length: 64 }, (_, i) => [targets('0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a'), calldata(4, word(BigInt(i)))]);
   assert.equal(await attention([or([...many, [calldata(4, EVIL.slice(2).padStart(64, '0'))]]), zero]), 'danger');
-  // A fixed execute(…) on the account, by ExactCalldata: not simulated, so not taken as a fixed call.
+  // A fixed execute(…) on the account, by ExactCalldata: not simulated, so its calls are named, with their warnings
+  // (fifth review: as the same call simulated as an exact execution would be, not as full control).
   const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), args: [EVIL as `0x${string}`, (1n << 256n) - 1n] });
   const exec = encodeFunctionData({ abi: parseAbi(['function execute(bytes32,bytes)']), args: [`0x${'0'.repeat(64)}`, `0x${USDC.slice(2)}${word(0n)}${approve.slice(2)}`] });
-  assert.equal(await attention([exactData(exec), targets(ALICE)]), 'danger');
+  const fixedExec = await sign(delegation(BOB, [exactData(exec), targets(ALICE), until]));
+  assert.ok(!codes(fixedExec).includes('delegation_unrestricted'));
+  assert.match(fixedExec.warnings.find(w => w.code === 'delegation_unsimulated_calls')!.message, /Allow 0x0000…e0e0 to spend unlimited USDC, as many times as wanted/i);
+  assert.ok(codes(fixedExec).includes('unlimited_approval'));
   // Streams and caps that cap nothing.
   assert.equal(await attention([exactData('0x'), { enforcer: '0xd10b97905a320b13a0608f7e9cc506b56747df19', terms: `0x${word((1n << 256n) - 1n)}${word((1n << 256n) - 1n)}${word(0n)}${word(1n)}` }]), 'danger');
   assert.equal(await attention([exactData('0x'), { enforcer: E.valueLte, terms: `0x${word((1n << 255n) - 1n)}` }, { enforcer: '0xc8b5d93463c893401094cc70e66a206fb5987997', terms: `0x${word(1n)}` }]), 'danger');
@@ -315,4 +319,63 @@ test('Fourth review: far pins, many OR groups, exact calldata on the account, un
   // An allowance that comes back every second is no cap.
   assert.equal(await attention([exactData('0x'), { enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 18n)}${word(1n)}${word(BigInt(NOW / 1000))}` }]), 'danger');
   assert.notEqual(await attention([{ enforcer: '0x474e3ae7e169e940607cc624da8a15eb120139ab', terms: `0x${USDC.slice(2)}${word(10n ** 9n)}${word(1n)}${word(BigInt(NOW / 1000))}` }, zero]), 'none');
+});
+
+test('Fifth review: exact calls inside an OR, a search past 256 OR combinations, native caps per redemption and per call, multi-token periods, a long pin', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const zero = { enforcer: E.valueLte, terms: `0x${word(0n)}` };
+  const EVIL = '0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1';
+  /** With an RPC that has the account hold `balance` wei, or none. */
+  const run = async (caveats: { enforcer: string; terms: string }[], balance?: bigint) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(delegation(BOB, [...caveats, until]))] }, { now: NOW, chainId: 1 }, {
+    tokens: new StaticTokenRegistry(),
+    ...(balance !== undefined && { rpc: { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+      if (method === 'eth_getBalance') return `0x${balance.toString(16)}`;
+      if (method === 'eth_getCode') return '0x';
+      return (params[0] as { data: string }).data.startsWith('0x70a08231') ? `0x${word(5_000_000_000n)}` : '0x';
+    } } }),
+  });
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  const or = (groups: { enforcer: string; terms: string }[][]) => ({ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [groups.map(g => ({ caveats: g.map(c => ({ ...c, args: '0x' })) })) as never]) });
+  const exec = (target: string, data: string) => encodeFunctionData({ abi: parseAbi(['function execute(bytes32,bytes)']), args: [`0x${'0'.repeat(64)}`, `0x${target.slice(2).toLowerCase()}${word(0n)}${data.slice(2)}`] });
+  const exactOn = (data: string) => ({ enforcer: E.exact, terms: `0x${ALICE.slice(2).toLowerCase()}${word(0n)}${data.slice(2)}` });
+  const benign = [{ enforcer: E.targets, terms: '0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a' }, calldata(0, '0xdeadbeef'), zero];
+  // An exact execute(…) inside an OR isn't simulated: its fixed calls are named, not exempted silently.
+  const drain = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [EVIL, 5_000_000_000n] });
+  const inOr = await run([or([[exactOn(exec(USDC, drain))], benign])]);
+  assert.match(inOr.warnings.find(w => w.code === 'delegation_unsimulated_calls')!.message, /Send 5,000 USDC, as many times as wanted/);
+  // One that upgrades the account hands it over, inside an OR or at the top.
+  const upgrade = encodeFunctionData({ abi: parseAbi(['function upgradeToAndCall(address,bytes)']), args: [EVIL, '0x'] });
+  assert.ok(codes(await run([or([[exactOn(exec(ALICE, upgrade))], benign])])).includes('delegation_unrestricted'));
+  assert.ok(codes(await run([exactOn(exec(ALICE, upgrade))])).includes('delegation_unrestricted'));
+  // Two ORs whose groups multiply past 256: approve(EVIL, unlimited) on every token is still found.
+  const approveOnly = { enforcer: E.methods, terms: toFunctionSelector('function approve(address,uint256)') };
+  const spender = or([[calldata(4, word(BigInt(EVIL)))], [calldata(4, word(0x1111n))]]);
+  const amount = or([[calldata(36, word((1n << 256n) - 1n))], ...Array.from({ length: 128 }, (_, i) => [calldata(36, word(BigInt(i + 0x10000)))])]);
+  assert.equal((await run([approveOnly, spender, amount, zero])).warnings.find(w => w.code === 'delegation_any_contract')?.severity, 'danger');
+  // Native coin: a balance cap on another address is no cap; a per-redemption cap times the count, against the balance.
+  const plain = { enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: '0x' };
+  const fall = (who: string, amount: bigint) => ({ enforcer: '0xbd7b277507723490cd50b12eaafe87c616be6880', terms: `0x01${who.slice(2).toLowerCase()}${word(amount)}` });
+  const once = { enforcer: '0xc8b5d93463c893401094cc70e66a206fb5987997', terms: `0x${word(1n)}` };
+  const limited = (n: bigint) => ({ enforcer: E.limitedCalls, terms: `0x${word(n)}` });
+  const nativeWarning = (p: Awaited<ReturnType<typeof run>>) => p.warnings.find(w => w.code.startsWith('delegation_native'));
+  assert.equal(nativeWarning(await run([plain, fall('0x000000000000000000000000000000000000dead', 0n), once]))?.severity, 'danger');
+  assert.equal(nativeWarning(await run([plain, fall(ALICE, 10n ** 21n), limited(10_000n)], 10n ** 20n))?.severity, 'danger');
+  assert.equal(nativeWarning(await run([plain, fall(ALICE, 10n ** 18n), limited(5n)], 10n ** 20n))?.code, 'delegation_native_limited');
+  // A stream with no most and a rate adds up without end.
+  assert.equal(nativeWarning(await run([plain, { enforcer: '0xd10b97905a320b13a0608f7e9cc506b56747df19', terms: `0x${word(0n)}${word((1n << 256n) - 1n)}${word(10n ** 18n)}${word(BigInt(NOW / 1000))}` }]))?.severity, 'danger');
+  // A per-call cap times a bounded count: a caution stating the total (with or without the balance), a danger past it.
+  const capped = [plain, { enforcer: E.valueLte, terms: `0x${word(10n ** 21n)}` }, limited(10n)];
+  const unread = nativeWarning(await run(capped))!;
+  assert.equal(unread.code, 'delegation_native_limited');
+  assert.match(unread.message, /up to 1,000 ETH each time, 10 times: up to 10,000 ETH in all \(what you hold wasn't read\)/);
+  assert.equal(nativeWarning(await run(capped, 10n ** 20n))?.severity, 'danger');
+  assert.match(nativeWarning(await run([plain, { enforcer: E.valueLte, terms: `0x${word(10n ** 19n)}` }, limited(5n)], 10n ** 20n))!.message, /50 ETH in all of the 100 ETH you hold/);
+  // MultiTokenPeriod's tokens are probed: no cap per day, or back every minute.
+  const multi = (amount: bigint, period: bigint) => ({ enforcer: '0xfb2f1a9bd76d3701b730e5d69c3219d42d80ebb7', terms: `0x${USDC.slice(2)}${word(amount)}${word(period)}${word(BigInt(NOW / 1000))}` });
+  assert.ok(codes(await run([multi((1n << 256n) - 1n, 86_400n), zero])).includes('delegation_any_function'));
+  assert.ok(codes(await run([multi(10n ** 9n, 60n), zero])).includes('delegation_any_function'));
+  assert.ok(!codes(await run([multi(10n ** 9n, 86_400n), zero])).includes('delegation_any_function'));
+  // A pin that starts inside the call and runs past 4 KB is laid, not taken as met by padding.
+  const fixedTransfer = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB, 1n] }).slice(2).padEnd(4100 * 2, '0');
+  assert.notEqual((await run([calldata(0, fixedTransfer), zero])).attention, 'danger');
 });

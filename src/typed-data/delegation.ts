@@ -19,11 +19,11 @@ import { decodeAbiParameters, toFunctionSelector, type Hex } from 'viem';
 import { formatTimestamp, formatUnits, isUnlimited, PreviewBuilder, shortAddress } from '../format.ts';
 import { chainName, CHAINS } from '../chains.ts';
 import { COMMON_SIGNATURES } from '../abi.ts';
-import { normalizeTransaction, previewTransaction } from '../evm/transaction.ts';
+import { decodeTransaction, normalizeTransaction, previewTransaction } from '../evm/transaction.ts';
 import type { ApprovalChange, AssetChange, Preview, TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
 import { canMoveNow } from './exposure.ts';
-import { ATTACKER, batchRule, probe, ruleOf, type Rule } from './delegation-probe.ts';
+import { ATTACKER, batchRule, innerCalls, probe, ruleOf, type Rule } from './delegation-probe.ts';
 
 export const DELEGATION_MANAGER = '0xdb9b1e94b5b69df7e401ddbede43491141047db3';
 const ANY_DELEGATE = '0x0000000000000000000000000000000000000a11';
@@ -31,6 +31,8 @@ const ROOT_AUTHORITY = `0x${'f'.repeat(64)}`;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 /** An end (a timestamp, a block) this far off is none: 2^40 seconds is past the year 36,000. */
 const FAR = 1n << 40n;
+/** A total of native coin this large (10^10 coins of 18 decimals, past any chain's supply here) caps nothing, where the balance isn't read. */
+const NO_CAP = 10n ** 28n;
 /** The addresses MetaMask redeems its users' permissions from (@metamask/7715-permission-types 2.0.0's METAMASK_FACILITATOR_ADDRESSES). */
 export const METAMASK_FACILITATORS = new Set(['0xb01caea8c6c47bbf4f4b4c5080ca642043359c2e', '0xc066ac5d385419b1a8c43a0e146fa439837a8b8c', '0xb42f812a44c22cc6b861478900401ee759ebead6']);
 const HEX = /^0x([0-9a-fA-F]{2})*$/;
@@ -69,8 +71,11 @@ interface CaveatRead {
   nativeLimit?: boolean;
   /** It caps the native coin sent in all, or per period (NativeTokenTransferAmount, NativeTokenPeriodTransfer, NativeTokenStreaming, MultiTokenPeriod's native). */
   nativeTotal?: boolean;
-  /** It caps the native coin each redemption sends (NativeBalanceChangeEnforcer's fall): a total only with the redemptions bounded. */
-  nativePerRedemption?: boolean;
+  /**
+   * The most one redemption may lower `balanceOf`'s native balance by (NativeBalanceChangeEnforcer's fall): a cap on
+   * what the delegate sends only when that is the account's own balance, and a total only with the redemptions bounded.
+   */
+  nativePerRedemption?: bigint; balanceOf?: string;
   /** Its allowance comes back more often than hourly: no cap in practice. */
   subHourly?: boolean;
   /** Caveats inside it that this preview doesn't know (LogicalOrWrapperEnforcer's groups). */
@@ -95,7 +100,7 @@ const balanceChange = (what: 'native' | 'erc20' | 'erc721' | 'erc1155'): Reader 
   const info = asset ? await token(asset) : undefined;
   const thing = what === 'native' ? nativeOf(amount, native) : what === 'erc20' ? amountOf(amount, info, asset!) : `${amount} ${what === 'erc721' ? 'NFT' : `of token ${id}`} of ${shortAddress(asset!)}`;
   return { name: `${what === 'native' ? 'Native' : what === 'erc20' ? 'ERC20' : what === 'erc721' ? 'ERC721' : 'ERC1155'}BalanceChangeEnforcer`, kind: 'limit',
-    ...(what === 'native' && decrease && { nativeLimit: true, nativePerRedemption: true }),
+    ...(what === 'native' && decrease && { nativeLimit: true, nativePerRedemption: amount, balanceOf: who }),
     text: decrease ? `each time it is redeemed, ${shortAddress(who)}'s balance may fall by at most ${thing}` : `each time it is redeemed, ${shortAddress(who)}'s balance must rise by at least ${thing}` };
 };
 async function erc20Streaming(t: string, token: (address: string) => Promise<TokenInfo | undefined>): Promise<CaveatRead> {
@@ -195,7 +200,8 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
   '0x4803a326dded6ddbc60e659e5ed12d85c7582811': { name: 'NativeTokenPaymentEnforcer', read: (t, _, native) => ({ name: 'NativeTokenPaymentEnforcer', kind: 'condition', text: `whoever redeems it must pay ${nativeOf(word(t, 20), native)} to ${shortAddress(addr(t, 0))}` }) },
   '0xd10b97905a320b13a0608f7e9cc506b56747df19': { name: 'NativeTokenStreamingEnforcer', read: (t, _, native) => {
     const initial = word(t, 0), max = word(t, 32), rate = word(t, 64), start = word(t, 96);
-    return { name: 'NativeTokenStreamingEnforcer', kind: 'limit', native: max, nativeLimit: true, nativeTotal: !isUnlimited(initial) && (!isUnlimited(max) || !isUnlimited(rate)), text: `${native} sent with the calls: ${nativeOf(initial, native)} from ${formatTimestamp(Number(start) * 1000)}, then ${nativeOf(rate, native)} more each second, ${nativeOf(max, native)} at most` };
+    // With no most, the rate adds up without end: a total only with a most, or with no rate.
+    return { name: 'NativeTokenStreamingEnforcer', kind: 'limit', native: max, nativeLimit: true, nativeTotal: !isUnlimited(max) || (rate === 0n && !isUnlimited(initial)), text: `${native} sent with the calls: ${nativeOf(initial, native)} from ${formatTimestamp(Number(start) * 1000)}, then ${nativeOf(rate, native)} more each second, ${nativeOf(max, native)} at most` };
   } },
   '0xeaa1be91f0ea417820a765df9c5be542286bffdc': { name: 'ERC20MultiOperationIncreaseBalanceEnforcer', read: async (t, token) => {
     const address = addr(t, 0), info = await token(address);
@@ -339,10 +345,14 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   // What its caveats leave open: the calls an attacker would make, tried against every caveat's rule
   // (src/typed-data/delegation-probe.ts). Caps on the totals (a token's, the native coin's) bound what gets through.
   const cappedTokens = new Set(known.filter(r => r.kind === 'scope' && !r.subHourly).flatMap(r => r.tokens?.filter(t => !isUnlimited(t.amount)).map(t => t.address) ?? []));
+  // The exact calls the preview simulates (below): the first top-level exact caveat's, for the account's own authority.
+  const simulated = exact && chainId !== null && root ? exact.map(e => e.data.toLowerCase()) : [];
   let p: ReturnType<typeof probe>;
-  try { p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens }); }
+  try { p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens, simulated }); }
   catch { p = { control: ['what its caveats allow', "which this preview couldn't work out from them"] }; }
-  const nativeTotal = known.some(r => r.nativeTotal), nativePerRedemption = known.some(r => r.nativePerRedemption);
+  const nativeTotal = known.some(r => r.nativeTotal);
+  // The smallest per-redemption cap on the account's own balance's fall (a cap on another address's balance is none).
+  const perRedemption = known.reduce<bigint | undefined>((m, r) => r.nativePerRedemption !== undefined && r.balanceOf === delegator && (m === undefined || r.nativePerRedemption < m) ? r.nativePerRedemption : m, undefined);
   const full = !!p.control;
   const account = root ? `your account ${shortAddress(delegator)}` : 'the account at the root of the delegation it passes on';
   const anyCall = `${who} can make any call as ${account}`;
@@ -372,21 +382,50 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
     }
     if (p.permit2) b.warn('danger', 'delegation_permit2', `${who} can approve ${p.permit2.spender === ATTACKER ? 'itself' : shortAddress(p.permit2.spender)} on Permit2, for any token and amount: every token your account has approved to Permit2 can then be taken${unless}.`);
     if (p.anyFunction?.length && (!p.tokens || p.tokens.on)) b.warn('caution', 'delegation_any_function', `${who} can call any function on ${p.anyFunction.map(shortAddress).join(', ')}, as your account: if ${p.anyFunction.length === 1 ? 'it is a token' : 'one is a token'}, all of your balance of it, transferred or approved to anyone${unless}.`);
-    // Native coin: per call, or with no cap, unless a total caps it (a native period, stream or amount; per-redemption
-    // and per-call caps only when the redemptions are bounded too). To a target named, only in a plain transfer or to
-    // an EOA (a call to a contract takes coin only into a payable function).
-    // A cap per call is a total of the cap times the redemptions; that much or more than the account holds is no cap.
+    // Native coin: per call, or with no cap, unless a total caps it (a native period, stream or amount, said in its
+    // caveat and its "Can move now"). Otherwise, with the redemptions bounded, a cap per call or per redemption times
+    // their count is a total: a caution, or a danger where it is as much as the account holds; with neither, a danger.
+    // To a target named, only in a plain transfer or to an EOA (a call to a contract takes coin only into a payable
+    // function), and a caution.
     let balance: bigint | undefined;
     try { if (chainId !== null && env.deps.rpc?.has(chainId)) balance = BigInt(await env.deps.rpc.call(chainId, 'eth_getBalance', [delegator, 'latest']) as string); } catch { balance = undefined; }
-    const below = (total: bigint) => !isUnlimited(total) && (balance === undefined ? total < 10n ** 24n : total < balance);
-    const capped = (perCall: bigint | null) => nativeTotal || (bounded && ((perCall !== null && below(perCall * (once ? 1n : count!))) || nativePerRedemption));
-    const each = (perCall: bigint | null) => perCall === null ? '' : `, up to ${nativeOf(perCall, native)} each time, as many times as wanted`;
-    if (p.native && !capped(p.native.perCall)) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}: nothing caps the total, so all of it${unless}.`);
-    else if (p.nativeTo) {
+    const times = once ? 1n : count;
+    const limitOf = (perCall: bigint | null) => {
+      if (!bounded || times === undefined) return undefined;
+      const caps = [perCall, perRedemption].filter((c): c is bigint => c !== null && c !== undefined && !isUnlimited(c)).map(c => c * times);
+      return caps.length ? caps.reduce((a, c) => c < a ? c : a) : undefined;
+    };
+    const fmt = (v: bigint) => `${formatUnits(v, CHAINS[chainId ?? 0]?.nativeDecimals ?? 18)} ${native}`;
+    const each = (perCall: bigint | null) => { const c = [perCall, perRedemption].filter((x): x is bigint => x !== null && x !== undefined && !isUnlimited(x)).reduce<bigint | undefined>((a, x) => a === undefined || x < a ? x : a, undefined); return c === undefined ? '' : `, up to ${fmt(c)} each time`; };
+    const often = bounded && times !== undefined ? `, ${times === 1n ? 'once' : `${times} times`}` : ', as many times as wanted';
+    if (p.native && !nativeTotal) {
+      const limit = limitOf(p.native.perCall);
+      if (limit === undefined) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: nothing caps the total, so all of it${unless}.`);
+      else if (balance !== undefined && limit >= balance) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: up to ${fmt(limit)} in all, as much as the ${fmt(balance)} you hold, so all of it${unless}.`);
+      else if (balance === undefined && limit >= NO_CAP) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: up to ${fmt(limit)} in all, no cap in practice, so all of it${unless}.`);
+      else b.warn('caution', 'delegation_native_limited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: up to ${fmt(limit)} in all${balance !== undefined ? ` of the ${fmt(balance)} you hold` : ' (what you hold wasn\'t read)'}${unless}.`);
+    } else if (p.nativeTo && !nativeTotal) {
       const eoa = async (a: string) => { try { return chainId !== null && !!env.deps.rpc?.has(chainId) && String(await env.deps.rpc.call(chainId, 'eth_getCode', [a, 'latest'])) === '0x'; } catch { return false; } };
       const reach: { target: string; perCall: bigint | null }[] = [];
-      for (const r of p.nativeTo) if (!capped(r.perCall) && (r.plain || await eoa(r.target))) reach.push(r);
-      if (reach.length) b.warn('caution', 'delegation_native_unlimited', `${who} can send your account's ${native} to ${reach.map(r => shortAddress(r.target)).join(', ')}${each(reach.some(r => r.perCall === null) ? null : reach[0].perCall)}: nothing caps the total, so all of it${unless}.`);
+      for (const r of p.nativeTo) {
+        const limit = limitOf(r.perCall);
+        if ((limit === undefined || limit >= (balance ?? NO_CAP)) && (r.plain || await eoa(r.target))) reach.push(r);
+      }
+      if (reach.length) b.warn('caution', 'delegation_native_unlimited', `${who} can send your account's ${native} to ${reach.map(r => shortAddress(r.target)).join(', ')}${each(reach.some(r => r.perCall === null) ? null : reach[0].perCall)}${often}: nothing caps the total below what you hold, so all of it${unless}.`);
+    }
+    // Fixed calls through the account's own execute that aren't simulated: what they are, read as the account's calls.
+    if (p.unsimulated?.length) {
+      // Each call decoded as the account's own transaction; what its decoding warns of, said of it.
+      const calls: string[] = [], inner: { severity: 'info' | 'caution' | 'danger'; code: string; message: string }[] = [];
+      for (const d of p.unsimulated.slice(0, 3)) for (const c of (innerCalls(d) ?? []).slice(0, 5)) {
+        try {
+          const call = await decodeTransaction({ chainId: chainId ?? 1, from: delegator, to: c.target, data: c.data as Hex, value: c.value }, env.deps, { ...env.context, ...(chainId !== null && { chainId }) });
+          calls.push(call.title);
+          for (const w of call.b.warnings) if (w.severity !== 'info') inner.push(w);
+        } catch { calls.push(`a call to ${shortAddress(c.target)}`); }
+      }
+      b.warn('caution', 'delegation_unsimulated_calls', `${who} can have your account run fixed calls through its own execute that aren't simulated here (a caveat inside a LogicalOr, or an ExactCalldata, fixes them): ${calls.join('; ') || 'calls that don\'t read'}${often}${unless}.`);
+      for (const w of inner) b.warn(w.severity, w.code, `A fixed call it allows: ${w.message}`);
     }
   }
   if (unknown.length) b.warn('caution', 'delegation_caveat_unknown', `${unknown.length} of its caveats ${unknown.length === 1 ? 'is' : 'are'} enforced by ${unknown.length === 1 ? 'a contract' : 'contracts'} this preview doesn't know (${unknown.map(c => shortAddress(c.enforcer)).join(', ')}): ${unknown.length === 1 ? 'its' : 'their'} rules aren't read, so what they allow or forbid isn't shown.`);

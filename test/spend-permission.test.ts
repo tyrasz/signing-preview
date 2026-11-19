@@ -88,3 +88,9 @@ test('Fourth review: a small frequent allowance under the balance; periods count
   const zero = await sign(single({ period: 0 }));
   assert.ok(codes(zero).includes('spend_permission_invalid'));
 });
+
+test('Fifth review: a permission that starts later is weighed against what the account holds now', async () => {
+  const p = await sign(single({ allowance: '1000000000', period: 60, start: now + 60, end: 281474976710655 }));
+  assert.equal(p.warnings.find(w => w.code === 'spend_permission_unlimited')?.severity, 'danger');
+  assert.equal(detail(p, 'Can move once it starts'), '1,000 USDC (the permitted amount; you hold 5,000 USDC)');
+});

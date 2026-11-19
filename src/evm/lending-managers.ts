@@ -4,7 +4,8 @@
 // allow(manager, true) lets the manager transfer, withdraw and borrow for the sender in that market. Either lasts until
 // revoked, and moves nothing when sent, so a simulation shows no change: what it allows is said here. A danger when
 // the address has no code (a person or a key, not an adapter or a bulker), a caution otherwise. allow(address,bool) is
-// a common name, so a contract is taken for a Compound III market only when it answers baseToken().
+// a common name, and other tokens answer baseToken() too, so a contract is taken for a Compound III market only when it
+// answers baseToken() with an address and CometExt's isAllowed(owner, manager) with a bool.
 import { decodeFunctionData, parseAbi } from 'viem';
 import { PreviewBuilder, shortAddress } from '../format.ts';
 import { decoded, type Adapter } from './common.ts';
@@ -30,10 +31,13 @@ export const lendingManagerAdapter: Adapter = async (tx, env) => {
   } catch { return null; }
   const rpc = env.deps.rpc?.has(tx.chainId) ? env.deps.rpc : undefined;
   if (comet) {
-    // A Compound III market answers baseToken(); without an RPC, nothing says it is one.
+    // A Compound III market answers baseToken() and isAllowed(owner, manager); without an RPC, nothing says it is one.
     try {
-      const base = rpc ? String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: '0xc55dae63' }, 'latest'])) : '0x';
+      if (!rpc) return null;
+      const base = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: '0xc55dae63' }, 'latest']));
       if (!/^0x0{24}[0-9a-f]{40}$/i.test(base) || /^0x0+$/.test(base)) return null;
+      const allowed = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: `0xa1654379${tx.from.slice(2).toLowerCase().padStart(64, '0')}${who.slice(2).padStart(64, '0')}` }, 'latest']));
+      if (!/^0x0{63}[01]$/.test(allowed)) return null;
     } catch { return null; }
   }
   const eoa = await keyAccount(env.deps, tx.chainId, who);

@@ -14,7 +14,7 @@
 //   - transfer, approve, transferFrom, setApprovalForAll and increaseAllowance to the delegate, on any token, or on
 //     the targets named, with the recipient free or as pinned;
 //   - any function at all on the targets named.
-import { toFunctionSelector } from 'viem';
+import { decodeAbiParameters, toFunctionSelector, type Hex } from 'viem';
 
 export interface Exec { target: string; value: bigint; data: string; batch: boolean }
 /** One caveat's rule on an execution: its call type, and what it checks of the call. */
@@ -57,6 +57,28 @@ const SELF_CONTROL = ['execute(bytes32,bytes)', 'executeFromExecutor(bytes32,byt
   'redeemDelegations(bytes[],bytes32[],bytes[])'].map(s => [sel(s), s.replace(/\(.*/, '')] as [string, string]);
 /** Control functions that, with fixed data, run only the fixed calls inside them (not a hand-over when exact). */
 const RUNS_FIXED = new Set(['execute(bytes32,bytes)', 'executeFromExecutor(bytes32,bytes)', 'execute((address,uint256,bytes))', 'executeBatch((address,uint256,bytes)[])'].map(sel));
+const CONTROL = new Set(SELF_CONTROL.map(([s]) => s));
+const EXECUTIONS = [{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'callData', type: 'bytes' }] }] as const;
+/**
+ * The calls an execute(…) on the account runs, read from its data (ERC-7579's single and batch modes, the DeleGator's
+ * execute(Execution) and executeBatch); null where they don't read as a fixed set of calls (a delegatecall mode).
+ */
+export function innerCalls(data: string): { target: string; value: bigint; data: string }[] | null {
+  const s = data.slice(0, 10), args = `0x${data.slice(10)}` as Hex;
+  const list = (xs: readonly { target: string; value: bigint; callData: string }[]) => xs.map(x => ({ target: x.target.toLowerCase(), value: x.value, data: x.callData.toLowerCase() }));
+  try {
+    if (s === sel('execute(bytes32,bytes)') || s === sel('executeFromExecutor(bytes32,bytes)')) {
+      const [mode, exec] = decodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes' }], args);
+      const callType = mode.slice(2, 4), e = exec.slice(2).toLowerCase();
+      if (callType === '00' && e.length >= 104) return [{ target: `0x${e.slice(0, 40)}`, value: BigInt(`0x${e.slice(40, 104)}`), data: `0x${e.slice(104)}` }];
+      if (callType === '01') return list(decodeAbiParameters(EXECUTIONS, exec)[0]);
+      return null;
+    }
+    if (s === sel('execute((address,uint256,bytes))')) return list([decodeAbiParameters([{ type: 'tuple', components: EXECUTIONS[0].components }], args)[0]]);
+    if (s === sel('executeBatch((address,uint256,bytes)[])')) return list(decodeAbiParameters(EXECUTIONS, args)[0]);
+  } catch { return null; }
+  return null;
+}
 
 const word = (v: bigint | string) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');
 const at = (data: string, start: number, bytes: number) => data.slice(2 + start * 2, 2 + (start + bytes) * 2);
@@ -78,9 +100,10 @@ export function ruleOf(enforcer: string, t: string): Rule | null {
     }
     case '0xc2b0d624c1c4319760c96503ba27c347f3260f55': { // AllowedCalldata
       const start = Number(big(0)), value = t.slice(64);
-      // Past 4 KB, the bytes aren't laid over the calls tried: any call padded with them (the function ignores data
-      // past its arguments) passes, up to the ~1 MB of call data a block can carry; beyond that, none can.
-      if (start + value.length / 2 > 4096) return { mode: 'single', allows: () => start + value.length / 2 <= 1_000_000 };
+      // From 4 KB on, the bytes aren't laid over the calls tried: any call padded with them (the function ignores data
+      // past its arguments) passes, up to the ~1 MB of call data a block can carry; beyond that, none can. Bytes that
+      // start before are laid, however far they run.
+      if (start >= FAR_PIN) return { mode: 'single', allows: () => start + value.length / 2 <= 1_000_000 };
       return { mode: 'single', pins: [{ start, value }], allows: e => at(e.data, start, value.length / 2) === value };
     }
     case '0x99f2e9bf15ce5ec84685604836f71ab835dbbded': // ExactCalldata
@@ -108,7 +131,9 @@ export function ruleOf(enforcer: string, t: string): Rule | null {
       return { mode: 'single' };
     case '0xfb2f1a9bd76d3701b730e5d69c3219d42d80ebb7': { // MultiTokenPeriod
       const tokens = Array.from({ length: Math.floor(t.length / 232) }, (_, i) => addr(i * 116));
-      return { mode: 'single', allows: e => (e.data.length === 2 + 136 && selectorOf(e.data) === SELECTORS.transfer && e.value === 0n && tokens.includes(e.target)) || (e.data === '0x' && e.value > 0n && tokens.includes('0x0000000000000000000000000000000000000000')) };
+      // Its tokens are named targets: what else can be called on them is tried, and a token whose allowance is no cap
+      // (unlimited, or back more often than hourly) is probed.
+      return { mode: 'single', targets: tokens.filter(a => !/^0x0{40}$/.test(a)), allows: e => (e.data.length === 2 + 136 && selectorOf(e.data) === SELECTORS.transfer && e.value === 0n && tokens.includes(e.target)) || (e.data === '0x' && e.value > 0n && tokens.includes('0x0000000000000000000000000000000000000000')) };
     }
     case '0x3790e6b7233f779b09da74c72b6e94813925b9af': { // ERC721Transfer
       const contract = addr(0), id = word(big(20));
@@ -134,6 +159,8 @@ export function ruleOf(enforcer: string, t: string): Rule | null {
   }
 }
 const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
+/** Pinned bytes from here on are met by padding a call with them, not laid over it. */
+const FAR_PIN = 4096;
 
 /** A batch enforcer's rule, from its executions: exact ones fix target, value and data; ExactCalldataBatch only data. */
 export function batchRule(executions: { target: string; value: bigint; data: string }[], dataOnly: boolean): Rule {
@@ -153,30 +180,40 @@ export function passes(rules: (Rule | null)[], e: Exec): boolean {
 
 const collect = <T>(rules: (Rule | null)[], f: (r: Rule) => T[] | undefined): T[] => rules.flatMap(r => !r ? [] : [...(f(r) ?? []), ...(r.groups ?? []).flatMap(g => collect(g, f))]);
 
-/** The sets of pins a call can satisfy at once: the top-level caveats' and, for an OR, each of its groups' (every
- * combination across several ORs while there are at most 256; past that, each group of each OR on its own). */
-function pinSets(rules: (Rule | null)[]): { start: number; value: string }[][] {
-  const top = rules.flatMap(r => r && !r.groups ? (r.pins ?? []).filter(p => p.start + p.value.length / 2 <= 4096) : []);
-  const ors = rules.filter((r): r is Rule => !!r?.groups?.length).map(r => r.groups!.flatMap(g => pinSets(g)));
+type Pin = { start: number; value: string };
+const lay = (data: string, list: Pin[]) => {
+  let d = data.slice(2);
+  for (const p of list) {
+    const need = (p.start + p.value.length / 2) * 2;
+    if (d.length < need) d = d.padEnd(need, '0');
+    d = d.slice(0, p.start * 2) + p.value + d.slice(need);
+  }
+  return `0x${d}`;
+};
+
+/**
+ * The sets of pins a call can satisfy at once: the top-level caveats' and, for an OR, each of its groups'. Every
+ * combination across several ORs while there are at most 256; past that, a search one OR at a time: each OR's group
+ * that changes the call tried least, and each group of each OR with the others at theirs.
+ */
+function pinSets(rules: (Rule | null)[], template: string): Pin[][] {
+  const top = rules.flatMap(r => r && !r.groups ? (r.pins ?? []).filter(p => p.start < FAR_PIN) : []);
+  const ors = rules.filter((r): r is Rule => !!r?.groups?.length).map(r => r.groups!.flatMap(g => pinSets(g, template)));
   if (!ors.length) return [top];
   const size = ors.reduce((n, o) => n * Math.max(o.length, 1), 1);
-  if (size <= 256) return ors.reduce<{ start: number; value: string }[][]>((sets, o) => sets.flatMap(set => o.map(g => [...set, ...g])), [top]);
-  return ors.flatMap(o => o.map(g => [...top, ...g]));
+  if (size <= 256) return ors.reduce<Pin[][]>((sets, o) => sets.flatMap(set => o.map(g => [...set, ...g])), [top]);
+  const base = lay(template, top);
+  const changed = (pins: Pin[]) => { const d = lay(base, pins); let n = Math.abs(d.length - base.length); for (let i = 0; i < Math.min(d.length, base.length); i++) if (d[i] !== base[i]) n++; return n; };
+  const best = ors.map(o => o.reduce<Pin[] | undefined>((a, g) => a === undefined || changed(g) < changed(a) ? g : a, undefined) ?? []);
+  const sets = [[...top, ...best.flat()]];
+  ors.forEach((o, i) => { for (const g of o) sets.push([...top, ...best.flatMap((b, j) => j === i ? g : b)]); });
+  return sets;
 }
 
 /** The data an attacker would send for a call, with each set of the caveats' pinned bytes laid over it, and the data they fix outright. */
 function variants(template: string, rules: (Rule | null)[], withFixed: boolean): string[] {
-  const lay = (data: string, list: { start: number; value: string }[]) => {
-    let d = data.slice(2);
-    for (const p of list) {
-      const need = (p.start + p.value.length / 2) * 2;
-      if (d.length < need) d = d.padEnd(need, '0');
-      d = d.slice(0, p.start * 2) + p.value + d.slice(need);
-    }
-    return `0x${d}`;
-  };
   const out = new Set<string>([template]);
-  for (const pins of pinSets(rules)) {
+  for (const pins of pinSets(rules, template)) {
     const args = pins.filter(p => p.start > 0), heads = pins.filter(p => p.start === 0);
     for (const p of pins) out.add(lay(template, [p]));
     out.add(lay(template, args));
@@ -203,24 +240,37 @@ export interface Probe {
   permit2?: { spender: string };
   /** Targets named on which any function can be called. */
   anyFunction?: string[];
+  /** Fixed data for the account's own execute(…) that the preview doesn't simulate (a LogicalOr group's exact execution, an ExactCalldata), which runs only the calls fixed in it. */
+  unsimulated?: string[];
 }
 
 /** The attacker's calls against the caveats' rules: what gets through. */
-export function probe(rules: (Rule | null)[], account: string, manager: string, capped: { tokens: Set<string> }): Probe {
+export function probe(rules: (Rule | null)[], account: string, manager: string, capped: { tokens: Set<string>; simulated?: string[] }): Probe {
   const out: Probe = {};
   // A call tried with the caveats' pins laid over it, and the data they fix: it must still be the function tried
   // (sameFunction), but for native coin to an EOA, which takes any data.
-  // Exact executions' calls (simulated by the preview): an execute(…) among them runs only the calls fixed inside it.
-  const fixed = new Set(collect(rules, r => r.simulated ? r.datas : undefined));
-  const tries = (target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true, fixedRunsCalls = true) => {
+  // The exact executions' calls the preview simulates (a top-level caveat's, not one inside an OR): an execute(…) among
+  // them runs only the calls fixed inside it, a hand-over only if one of those is (handsOver).
+  const fixed = new Set(capped.simulated ?? []), fixedData = new Set(collect(rules, r => r.datas)), unsimulated = new Set<string>();
+  const handsOver = (data: string, depth: number): boolean => {
+    const inner = depth < 4 ? innerCalls(data) : null;
+    return inner === null || inner.some(c => (c.target === account && CONTROL.has(selectorOf(c.data)) && (!RUNS_FIXED.has(selectorOf(c.data)) || handsOver(c.data, depth + 1)))
+      || (c.target === manager && selectorOf(c.data) === SELECTORS.redeemDelegations));
+  };
+  // Every call that gets through, of those tried (passing); the first (tries).
+  function* passing(target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true, fixedRunsCalls = true) {
     for (const batch of [false, true]) for (const t of templates) for (const data of variants(t, rules, withFixed)) {
       if (sameFunction && selectorOf(data) !== selectorOf(t)) continue;
-      // An exact execute(…) on the account runs only the calls fixed inside it: those are simulated, not a hand-over.
-      if (!fixedRunsCalls && fixed.has(data) && RUNS_FIXED.has(selectorOf(data))) continue;
-      if (passes(rules, { target, value, data, batch })) return data;
+      // An execute(…) on the account with data a caveat fixes runs only the calls fixed inside it: not a hand-over
+      // unless one of those is. Simulated when it is the exact execution the preview runs, else said (unsimulated).
+      if (!fixedRunsCalls && (fixed.has(data) || fixedData.has(data)) && RUNS_FIXED.has(selectorOf(data)) && !handsOver(data, 0)) {
+        if (!fixed.has(data) && passes(rules, { target, value, data, batch })) unsimulated.add(data);
+        continue;
+      }
+      if (passes(rules, { target, value, data, batch })) yield data;
     }
-    return null;
-  };
+  }
+  const tries = (...args: Parameters<typeof passing>) => { for (const data of passing(...args)) return data; return null; };
   // Any call as the account: its own control functions on itself, the DelegationManager's redeemDelegations.
   // (each with one to six argument words: some rules check the call's length)
   const lengths = (selector: string) => [1, 2, 3, 6].map(n => `${selector}${'0'.repeat(64 * n)}`);
@@ -257,9 +307,9 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
     ['authorizeOperator', `${SELECTORS.authorizeOperator}${word(ATTACKER)}`, 4, null]];
   const tokenCalls = (target: string) => {
     const found: { name: string; recipient: string; amount: bigint }[] = [];
-    for (const [name, t, to, amount] of templates) {
-      const d = tries(target, 0n, [t], true);
-      if (d) found.push({ name, recipient: `0x${at(d, to, 32).slice(24)}`, amount: amount === null ? MAX : BigInt(`0x${at(d, amount, 32) || '0'}`) });
+    // Each call that gets through, not only the first: the recipient and amount the delegate can pick are the worst of them.
+    for (const [name, t, to, amount] of templates) for (const d of new Set(passing(target, 0n, [t], true))) {
+      found.push({ name, recipient: `0x${at(d, to, 32).slice(24)}`, amount: amount === null ? MAX : BigInt(`0x${at(d, amount, 32) || '0'}`) });
     }
     return found;
   };
@@ -270,7 +320,10 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
     // An amount of 2^128 - 1 or more is unlimited (as format.ts's isUnlimited reads it).
     const unlimited = (v: bigint) => v >= (1n << 128n) - 1n;
     const open = found.find(f => f.recipient === ATTACKER && unlimited(f.amount));
-    return { on, recipient: open || found.some(f => f.recipient === ATTACKER) ? null : found[0].recipient, amount: open || found.some(f => unlimited(f.amount)) ? null : found[0].amount, functions: [...new Set(found.map(f => f.name))] };
+    // The delegate picks among them: any recipient where it can name itself, or several are pinned; the largest amount.
+    const recipients = new Set(found.map(f => f.recipient));
+    const largest = found.reduce((m, f) => f.amount > m ? f.amount : m, 0n);
+    return { on, recipient: open || recipients.has(ATTACKER) || recipients.size > 1 ? null : found[0].recipient, amount: open || unlimited(largest) ? null : largest, functions: [...new Set(found.map(f => f.name))] };
   };
   const any = tokenCalls(SOME_TOKEN);
   if (any.length) out.tokens = summary(null, any);
@@ -281,6 +334,7 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   // Any function on a target named.
   const free = named.filter(t => tries(t, 0n, [`0x5eedf00d${'0'.repeat(128)}`], false));
   if (free.length) out.anyFunction = free;
+  if (unsimulated.size) out.unsimulated = [...unsimulated];
   return out;
 }
 
