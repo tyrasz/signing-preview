@@ -83,3 +83,15 @@ test("EntryPoint v0.6 bundles decode, said of the operation's account when a bun
   assert.equal(detail(p, 'Contract'), `EntryPoint v0.6 (${V06.toLowerCase()})`);
   assert.ok(codes(p).includes('erc4337_bundle'));
 });
+
+test("wallet_sendCalls' dataSuffix capability: the suffix is appended to each call and its attribution shown", async () => {
+  const plain = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB as Hex, 1_000_000n] });
+  const codes0 = '0x626173656170702c6d6f7270686f0e0080218021802180218021802180218021';
+  const ran: string[] = [];
+  const d: Dependencies = { tokens: new StaticTokenRegistry(), simulator: { simulate: async r => { ran.push(r.data ?? ''); return { status: 'success', source: 'mock', gasUsed: 30_000n, transfers: [] }; } } };
+  const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: USDC, data: plain }], capabilities: { dataSuffix: { value: codes0, optional: true } } }] }, { now: NOW }, d);
+  assert.equal(detail(p, 'Attribution (ERC-8021)'), 'codes baseapp, morpho');
+  assert.equal(p.title, 'Send 1 USDC');
+  assert.equal(ran[0], `${plain}${codes0.slice(2)}`);
+  await assert.rejects(previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: USDC, data: plain }], capabilities: { dataSuffix: { value: 'nope' } } }] }, { now: NOW }, d), /dataSuffix/);
+});

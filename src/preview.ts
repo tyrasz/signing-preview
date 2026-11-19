@@ -26,6 +26,7 @@ import { cometAuthorizationAdapter } from './typed-data/comet.ts';
 import { snapshotAdapter } from './typed-data/snapshot.ts';
 import { governanceAdapter } from './typed-data/governance.ts';
 import { previewMessage } from './message.ts';
+import { readAttribution } from './attribution.ts';
 import { previewSignedOperation } from './userop-hash.ts';
 import { previewSupertransaction, previewTypedSupertransaction } from './supertransaction.ts';
 import { previewPermissionRequests } from './permissions.ts';
@@ -133,10 +134,15 @@ const SKIPPED_IN_BATCH = "This call was not simulated: it may depend on the call
  */
 export async function previewBatch(raw: unknown, context: PreviewContext, deps: Dependencies): Promise<Preview> {
   if (!raw || typeof raw !== 'object' || !Array.isArray((raw as Record<string, unknown>).calls)) throw new RequestError('wallet_sendCalls needs { calls: [...] }');
-  const batch = raw as { chainId?: string; from?: string; atomicRequired?: boolean; calls: unknown[] };
+  const batch = raw as { chainId?: string; from?: string; atomicRequired?: boolean; calls: unknown[]; capabilities?: { dataSuffix?: { value?: unknown; optional?: boolean } } };
   if (batch.calls.length === 0 || batch.calls.length > 32) throw new RequestError('wallet_sendCalls must contain 1 to 32 calls');
   const chainId = batch.chainId !== undefined ? Number(BigInt(batch.chainId)) : context.chainId;
-  const txs = batch.calls.map(call => normalizeTransaction(call, context, batch.from, chainId));
+  // The dataSuffix capability (as viem sends a client's data suffix, ERC-8021 attributions among them): bytes a wallet
+  // that supports it appends to each call's data, which the calls are previewed and simulated with.
+  const suffix = batch.capabilities?.dataSuffix?.value;
+  if (suffix !== undefined && (typeof suffix !== 'string' || !/^0x([0-9a-fA-F]{2})*$/.test(suffix) || suffix.length > 2 + 2 * 1024)) throw new RequestError('capabilities.dataSuffix.value must be hex bytes (at most 1,024)');
+  const txs = batch.calls.map(call => normalizeTransaction(call, context, batch.from, chainId))
+    .map(tx => suffix && suffix !== '0x' && tx.to ? { ...tx, data: `${tx.data}${suffix.slice(2).toLowerCase()}` as `0x${string}` } : tx);
   // Decoded first: decoders name tokens the calls change without mentioning them, which state-reading simulators need.
   const decoded: Decoded[] = [];
   for (const tx of txs) decoded.push(await decodeTransaction(tx, deps, context));
@@ -194,6 +200,11 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   }
 
   const b = new PreviewBuilder();
+  if (suffix && suffix !== '0x') {
+    const attribution = readAttribution(suffix);
+    b.detail(attribution ? 'Attribution (ERC-8021)' : 'Data suffix', attribution ? attribution.parts.join('; ') : suffix.length > 2 + 64 ? `${suffix.slice(0, 66)}… (${(suffix.length - 2) / 2} bytes)` : suffix, suffix);
+    b.note(`The dApp asks the wallet to append ${attribution ? 'an ERC-8021 attribution' : `${(suffix.length - 2) / 2} bytes`} to each call's data (the dataSuffix capability${batch.capabilities?.dataSuffix?.optional ? ', optional' : ''}); the calls are previewed with it.`);
+  }
   let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
   let approvals: ApprovalChange[] = [];
   let simulation: SimulationSummary | undefined;
@@ -235,7 +246,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     network: chainId ? { kind: 'evm', chainId, name: chainName(chainId) } : null,
     title: calls.length === 1 ? calls[0].title : `${calls.length} actions: ${calls.map(c => c.title).join(' → ')}`,
     summary: `Runs ${calls.length} call${calls.length === 1 ? '' : 's'} in order${batch.atomicRequired ? ', all or nothing' : ''}. ${calls.map((c, i) => `(${i + 1}) ${c.summary}`).join(' ')}`,
-    details: [], assetChanges, ...(approvals.length ? { approvals } : {}), warnings, attention: attentionOf(warnings),
+    details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings, attention: attentionOf(warnings),
     decoding: { status: statuses.every(s => s === 'full') ? 'full' : statuses.every(s => s === 'opaque') ? 'opaque' : 'partial', decoder: 'batch', notes: b.notes },
     ...(simulation && { simulation }),
     calls,
