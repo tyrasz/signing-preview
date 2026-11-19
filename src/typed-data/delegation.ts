@@ -23,6 +23,7 @@ import { normalizeTransaction, previewTransaction } from '../evm/transaction.ts'
 import type { ApprovalChange, AssetChange, Preview, TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
 import { canMoveNow } from './exposure.ts';
+import { batchRule, probe, ruleOf, type Rule } from './delegation-probe.ts';
 
 export const DELEGATION_MANAGER = '0xdb9b1e94b5b69df7e401ddbede43491141047db3';
 const ANY_DELEGATE = '0x0000000000000000000000000000000000000a11';
@@ -66,6 +67,10 @@ interface CaveatRead {
   plain?: boolean;
   /** It bounds the native coin sent with the calls (ValueLte, NativeTokenTransferAmount, a period's, a stream's, a balance's fall). */
   nativeLimit?: boolean;
+  /** It caps the native coin sent in all, or per period (NativeTokenTransferAmount, NativeTokenPeriodTransfer, NativeTokenStreaming, MultiTokenPeriod's native). */
+  nativeTotal?: boolean;
+  /** It caps the native coin each redemption sends (NativeBalanceChangeEnforcer's fall): a total only with the redemptions bounded. */
+  nativePerRedemption?: boolean;
   /** Caveats inside it that this preview doesn't know (LogicalOrWrapperEnforcer's groups). */
   unread?: number;
   /** The only addresses that may redeem it (RedeemerEnforcer). */
@@ -88,7 +93,7 @@ const balanceChange = (what: 'native' | 'erc20' | 'erc721' | 'erc1155'): Reader 
   const info = asset ? await token(asset) : undefined;
   const thing = what === 'native' ? nativeOf(amount, native) : what === 'erc20' ? amountOf(amount, info, asset!) : `${amount} ${what === 'erc721' ? 'NFT' : `of token ${id}`} of ${shortAddress(asset!)}`;
   return { name: `${what === 'native' ? 'Native' : what === 'erc20' ? 'ERC20' : what === 'erc721' ? 'ERC721' : 'ERC1155'}BalanceChangeEnforcer`, kind: 'limit',
-    ...(what === 'native' && decrease && { nativeLimit: true }),
+    ...(what === 'native' && decrease && { nativeLimit: true, nativePerRedemption: true }),
     text: decrease ? `each time it is redeemed, ${shortAddress(who)}'s balance may fall by at most ${thing}` : `each time it is redeemed, ${shortAddress(who)}'s balance must rise by at least ${thing}` };
 };
 async function erc20Streaming(t: string, token: (address: string) => Promise<TokenInfo | undefined>): Promise<CaveatRead> {
@@ -158,7 +163,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     for (const c of configs) sum.set(c.address, (sum.get(c.address) ?? 0n) + c.amount);
     const nativeCap = configs.some(c => c.nativeCoin) ? sum.get('0x0000000000000000000000000000000000000000') : undefined;
     const erc20 = configs.some(c => !c.nativeCoin);
-    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true }),
+    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: true }),
       text: `only ${[erc20 && 'transfer() calls on these tokens', nativeCap !== undefined && `plain ${native} transfers`].filter(Boolean).join(', or ')}, up to: ${configs.map(c => c.text).join('; ')}` };
   } },
   '0x3790e6b7233f779b09da74c72b6e94813925b9af': { name: 'ERC721TransferEnforcer', read: t => ({ name: 'ERC721TransferEnforcer', kind: 'scope', text: `only transferring NFT #${word(t, 20)} of ${shortAddress(addr(t, 0))} (transferFrom or safeTransferFrom), to anyone` }) },
@@ -187,7 +192,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
   '0x4803a326dded6ddbc60e659e5ed12d85c7582811': { name: 'NativeTokenPaymentEnforcer', read: (t, _, native) => ({ name: 'NativeTokenPaymentEnforcer', kind: 'condition', text: `whoever redeems it must pay ${nativeOf(word(t, 20), native)} to ${shortAddress(addr(t, 0))}` }) },
   '0xd10b97905a320b13a0608f7e9cc506b56747df19': { name: 'NativeTokenStreamingEnforcer', read: (t, _, native) => {
     const initial = word(t, 0), max = word(t, 32), rate = word(t, 64), start = word(t, 96);
-    return { name: 'NativeTokenStreamingEnforcer', kind: 'limit', native: max, nativeLimit: true, text: `${native} sent with the calls: ${nativeOf(initial, native)} from ${formatTimestamp(Number(start) * 1000)}, then ${nativeOf(rate, native)} more each second, ${nativeOf(max, native)} at most` };
+    return { name: 'NativeTokenStreamingEnforcer', kind: 'limit', native: max, nativeLimit: true, nativeTotal: true, text: `${native} sent with the calls: ${nativeOf(initial, native)} from ${formatTimestamp(Number(start) * 1000)}, then ${nativeOf(rate, native)} more each second, ${nativeOf(max, native)} at most` };
   } },
   '0xeaa1be91f0ea417820a765df9c5be542286bffdc': { name: 'ERC20MultiOperationIncreaseBalanceEnforcer', read: async (t, token) => {
     const address = addr(t, 0), info = await token(address);
@@ -217,11 +222,11 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     const amount = word(t, 0), period = word(t, 32), start = word(t, 64);
     // It checks only the value each call sends, not what is called (its comment expects no call data, but nothing
     // checks that: MetaMask pairs it with ExactCalldataEnforcer(0x)).
-    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
+    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: true, text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
   } },
   '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320': { name: 'NativeTokenTransferAmountEnforcer', read: (t, _, native) => {
     const amount = word(t, 0);
-    return { name: 'NativeTokenTransferAmountEnforcer', kind: 'limit', native: amount, nativeLimit: true, text: `${nativeOf(amount, native)} sent with the calls, in all` };
+    return { name: 'NativeTokenTransferAmountEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: true, text: `${nativeOf(amount, native)} sent with the calls, in all` };
   } },
   '0x92bf12322527caa612fd31a0e810472bbb106a8f': { name: 'ValueLteEnforcer', read: (t, _, native) => ({ name: 'ValueLteEnforcer', kind: 'limit', nativeLimit: true, text: `at most ${nativeOf(word(t, 0), native)} sent with each call` }) },
   '0xbd7b277507723490cd50b12eaafe87c616be6880': { name: 'NativeBalanceChangeEnforcer', read: balanceChange('native') },
@@ -247,6 +252,26 @@ const TX_ONLY = new Set(['fee_below_base_fee', 'nonce_replaces', 'nonce_used', '
 const TX_DETAILS = /^Network fee\b/;
 /** Warnings that a call would fail, said once for the delegation (delegation_calls_fail): the signer pays nothing for it. */
 const FAILS = new Set(['simulation_reverted', 'batch_will_fail', 'batch_partial_failure']);
+
+/** A caveat's rule on the calls it lets through (src/typed-data/delegation-probe.ts); null when its terms don't read. */
+function ruleFor(enforcer: string, t: string): Rule | null {
+  if (!ENFORCERS[enforcer]) return null;
+  const executions = () => decodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'callData', type: 'bytes' }] }], `0x${t}`)[0]
+    .map(e => ({ target: e.target.toLowerCase(), value: e.value, data: e.callData.toLowerCase() }));
+  try {
+    if (enforcer === '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c') {
+      const [groups] = decodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], `0x${t}`);
+      return { groups: groups.map(g => g.caveats.map(c => ruleFor(c.enforcer.toLowerCase(), c.terms.slice(2).toLowerCase()))) };
+    }
+    if (enforcer === '0x1e141e455d08721dd5bcda1baa6ea5633afd5017') return batchRule(executions(), false);
+    if (enforcer === '0x982fd5c86bbf425d7d1451f974192d4525113dfd') return batchRule(executions(), true);
+    if (enforcer === '0x6649b61c873f6f9686a1e1ae9ee98ac380c7ba13') {
+      const token = `0x${t.slice(0, 40)}`, recipient = t.slice(40, 80), amount = t.slice(80, 144);
+      return batchRule([{ target: `0x${t.slice(144, 184)}`, value: BigInt(`0x${t.slice(184, 248)}`), data: `0x${t.slice(248)}` }, { target: token, value: 0n, data: `0xa9059cbb${recipient.padStart(64, '0')}${amount}` }], false);
+    }
+    return ruleOf(enforcer, t);
+  } catch { return null; }
+}
 
 /** "Can move now" for native coin: the cap against the account's balance (eth_getBalance), or nothing without an RPC. */
 export async function nativeCanMoveNow(env: TypedEnv, b: PreviewBuilder, chainId: number, account: string, cap: bigint, native: string, label: string): Promise<void> {
@@ -287,11 +312,13 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   // Each caveat read by its enforcer; one this preview doesn't know is named, its rule unread.
   const token = async (address: string): Promise<TokenInfo | undefined> => { try { return chainId !== null ? (await env.deps.tokens?.get(chainId, address)) ?? undefined : undefined; } catch { return undefined; } };
   const reads: (CaveatRead | null)[] = [];
+  const rules: (Rule | null)[] = [];
   for (const [i, c] of caveats.entries()) {
     const known = ENFORCERS[c.enforcer];
     let r: CaveatRead | null = null;
     try { r = known ? await known.read(c.terms.slice(2), token, native) : null; } catch { r = null; }
     reads.push(r);
+    rules.push(r ? ruleFor(c.enforcer, c.terms.slice(2)) : null);
     b.detail(`Caveat ${i + 1}`, r ? `${r.name}: ${r.text}` : `${known ? `${known.name}, its terms malformed` : `an enforcer this preview doesn't know (${c.enforcer})`}: ${c.terms.length > 2 + 64 * 2 ? `${c.terms.slice(0, 66)}… (${(c.terms.length - 2) / 2} bytes)` : c.terms}`, c.enforcer);
   }
   const unknown = caveats.filter((_, i) => !reads[i] || reads[i]!.unread);
@@ -302,36 +329,53 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   // ANY_DELEGATE, but a RedeemerEnforcer names who may redeem it.
   const redeemers = known.find(r => r.redeemers)?.redeemers;
   if (anyone && redeemers) who = redeemers.length === 1 ? shortAddress(redeemers[0]) : `the ${redeemers.length} redeemers it names`;
-  // What its caveats leave open. All of them must pass, so the narrowest scope decides; where none narrows what is
-  // called, the delegate makes any call as the account. Calls to the DelegationManager (redeemDelegations with no
-  // delegations has the caller, the account, run any call: its executeFromExecutor) or to the account itself (its
-  // execute, which the account may call on itself) are any call too.
-  const targets = known.find(r => r.targets && !r.anyContract)?.targets;
-  const pinned = !!exact || scopes.some(r => r.tokens || r.name === 'ERC721TransferEnforcer' || r.name === 'OwnershipTransferEnforcer' || r.name === 'ApprovalRevocationEnforcer');
-  const functions = scopes.filter(r => r.anyContract);
-  const selectors = functions.flatMap(r => r.selectors ?? []);
-  const nativeLimit = known.some(r => r.nativeLimit);
-  const gateways = (targets ?? []).filter(t => t === DELEGATION_MANAGER || t === delegator);
-  const through = gateways.length && (!functions.length || selectors.some(x => GATEWAY_SELECTORS.has(x)));
-  const executes = !targets && !pinned && selectors.some(x => GATEWAY_SELECTORS.has(x));
-  const full = !scopes.length || (!pinned && (!!through || executes));
+  // How often: once with an IdEnforcer, a count with LimitedCalls, else as often as its other caveats allow.
+  const once = known.some(r => r.once), count = known.reduce<bigint | undefined>((m, r) => r.redemptions !== undefined && (m === undefined || r.redemptions < m) ? r.redemptions : m, undefined);
+  const bounded = once || count !== undefined;
+  // What its caveats leave open: the calls an attacker would make, tried against every caveat's rule
+  // (src/typed-data/delegation-probe.ts). Caps on the totals (a token's, the native coin's) bound what gets through.
+  const cappedTokens = new Set(known.filter(r => r.kind === 'scope').flatMap(r => r.tokens?.map(t => t.address) ?? []));
+  const p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens });
+  const nativeTotal = known.some(r => r.nativeTotal), nativePerRedemption = known.some(r => r.nativePerRedemption);
+  const full = !!p.control;
   const account = root ? `your account ${shortAddress(delegator)}` : 'the account at the root of the delegation it passes on';
   const anyCall = `${who} can make any call as ${account}`;
+  const unless = unknown.length ? ` (unless ${unknown.length === 1 ? 'the enforcer' : 'one of the enforcers'} this preview doesn't read stops it)` : '';
   if (self) b.warn('info', 'delegation_to_self', `It delegates to your own account: only your account can redeem it, and it can already make any call. Its caveats are checks on what is done through it.`);
   else if (!root) b.warn(full ? 'caution' : 'info', 'delegation_redelegated', `It passes on a delegation your account holds (${shortAddress(authority)}): whoever redeems it acts as the account at the root of that chain, not yours, and ${full ? `${who} gets all that delegation allows` : `${who} can do at most what that delegation allows, within these caveats`}.`);
   else if (!caveats.length) b.warn('danger', 'delegation_unrestricted', `It has no caveats: ${anyCall}, at any time, as often as wanted: move every token and coin it holds, approve spenders, change its owners. This is full control of the account. Don't sign it unless you mean to hand the account over.`);
-  else if (!scopes.length) b.warn('danger', 'delegation_unrestricted', `None of its caveats restricts what is called: ${anyCall}${limits.length ? `, within these limits only: ${limits.join('; ')}` : ''}${unknown.length ? ` (unless ${unknown.length === 1 ? 'the enforcer' : 'one of the enforcers'} this preview doesn't read restricts it)` : ''}: move its other tokens and coin, approve spenders, change its owners.`);
-  else if (full) b.warn('danger', 'delegation_unrestricted', `Its calls may go to ${through ? gateways.map(g => g === delegator ? 'your account itself' : 'the DelegationManager').join(' and ') : 'any contract, with functions that run other calls'} (${through ? 'any function' : selectors.filter(x => GATEWAY_SELECTORS.has(x)).map(x => GATEWAY_SELECTORS.get(x)).join(', ')}): through ${through && gateways.length === 1 ? 'it' : 'them'}, ${anyCall}: move every token and coin it holds, approve spenders, change its owners.`);
+  else if (full && !scopes.length) b.warn('danger', 'delegation_unrestricted', `None of its caveats restricts what is called: ${anyCall}${limits.length ? `, within these limits only: ${limits.join('; ')}` : ''}${unless}: move its other tokens and coin, approve spenders, change its owners.`);
+  else if (full) b.warn('danger', 'delegation_unrestricted', `Its caveats let calls reach ${p.control![0]} (${p.control![1]}): through it, ${anyCall}${unless}: move every token and coin it holds, approve spenders, change its owners.`);
   if (root && !self && !full) {
-    // Functions or data, but on any contract: transfer() allowed on every token the account holds.
-    if (!targets && !pinned && functions.length && scopes.every(r => r.anyContract)) {
-      const open = functions.some(r => r.open);
-      b.warn(open ? 'danger' : 'caution', 'delegation_any_contract', `Its caveats limit which functions are called (${functions.map(r => r.name).join(', ')}), but not on which contract: ${who} can call them on any contract your account uses, every token it holds included${open ? ' (a transfer or an approval of each, to anyone or for any amount the rest allows)' : ''}.`);
+    // Tokens moved or approved: on any token is the account's every token.
+    if (p.tokens) {
+      const to = p.tokens.recipient ? ` to ${shortAddress(p.tokens.recipient)} only` : ' to anyone';
+      const fns = p.tokens.functions.join(', ');
+      const open = !p.tokens.recipient && p.tokens.amount === null;
+      const info = p.tokens.on?.length === 1 ? await token(p.tokens.on[0]) : undefined;
+      const units = (v: bigint) => info ? `${formatUnits(v, info.decimals)} ${info.symbol}` : `${v} base units`;
+      if (p.tokens.recipient && p.tokens.amount !== null && p.tokens.on && bounded) {
+        // A recipient and an amount pinned, a bounded number of times: a fixed transfer, in effect.
+        b.warn('info', 'delegation_fixed_transfer', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, for ${units(p.tokens.amount)}, ${once ? 'once' : `at most ${count} time${count === 1n ? '' : 's'}`}.`);
+      } else {
+        const amount = p.tokens.amount === null ? 'for any amount' : `for ${units(p.tokens.amount)} each time${bounded ? '' : ', as many times as wanted'}`;
+        if (!p.tokens.on) b.warn(open ? 'danger' : 'caution', 'delegation_any_contract', `Its caveats don't limit which contract is called: ${who} can call ${fns} on any token your account holds${to}, ${amount}${open ? ': all of every token' : ''}${unless}.`);
+        else b.warn('caution', 'delegation_any_function', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, ${amount}: if ${p.tokens.on.length === 1 ? 'it is a token' : 'they are tokens'}, ${p.tokens.amount === null ? `all of your balance of ${p.tokens.on.length === 1 ? 'it' : 'them'}` : 'that much of it each time'}${unless}.`);
+      }
     }
-    // Contracts, but any function on them with any value: a token's whole balance, coin sent to them.
-    else if (targets && !pinned && !functions.length && !scopes.some(r => r.plain)) b.warn('caution', 'delegation_any_function', `Its caveats limit which contracts are called (${targets.map(shortAddress).join(', ')}), but not what is called on them: ${who} can call any of their functions${nativeLimit ? '' : `, sending any amount of ${native}`}, as your account. If one is a token, that is all of your balance of it, transferred or approved to anyone.`);
-    // Plain transfers of native coin to anyone, with nothing bounding the amount.
-    if (!pinned && scopes.some(r => r.plain) && !nativeLimit) b.warn(targets ? 'caution' : 'danger', 'delegation_native_unlimited', `It allows plain ${native} transfers${targets ? ` to ${targets.map(shortAddress).join(', ')}` : ' to any address'}, and nothing limits the amount: ${who} can send all of your account's ${native}.`);
+    if (p.anyFunction?.length && (!p.tokens || p.tokens.on)) b.warn('caution', 'delegation_any_function', `${who} can call any function on ${p.anyFunction.map(shortAddress).join(', ')}, as your account: if ${p.anyFunction.length === 1 ? 'it is a token' : 'one is a token'}, all of your balance of it, transferred or approved to anyone${unless}.`);
+    // Native coin: per call, or with no cap, unless a total caps it (a native period, stream or amount; per-redemption
+    // and per-call caps only when the redemptions are bounded too). To a target named, only in a plain transfer or to
+    // an EOA (a call to a contract takes coin only into a payable function).
+    const capped = (perCall: bigint | null) => nativeTotal || (bounded && (perCall !== null || nativePerRedemption));
+    const each = (perCall: bigint | null) => perCall === null ? '' : `, up to ${nativeOf(perCall, native)} each time, as many times as wanted`;
+    if (p.native && !capped(p.native.perCall)) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}: nothing caps the total, so all of it${unless}.`);
+    else if (p.nativeTo) {
+      const eoa = async (a: string) => { try { return chainId !== null && !!env.deps.rpc?.has(chainId) && String(await env.deps.rpc.call(chainId, 'eth_getCode', [a, 'latest'])) === '0x'; } catch { return false; } };
+      const reach: { target: string; perCall: bigint | null }[] = [];
+      for (const r of p.nativeTo) if (!capped(r.perCall) && (r.plain || await eoa(r.target))) reach.push(r);
+      if (reach.length) b.warn('caution', 'delegation_native_unlimited', `${who} can send your account's ${native} to ${reach.map(r => shortAddress(r.target)).join(', ')}${each(reach.some(r => r.perCall === null) ? null : reach[0].perCall)}: nothing caps the total, so all of it${unless}.`);
+    }
   }
   if (unknown.length) b.warn('caution', 'delegation_caveat_unknown', `${unknown.length} of its caveats ${unknown.length === 1 ? 'is' : 'are'} enforced by ${unknown.length === 1 ? 'a contract' : 'contracts'} this preview doesn't know (${unknown.map(c => shortAddress(c.enforcer)).join(', ')}): ${unknown.length === 1 ? 'its' : 'their'} rules aren't read, so what they allow or forbid isn't shown.`);
   if (anyone && redeemers) b.warn('info', 'delegation_any_delegate', `Its delegate is ANY_DELEGATE, but a RedeemerEnforcer caveat lets only ${redeemers.map(shortAddress).join(', ')} redeem it.`);
@@ -346,7 +390,6 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   if (!ends && !self) b.warn('caution', 'delegation_no_expiry', `It has no expiry: it stays redeemable until you disable it (disableDelegation on the DelegationManager)${known.some(r => r.name === 'NonceEnforcer') ? ' or raise your nonce with its enforcer' : ''}, or its other caveats run out.`);
   // How often: once with an IdEnforcer, a count with LimitedCalls, else as often as its other caveats allow. Exact
   // calls are the same each time, so what they move repeats.
-  const once = known.some(r => r.once), count = known.reduce<bigint | undefined>((m, r) => r.redemptions !== undefined && (m === undefined || r.redemptions < m) ? r.redemptions : m, undefined);
   if (exact && !once && count === undefined) b.warn('caution', 'delegation_repeatable', `Nothing limits how often it can be redeemed: the exact call${exact.length === 1 ? '' : 's'} can be made again and again, each time moving what is shown below, until you disable it${ends ? ' or it expires' : ''}.`);
   else if (exact && !once && count !== undefined && count > 1n) b.warn('info', 'delegation_repeatable', `It can be redeemed ${count} times: the exact call${exact.length === 1 ? '' : 's'} can be made ${count} times, each time moving what is shown below.`);
   if (env.signer && env.signer !== delegator) b.warn('info', 'delegation_owner_signature', `You sign as an owner of the smart account ${shortAddress(delegator)}: the delegation is the account's, not ${shortAddress(env.signer)}'s.`);

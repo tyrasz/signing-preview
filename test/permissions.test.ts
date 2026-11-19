@@ -66,7 +66,11 @@ test('Unknown types and rules, malformed requests, several permissions at once',
   assert.ok(codes(m).includes('permission_malformed'));
   assert.match(m.warnings.find(w => w.code === 'permission_malformed')!.message, /amountPerSecond is missing/);
   const r = await ask([request('native-token-allowance', { allowanceAmount: hex(10n ** 18n) }, [{ type: 'spending-cap', data: {} }])]);
-  assert.ok(codes(r).includes('permission_rule_unknown'));
+  assert.match(r.warnings.find(w => w.code === 'permission_malformed')!.message, /"spending-cap" rule isn't one MetaMask takes/);
+  const hexTime = await ask([request('native-token-allowance', { allowanceAmount: hex(10n ** 18n) }, [{ type: 'expiry', data: { timestamp: `0x${'f'.repeat(40)}` } }])]);
+  assert.match(hexTime.warnings.find(w => w.code === 'permission_malformed')!.message, /expiry timestamp isn't a positive number of seconds/);
+  const twice = await ask([request('native-token-allowance', { allowanceAmount: hex(10n ** 18n) }, [expiry, expiry])]);
+  assert.ok(codes(twice).includes('permission_malformed'));
   const both = await ask([request('native-token-allowance', { allowanceAmount: hex(10n ** 18n) }), request('erc20-token-periodic', { tokenAddress: USDC, periodAmount: hex(10_000_000n), periodDuration: 604_800 })]);
   assert.equal(both.calls?.length, 2);
   assert.equal(both.title, '2 permissions: Let 0x0165…e006 spend up to 1 ETH from your account; Let 0x0165…e006 spend up to 10 USDC a week from your account');

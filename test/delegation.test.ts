@@ -2,7 +2,7 @@
 // leaves unrestricted, and an exact execution simulated as the account would make it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeAbiParameters, encodeFunctionData, parseAbi, parseAbiParameters } from 'viem';
+import { encodeAbiParameters, encodeFunctionData, parseAbi, parseAbiParameters, toFunctionSelector } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
 import { DELEGATION_MANAGER } from '../src/typed-data/delegation.ts';
@@ -153,7 +153,9 @@ test('The rest of 1.3.0: OR groups, multi-token periods, a specific action then 
   assert.ok(!codes(b).includes('delegation_no_expiry'));
   assert.equal(detail(b, 'Caveat 1'), 'BlockNumberEnforcer: usable before block 25000000');
   assert.match(detail(b, 'Caveat 2')!, /to any contract, with any value, unless other caveats limit those$/);
-  assert.ok(codes(b).includes('delegation_any_contract'));
+  // Exact calldata on any contract: any value to any address with that data (an EOA takes it), and its transfer on every token.
+  assert.equal(b.warnings.find(w => w.code === 'delegation_native_unlimited')!.severity, 'danger');
+  assert.equal(b.warnings.find(w => w.code === 'delegation_any_contract')!.severity, 'caution');
   const pinned = await sign(delegation(BOB, [{ enforcer: E.targets, terms: `0x${USDC.slice(2)}` }, { enforcer: E.methods, terms: '0xa9059cbb' }]));
   assert.ok(!codes(pinned).includes('delegation_any_contract'));
   assert.equal(detail(pinned, 'Caveat 2'), 'AllowedMethodsEnforcer: only the functions transfer (0xa9059cbb)');
@@ -220,4 +222,38 @@ test('Review: a batch that fails when the simulator runs only its first call', a
   const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(delegation(BOB, [{ enforcer: E.exactBatch, terms: batch }, { enforcer: E.limitedCalls, terms: `0x${word(1n)}` }]))] }, { now: NOW, chainId: 1 }, failing);
   assert.ok(codes(p).includes('delegation_calls_fail'));
   assert.deepEqual(p.assetChanges, []);
+});
+
+test('Second review: routes to full control, coin and tokens the probes find', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const sev = async (caveats: { enforcer: string; terms: string }[], code: string) => (await sign(delegation(BOB, [...caveats, until]))).warnings.find(w => w.code === code)?.severity;
+  const att = (fn: string) => toFunctionSelector(`function ${fn}`);
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  const targets = (...a: string[]) => ({ enforcer: E.targets, terms: `0x${a.map(x => x.slice(2).toLowerCase()).join('')}` });
+  const methods = (...s: string[]) => ({ enforcer: E.methods, terms: `0x${s.map(x => x.slice(2)).join('')}` });
+  const or = (...groups: { enforcer: string; terms: string }[][]) => ({ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [groups.map(g => ({ caveats: g.map(c => ({ ...c, args: '0x' })) })) as never]) });
+  const exactData = (d: string) => ({ enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: d });
+  const valueLte = (v: bigint) => ({ enforcer: E.valueLte, terms: `0x${word(v)}` });
+  // Full control through the account itself or the DelegationManager, however the function is pinned.
+  assert.equal(await sev([targets(ALICE), calldata(0, att('execute(bytes32,bytes)'))], 'delegation_unrestricted'), 'danger');
+  assert.equal(await sev([targets(DELEGATION_MANAGER), calldata(0, att('redeemDelegations(bytes[],bytes32[],bytes[])'))], 'delegation_unrestricted'), 'danger');
+  assert.equal(await sev([or([targets(DELEGATION_MANAGER), methods(att('redeemDelegations(bytes[],bytes32[],bytes[])'))])], 'delegation_unrestricted'), 'danger');
+  assert.equal(await sev([targets(ALICE), methods(att('transferOwnership(address)'))], 'delegation_unrestricted'), 'danger');
+  assert.equal(await sev([{ enforcer: '0x7eef9734e7092032b5c56310eb9bbd1f4a524681', terms: ALICE.toLowerCase() }], 'delegation_unrestricted'), 'danger');
+  // Native coin: a cap per call is no cap unless the redemptions are bounded.
+  assert.equal(await sev([exactData('0x'), valueLte(10n ** 18n)], 'delegation_native_unlimited'), 'danger');
+  assert.equal(await sev([exactData('0x'), valueLte(10n ** 18n), { enforcer: E.limitedCalls, terms: `0x${word(1n)}` }], 'delegation_native_unlimited'), undefined);
+  assert.equal(await sev([exactData('0x'), { enforcer: '0xbd7b277507723490cd50b12eaafe87c616be6880', terms: `0x01${ALICE.slice(2).toLowerCase()}${word(10n ** 18n)}` }], 'delegation_native_unlimited'), 'danger');
+  assert.equal(await sev([or([targets(USDC)], [exactData('0x')])], 'delegation_native_unlimited'), 'danger');
+  assert.equal(await sev([or([{ enforcer: E.erc20Amount, terms: `0x${USDC.slice(2)}${word(10n ** 6n)}` }], [targets(BOB), exactData('0x')])], 'delegation_native_unlimited'), 'caution');
+  const batchOfEmpty = encodeAbiParameters(parseAbiParameters('(address target, uint256 value, bytes callData)[]'), [[{ target: USDC, value: 0n, callData: '0x' }, { target: USDC, value: 0n, callData: '0x' }]]);
+  assert.equal(await sev([{ enforcer: '0x982fd5c86bbf425d7d1451f974192d4525113dfd', terms: batchOfEmpty }], 'delegation_native_unlimited'), 'danger');
+  // A token's functions with open arguments: its whole balance.
+  assert.equal(await sev([targets(USDC), methods(att('transfer(address,uint256)'))], 'delegation_any_function'), 'caution');
+  // No false danger on MetaMask's own patterns, or a payee that is the account itself.
+  for (const caveats of [
+    [{ enforcer: '0x474e3ae7e169e940607cc624da8a15eb120139ab', terms: `0x${USDC.slice(2)}${word(10n ** 6n)}${word(86_400n)}${word(BigInt(NOW / 1000))}` }, valueLte(0n)],
+    [{ enforcer: '0xd10b97905a320b13a0608f7e9cc506b56747df19', terms: `0x${word(0n)}${word(10n ** 18n)}${word(10n ** 12n)}${word(BigInt(NOW / 1000))}` }, exactData('0x')],
+    [{ enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 17n)}${word(86_400n)}${word(BigInt(NOW / 1000))}` }, exactData('0x'), targets(ALICE)],
+  ]) assert.notEqual((await sign(delegation(BOB, [...caveats, until]))).attention, 'danger', JSON.stringify(caveats.map(c => c.enforcer)));
 });

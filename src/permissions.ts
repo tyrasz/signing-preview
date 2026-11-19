@@ -63,7 +63,12 @@ async function permissionDelegation(req: Record<string, unknown>, chainId: numbe
     return v;
   };
   const optional = (key: string, fallback: bigint) => data[key] === undefined || data[key] === null ? fallback : need(key, () => true);
-  const start = data.startTime === undefined || data.startTime === null ? BigInt(Math.floor(now / 1000)) : need('startTime');
+  // Times and periods are numbers of seconds in MetaMask's schema (zod numbers): a hex string or a huge value is refused.
+  const seconds = (v: unknown, what: string) => {
+    if (typeof v !== 'number' || !Number.isSafeInteger(v) || v <= 0) throw new Malformed(`its ${what} isn't a positive number of seconds`);
+    return BigInt(v);
+  };
+  const start = data.startTime === undefined || data.startTime === null ? BigInt(Math.floor(now / 1000)) : seconds(data.startTime, 'startTime');
   const token = async (): Promise<{ address: string; info?: TokenInfo }> => {
     const address = String(data.tokenAddress ?? '');
     if (!ADDRESS.test(address) || /^0x0{40}$/.test(address)) throw new Malformed('its tokenAddress is missing or not a token');
@@ -99,7 +104,7 @@ async function permissionDelegation(req: Record<string, unknown>, chainId: numbe
       const allowance = type.endsWith('allowance');
       const t = erc20 ? await token() : null;
       const amount = need(allowance ? 'allowanceAmount' : 'periodAmount');
-      const period = allowance ? MAX : (() => { const p = quantity(data.periodDuration); if (p === null || p <= 0n || p > 315_360_000n) throw new Malformed('its periodDuration is missing, not positive or over ten years'); return p; })();
+      const period = allowance ? MAX : (() => { const p = seconds(data.periodDuration, 'periodDuration'); if (p > 315_360_000n) throw new Malformed('its periodDuration is over ten years'); return p; })();
       caveats.push(t ? { enforcer: ENFORCER.erc20Period, terms: `0x${addressHex(t.address)}${word(amount)}${word(period)}${word(start)}` }
         : { enforcer: ENFORCER.nativePeriod, terms: `0x${word(amount)}${word(period)}${word(start)}` });
       what = `spend up to ${t ? tokenText(amount, t) : coin(amount)}${allowance ? '' : ` ${per(period)}`} from your account`;
@@ -118,21 +123,26 @@ async function permissionDelegation(req: Record<string, unknown>, chainId: numbe
   // The other half of each kind: native coin only as plain transfers; tokens with no native coin sent.
   if (type.startsWith('native')) caveats.push({ enforcer: ENFORCER.exactCalldata, terms: '0x' });
   else if (erc20) caveats.push({ enforcer: ENFORCER.valueLte, terms: `0x${word(0n)}` });
-  // Rules.
-  for (const rule of Array.isArray(req.rules) ? req.rules as { type?: unknown; data?: Record<string, unknown> }[] : []) {
+  // Rules: those MetaMask takes for the type (SUPPORTED_RULE_TYPES), once each.
+  const list = Array.isArray(req.rules) ? req.rules as { type?: unknown; data?: Record<string, unknown> }[] : [];
+  const names = list.map(r => nameOf(r?.type));
+  if (new Set(names).size !== names.length) throw new Malformed('it repeats a rule type');
+  const supported = type === 'token-approval-revocation' ? ['expiry', 'redeemer'] : RULES;
+  for (const n of names) if (!supported.includes(n)) throw new Malformed(`its "${n || 'unnamed'}" rule isn't one MetaMask takes for ${type} (${supported.join(', ')})`);
+  for (const rule of list) {
     const name = nameOf(rule?.type), d = rule?.data ?? {};
     const addresses = Array.isArray(d.addresses) ? (d.addresses as unknown[]).filter((a): a is string => typeof a === 'string' && ADDRESS.test(a)).map(a => a.toLowerCase()) : [];
-    if (name === 'expiry') {
-      const ts = quantity(d.timestamp);
-      if (ts === null || ts <= 0n) throw new Malformed('its expiry rule has no timestamp');
-      caveats.push({ enforcer: ENFORCER.timestamp, terms: `0x${half(0n)}${half(ts)}` });
-    } else if (name === 'redeemer' && addresses.length) caveats.push({ enforcer: ENFORCER.redeemer, terms: `0x${addresses.map(addressHex).join('')}` });
-    else if (name === 'payee' && addresses.length && type !== 'token-approval-revocation') {
-      caveats.push(erc20 ? { enforcer: ENFORCER.allowedCalldata, terms: `0x${word(4n)}${addressHex(addresses[0]).padStart(64, '0')}` }
-        : { enforcer: ENFORCER.allowedTargets, terms: `0x${addresses.map(addressHex).join('')}` });
-      what += `, paid only to ${addresses.map(shortAddress).join(', ')}`;
-      if (erc20 && addresses.length > 1) warnings.push(['info', 'permission_payee_first', `Its payee rule names ${addresses.length} addresses; MetaMask's caveat for a token holds one, so only ${shortAddress(addresses[0])} is shown.`]);
-    } else warnings.push(['caution', 'permission_rule_unknown', `Its "${name || 'unnamed'}" rule isn't one this preview knows (${RULES.join(', ')}): what it adds to the permission isn't shown.`]);
+    if (name === 'expiry') caveats.push({ enforcer: ENFORCER.timestamp, terms: `0x${half(0n)}${half(seconds(d.timestamp, 'expiry timestamp'))}` });
+    else {
+      if (!addresses.length) throw new Malformed(`its ${name} rule names no addresses`);
+      if (name === 'redeemer') caveats.push({ enforcer: ENFORCER.redeemer, terms: `0x${addresses.map(addressHex).join('')}` });
+      else {
+        caveats.push(erc20 ? { enforcer: ENFORCER.allowedCalldata, terms: `0x${word(4n)}${addressHex(addresses[0]).padStart(64, '0')}` }
+          : { enforcer: ENFORCER.allowedTargets, terms: `0x${addresses.map(addressHex).join('')}` });
+        what += `, paid only to ${addresses.map(shortAddress).join(', ')}`;
+        if (erc20 && addresses.length > 1) warnings.push(['info', 'permission_payee_first', `Its payee rule names ${addresses.length} addresses; MetaMask's caveat for a token holds one, so only ${shortAddress(addresses[0])} is shown.`]);
+      }
+    }
   }
   const typed = {
     domain: { name: 'DelegationManager', version: '1', chainId, verifyingContract: DELEGATION_MANAGER },
