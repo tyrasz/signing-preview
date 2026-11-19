@@ -10,6 +10,7 @@
 // intents, Base meta-transactions) recover to their senders over the digest computed here.
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
+import { tokenSourceWarnings } from '../evm/common.ts';
 import type { TokenInfo } from '../types.ts';
 import { big, str, type TypedEnv } from './common.ts';
 
@@ -22,9 +23,9 @@ const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 export function settlerWitness(types: Record<string, { name: string; type: string }[]>, primaryType: string, message: Record<string, unknown>) {
   if (primaryType !== 'PermitWitnessTransferFrom') return null;
   const field = types.PermitWitnessTransferFrom?.find(f => f.name === 'slippageAndActions' || f.name === 'slippage');
-  if (!field) return null;
+  if (!field || !Object.hasOwn(types, field.type) || !Array.isArray(types[field.type])) return null;
   const kind = field.name as keyof typeof FIELDS;
-  if (types[field.type]?.map(f => `${f.type} ${f.name}`).join(',') !== FIELDS[kind]) return null;
+  if (types[field.type].map(f => `${f.type} ${f.name}`).join(',') !== FIELDS[kind]) return null;
   const w = message[kind] as Record<string, unknown> | undefined;
   if (!w || typeof w !== 'object') return null;
   const recipient = str(w.recipient).toLowerCase(), buyToken = str(w.buyToken).toLowerCase(), minAmountOut = big(w.minAmountOut);
@@ -56,8 +57,12 @@ export async function settlerSwap(w: NonNullable<ReturnType<typeof settlerWitnes
   const settler = chainId !== null ? await isSettler(env, chainId, spender, w.kind === 'slippage' ? 4 : 3) : undefined;
   if (settler === false) b.warn('danger', 'settler_unknown', `It is signed for ${shortAddress(spender)}, which isn't 0x's Settler (its deployer, ${shortAddress(DEPLOYER)}, names others): whatever that contract does with your tokens isn't bound by the minimum shown.`);
   else if (settler === undefined) b.warn('caution', 'settler_unchecked', `Whether ${shortAddress(spender)} is 0x's Settler wasn't checked (no RPC): only Settler holds the swap to the minimum and recipient shown.`);
+  // The minimum is in the token bought: one that isn't the token its name says, or isn't known, makes it no minimum.
+  if (!native && chainId !== null) tokenSourceWarnings(b, chainId, info);
+  if (!native && !info) b.warn('caution', 'unknown_token', `The token bought (${w.buyToken}) isn't in the known-token list: the minimum is in its units, whatever it is worth.`);
   if (!yours) b.warn('caution', 'settler_recipient_other', `What the swap buys goes to ${shortAddress(w.recipient)}, not to you.`);
-  if (w.minAmountOut === 0n) b.warn('caution', 'settler_no_minimum', `It sets no minimum for what the swap gives: it can be filled at any price, down to nothing.`);
+  // With no minimum, an intent's solver (which picks the route) can keep what you sell; a meta-transaction's route is signed.
+  if (w.minAmountOut === 0n) b.warn(w.kind === 'slippage' ? 'danger' : 'caution', 'settler_no_minimum', w.kind === 'slippage' ? 'It sets no minimum for what the swap gives, and a solver picks the route: it can be filled for nothing.' : 'It sets no minimum for what the swap gives: it can be filled at any price, down to nothing.');
   b.note(`A gasless 0x swap: a relayer submits it, Settler takes ${input} and must send at least ${least} to ${yours ? 'you' : shortAddress(w.recipient)}, or the whole swap fails.`);
   return {
     title: `0x: swap ${input} for at least ${least}${yours ? '' : `, to ${shortAddress(w.recipient)}`}`,

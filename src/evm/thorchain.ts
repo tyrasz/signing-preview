@@ -9,7 +9,7 @@
 // ASSET is CHAIN.SYMBOL[-CONTRACT] or a short code (b for BTC.BTC); LIMIT is the least the swap may give, in the
 // network's units of 10^-8. Read from 1,850 real memos to the four routers below (2026-11-19). The vault must be the
 // network's current inbound address (its inbound_addresses): the router sends to any vault it is given.
-import { decodeFunctionData, parseAbi } from 'viem';
+import { decodeFunctionData, isAddress, parseAbi, sha256 } from 'viem';
 import { formatTimestamp, formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import { decoded, nativeAmount, tokenAmount, tokenInfo, tokenSourceWarnings, type Adapter } from './common.ts';
@@ -30,17 +30,49 @@ const SHORT: Record<string, Record<string, string>> = {
   Maya: { b: 'BTC.BTC', e: 'ETH.ETH', c: 'MAYA.CACAO' },
 };
 const NO_LIMIT_BPS = 100n;
-/** Address formats by the chain an asset is on, as the networks' own clients take them (bech32 data characters, base58, hex). */
+/**
+ * Whether a destination is an address on the chain of `asset` (CHAIN.SYMBOL), its checksum checked: base58check
+ * (Bitcoin-style, TRON, XRP's alphabet, Zcash), bech32 or bech32m (segwit, Cosmos-style), EIP-55 where an EVM address
+ * is in mixed case. A string the network can't read as an address it takes as a name (THORName, MAYAName), so one with
+ * an address's shape but not its checksum is a name. Undefined where the chain's format isn't known here.
+ */
 const B32 = '[02-9ac-hj-np-z]', B58 = '[1-9A-HJ-NP-Za-km-z]';
-const ADDRESS_FORMATS: Record<string, RegExp> = {
-  BTC: new RegExp(`^(bc1q${B32}{38}|bc1[qp]${B32}{58}|[13]${B58}{25,34})$`), LTC: new RegExp(`^(ltc1q${B32}{38}|ltc1[qp]${B32}{58}|[LM3]${B58}{26,33})$`),
-  BCH: new RegExp(`^((bitcoincash:)?[qp]${B32}{41}|[13]${B58}{25,34})$`), DOGE: new RegExp(`^[DA9]${B58}{25,34}$`),
-  ETH: /^0x[0-9a-fA-F]{40}$/, BSC: /^0x[0-9a-fA-F]{40}$/, AVAX: /^0x[0-9a-fA-F]{40}$/, BASE: /^0x[0-9a-fA-F]{40}$/, ARB: /^0x[0-9a-fA-F]{40}$/,
-  GAIA: new RegExp(`^cosmos1${B32}{38}$`), THOR: new RegExp(`^thor1${B32}{38}$`), MAYA: new RegExp(`^maya1${B32}{38}$`),
-  TRON: new RegExp(`^T${B58}{33}$`), XRP: new RegExp(`^r${B58}{24,34}$`), SOL: new RegExp(`^${B58}{32,44}$`), ZEC: new RegExp(`^t[13]${B58}{33}$`),
+const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz', XRP58 = 'rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz';
+function base58check(s: string, alphabet = BASE58): boolean {
+  let n = 0n;
+  for (const c of s) { const i = alphabet.indexOf(c); if (i < 0) return false; n = n * 58n + BigInt(i); }
+  let zeros = 0;
+  while (s[zeros] === alphabet[0]) zeros++;
+  const hex = n.toString(16), bytes = '00'.repeat(zeros) + (hex.length % 2 ? `0${hex}` : hex);
+  if (bytes.length < 10) return false;
+  return sha256(sha256(`0x${bytes.slice(0, -8)}`)).slice(2, 10) === bytes.slice(-8);
+}
+function bech32(s: string, hrp: string): boolean {
+  const lower = s.toLowerCase();
+  if ((s !== lower && s !== s.toUpperCase()) || !lower.startsWith(`${hrp}1`)) return false;
+  const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l', GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  const data = [...lower.slice(hrp.length + 1)].map(c => CHARSET.indexOf(c));
+  if (data.length < 7 || data.some(d => d < 0)) return false;
+  let chk = 1;
+  for (const v of [...[...hrp].map(c => c.charCodeAt(0) >> 5), 0, ...[...hrp].map(c => c.charCodeAt(0) & 31), ...data]) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i = 0; i < 5; i++) if ((top >>> i) & 1) chk ^= GEN[i];
+  }
+  return chk === 1 || chk === 0x2bc830a3;
+}
+const evm = (d: string) => /^0x[0-9a-fA-F]{40}$/.test(d) && isAddress(d, { strict: true });
+const ADDRESS_CHECKS: Record<string, (d: string) => boolean> = {
+  BTC: d => new RegExp(`^(bc1q${B32}{38}|bc1[qp]${B32}{58})$`).test(d) ? bech32(d, 'bc') : new RegExp(`^[13]${B58}{25,34}$`).test(d) && base58check(d),
+  LTC: d => new RegExp(`^(ltc1q${B32}{38}|ltc1[qp]${B32}{58})$`).test(d) ? bech32(d, 'ltc') : new RegExp(`^[LM3]${B58}{26,33}$`).test(d) && base58check(d),
+  BCH: d => new RegExp(`^(bitcoincash:)?[qp]${B32}{41}$`).test(d) || (new RegExp(`^[13]${B58}{25,34}$`).test(d) && base58check(d)),
+  DOGE: d => new RegExp(`^[DA9]${B58}{25,34}$`).test(d) && base58check(d),
+  ETH: evm, BSC: evm, AVAX: evm, BASE: evm, ARB: evm,
+  GAIA: d => bech32(d, 'cosmos'), THOR: d => bech32(d, 'thor'), MAYA: d => bech32(d, 'maya'),
+  TRON: d => new RegExp(`^T${B58}{33}$`).test(d) && base58check(d), XRP: d => /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(d) && base58check(d, XRP58),
+  SOL: d => new RegExp(`^${B58}{32,44}$`).test(d), ZEC: d => new RegExp(`^t[13]${B58}{33}$`).test(d) && base58check(d),
 };
-/** Whether a destination is an address on the chain of `asset` (CHAIN.SYMBOL); undefined where that chain's format isn't known here. */
-const addressOn = (asset: string | undefined, destination: string) => { const f = asset ? ADDRESS_FORMATS[asset.split('.')[0]] : undefined; return f ? f.test(destination) : undefined; };
+const addressOn = (asset: string | undefined, destination: string) => { const chain = asset?.split('.')[0]; return chain && Object.hasOwn(ADDRESS_CHECKS, chain) ? ADDRESS_CHECKS[chain](destination) : undefined; };
 
 export interface ThorMemo {
   action: 'swap' | 'limit_swap' | 'trade' | 'secure' | 'add' | 'other';

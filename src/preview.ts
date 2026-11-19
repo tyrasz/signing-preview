@@ -148,7 +148,11 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   const txs = given.map(tx => suffix && suffix !== '0x' && tx.to && tx.data !== '0x' ? { ...tx, data: `${tx.data}${suffix.slice(2).toLowerCase()}` as `0x${string}` } : tx);
   // Decoded first: decoders name tokens the calls change without mentioning them, which state-reading simulators need.
   const decoded: Decoded[] = [];
-  for (const tx of txs) decoded.push(await decodeTransaction(tx, deps, context));
+  // (Where a call with the suffix reads as nothing, as a strict ABI decoder may, it is read as the dApp gave it.)
+  for (const [i, tx] of txs.entries()) {
+    const d = await decodeTransaction(tx, deps, context);
+    decoded.push(d.status === 'opaque' && tx !== given[i] ? await decodeTransaction(given[i], deps, context).then(g => g.status === 'opaque' ? d : g) : d);
+  }
 
   // Simulate the whole batch in order when the simulator can; otherwise only the first call is independent.
   let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);

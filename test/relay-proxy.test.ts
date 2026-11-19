@@ -96,3 +96,10 @@ test('Seventh review: what the router pays others, only Relay\'s own contracts r
   const nested = await sign(withCalls([call(PROXY, data)]));
   assert.ok(nested.warnings.some(w => w.code === 'relay_call_unread' && /nested inside two others/.test(w.message)));
 });
+
+test('Eighth review: coin paid with a message, or by the Universal Router, is said', async () => {
+  const call = (target: string, callData: string, value = '0') => ({ target, allowFailure: false, value, callData });
+  const withCalls = (cs: ReturnType<typeof call>[]) => { const w = witness(); (w.message.witness as { call3Values: unknown[] }).call3Values = cs; return w; };
+  const text = `0x${Buffer.from('gm, thanks').toString('hex')}`;
+  assert.ok(codes(await sign(withCalls([call(EVIL, text, '5000000000000000000')]))).includes('relay_call_recipient'));
+});

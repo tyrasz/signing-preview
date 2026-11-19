@@ -48,3 +48,15 @@ test("Another recipient, no minimum, a spender that isn't 0x's Settler, no RPC",
   assert.equal((await sign(swap({ spender: '0x1234567890123456789012345678901234567890' }))).warnings.find(w => w.code === 'settler_unknown')?.severity, 'danger');
   assert.ok(codes(await sign(swap(), deps(false))).includes('settler_unchecked'));
 });
+
+test('Eighth review: the token bought is checked, an intent with no minimum is a danger, odd type names do not crash', async () => {
+  const fake = swap();
+  (fake.message as Record<string, Record<string, unknown>>).slippageAndActions.buyToken = '0xfa4efa4efa4efa4efa4efa4efa4efa4efa4efa4e';
+  assert.ok(codes(await sign(fake)).includes('unknown_token'));
+  assert.equal((await sign(swap({ kind: 'intent', min: '0' }))).warnings.find(w => w.code === 'settler_no_minimum')?.severity, 'danger');
+  for (const name of ['constructor', 'toString', '__proto__']) {
+    const odd = swap({ kind: 'intent' });
+    (odd.types.PermitWitnessTransferFrom as { name: string; type: string }[])[4].type = name;
+    await sign(odd); // no throw
+  }
+});

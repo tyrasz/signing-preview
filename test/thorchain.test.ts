@@ -76,3 +76,10 @@ test('Seventh review: short codes that are Object properties, a destination that
   assert.equal(odd.warnings.find(w => w.code === 'thorchain_unexpected_coin')?.severity, 'caution');
   assert.ok(odd.assetChanges.some(a => a.asset === 'native'));
 });
+
+test('Eighth review: an address-shaped name fails its checksum; real addresses pass', async () => {
+  assert.ok(codes(await send('=:BTC.BTC:1BoatSLRxxxxxxxxxxxxxxxxETtpyT:1')).includes('thorchain_destination_name'));
+  for (const real of ['=:BTC.BTC:1BoatSLRHtKNngkdXEeobR76b53LETtpyT:1', '=:d:DLhQL9CFkb13Z5AtiJrZkp35455XYTZnxt:1', '=:XRP.XRP:rpcBwxGz34fHwnwbyMkRf3Eh4JSa4pNH4V:1', '=:g:cosmos12t8y4r08wkqeq58hzjyvul3u49jygmcu70y9ew:1', '=:TRON.TRX:TWrxDz6qVYtCujxqwUu7riWWSBPQ7dbxQQ:1'])
+    assert.ok(!codes(await send(real)).includes('thorchain_destination_name'), real);
+  assert.ok(codes(await send('=:ETH.USDC:0x30960eb7ff617db38fDE0875A67b044BF39FC0D3:1')).includes('thorchain_destination_name'));
+});

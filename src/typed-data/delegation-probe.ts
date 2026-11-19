@@ -194,9 +194,11 @@ const lay = (data: string, list: Pin[]) => {
 };
 
 /** What the search for calls did: whether it tried every combination of OR groups, and the bytes it laid so far. */
-interface Search { incomplete: boolean; work: number }
+interface Search { incomplete: boolean; work: number; total: number }
 /** Hex characters of call data laid for one call tried (all its templates and variants), before its search stops (and says it didn't finish). */
 const WORK = 4_000_000;
+/** And for all the calls tried together (a caveat naming many contracts multiplies them). */
+const TOTAL_WORK = 60_000_000;
 /** The call tried: where it goes, with what value, in which mode. */
 type Attempt = { target: string; value: bigint; batch: boolean };
 
@@ -221,7 +223,7 @@ function pinSets(rules: (Rule | null)[], template: string, e: Attempt, search: S
     for (let i = 0; i < old.length; i++) if (old[i] !== p.value[i]) d++;
     return n + d;
   }, 0);
-  const passing = (a: { pins: Pin[]; group: (Rule | null)[] }) => { if (search.work > WORK) return false; search.work += base.length; return passes(a.group, { ...e, data: lay(base, a.pins) }); };
+  const passing = (a: { pins: Pin[]; group: (Rule | null)[] }) => { if (search.work > WORK || search.total > TOTAL_WORK) return false; search.work += base.length; search.total += base.length; return passes(a.group, { ...e, data: lay(base, a.pins) }); };
   const best = ors.map(o => {
     const able = o.filter(passing);
     return (able.length ? able : o).reduce<{ pins: Pin[] } | undefined>((a, g) => a === undefined || changed(g.pins) < changed(a.pins) ? g : a, undefined)?.pins ?? [];
@@ -234,7 +236,7 @@ function pinSets(rules: (Rule | null)[], template: string, e: Attempt, search: S
 /** The data an attacker would send for a call, with each set of the caveats' pinned bytes laid over it, and the data they fix outright. */
 function variants(template: string, rules: (Rule | null)[], withFixed: boolean, e: Attempt, search: Search): string[] {
   const out = new Set<string>([template]);
-  const add = (pins: Pin[]) => { if (search.work > WORK) { search.incomplete = true; return; } const d = lay(template, pins); search.work += d.length; out.add(d); };
+  const add = (pins: Pin[]) => { if (search.work > WORK || search.total > TOTAL_WORK) { search.incomplete = true; return; } const d = lay(template, pins); search.work += d.length; search.total += d.length; out.add(d); };
   // Each set with all its pins laid first (what a call satisfying them is), then each pin alone.
   const sets = pinSets(rules, template, e, search);
   for (const pins of sets) {
@@ -283,7 +285,7 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   // The exact executions' calls the preview simulates (a top-level caveat's, not one inside an OR): an execute(…) among
   // them runs only the calls fixed inside it, a hand-over only if one of those is (handsOver).
   const fixed = new Set(capped.simulated ?? []), fixedData = new Set(collect(rules, r => r.datas)), unsimulated = new Map<string, { target: string; value: bigint; data: string }>();
-  const search: Search = { incomplete: false, work: 0 };
+  const search: Search = { incomplete: false, work: 0, total: 0 };
   const handsOver = (data: string, depth: number): boolean => {
     const inner = depth < 4 ? innerCalls(data) : null;
     return inner === null || inner.some(c => (c.target === account && CONTROL.has(selectorOf(c.data)) && (!RUNS_FIXED.has(selectorOf(c.data)) || handsOver(c.data, depth + 1)))

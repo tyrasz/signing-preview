@@ -69,8 +69,11 @@ export const relayAdapter: Adapter = async (tx, env) => {
   const calls = request.calls;
   const inner: Decoded[] = [], titles: string[] = [];
   const assetChanges: AssetChange[] = [];
+  // (Calls inside calls are read two levels deep, as in relayCalls: their slots can all point at the same bytes.)
+  const depth = (env.context as { relayDepth?: number }).relayDepth ?? 0;
   for (const [i, c] of calls.slice(0, MAX_CALLS).entries()) {
-    const d = await decodeTransaction({ chainId: tx.chainId, from: RELAY_DEPOSITORY, to: c.to.toLowerCase(), data: c.data, value: c.value }, env.deps, env.context);
+    if (depth >= 2) { b.detail(calls.length > 1 ? `Call ${i + 1}` : 'Call', `a call to ${shortAddress(c.to)}, not read (nested too deep)`, c.to.toLowerCase()); continue; }
+    const d = await decodeTransaction({ chainId: tx.chainId, from: RELAY_DEPOSITORY, to: c.to.toLowerCase(), data: c.data, value: c.value }, env.deps, { ...env.context, relayDepth: depth + 1 } as AdapterEnv['context']);
     inner.push(d);
     // A transfer's recipient: "to you" when the payout comes to the sender, whose balance then goes up.
     const recipient = d.b.details.find(x => x.label === 'Recipient')?.value;
@@ -157,14 +160,18 @@ export async function relayCalls(w: { relayer?: unknown; refundTo?: unknown; nft
       titles.push(d.title);
       b.detail(`Call ${i + 1}`, `${d.title} (${shortAddress(target)})${c.allowFailure === true ? ', may fail' : ''}`, target);
       for (const x of d.b.warnings) if (x.severity !== 'info') b.warn(x.severity, x.code, `Call ${i + 1}: ${x.message}`);
+      // A router paying someone along the way (the Universal Router's TRANSFER, SWEEP, PAY_PORTION): said as a caution here.
+      for (const x of d.b.warnings) if (x.code === 'router_payment') b.warn('caution', 'relay_call_recipient', `Call ${i + 1}: ${x.message}`);
       // Where the call sends value: a transfer's recipient, a cleanup's, a swap's output and leftovers. One that isn't
       // you, your refund address or Relay's own contracts is said: a request that pays someone else.
       const to = new Set<string>();
       for (const x of d.b.details) {
         const a = (x.raw ?? x.value).toLowerCase();
         if (!/^0x[0-9a-f]{40}$/.test(a)) continue;
-        if ((x.label === 'Recipient' && ['erc20_transfer', 'erc20_transfer_from', 'native_transfer'].includes(d.decoder)) || (d.decoder === 'relay_router_cleanup' && /^Sends/.test(x.label)) || (d.decoder === 'relay_route_racer' && /^(Output to|Leftovers to)$/.test(x.label))) to.add(a);
+        if ((x.label === 'Recipient' && ['erc20_transfer', 'erc20_transfer_from', 'native_transfer', 'calldata_text'].includes(d.decoder)) || (d.decoder === 'relay_router_cleanup' && /^Sends/.test(x.label)) || (d.decoder === 'relay_route_racer' && /^(Output to|Leftovers to)$/.test(x.label))) to.add(a);
       }
+      // Coin sent with a call the target keeps (a plain transfer, a message, a call that doesn't read) is paid to it.
+      if ((value ?? 0n) > 0n && ['native_transfer', 'calldata_text', 'unknown'].includes(d.decoder)) to.add(target);
       for (const a of to) if (!ours(a)) b.warn('caution', 'relay_call_recipient', `Call ${i + 1} (${d.title.replace(/ \(Relay's (router|RouteRacer)\)$/, '')}) pays ${shortAddress(a)}, not you or your refund address: check it is who you mean to pay.`);
     } catch { titles.push(`a call to ${shortAddress(target)}`); b.warn('caution', 'relay_call_unread', `Call ${i + 1} couldn't be read: what it does isn't known.`); }
   }

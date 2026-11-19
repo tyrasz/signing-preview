@@ -468,3 +468,19 @@ test('Seventh review: a padding caveat does not exhaust the search, decoys past 
   assert.match((await run([plain, hourly, until(30n * 86_400n)], 10n ** 19n)).warnings.find(w => w.code === 'delegation_native_limited')?.message ?? '', /720 ETH over its window/);
   assert.match((await run([plain, hourly], 10n ** 19n)).warnings.find(w => w.code === 'delegation_native_limited')?.message ?? '', /with no end/);
 });
+
+test('Eighth review: periods counted from the allowance start, an OR confines only when every group does, many named contracts stay quick', async () => {
+  const NOWS = BigInt(NOW / 1000);
+  const until = (s: bigint) => ({ enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${(NOWS + s).toString(16).padStart(32, '0')}` });
+  const run = async (caveats: { enforcer: string; terms: string }[], balance?: bigint) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(delegation(BOB, caveats))] }, { now: NOW, chainId: 1 }, {
+    tokens: new StaticTokenRegistry(), ...(balance !== undefined && { rpc: { has: () => true, call: async (_c: number, method: string) => method === 'eth_getBalance' ? `0x${balance.toString(16)}` : '0x' } }) });
+  // 1 ETH a day, the day ending in a minute, an hour's window: two periods reachable, 2 ETH against 1.5 held.
+  const plain = { enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: '0x' };
+  const daily = { enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 18n)}${word(86_400n)}${word(NOWS - 86_400n + 60n)}` };
+  assert.ok(codes(await run([plain, daily, until(3_600n)], 15n * 10n ** 17n)).includes('delegation_native_limited'));
+  // 1000 contracts and 1000 functions named: bounded.
+  const started = Date.now();
+  const many = (n: number, size: number) => Array.from({ length: n }, (_, i) => (i + 1).toString(16).padStart(size, '0')).join('');
+  await run([{ enforcer: E.targets, terms: `0x${many(1000, 40)}` }, { enforcer: E.methods, terms: `0x${many(1000, 8)}` }, until(86_400n)]);
+  assert.ok(Date.now() - started < 6_000, `took ${Date.now() - started} ms`);
+});
