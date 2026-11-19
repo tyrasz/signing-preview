@@ -444,3 +444,27 @@ test('Sixth review: ANY_DELEGATE with an OR, a search past 256 with decoys, exac
   await run([calldata(4, 'ab'.repeat(65_536)), ...ors]);
   assert.ok(Date.now() - started < 3_000, `took ${Date.now() - started} ms`);
 });
+
+test('Seventh review: a padding caveat does not exhaust the search, decoys past 256 with no named contracts, a per-period native allowance over its window', async () => {
+  const EVIL = '0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1';
+  const NOWS = BigInt(NOW / 1000);
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  const zero = { enforcer: E.valueLte, terms: `0x${word(0n)}` };
+  const approveOnly = { enforcer: E.methods, terms: toFunctionSelector('function approve(address,uint256)') };
+  const until = (s: bigint) => ({ enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${(NOWS + s).toString(16).padStart(32, '0')}` });
+  const run = async (caveats: { enforcer: string; terms: string }[], balance?: bigint) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(delegation(BOB, caveats))] }, { now: NOW, chainId: 1 }, {
+    tokens: new StaticTokenRegistry(), ...(balance !== undefined && { rpc: { has: () => true, call: async (_c: number, method: string) => method === 'eth_getBalance' ? `0x${balance.toString(16)}` : method === 'eth_getCode' ? '0x' : '0x' } }) });
+  // 64 KB of required trailing bytes: each call tried has its own budget, so the drain is still found.
+  const drain = [approveOnly, calldata(4, `${word(BigInt(EVIL))}${'f'.repeat(64)}`), zero, until(86_400n)];
+  assert.equal((await run([...drain, calldata(68, 'ab'.repeat(65_536))])).warnings.find(w => w.code === 'delegation_any_contract')?.severity, 'danger');
+  // Decoys past 256 combinations, no contract named: a partial search is a danger.
+  const or = (groups: { enforcer: string; terms: string }[][]) => ({ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [groups.map(g => ({ caveats: g.map(c => ({ ...c, args: '0x' })) })) as never]) });
+  const decoys = (at: number) => Array.from({ length: 16 }, (_, i) => [calldata(at, word(BigInt(i + 1)))]);
+  const partial = await run([approveOnly, or([[calldata(4, word(BigInt(EVIL)))], ...decoys(4)]), or([[calldata(36, word((1n << 256n) - 1n))], ...decoys(36)]), zero, until(86_400n)]);
+  assert.equal(partial.attention, 'danger');
+  // 1 ETH an hour for 30 days is 720 ETH: against 10 ETH held, all of it.
+  const plain = { enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: '0x' };
+  const hourly = { enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 18n)}${word(3_600n)}${word(NOWS)}` };
+  assert.match((await run([plain, hourly, until(30n * 86_400n)], 10n ** 19n)).warnings.find(w => w.code === 'delegation_native_limited')?.message ?? '', /720 ETH over its window/);
+  assert.match((await run([plain, hourly], 10n ** 19n)).warnings.find(w => w.code === 'delegation_native_limited')?.message ?? '', /with no end/);
+});

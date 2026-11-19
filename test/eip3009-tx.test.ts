@@ -117,3 +117,20 @@ test('Sixth review: a dataSuffix is not appended to a call without data; an attr
   assert.equal(bundle.warnings.find(w => w.code === 'approval_for_all')?.severity, 'info');
   assert.notEqual(bundle.attention, 'danger');
 });
+
+test('Seventh review: calldata that only looks like it ends with an attribution is read whole; a dataSuffix completing a call is read with it', async () => {
+  const EVIL = '0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1', NFT = '0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d';
+  const approveAll = encodeFunctionData({ abi: parseAbi(['function setApprovalForAll(address,bool)']), args: [EVIL as Hex, true] });
+  // A self-call whose inner data's tail makes the whole end like a marker: still the danger it is.
+  const outer = encodeFunctionData({ abi: parseAbi(['function execute(address target, uint256 value, bytes data)']), args: [NFT, 0n, `${approveAll}${'ab'.repeat(10)}0000${'8021'.repeat(8)}` as Hex] });
+  const self = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: outer, chainId: '0x1' }] }, { now: NOW, chainId: 1, account: ALICE }, { tokens: new StaticTokenRegistry() });
+  assert.ok(codes(self).includes('approval_for_all'));
+  // An approval whose amount ends like a marker: no attribution is made up.
+  const amount = BigInt(`0x${'ff'.repeat(14)}0000${'8021'.repeat(8)}`);
+  const approve = await send(ALICE, encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), args: [EVIL as Hex, amount] }));
+  assert.equal(approve.decoding.decoder, 'erc20_approve');
+  assert.equal(detail(approve, 'Attribution (ERC-8021)'), undefined);
+  // A selector whose arguments come in the dataSuffix: read as the wallet sends it.
+  const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: NFT, data: approveAll.slice(0, 10) }], capabilities: { dataSuffix: { value: `0x${approveAll.slice(10)}` } } }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  assert.ok(codes(batch).includes('approval_for_all'));
+});

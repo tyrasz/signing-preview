@@ -23,7 +23,7 @@ import { beaconDepositAdapter } from './beacon-deposit.ts';
 import { lendingManagerAdapter } from './lending-managers.ts';
 import { eip3009TxAdapter } from './eip3009.ts';
 import { thorchainAdapter } from './thorchain.ts';
-import { readAttribution } from '../attribution.ts';
+import { callAttribution } from '../attribution.ts';
 import { orbitInboxAdapter } from './orbit-inbox.ts';
 import { aggregatorAdapters } from './aggregators.ts';
 import { uniswapForkAdapter, uniswapRoutersAdapter } from './uniswap-routers.ts';
@@ -150,14 +150,14 @@ export async function decodeTransaction(tx: Tx, deps: Dependencies, context: Pre
   // A call to your own account in the transaction that delegates it runs the new delegate's code: decode against that.
   const delegate = tx.to && sameAddress(tx.to, tx.from) && deps.abis ? await ownDelegateAfter(tx) : undefined;
   const env = { deps: delegate ? { ...deps, abis: delegatedAbis(deps.abis!, tx.from, delegate) } : deps, context };
-  // An ERC-8021 attribution at the end is the app's or wallet's, which the contract ignores: the call is read without it.
-  const attribution = tx.to ? readAttribution(tx.data) : undefined;
-  const call = attribution ? { ...tx, data: tx.data.slice(0, tx.data.length - attribution.bytes * 2) as `0x${string}` } : tx;
-  for (const adapter of ADAPTERS) {
-    const result = await adapter(call, env);
-    if (result) return result;
-  }
-  throw new Error('no decoder answered');
+  const run = async (t: Tx) => { for (const adapter of ADAPTERS) { const result = await adapter(t, env); if (result) return result; } throw new Error('no decoder answered'); };
+  const full = await run(tx);
+  // An ERC-8021 attribution at the end is the app's or wallet's, which the contract ignores. The call is read whole
+  // first (bytes that only look like one are the call's own); where that reads nothing, without it.
+  const attribution = tx.to && full.status === 'opaque' ? callAttribution(tx.data) : undefined;
+  if (!attribution) return full;
+  const stripped = await run({ ...tx, data: tx.data.slice(0, tx.data.length - attribution.bytes * 2) as `0x${string}` });
+  return stripped.status === 'opaque' ? full : stripped;
 }
 
 /** `decoded`: the result of decodeTransaction when the caller already has it (batches decode before simulating). */
@@ -165,7 +165,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   const d = decoded ?? await decodeTransaction(tx, deps, context);
   const b = d.b;
   // Who the app or wallet says brought it (ERC-8021): a suffix the contract ignores.
-  const attribution = tx.to ? readAttribution(tx.data) : undefined;
+  const attribution = tx.to ? callAttribution(tx.data) : undefined;
   if (attribution) b.detail('Attribution (ERC-8021)', attribution.parts.join('; '));
   if (!CHAINS[tx.chainId]) b.warn('caution', 'unsupported_chain', `Chain ${tx.chainId} is not one of the supported networks (Ethereum, Arbitrum One, HyperEVM). Token names and routes were not checked for it.`);
   if (context.account && !sameAddress(context.account, tx.from)) b.warn('danger', 'sender_mismatch', `The transaction's sender (${tx.from}) is not the connected account (${context.account}).`);

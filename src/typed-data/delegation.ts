@@ -80,10 +80,14 @@ interface CaveatRead {
    * what the delegate sends only when that is the account's own balance, and a total only with the redemptions bounded.
    */
   nativePerRedemption?: bigint; balanceOf?: string;
+  /** Its native total comes back each period of this many seconds (NativeTokenPeriodTransfer, MultiTokenPeriod's native). */
+  nativePeriod?: bigint;
   /** Its allowance comes back more often than hourly: no cap in practice. */
   subHourly?: boolean;
   /** Caveats inside it that this preview doesn't know (LogicalOrWrapperEnforcer's groups). */
   unread?: number;
+  /** Every one of its groups names the contracts called (LogicalOrWrapperEnforcer): the calls are confined to those. */
+  confined?: boolean;
   /** The only addresses that may redeem it (RedeemerEnforcer). */
   redeemers?: string[];
 }
@@ -173,9 +177,10 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     const sum = new Map<string, bigint>();
     for (const c of configs) sum.set(c.address, (sum.get(c.address) ?? 0n) + c.amount);
     const nativeCap = configs.some(c => c.nativeCoin) ? sum.get('0x0000000000000000000000000000000000000000') : undefined;
+    const nativePeriod = configs.filter(c => c.nativeCoin).reduce<bigint | undefined>((m, c) => m === undefined || c.period < m ? c.period : m, undefined);
     const subHourly = configs.some(c => c.period < 3_600n);
     const erc20 = configs.some(c => !c.nativeCoin);
-    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: !isUnlimited(nativeCap) && !subHourly }), ...(subHourly && { subHourly: true }),
+    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: !isUnlimited(nativeCap) && !subHourly, ...(nativePeriod !== undefined && nativePeriod < 1n << 64n && { nativePeriod }) }), ...(subHourly && { subHourly: true }),
       text: `only ${[erc20 && 'transfer() calls on these tokens', nativeCap !== undefined && `plain ${native} transfers`].filter(Boolean).join(', or ')}, up to: ${configs.map(c => c.text).join('; ')}` };
   } },
   '0x3790e6b7233f779b09da74c72b6e94813925b9af': { name: 'ERC721TransferEnforcer', read: t => ({ name: 'ERC721TransferEnforcer', kind: 'scope', text: `only transferring NFT #${word(t, 20)} of ${shortAddress(addr(t, 0))} (transferFrom or safeTransferFrom), to anyone` }) },
@@ -223,6 +228,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     const scopesOf = (g: (CaveatRead | null)[]) => g.filter((r): r is CaveatRead => r?.kind === 'scope');
     const targetOnly = read.filter(g => scopesOf(g).length && scopesOf(g).every(r => r.targets));
     return { name: 'LogicalOrWrapperEnforcer', kind: scoped ? 'scope' : 'condition', unread: read.flat().filter(r => !r).length,
+      confined: read.length > 0 && read.every(g => scopesOf(g).some(r => r.targets?.length || r.exact || r.confined)),
       anyContract: read.some(g => scopesOf(g).length > 0 && scopesOf(g).every(r => r.anyContract)),
       open: read.some(g => scopesOf(g).length > 0 && scopesOf(g).every(r => r.anyContract) && scopesOf(g).some(r => r.open)),
       ...(targetOnly.length && { targets: [...new Set(targetOnly.flatMap(g => scopesOf(g).flatMap(r => r.targets!)))] }),
@@ -235,7 +241,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     const amount = word(t, 0), period = word(t, 32), start = word(t, 64);
     // It checks only the value each call sends, not what is called (its comment expects no call data, but nothing
     // checks that: MetaMask pairs it with ExactCalldataEnforcer(0x)).
-    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: !isUnlimited(amount) && period >= 3_600n, ...(period < 3_600n && { subHourly: true }), text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
+    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: !isUnlimited(amount) && period >= 3_600n, nativePeriod: period, ...(period < 3_600n && { subHourly: true }), text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
   } },
   '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320': { name: 'NativeTokenTransferAmountEnforcer', read: (t, _, native) => {
     const amount = word(t, 0);
@@ -371,7 +377,10 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   // Whether what it allows is only fixed: a transfer whose recipient and amount are pinned, once, and nothing else
   // open, under caveats the probe models whole (no OR groups, no exact executions), its search complete.
   let fixedOnly = false;
-  if (p.incomplete && root && !self && !full) b.warn('caution', 'delegation_search_partial', `Its caveats combine in more ways than this preview tries (OR groups whose combinations number more than 256, or calls too long to try them all): what ${who} can do by picking one group of each may be more than is shown.`);
+  // A partial search where no caveat confines the calls to contracts it names: a danger (what it missed could be any
+  // token); confined, a caution.
+  const confined = scopes.some(r => r.targets?.length || r.exact || r.confined);
+  if (p.incomplete && root && !self && !full) b.warn(confined ? 'caution' : 'danger', 'delegation_search_partial', `Its caveats combine in more ways than this preview tries (OR groups whose combinations number more than 256, or calls too long to try them all): what ${who} can do by picking one group of each may be more than is shown${confined ? '' : ', on any contract'}.`);
   if (root && !self && !full) {
     // (Coin sent with a call to a contract named counts only where it lands: in a plain transfer or an EOA, below.)
     fixedOnly = !p.incomplete && !exact && !unknown.length && !rules.some(r => r?.groups) && scopes.every(r => MODELLED.has(r.name))
@@ -413,10 +422,18 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
     const each = (perCall: bigint | null) => { const c = [perCall, perRedemption].filter((x): x is bigint => x !== null && x !== undefined && !isUnlimited(x)).reduce<bigint | undefined>((a, x) => a === undefined || x < a ? x : a, undefined); return c === undefined ? '' : `, up to ${fmt(c)} each time`; };
     const often = bounded && times !== undefined ? `, ${times === 1n ? 'once' : `${times} times`}` : ', as many times as wanted';
     if (p.native && nativeTotal && nativeCap !== undefined) {
-      // A total a caveat sets (in all or per period): no cap in practice past a million coins (with the balance unread)
-      // or past 2^128; a caution where it is as much as the account holds.
-      if (isUnlimited(nativeCap) || (balance === undefined && nativeCap >= NO_CAP)) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${often}: its caveats cap it at ${fmt(nativeCap)}, no cap in practice, so all of it${unless}.`);
-      else if (balance !== undefined && nativeCap >= balance) b.warn('caution', 'delegation_native_limited', `${who} can send your account's ${native} to any address: up to ${fmt(nativeCap)} as its caveats set it, as much as the ${fmt(balance)} you hold, so all of it${unless}.`);
+      // A total a caveat sets: in all, or per period, where it adds up over the periods until the delegation ends (with
+      // no end, without bound). No cap in practice past a million coins (with the balance unread) or past 2^128; a
+      // caution where it is as much as the account holds, or comes back with no end.
+      const period = known.find(r => r.nativeTotal && r.native === nativeCap)?.nativePeriod;
+      const until = known.find(r => r.window)?.window?.before, nowS = BigInt(Math.floor(env.now / 1000));
+      const end = until && until < FAR ? until : undefined;
+      const periods = period === undefined ? 1n : end === undefined ? undefined : end > nowS ? (end - nowS + period - 1n) / period : 0n;
+      const total = periods === undefined ? undefined : nativeCap * periods;
+      const each = period !== undefined ? ` ${every(period)}` : '';
+      if (isUnlimited(nativeCap) || (balance === undefined && total !== undefined && total >= NO_CAP)) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${often}: its caveats cap it at ${fmt(nativeCap)}${each}, no cap in practice, so all of it${unless}.`);
+      else if (total === undefined) b.warn('caution', 'delegation_native_limited', `${who} can send your account's ${native} to any address: up to ${fmt(nativeCap)}${each}, with no end, so over time as much as you hold${unless}.`);
+      else if (balance !== undefined && total >= balance) b.warn('caution', 'delegation_native_limited', `${who} can send your account's ${native} to any address: up to ${fmt(total)}${period !== undefined ? ` over its window (${fmt(nativeCap)}${each})` : ' as its caveats set it'}, as much as the ${fmt(balance)} you hold, so all of it${unless}.`);
     } else if (p.native) {
       const limit = limitOf(p.native.perCall);
       if (limit === undefined) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: nothing caps the total, so all of it${unless}.`);

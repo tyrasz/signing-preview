@@ -96,3 +96,16 @@ export function readAttribution(data: string): Attribution | undefined {
   } catch { return undefined; }
   return undefined;
 }
+
+/**
+ * The attribution a call's data ends with, where it reads as one: not where the data is ABI-shaped (a selector and
+ * whole words) and only the part before the "suffix" isn't, since then those bytes are the call's own arguments that
+ * happen to end like a marker.
+ */
+export function callAttribution(data: string): Attribution | undefined {
+  const a = readAttribution(data);
+  if (!a) return undefined;
+  const bytes = (data.length - 2) / 2, rest = bytes - a.bytes;
+  const shaped = (n: number) => n >= 4 && (n - 4) % 32 === 0;
+  return shaped(bytes) && !shaped(rest) ? undefined : a;
+}

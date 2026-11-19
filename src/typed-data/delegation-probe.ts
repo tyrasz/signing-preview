@@ -195,8 +195,8 @@ const lay = (data: string, list: Pin[]) => {
 
 /** What the search for calls did: whether it tried every combination of OR groups, and the bytes it laid so far. */
 interface Search { incomplete: boolean; work: number }
-/** Hex characters of call data laid in all, before the search stops (and says it didn't finish). */
-const WORK = 40_000_000;
+/** Hex characters of call data laid for one call tried (all its templates and variants), before its search stops (and says it didn't finish). */
+const WORK = 4_000_000;
 /** The call tried: where it goes, with what value, in which mode. */
 type Attempt = { target: string; value: bigint; batch: boolean };
 
@@ -221,7 +221,7 @@ function pinSets(rules: (Rule | null)[], template: string, e: Attempt, search: S
     for (let i = 0; i < old.length; i++) if (old[i] !== p.value[i]) d++;
     return n + d;
   }, 0);
-  const passing = (a: { pins: Pin[]; group: (Rule | null)[] }) => { search.work += base.length; return passes(a.group, { ...e, data: lay(base, a.pins) }); };
+  const passing = (a: { pins: Pin[]; group: (Rule | null)[] }) => { if (search.work > WORK) return false; search.work += base.length; return passes(a.group, { ...e, data: lay(base, a.pins) }); };
   const best = ors.map(o => {
     const able = o.filter(passing);
     return (able.length ? able : o).reduce<{ pins: Pin[] } | undefined>((a, g) => a === undefined || changed(g.pins) < changed(a.pins) ? g : a, undefined)?.pins ?? [];
@@ -235,11 +235,15 @@ function pinSets(rules: (Rule | null)[], template: string, e: Attempt, search: S
 function variants(template: string, rules: (Rule | null)[], withFixed: boolean, e: Attempt, search: Search): string[] {
   const out = new Set<string>([template]);
   const add = (pins: Pin[]) => { if (search.work > WORK) { search.incomplete = true; return; } const d = lay(template, pins); search.work += d.length; out.add(d); };
-  for (const pins of pinSets(rules, template, e, search)) {
+  // Each set with all its pins laid first (what a call satisfying them is), then each pin alone.
+  const sets = pinSets(rules, template, e, search);
+  for (const pins of sets) {
     const args = pins.filter(p => p.start > 0), heads = pins.filter(p => p.start === 0);
-    for (const p of pins) add([p]);
-    add(args);
-    for (const h of heads) add([...args, h]);
+    if (heads.length) for (const h of heads) add([...args, h]); else add(args);
+  }
+  for (const pins of sets) {
+    if (pins.length > 1) for (const p of pins) add([p]);
+    if (pins.some(p => p.start === 0)) add(pins.filter(p => p.start > 0));
   }
   if (withFixed) for (const d of collect(rules, r => r.datas)) out.add(d);
   return [...out];
@@ -287,6 +291,7 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   };
   // Every call that gets through, of those tried (passing); the first (tries).
   function* passing(target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true, fixedRunsCalls = true) {
+    search.work = 0; // each call tried has its own budget
     for (const batch of [false, true]) for (const t of templates) for (const data of variants(t, rules, withFixed, { target, value, batch }, search)) {
       if (sameFunction && selectorOf(data) !== selectorOf(t)) continue;
       // An execute(…) on the account with data a caveat fixes runs only the calls fixed inside it: not a hand-over

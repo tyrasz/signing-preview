@@ -15,7 +15,7 @@ import { writeFileSync } from 'node:fs';
 import { previewRequest } from '../src/preview.ts';
 import { rpcUrlFor, StaticTokenRegistry } from '../src/chains.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
-import { readAttribution } from '../src/attribution.ts';
+import { callAttribution } from '../src/attribution.ts';
 import { ChainedSignatures, ContractAbiResolver, SourcifyAbiSource } from '../src/abi.ts';
 import type { AbiResolver, ContractAbi, Dependencies, Preview, SignatureCandidate, SignatureResolver } from '../src/types.ts';
 
@@ -44,7 +44,7 @@ interface Row { hash: string; from: string; block: number; to: string | null; se
 type Shape = 'abi' | 'packed' | 'vanity';
 const shapeOf = (input: string): Shape => {
   // An ERC-8021 attribution suffix (src/attribution.ts) is the app's or wallet's, not the call's encoding.
-  const suffix = readAttribution(input);
+  const suffix = callAttribution(input);
   const data = suffix ? input.slice(0, input.length - suffix.bytes * 2) : input;
   if (data === '0x') return 'abi';
   const bytes = (data.length - 2) / 2;
@@ -100,7 +100,7 @@ async function blockAt(chainId: number, ts: number, latest: number): Promise<num
 
 function preview(chainId: number, t: RawTx, ts: number, block: number, deps: Dependencies): Promise<Row> {
   const selector = t.input.length >= 10 ? t.input.slice(0, 10) : t.input === '0x' ? 'none' : 'short';
-  const base = { hash: t.hash, from: t.from.toLowerCase(), block, to: t.to?.toLowerCase() ?? null, selector, type: t.type, shape: shapeOf(t.input), attributed: t.to !== null && readAttribution(t.input) !== undefined };
+  const base = { hash: t.hash, from: t.from.toLowerCase(), block, to: t.to?.toLowerCase() ?? null, selector, type: t.type, shape: shapeOf(t.input), attributed: t.to !== null && callAttribution(t.input) !== undefined };
   const tx = { from: t.from, ...(t.to && { to: t.to }), data: t.input, value: t.value, chainId: '0x' + chainId.toString(16), ...(t.authorizationList && { authorizationList: t.authorizationList }) };
   return previewRequest({ method: 'eth_sendTransaction', params: [tx] }, { now: ts * 1000 }, deps)
     .then(p => ({ ...base, status: p.decoding.status, decoder: p.decoding.decoder, title: p.title, eip7702: p.warnings.map(w => w.code).filter(c => c.startsWith('eip7702_')) }))

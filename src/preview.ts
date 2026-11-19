@@ -143,11 +143,12 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   const suffix = batch.capabilities?.dataSuffix?.value;
   if (suffix !== undefined && (typeof suffix !== 'string' || !/^0x([0-9a-fA-F]{2})*$/.test(suffix) || suffix.length > 2 + 2 * 1024)) throw new RequestError('capabilities.dataSuffix.value must be hex bytes (at most 1,024)');
   const given = batch.calls.map(call => normalizeTransaction(call, context, batch.from, chainId));
-  // Appended only to a call with data, as viem does: a plain transfer stays one. Decoded on the data the dApp gave.
+  // Appended only to a call with data, as viem does: a plain transfer stays one. Decoded as the wallet sends it (an
+  // ERC-8021 attribution is read past, src/evm/transaction.ts; other bytes can be the call's own arguments).
   const txs = given.map(tx => suffix && suffix !== '0x' && tx.to && tx.data !== '0x' ? { ...tx, data: `${tx.data}${suffix.slice(2).toLowerCase()}` as `0x${string}` } : tx);
   // Decoded first: decoders name tokens the calls change without mentioning them, which state-reading simulators need.
   const decoded: Decoded[] = [];
-  for (const tx of given) decoded.push(await decodeTransaction(tx, deps, context));
+  for (const tx of txs) decoded.push(await decodeTransaction(tx, deps, context));
 
   // Simulate the whole batch in order when the simulator can; otherwise only the first call is independent.
   let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);
@@ -205,7 +206,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   if (suffix && suffix !== '0x') {
     const attribution = readAttribution(suffix);
     b.detail(attribution ? 'Attribution (ERC-8021)' : 'Data suffix', attribution ? attribution.parts.join('; ') : suffix.length > 2 + 64 ? `${suffix.slice(0, 66)}… (${(suffix.length - 2) / 2} bytes)` : suffix, suffix);
-    b.note(`The dApp asks the wallet to append ${attribution ? 'an ERC-8021 attribution' : `${(suffix.length - 2) / 2} bytes`} to each call's data (the dataSuffix capability${batch.capabilities?.dataSuffix?.optional ? ', optional' : ''}): each call with data is simulated with it, and read as the dApp gave it.`);
+    b.note(`The dApp asks the wallet to append ${attribution ? 'an ERC-8021 attribution' : `${(suffix.length - 2) / 2} bytes`} to each call's data (the dataSuffix capability${batch.capabilities?.dataSuffix?.optional ? ', optional' : ''}): each call with data is previewed and simulated with it.`);
   }
   let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
   let approvals: ApprovalChange[] = [];

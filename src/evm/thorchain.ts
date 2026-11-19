@@ -11,6 +11,7 @@
 // network's current inbound address (its inbound_addresses): the router sends to any vault it is given.
 import { decodeFunctionData, parseAbi } from 'viem';
 import { formatTimestamp, formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
+import { CHAINS } from '../chains.ts';
 import { decoded, nativeAmount, tokenAmount, tokenInfo, tokenSourceWarnings, type Adapter } from './common.ts';
 
 /** The routers, by chain: each verified on Sourcify, each with deposits on 2026-11-19. */
@@ -29,6 +30,17 @@ const SHORT: Record<string, Record<string, string>> = {
   Maya: { b: 'BTC.BTC', e: 'ETH.ETH', c: 'MAYA.CACAO' },
 };
 const NO_LIMIT_BPS = 100n;
+/** Address formats by the chain an asset is on, as the networks' own clients take them (bech32 data characters, base58, hex). */
+const B32 = '[02-9ac-hj-np-z]', B58 = '[1-9A-HJ-NP-Za-km-z]';
+const ADDRESS_FORMATS: Record<string, RegExp> = {
+  BTC: new RegExp(`^(bc1q${B32}{38}|bc1[qp]${B32}{58}|[13]${B58}{25,34})$`), LTC: new RegExp(`^(ltc1q${B32}{38}|ltc1[qp]${B32}{58}|[LM3]${B58}{26,33})$`),
+  BCH: new RegExp(`^((bitcoincash:)?[qp]${B32}{41}|[13]${B58}{25,34})$`), DOGE: new RegExp(`^[DA9]${B58}{25,34}$`),
+  ETH: /^0x[0-9a-fA-F]{40}$/, BSC: /^0x[0-9a-fA-F]{40}$/, AVAX: /^0x[0-9a-fA-F]{40}$/, BASE: /^0x[0-9a-fA-F]{40}$/, ARB: /^0x[0-9a-fA-F]{40}$/,
+  GAIA: new RegExp(`^cosmos1${B32}{38}$`), THOR: new RegExp(`^thor1${B32}{38}$`), MAYA: new RegExp(`^maya1${B32}{38}$`),
+  TRON: new RegExp(`^T${B58}{33}$`), XRP: new RegExp(`^r${B58}{24,34}$`), SOL: new RegExp(`^${B58}{32,44}$`), ZEC: new RegExp(`^t[13]${B58}{33}$`),
+};
+/** Whether a destination is an address on the chain of `asset` (CHAIN.SYMBOL); undefined where that chain's format isn't known here. */
+const addressOn = (asset: string | undefined, destination: string) => { const f = asset ? ADDRESS_FORMATS[asset.split('.')[0]] : undefined; return f ? f.test(destination) : undefined; };
 
 export interface ThorMemo {
   action: 'swap' | 'limit_swap' | 'trade' | 'secure' | 'add' | 'other';
@@ -41,7 +53,8 @@ export interface ThorMemo {
 export function readMemo(memo: string, network: 'THORChain' | 'Maya'): ThorMemo {
   const parts = memo.split(':');
   const head = parts[0].toLowerCase();
-  const asset = (code: string | undefined) => code === undefined ? {} : SHORT[network][code.toLowerCase()] ? { asset: SHORT[network][code.toLowerCase()], code } : /^[A-Za-z0-9]+\.[^:]+$/.test(code) ? { asset: code.toUpperCase() } : { code };
+  // (Object.hasOwn: a code such as "constructor" must not find Object's own properties.)
+  const asset = (code: string | undefined) => code === undefined ? {} : Object.hasOwn(SHORT[network], code.toLowerCase()) ? { asset: SHORT[network][code.toLowerCase()], code } : /^[A-Za-z0-9]+\.[^:]+$/.test(code) ? { asset: code.toUpperCase() } : { code };
   if (head === '=' || head === 's' || head === 'swap' || head === '=<') {
     const [destination, refund] = (parts[2] ?? '').split('/');
     const [limit, interval, quantity] = (parts[3] ?? '').split('/');
@@ -78,7 +91,12 @@ export const thorchainAdapter: Adapter = async (tx, env) => {
   if (!native && !info) b.warn('caution', 'unknown_token', 'This token is not in the known-token list, so its name and decimals are unverified. Amounts are shown in base units.');
   if (!known) b.warn('caution', 'thorchain_router_unknown', `${shortAddress(router)} takes a THORChain-style deposit but isn't THORChain's or Maya's router as known here: what it does with the deposit isn't known.`);
   if (native && tx.value === 0n) b.warn('info', 'thorchain_nothing_sent', 'It sends no coin: the router deposits what the transaction sends, whatever its amount says.');
-  if (!native && tx.value > 0n) b.warn('info', 'thorchain_unexpected_coin', 'It sends coin with a token deposit: the router refuses it ("unexpected eth").');
+  if (!native && tx.value > 0n) {
+    // THORChain's and Maya's routers refuse it; a router this preview doesn't know may keep it.
+    b.detail('Coin sent with it', nativeAmount(tx.chainId, tx.value), tx.value.toString());
+    if (known) b.warn('info', 'thorchain_unexpected_coin', 'It sends coin with a token deposit: the router refuses it ("unexpected eth").');
+    else b.warn('caution', 'thorchain_unexpected_coin', `It sends ${nativeAmount(tx.chainId, tx.value)} with a token deposit, to a router this preview doesn't know, which may keep it.`);
+  }
   const now = Math.floor(env.context.replay ? Number(env.context.replay.at.header.timestamp) * 1000 : env.context.now ?? Date.now());
   if (expiration !== undefined) {
     b.detail('Expires', expiration >= 1n << 40n ? 'never' : formatTimestamp(Number(expiration) * 1000), expiration.toString());
@@ -94,8 +112,9 @@ export const thorchainAdapter: Adapter = async (tx, env) => {
     } catch { /* not read */ }
   }
   b.note(`${network} credits a deposit only to its current inbound vault (its inbound_addresses): the router sends to the vault named, so one that isn't ${network}'s loses the deposit.`);
+  const coin = !native && tx.value > 0n && !known ? [{ direction: 'out' as const, account: tx.from, amount: formatUnits(tx.value, CHAINS[tx.chainId]?.nativeDecimals ?? 18), symbol: CHAINS[tx.chainId]?.nativeSymbol ?? 'native', raw: tx.value.toString(), asset: 'native', basis: 'requested' as const }] : [];
   const outflow = native ? (tx.value > 0n ? [{ direction: 'out' as const, account: tx.from, amount: sent.split(' ')[0], symbol: sent.split(' ')[1], raw: tx.value.toString(), asset: 'native', basis: 'requested' as const }] : [])
-    : [{ direction: 'out' as const, account: tx.from, amount: info ? formatUnits(amount, info.decimals) : amount.toString(), symbol: info?.symbol ?? assetAddress, raw: amount.toString(), asset: assetAddress.toLowerCase(), basis: 'requested' as const }];
+    : [{ direction: 'out' as const, account: tx.from, amount: info ? formatUnits(amount, info.decimals) : amount.toString(), symbol: info?.symbol ?? assetAddress, raw: amount.toString(), asset: assetAddress.toLowerCase(), basis: 'requested' as const }, ...coin];
   const what = m.asset ?? (m.code ? `the asset with short code "${m.code}"` : undefined);
   switch (m.action) {
     case 'swap': case 'limit_swap': {
@@ -109,6 +128,9 @@ export const thorchainAdapter: Adapter = async (tx, env) => {
       const total = (m.affiliates ?? []).reduce((s, a) => s + (a.bps ?? 0n), 0n);
       if (m.affiliates?.length) b.detail('Affiliate fees', `${m.affiliates.map(a => `${a.name} ${a.bps ?? '?'} bps`).join(', ')} (${formatUnits(total, 2)}% in all)`);
       if (!m.destination) b.warn('caution', 'thorchain_no_destination', 'Its memo names no destination address: what the network does with the swap isn\'t read here.');
+      // A destination that isn't an address on the asset's chain is read by the network as a name (a THORName or
+      // MAYAName), an alias whose owner sets where it pays.
+      else if (addressOn(m.asset, m.destination) === false) b.warn('caution', 'thorchain_destination_name', `Its destination (${m.destination}) isn't an address on ${m.asset!.split('.')[0]}: ${network} takes it as a name, an alias whose owner chooses where it pays. Check it is yours.`);
       if (!least) b.warn('caution', 'thorchain_no_limit', `It sets no minimum for what the swap gives: ${network} swaps it at whatever the price is when it runs.`);
       if (total > NO_LIMIT_BPS) b.warn('caution', 'thorchain_affiliate_fee', `Affiliates take ${formatUnits(total, 2)}% of the swap (${m.affiliates!.map(a => `${a.name} ${a.bps ?? '?'} bps`).join(', ')}).`);
       if (m.action === 'limit_swap') b.note('A limit swap (=<) waits until the price gives at least its limit.');
@@ -123,6 +145,7 @@ export const thorchainAdapter: Adapter = async (tx, env) => {
       const kind = m.action === 'trade' ? 'trade account' : 'secured asset';
       b.detail('Credited to', m.destination ?? 'none');
       if (!m.destination) b.warn('caution', 'thorchain_no_destination', 'Its memo names no address to credit.');
+      else if (addressOn(network === 'Maya' ? 'MAYA.CACAO' : 'THOR.RUNE', m.destination) === false) b.warn('caution', 'thorchain_destination_name', `The address credited (${m.destination}) isn't a ${network} address: ${network} takes it as a name, an alias whose owner chooses where it pays. Check it is yours.`);
       return decoded({ title: `Deposit ${sent} into ${network} as a ${kind}${m.destination ? ` for ${m.destination.slice(0, 10)}…${m.destination.slice(-6)}` : ''}`, summary: `${sent} goes to ${network}'s vault, credited ${m.action === 'trade' ? 'to the trade account' : 'as a secured asset'} of ${m.destination ?? 'the memo\'s address'} on ${network}.`, decoder: 'thorchain_deposit', status: known && m.destination ? 'full' : 'partial', b, assetChanges: outflow });
     }
     case 'add':

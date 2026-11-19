@@ -109,7 +109,15 @@ const ROUTER_ABI = parseAbi([
   'function race(address tokenIn, uint256 amountIn, address tokenOut, uint256 minAmountOut, address recipient, address refundTo, (address target, address spender, uint256 value, uint256 gasLimit, uint256 feePpm, bytes callData)[] routes, bool emitEvents, bytes metadata) payable',
   'function raceWithBackups(address tokenIn, uint256 amountIn, address tokenOut, uint256 minAmountOut, address recipient, address refundTo, (address target, address spender, uint256 value, uint256 gasLimit, uint256 feePpm, bytes callData)[] routes, uint256 mainCount, bool emitEvents, bytes metadata) payable',
 ]);
-const ROUTER_SELECTORS = ['0x9bb43718', '0xa6bd8c96', '0xdbd33919', '0xbda3361c'];
+const CLEANUP_SELECTORS = ['0x9bb43718', '0xa6bd8c96'], RACE_SELECTORS = ['0xdbd33919', '0xbda3361c'];
+/** Relay's router (RelayRouter, RelayRouterV3) and RouteRacer: the same addresses and code on every chain here. */
+const RELAY_ROUTERS = new Set(['0x0729e2a4716d9f7dd17858d5d504426d228697f7', '0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f']);
+const ROUTE_RACER = '0x195627f03fe2668d65c763cd39eec45b1d76c8ee';
+/** Relay's own contracts: value sent to them stays within the request. */
+const RELAY_CONTRACTS = new Set([...RELAY_ROUTERS, ROUTE_RACER, RELAY_APPROVAL_PROXY, RELAY_DEPOSITORY]);
+/** An amount as typed data or calldata gives it: a bigint, a safe integer, or a decimal or hex string; null otherwise. */
+const quantity = (v: unknown): bigint | null => typeof v === 'bigint' ? v : typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? BigInt(v)
+  : typeof v === 'string' && /^(\d+|0x[0-9a-fA-F]+)$/.test(v) ? BigInt(v) : v === undefined ? 0n : null;
 const RELAY_CALLS = 12;
 
 /**
@@ -122,10 +130,16 @@ export async function relayCalls(w: { relayer?: unknown; refundTo?: unknown; nft
   const text = (v: unknown) => typeof v === 'string' ? v.toLowerCase() : '';
   const refundTo = text(w.refundTo), relayer = text(w.relayer), nftRecipient = text(w.nftRecipient);
   if (!/^0x[0-9a-f]{40}$/.test(refundTo)) return null;
+  // A Relay request inside another's calls is read two levels deep, no more (each level reads up to RELAY_CALLS calls).
+  const depth = (env.context as { relayDepth?: number }).relayDepth ?? 0;
   if (relayer) b.detail('Relayer (only it can submit this)', relayer);
   b.detail('Leftovers go to', sameAddress(refundTo, account) ? `you (${refundTo})` : refundTo, refundTo);
-  if (/^0x[0-9a-f]{40}$/.test(nftRecipient) && !/^0x0{40}$/.test(nftRecipient)) b.detail('NFTs minted go to', nftRecipient);
-  const msgValue = typeof w.msgValue === 'string' && /^\d+$/.test(w.msgValue) ? BigInt(w.msgValue) : typeof w.msgValue === 'bigint' ? w.msgValue : 0n;
+  const ours = (a: string) => sameAddress(a, account) || sameAddress(a, refundTo) || RELAY_CONTRACTS.has(a.toLowerCase());
+  if (/^0x[0-9a-f]{40}$/.test(nftRecipient) && !/^0x0{40}$/.test(nftRecipient)) {
+    b.detail('NFTs minted go to', nftRecipient);
+    if (!ours(nftRecipient)) b.warn('caution', 'relay_nft_recipient', `NFTs the calls mint go to ${shortAddress(nftRecipient)}, not to you.`);
+  }
+  const msgValue = quantity(w.msgValue) ?? 0n;
   if (msgValue > 0n && chainId !== null) b.detail('Coin the relayer attaches', nativeAmount(chainId, msgValue), msgValue.toString());
   if (!sameAddress(spender, RELAY_APPROVAL_PROXY)) b.warn('caution', 'relay_proxy_unknown', `The tokens go to ${shortAddress(spender)}, which isn't Relay's approval proxy (${shortAddress(RELAY_APPROVAL_PROXY)}): whether it makes the calls below, and only those, isn't known.`);
   if (!sameAddress(refundTo, account)) b.warn('caution', 'relay_refund_other', `What the calls leave in Relay's router (your tokens and coin, or what a swap gives) goes to ${shortAddress(refundTo)}, not to you.`);
@@ -134,17 +148,25 @@ export async function relayCalls(w: { relayer?: unknown; refundTo?: unknown; nft
     if (i >= RELAY_CALLS) break;
     const c = (raw ?? {}) as Record<string, unknown>;
     const target = text(c.target), data = text(c.callData);
-    const value = typeof c.value === 'bigint' ? c.value : typeof c.value === 'string' && /^\d+$/.test(c.value) ? BigInt(c.value) : 0n;
-    if (!/^0x[0-9a-f]{40}$/.test(target) || !/^0x([0-9a-f]{2})*$/.test(data)) { titles.push('a call that doesn\'t read'); continue; }
+    const value = quantity(c.value);
+    if (value === null) b.warn('caution', 'relay_value_unread', `Call ${i + 1}'s value (${JSON.stringify(c.value)}) doesn't read as an amount: what it sends isn't known.`);
+    if (!/^0x[0-9a-f]{40}$/.test(target) || !/^0x([0-9a-f]{2})*$/.test(data)) { titles.push('a call that doesn\'t read'); b.warn('caution', 'relay_call_unread', `Call ${i + 1} doesn't read (its target or data isn't hex): what it does isn't known.`); continue; }
+    if (depth >= 2) { titles.push(`a call to ${shortAddress(target)}`); b.warn('caution', 'relay_call_unread', `Call ${i + 1} is in a Relay request nested inside two others, which isn't read: what it does isn't known.`); continue; }
     try {
-      const d = await decodeTransaction({ chainId: chainId ?? 1, from: account, to: target, data: data as Hex, value }, env.deps, { ...env.context, ...(chainId !== null && { chainId }) });
+      const d = await decodeTransaction({ chainId: chainId ?? 1, from: account, to: target, data: data as Hex, value: value ?? 0n }, env.deps, { ...env.context, ...(chainId !== null && { chainId }), relayDepth: depth + 1 } as AdapterEnv['context']);
       titles.push(d.title);
       b.detail(`Call ${i + 1}`, `${d.title} (${shortAddress(target)})${c.allowFailure === true ? ', may fail' : ''}`, target);
       for (const x of d.b.warnings) if (x.severity !== 'info') b.warn(x.severity, x.code, `Call ${i + 1}: ${x.message}`);
-      // Tokens sent straight to someone else by the router (a token's transfer), as opposed to a swap or a bridge's deposit.
-      const to = d.decoder === 'erc20_transfer' ? d.b.details.find(x => x.label === 'Recipient')?.value : undefined;
-      if (to && !sameAddress(to, account) && !sameAddress(to, refundTo)) b.warn('caution', 'relay_call_transfer', `Call ${i + 1} sends ${d.title.replace(/^Send /, '')} straight to ${shortAddress(to)}, not to you: check it is the recipient you expect.`);
-    } catch { titles.push(`a call to ${shortAddress(target)}`); }
+      // Where the call sends value: a transfer's recipient, a cleanup's, a swap's output and leftovers. One that isn't
+      // you, your refund address or Relay's own contracts is said: a request that pays someone else.
+      const to = new Set<string>();
+      for (const x of d.b.details) {
+        const a = (x.raw ?? x.value).toLowerCase();
+        if (!/^0x[0-9a-f]{40}$/.test(a)) continue;
+        if ((x.label === 'Recipient' && ['erc20_transfer', 'erc20_transfer_from', 'native_transfer'].includes(d.decoder)) || (d.decoder === 'relay_router_cleanup' && /^Sends/.test(x.label)) || (d.decoder === 'relay_route_racer' && /^(Output to|Leftovers to)$/.test(x.label))) to.add(a);
+      }
+      for (const a of to) if (!ours(a)) b.warn('caution', 'relay_call_recipient', `Call ${i + 1} (${d.title.replace(/ \(Relay's (router|RouteRacer)\)$/, '')}) pays ${shortAddress(a)}, not you or your refund address: check it is who you mean to pay.`);
+    } catch { titles.push(`a call to ${shortAddress(target)}`); b.warn('caution', 'relay_call_unread', `Call ${i + 1} couldn't be read: what it does isn't known.`); }
   }
   if (calls.length > RELAY_CALLS) b.warn('danger', 'relay_calls_unread', `It has ${calls.length} calls; the ${calls.length - RELAY_CALLS} after the first ${RELAY_CALLS} aren't read here, and any of them could send your tokens elsewhere.`);
   if (!calls.length) b.warn('caution', 'relay_no_calls', `It has no calls: the tokens go to Relay's router and on to ${sameAddress(refundTo, account) ? 'you' : shortAddress(refundTo)}.`);
@@ -191,10 +213,12 @@ export const relayProxyAdapter: Adapter = async (tx, env) => {
 
 /** Relay's router's own calls, as a request's calls name them: a RouteRacer swap, a cleanup sending tokens on. */
 export const relayRouterAdapter: Adapter = async (tx, env) => {
-  if (!tx.to || !ROUTER_SELECTORS.includes(tx.data.slice(0, 10))) return null;
+  // Only Relay's own router and RouteRacer: another contract with these selectors could do anything.
+  const selector = tx.data.slice(0, 10), to = tx.to?.toLowerCase() ?? '';
+  if (!(CLEANUP_SELECTORS.includes(selector) && RELAY_ROUTERS.has(to)) && !(RACE_SELECTORS.includes(selector) && to === ROUTE_RACER)) return null;
   let call;
   try { call = decodeFunctionData({ abi: ROUTER_ABI, data: tx.data }); } catch { return null; }
-  const b = new PreviewBuilder().detail('Contract', tx.to.toLowerCase());
+  const b = new PreviewBuilder().detail('Contract', to === ROUTE_RACER ? `Relay's RouteRacer (${to})` : `Relay's router (${to})`, to);
   const amountOf = async (token: string, raw: bigint, all: string) => {
     if (/^0x0{40}$/.test(token)) return raw === 0n ? all : nativeAmount(tx.chainId, raw);
     const info = await tokenInfo(env, tx.chainId, token);
@@ -219,6 +243,7 @@ export const relayRouterAdapter: Adapter = async (tx, env) => {
     return decoded({ title: `Send ${what} to ${to} (Relay's router)`, summary: `Relay's router sends ${what} on.`, decoder: 'relay_router_cleanup', status: 'full', b });
   }
   const [tokenIn, amountIn, tokenOut, minOut, recipient, refundTo, routes] = call.args;
+  if (minOut === 0n) b.warn('info', 'relay_race_no_minimum', 'It sets no minimum output: RouteRacer refuses that (its guard against a route keeping the tokens), so this call fails.');
   const give = await amountOf(tokenIn, amountIn, 'all it is given'), least = await amountOf(tokenOut, minOut, 'any amount');
   const outSymbol = /^0x0{40}$/.test(tokenOut) ? CHAINS[tx.chainId]?.nativeSymbol ?? 'coin' : (await tokenInfo(env, tx.chainId, tokenOut))?.symbol ?? shortAddress(tokenOut);
   b.detail('Swaps', give).detail('For at least', least).detail('Output to', recipient.toLowerCase()).detail('Leftovers to', refundTo.toLowerCase())

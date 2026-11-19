@@ -41,7 +41,7 @@ test("A Relay request signed with Permit2: the router's calls, read as the swap 
   assert.ok(codes(await sign(witness({ refundTo: EVIL }))).includes('relay_refund_other'));
   const direct = witness();
   direct.message.witness.call3Values.push({ target: USDC, allowFailure: false, value: '0', callData: encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [EVIL, 6_000_000n] }) });
-  assert.ok(codes(await sign(direct)).includes('relay_call_transfer'));
+  assert.ok(codes(await sign(direct)).includes('relay_call_recipient'));
   assert.ok(codes(await sign(witness({ spender: '0x1234567890123456789012345678901234567890' }))).includes('relay_proxy_unknown'));
   // A request with more calls than are read is a danger.
   const many = witness();
@@ -72,4 +72,27 @@ test('A MulticallAuthorization (USDC-funded): the funding and the calls', async 
   assert.equal(p.decoding.decoder, 'relay_multicall');
   assert.equal(detail(p, 'Funding 1'), '6 USDC');
   assert.match(p.title, /^Relay: let its router make 3 calls with your tokens/);
+});
+
+test('Seventh review: what the router pays others, only Relay\'s own contracts read as Relay\'s, values in hex, nesting bounded', async () => {
+  const call = (target: string, callData: string, value = '0') => ({ target, allowFailure: false, value, callData });
+  const withCalls = (cs: ReturnType<typeof call>[]) => { const w = witness(); (w.message.witness as { call3Values: unknown[] }).call3Values = cs; return w; };
+  // A cleanup to someone else, a swap's output to someone else: cautions.
+  assert.ok(codes(await sign(withCalls([call(ROUTER, cleanup(EVIL))]))).includes('relay_call_recipient'));
+  const raceTo = (to: string) => encodeFunctionData({ abi: parseAbi(['function race(address tokenIn, uint256 amountIn, address tokenOut, uint256 minAmountOut, address recipient, address refundTo, (address target, address spender, uint256 value, uint256 gasLimit, uint256 feePpm, bytes callData)[] routes, bool emitEvents, bytes metadata)']), args: [USDC, 6_000_000n, WETH, 1n, to as Hex, ALICE, [], false, '0x'] });
+  assert.ok(codes(await sign(withCalls([call(RACER, raceTo(EVIL))]))).includes('relay_call_recipient'));
+  // The same selectors on a contract that isn't Relay's: not read as Relay's.
+  const fake = await sign(withCalls([call('0xbad0000000000000000000000000000000000bad', raceTo(ALICE))]));
+  assert.ok(codes(fake).includes('unknown_function'));
+  // A value given in hex is the same value.
+  const unwrap = encodeFunctionData({ abi: parseAbi(['function withdraw(uint256)']), args: [5n * 10n ** 18n] });
+  const hex = await sign(withCalls([call(WETH, unwrap), call(EVIL, '0x', '0x4563918244f40000')]));
+  assert.match(detail(hex, 'Call 2') ?? '', /^Send 5 ETH/);
+  assert.ok(codes(hex).includes('relay_call_recipient'));
+  // Requests nested in requests: read two levels deep, then said not to be.
+  const ABI = parseAbi(['function transferAndMulticall(address[] tokens, uint256[] amounts, (address target, bool allowFailure, uint256 value, bytes callData)[] calls, address refundTo, address nftRecipient, bytes metadata) payable']);
+  let data: Hex = cleanup(ALICE), target = ROUTER;
+  for (let i = 0; i < 3; i++) { data = encodeFunctionData({ abi: ABI, args: [[], [], [{ target: target as Hex, allowFailure: false, value: 0n, callData: data }], ALICE, ALICE, '0x'] }); target = PROXY; }
+  const nested = await sign(withCalls([call(PROXY, data)]));
+  assert.ok(nested.warnings.some(w => w.code === 'relay_call_unread' && /nested inside two others/.test(w.message)));
 });

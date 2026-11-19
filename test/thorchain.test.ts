@@ -64,3 +64,15 @@ test('A vault that is a contract or has never sent a transaction, an unknown rou
   assert.ok(codes(await send(memo, { expiry: t - 1n })).includes('thorchain_expired'));
   assert.ok(codes(await send(memo, { value: 0n })).includes('thorchain_nothing_sent'));
 });
+
+test('Seventh review: short codes that are Object properties, a destination that is a name, coin to an unknown router', async () => {
+  assert.equal(readMemo('=:constructor:bc1q:1', 'THORChain').asset, undefined);
+  assert.ok(!(await send('=:__proto__:bc1qdest:100000')).warnings.some(w => w.severity === 'danger'));
+  // A destination that isn't a Bitcoin address: THORChain reads it as a name.
+  assert.ok(codes(await send('=:b:bc1q57e4yn990kqllfchm6aq6mvl7r:138750467/1/0')).includes('thorchain_destination_name'));
+  assert.ok(!codes(await send('=:b:bc1q57e4yn990kqllfchm6aqz3juce9dv0tl6mvl7r:138750467/1/0')).includes('thorchain_destination_name'));
+  // Coin with a token deposit to a router not known: shown and cautioned.
+  const odd = await send('=:b:bc1q57e4yn990kqllfchm6aqz3juce9dv0tl6mvl7r:1', { asset: USDC, amount: 1_000_000n, value: 10n ** 19n, to: '0x1234567890123456789012345678901234567890' });
+  assert.equal(odd.warnings.find(w => w.code === 'thorchain_unexpected_coin')?.severity, 'caution');
+  assert.ok(odd.assetChanges.some(a => a.asset === 'native'));
+});
