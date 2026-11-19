@@ -41,3 +41,18 @@ test('A used nonce, a passed expiry, a contract that is not a market', async () 
   assert.ok(codes(other).includes('comet_market_unknown'));
   assert.equal(other.decoding.status, 'partial');
 });
+
+test('The same grants sent as transactions: Morpho setAuthorization, Compound allow', async () => {
+  const { encodeFunctionData, parseAbi } = await import('viem');
+  const { MORPHO } = await import('../src/typed-data/morpho.ts');
+  const send = (to: string, data: string, code: string, comet = true) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to, data, value: '0x0', chainId: '0x1' }] }, { now: NOW, chainId: 1, account: ALICE }, deps(code, comet));
+  const morpho = await send(MORPHO, encodeFunctionData({ abi: parseAbi(['function setAuthorization(address,bool)']), args: [BOB, true] }), '0x');
+  assert.equal(morpho.title, 'Authorize 0xb0b0…0002 to manage your Morpho positions');
+  assert.equal(morpho.warnings.find(w => w.code === 'morpho_authorize')!.severity, 'danger');
+  const allow = encodeFunctionData({ abi: parseAbi(['function allow(address,bool)']), args: [BOB, true] });
+  const comet = await send(CUSDC, allow, '0x6080');
+  assert.equal(comet.title, 'Make 0xb0b0…0002 a manager of your Compound position');
+  assert.equal(comet.warnings.find(w => w.code === 'comet_authorize')!.severity, 'caution');
+  // allow(address,bool) on a contract that isn't a market: not read as one.
+  assert.ok(!codes(await send(CUSDC, allow, '0x6080', false)).includes('comet_authorize'));
+});
