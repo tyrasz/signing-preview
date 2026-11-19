@@ -22,11 +22,12 @@ import { delegationAdapter } from './typed-data/delegation.ts';
 import { previewMessage } from './message.ts';
 import { previewSignedOperation } from './userop-hash.ts';
 import { previewSupertransaction, previewTypedSupertransaction } from './supertransaction.ts';
+import { previewPermissionRequests } from './permissions.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
-export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'] as const;
+export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign', 'wallet_requestExecutionPermissions'] as const;
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
@@ -74,6 +75,9 @@ async function previewOf(request: SigningRequest, context: PreviewContext, deps:
     case 'eth_signTypedData_v3':
     case 'eth_signTypedData':
       return previewTypedData(method, params, context, deps);
+    case 'wallet_requestExecutionPermissions':
+      // ERC-7715: permissions granted by a delegation the wallet signs (src/permissions.ts).
+      return previewPermissionRequests(method, params, context, deps);
     case 'personal_sign':
     case 'eth_sign':
       // A supertransaction's hash, with its operations (context.meeOperations); an operation's own hash (context.userOperation).
@@ -108,7 +112,7 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   else d.b.note('The EIP-712 digest could not be computed; the types may be malformed.');
   return {
     schema: 'signing-preview/1', method, kind: 'typed_data', network: d.network,
-    title: d.title, summary: d.summary, details: d.b.details, assetChanges: d.assetChanges ?? [], warnings: d.b.warnings, attention: attentionOf(d.b.warnings),
+    title: d.title, summary: d.summary, details: d.b.details, assetChanges: d.assetChanges ?? [], ...(d.approvals?.length && { approvals: d.approvals }), warnings: d.b.warnings, attention: attentionOf(d.b.warnings),
     decoding: { status: d.status, decoder: d.decoder, notes: d.b.notes },
     ...(d.b.trace && { trace: d.b.trace }),
   };

@@ -161,3 +161,63 @@ test('The rest of 1.3.0: OR groups, multi-token periods, a specific action then 
   assert.equal(detail(spender, 'Caveat 2'), "AllowedCalldataEnforcer: the call's first argument must be 0xb0b0…0002");
   assert.ok(codes(spender).includes('delegation_any_contract'));
 });
+
+test('Review: what the caveats really leave open', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const severity = (p: Awaited<ReturnType<typeof sign>>, code: string) => p.warnings.find(w => w.code === code)?.severity;
+  // A native period checks only the value: any call with no value passes.
+  const period = await sign(delegation(BOB, [{ enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 16n)}${word(86_400n)}${word(BigInt(NOW / 1000))}` }, until]));
+  assert.equal(severity(period, 'delegation_unrestricted'), 'danger');
+  // Calls to the DelegationManager or to the account itself are any call; to a token, any function on it.
+  for (const target of [DELEGATION_MANAGER, ALICE.toLowerCase()]) {
+    const p = await sign(delegation(BOB, [{ enforcer: E.targets, terms: `0x${target.slice(2)}` }, until]));
+    assert.equal(severity(p, 'delegation_unrestricted'), 'danger', target);
+    assert.match(p.title, /^Delegate full control/);
+  }
+  const token = await sign(delegation(BOB, [{ enforcer: E.targets, terms: `0x${USDC.slice(2)}` }, until]));
+  assert.equal(severity(token, 'delegation_any_function'), 'caution');
+  assert.ok(!codes(token).includes('delegation_unrestricted'));
+  // execute() allowed on any contract (the account itself among them).
+  const exec = await sign(delegation(BOB, [{ enforcer: E.methods, terms: '0xe9ae5c53' }, until]));
+  assert.equal(severity(exec, 'delegation_unrestricted'), 'danger');
+  // Functions on any contract: transfer() on every token. Inside an OR group too.
+  const transfers = await sign(delegation(BOB, [{ enforcer: E.methods, terms: '0xa9059cbb' }, until]));
+  assert.equal(severity(transfers, 'delegation_any_contract'), 'danger');
+  const or = encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [[{ caveats: [{ enforcer: E.methods, terms: '0xa9059cbb', args: '0x' }] }] as never]);
+  assert.equal(severity(await sign(delegation(BOB, [{ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: or }, until])), 'delegation_any_contract'), 'danger');
+  // Plain transfers with nothing bounding them: all the coin.
+  const plain = await sign(delegation(BOB, [{ enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: '0x' }, until]));
+  assert.equal(severity(plain, 'delegation_native_unlimited'), 'danger');
+  // An end set far off is none.
+  const far = await sign(delegation(BOB, [{ enforcer: E.targets, terms: `0x${USDC.slice(2)}` }, { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${(1n << 100n).toString(16).padStart(32, '0')}` }]));
+  assert.ok(codes(far).includes('delegation_no_expiry'));
+  // Two configurations of one token add up; no native coin unless configured.
+  const start = BigInt(NOW / 1000), cfg = `${USDC.slice(2)}${word(100_000_000n)}${word(86_400n)}${word(start)}`;
+  const twice = await sign(delegation(BOB, [{ enforcer: '0xfb2f1a9bd76d3701b730e5d69c3219d42d80ebb7', terms: `0x${cfg}${cfg}` }]));
+  assert.equal(detail(twice, 'Can move now (MultiTokenPeriodEnforcer)'), '200 USDC (the permitted amount; you hold 5,000 USDC)');
+  assert.doesNotMatch(detail(twice, 'Caveat 1')!, /plain ETH/);
+  // A balance's change is checked each time it is redeemed.
+  const change = await sign(delegation(BOB, [{ enforcer: '0xcdf6ab796408598cea671d79506d7d48e97a5437', terms: `0x01${USDC.slice(2)}${ALICE.slice(2).toLowerCase()}${word(10n ** 6n)}` }]));
+  assert.match(detail(change, 'Caveat 1')!, /^ERC20BalanceChangeEnforcer: each time it is redeemed, 0xa11c…0001's balance may fall by at most 1 USDC$/);
+});
+
+test('Review: a delegation passed on is about the root account, not the signer', async () => {
+  ran.length = 0;
+  const p = await sign(delegation(BOB, [{ enforcer: E.exact, terms: `0x${USDC.slice(2)}${word(0n)}${transfer.slice(2)}` }, { enforcer: E.erc20Amount, terms: `0x${USDC.slice(2)}${word(100_000_000n)}` }], { authority: `0x${'ab'.repeat(32)}` }));
+  assert.equal(ran.length, 0);
+  assert.deepEqual(p.assetChanges, []);
+  assert.ok(!p.details.some(d => d.label.startsWith('Can move now')));
+  assert.equal(p.warnings.find(w => w.code === 'delegation_redelegated')!.severity, 'info');
+  const none = await sign(delegation(BOB, [], { authority: `0x${'ab'.repeat(32)}` }));
+  assert.ok(!codes(none).includes('delegation_unrestricted'));
+  assert.equal(none.warnings.find(w => w.code === 'delegation_redelegated')!.severity, 'caution');
+  assert.doesNotMatch(none.summary, /your account/);
+});
+
+test('Review: a batch that fails when the simulator runs only its first call', async () => {
+  const failing: Dependencies = { ...deps(), simulator: { simulate: async () => ({ status: 'reverted', source: 'mock', gasUsed: 30_000n, revertReason: 'nope', transfers: [] }) } };
+  const batch = encodeAbiParameters(parseAbiParameters('(address target, uint256 value, bytes callData)[]'), [[{ target: USDC, value: 0n, callData: transfer }, { target: USDC, value: 0n, callData: transfer }]]);
+  const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(delegation(BOB, [{ enforcer: E.exactBatch, terms: batch }, { enforcer: E.limitedCalls, terms: `0x${word(1n)}` }]))] }, { now: NOW, chainId: 1 }, failing);
+  assert.ok(codes(p).includes('delegation_calls_fail'));
+  assert.deepEqual(p.assetChanges, []);
+});

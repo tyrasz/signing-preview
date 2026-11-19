@@ -4,7 +4,7 @@
     "title": "signing-preview",
     "version": "0.1.0",
     "summary": "Human-readable previews of EVM and Hyperliquid signing requests.",
-    "description": "Send any EIP-1193 signing request (the `{ method, params }` object a dApp passes to `provider.request()`) and get back a plain-JSON preview that a wallet, extension or backend can show before the user signs.\n\nCovers Ethereum, Arbitrum One, HyperEVM and Hyperliquid HyperCore: transactions (`eth_sendTransaction`, `eth_signTransaction`), EIP-5792 batches (`wallet_sendCalls`), EIP-712 typed data (`eth_signTypedData_v4` / `_v3`), and messages (`personal_sign`, `eth_sign`).\n\n`attention` is a display hint, not a security verdict: `none` does not mean \"safe\". Amounts with `basis: \"requested\"` come from the request itself; `simulated_events` and `simulated_state` come from a simulation of the latest block and can differ from the final result.",
+    "description": "Send any EIP-1193 signing request (the `{ method, params }` object a dApp passes to `provider.request()`) and get back a plain-JSON preview that a wallet, extension or backend can show before the user signs.\n\nCovers Ethereum, Arbitrum One, HyperEVM and Hyperliquid HyperCore: transactions (`eth_sendTransaction`, `eth_signTransaction`), EIP-5792 batches (`wallet_sendCalls`), EIP-712 typed data (`eth_signTypedData_v4` / `_v3`), messages (`personal_sign`, `eth_sign`), and ERC-7715 permission requests (`wallet_requestExecutionPermissions`).\n\n`attention` is a display hint, not a security verdict: `none` does not mean \"safe\". Amounts with `basis: \"requested\"` come from the request itself; `simulated_events` and `simulated_state` come from a simulation of the latest block and can differ from the final result.",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -468,7 +468,7 @@
         "required": [
           "method"
         ],
-        "description": "An EIP-1193 request, exactly as a dApp sends it. Params by method:\n- `eth_sendTransaction`, `eth_signTransaction`: `[transaction]` (`from`, `to`, `data`, `value`, `chainId`; hex quantities; EIP-7702 `authorizationList` entries `{ address, chainId, nonce, r?, s?, yParity? }`)\n- `wallet_sendCalls`: `[{ version, chainId, from, atomicRequired?, calls: [{ to, data, value }] }]`\n- `eth_signTypedData_v4`, `eth_signTypedData_v3`: `[address, typedData]` (typed data as a JSON string or object)\n- `personal_sign`: `[message, address]`; `eth_sign`: `[address, message]`",
+        "description": "An EIP-1193 request, exactly as a dApp sends it. Params by method:\n- `eth_sendTransaction`, `eth_signTransaction`: `[transaction]` (`from`, `to`, `data`, `value`, `chainId`; hex quantities; EIP-7702 `authorizationList` entries `{ address, chainId, nonce, r?, s?, yParity? }`)\n- `wallet_sendCalls`: `[{ version, chainId, from, atomicRequired?, calls: [{ to, data, value }] }]`\n- `eth_signTypedData_v4`, `eth_signTypedData_v3`: `[address, typedData]` (typed data as a JSON string or object)\n- `personal_sign`: `[message, address]`; `eth_sign`: `[address, message]`\n- `wallet_requestExecutionPermissions`: `[{ chainId, from?, to, permission: { type, isAdjustmentAllowed, data }, rules? }, ...]`",
         "properties": {
           "method": {
             "type": "string",
@@ -827,7 +827,7 @@
             "items": {
               "$ref": "#/components/schemas/Preview"
             },
-            "description": "Batches (`wallet_sendCalls`): one preview per call."
+            "description": "Batches (`wallet_sendCalls`): one preview per call. Permission requests (`wallet_requestExecutionPermissions`) for several permissions: one preview per permission."
           },
           "trace": {
             "$ref": "#/components/schemas/PreviewTrace"

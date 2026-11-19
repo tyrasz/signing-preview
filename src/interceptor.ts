@@ -22,7 +22,7 @@ export interface InterceptorOptions {
   methods?: readonly string[];
 }
 
-export const DEFAULT_SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'];
+export const DEFAULT_SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign', 'wallet_requestExecutionPermissions'];
 
 export class UserRejectedError extends Error {
   code = 4001;

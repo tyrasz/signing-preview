@@ -1,6 +1,6 @@
 import { hashTypedData, type Hex } from 'viem';
 import type { PreviewBuilder } from '../format.ts';
-import type { AssetChange, Dependencies, Network, PreviewContext } from '../types.ts';
+import type { ApprovalChange, AssetChange, Dependencies, Network, PreviewContext } from '../types.ts';
 
 export interface TypedField { name: string; type: string }
 
@@ -27,6 +27,8 @@ export interface TypedDecoded {
   b: PreviewBuilder;
   network: Network | null;
   assetChanges?: AssetChange[];
+  /** Permissions the signed message's calls would leave (a delegation's exact calls, simulated). */
+  approvals?: ApprovalChange[];
 }
 
 export type TypedAdapter = (data: TypedData, env: TypedEnv) => Promise<TypedDecoded | null>;

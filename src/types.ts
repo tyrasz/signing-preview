@@ -141,7 +141,7 @@ export interface Preview {
     notes: string[];
   };
   simulation?: SimulationSummary;
-  /** Per-call previews for batches (wallet_sendCalls). */
+  /** Per-call previews for batches (wallet_sendCalls); per-permission previews for wallet_requestExecutionPermissions. */
   calls?: Preview[];
   /** The simulated call's trace and state changes, when the context asked for them (PreviewContext.trace) and the simulator could. */
   trace?: PreviewTrace;
