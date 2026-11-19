@@ -1842,6 +1842,8 @@ async function okxDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> 
 export const SHRINCS_IMPLEMENTATION = '0xc4e4652898bb12c4f0ba9083829689b1963135e7';
 /** Another build of it (verified on Sourcify, Base; the same storage and pinned verifier), seen 2026-11-13. */
 const SHRINCS_IMPLEMENTATION_2 = '0x680840c831c6d147404a0e00eda08a5360564fbc';
+/** Both builds: the wallet's owner() signs its ECDSA half (shrincsStub). */
+export const SHRINCS_IMPLEMENTATIONS = new Set([SHRINCS_IMPLEMENTATION, SHRINCS_IMPLEMENTATION_2]);
 /** Its storage (ShrincsWalletStorage): the key's commitment at +1, keyVersion +3, the action nonce +4, then statefulLeavesUsed and maxSignatures (uint32s, packed, the first the lowest) at +5. */
 const SHRINCS_SLOT = 0x156c3acdcccbf9925f3430f598565ae5b05788e8a68a7bf182e71c432eafdc00n;
 const SHRINCS_OP_VERIFY_STATEFUL = keccak256(stringToHex('shrincs-verify-stateful'));

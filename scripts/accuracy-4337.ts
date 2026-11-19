@@ -53,7 +53,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { headerOf, stateBefore, type BlockAt, type RpcHeader } from '../src/block.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ORDINARY_GAS_CAP, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ORDINARY_GAS_CAP, SHRINCS_IMPLEMENTATIONS, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SUPER_TX_ARRAY_TYPEHASH } from '../src/supertransaction.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
@@ -719,6 +719,10 @@ async function replay(item: string): Promise<void> {
   }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
+  // Quip's ShrincsWallet: its owner() signs the ECDSA half of a 3 KB signature, the rest of whose bytes recover as
+  // junk addresses, three of which were tried before it (Base, 2026-11-19: three operations shown rejecting the
+  // stand-in, 33-44% low, where asked of owner() it validates). Its owner first.
+  if (/^0x0{24}[0-9a-f]{40}$/i.test(owner) && SHRINCS_IMPLEMENTATIONS.has(await implementationOf(deps, CHAIN, sender) ?? '')) { const o = `0x${owner.slice(26)}`.toLowerCase(), i = signers.indexOf(o); if (i >= 0) signers.splice(i, 1); signers.unshift(o); }
   // First, a Kernel permission's recorded owner (whose signature recovers to someone else).
   const recorded = code.length > 2 && !module ? await permissionOwner((to, data) => atParent.call(CHAIN, 'eth_call', [{ to, data }, 'latest']) as Promise<string>, sender, BigInt(op.nonce)) : undefined;
   if (recorded) { const i = signers.indexOf(recorded); if (i >= 0) signers.splice(i, 1); signers.unshift(recorded); }
