@@ -15,7 +15,7 @@ import { eip3009Adapter } from './typed-data/eip3009.ts';
 import { userOperationAdapter } from './typed-data/user-operation.ts';
 import { seaportAdapter } from './typed-data/seaport.ts';
 import { safeTxAdapter } from './typed-data/safe.ts';
-import { cowOrderAdapter, oneInchOrderAdapter } from './typed-data/orders.ts';
+import { cowOrderAdapter, veloraDeltaAdapter, oneInchOrderAdapter } from './typed-data/orders.ts';
 import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts';
 import { kernelEnableAdapter } from './typed-data/kernel-enable.ts';
 import { delegationAdapter } from './typed-data/delegation.ts';
@@ -33,7 +33,7 @@ import { previewSupertransaction, previewTypedSupertransaction } from './supertr
 import { previewPermissionRequests } from './permissions.ts';
 import { metaTransactionAdapter } from './typed-data/meta-transaction.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, relayMulticallAdapter, metaTransactionAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, veloraDeltaAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, relayMulticallAdapter, metaTransactionAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign', 'wallet_requestExecutionPermissions'] as const;

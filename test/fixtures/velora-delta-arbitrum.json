@@ -1,0 +1,137 @@
+{
+  "chainId": 42161,
+  "tx": "0x15a60a2419d480a6e8476228d50df42ec80ab7b465a8ab48e84537489bdb3d35",
+  "owner": "0xaa6aec16c5680d25f317124cf4f4a2c163ac71a0",
+  "signature": "0xb0f8c5e36abf98805aa2116df90f08dbfba6160b26257449d65c816988bc370928e62e6eff18b205e46e287df15392a26b34f5684e61899fe02227d239d439371c",
+  "typedData": {
+    "types": {
+      "EIP712Domain": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "string"
+        },
+        {
+          "name": "chainId",
+          "type": "uint256"
+        },
+        {
+          "name": "verifyingContract",
+          "type": "address"
+        }
+      ],
+      "Order": [
+        {
+          "name": "owner",
+          "type": "address"
+        },
+        {
+          "name": "beneficiary",
+          "type": "address"
+        },
+        {
+          "name": "srcToken",
+          "type": "address"
+        },
+        {
+          "name": "destToken",
+          "type": "address"
+        },
+        {
+          "name": "srcAmount",
+          "type": "uint256"
+        },
+        {
+          "name": "destAmount",
+          "type": "uint256"
+        },
+        {
+          "name": "expectedAmount",
+          "type": "uint256"
+        },
+        {
+          "name": "deadline",
+          "type": "uint256"
+        },
+        {
+          "name": "kind",
+          "type": "uint8"
+        },
+        {
+          "name": "nonce",
+          "type": "uint256"
+        },
+        {
+          "name": "partnerAndFee",
+          "type": "uint256"
+        },
+        {
+          "name": "permit",
+          "type": "bytes"
+        },
+        {
+          "name": "metadata",
+          "type": "bytes"
+        },
+        {
+          "name": "bridge",
+          "type": "Bridge"
+        }
+      ],
+      "Bridge": [
+        {
+          "name": "protocolSelector",
+          "type": "bytes4"
+        },
+        {
+          "name": "destinationChainId",
+          "type": "uint256"
+        },
+        {
+          "name": "outputToken",
+          "type": "address"
+        },
+        {
+          "name": "scalingFactor",
+          "type": "int8"
+        },
+        {
+          "name": "protocolData",
+          "type": "bytes"
+        }
+      ]
+    },
+    "primaryType": "Order",
+    "domain": {
+      "name": "Portikus",
+      "version": "2.0.0",
+      "chainId": 42161,
+      "verifyingContract": "0x0000000000bbf5c5fd284e657f01bd000933c96d"
+    },
+    "message": {
+      "owner": "0xAa6aEC16c5680d25F317124Cf4f4a2C163ac71a0",
+      "beneficiary": "0xf98f8Ee7A0bdc7F81c2c7775A8bEf25975404eC0",
+      "srcToken": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      "destToken": "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1",
+      "srcAmount": "27155078957",
+      "destAmount": "27022117853935894966507",
+      "expectedAmount": "27157907390890346700008",
+      "deadline": "1795068870",
+      "kind": 0,
+      "nonce": "25845226271810004567990202558891650161110465314159355993360903559094821414243",
+      "partnerAndFee": "512",
+      "permit": "0x000000000000000000000000aa6aec16c5680d25f317124cf4f4a2c163ac71a00000000000000000000000000000000000bbf5c5fd284e657f01bd000933c96d0000000000000000000000000000000000000000000000000000000652919f2d000000000000000000000000000000000000000000000000000000006afea8dc000000000000000000000000000000000000000000000000000000000000001bfd1d26b863e0dc54b39c96d98a8e811ea6413ff27509027cb53952bcec42ec3e78707aada3d498b0d152830aafd6c67a8154c644d5c5ca15b8639f9c4f3cb925",
+      "metadata": "0x",
+      "bridge": {
+        "protocolSelector": "0x00000000",
+        "destinationChainId": "0",
+        "outputToken": "0x0000000000000000000000000000000000000000",
+        "scalingFactor": 0,
+        "protocolData": "0x"
+      }
+    }
+  }
+}
