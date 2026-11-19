@@ -42,3 +42,13 @@ test('A real Binance Web3 Wallet bridge through LI.FI reads as the LI.FI bridge 
   assert.equal(detail(p, 'You pay'), '0.001 ETH');
   assert.ok(codes(p).includes('bridge_same_address'));
 });
+
+test("The router is read on BNB Chain, Base, Arbitrum One, Polygon and OP Mainnet too, each chain's native coin named", async () => {
+  const on = (chainId: number, data: Hex, value = 0n) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ROUTER, data, value: toHex(value), chainId: toHex(chainId) }] }, { now: NOW }, deps);
+  const bnb = await on(56, call(ZERO, 40_000_000_000_000_000n, 50n, '0x55d398326f99059ff775485246999027b3197955', 24_000_000_000_000_000_000n), 40_000_000_000_000_000n);
+  assert.equal(bnb.decoding.decoder, 'binance_wallet');
+  assert.match(bnb.title, /^Swap 0\.04 BNB for at least /);
+  for (const chainId of [8453, 42161, 137, 10]) assert.equal((await on(chainId, call(ZERO, 10n ** 15n, 50n, BOB, 1n), 10n ** 15n)).decoding.decoder, 'binance_wallet', String(chainId));
+  // Not on a chain whose facet wasn't checked.
+  assert.notEqual((await on(999, call(ZERO, 10n ** 15n, 50n, BOB, 1n), 10n ** 15n)).decoding.decoder, 'binance_wallet');
+});

@@ -10,6 +10,10 @@
 // 28 of 28 swaps with a token output the sender received at least minOut of the token in the low 160 bits of the
 // fifth word; and the bits above it are a fee in basis points of the output, paid to feeReceiver (50 bps in 5 of 5).
 // A zero fifth word means no output on this chain: a bridge, read from the wrapped aggregator call.
+// The facets of other chains run other code (BNB Chain's its own; Arbitrum One's, Base's, Polygon's and OP Mainnet's
+// one build), with the same layout, checked against receipts on 2026-11-19: on BNB Chain 147 of 147 senders paid
+// exactly amountIn and 112 of 112 token outputs met minOut; on Base 31 of 31 and 26 of 26; on Arbitrum One 13 of 13
+// and 11 of 11 (Polygon's and OP Mainnet's facets are byte for byte Base's and Arbitrum One's).
 import { decodeAbiParameters, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
@@ -19,8 +23,8 @@ import { decodeTransaction } from './transaction.ts';
 
 const ROUTER = '0xb300000b72deaeb607a12d5f54773d1c19c7028d';
 const SELECTOR = '0x810c705b';
-/** Only Ethereum's facet was checked against receipts; Arbitrum's diamond has different facet code. */
-const CHAIN_IDS = [1];
+/** The chains whose facet was checked against receipts, or runs the same code as one that was. */
+const CHAIN_IDS = [1, 56, 8453, 42161, 137, 10];
 const LOW160 = (1n << 160n) - 1n;
 const isZero = (a: string) => /^0x0{40}$/.test(a);
 
