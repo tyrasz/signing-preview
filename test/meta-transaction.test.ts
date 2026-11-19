@@ -16,6 +16,8 @@ const USDC_E = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174';
 const FORWARDER = '0xdd870cb1db09d566b1063f6ef68d0036aa187f91';
 const GELATO_1BALANCE = '0xd8253782c45a12053594b9deb72d8e8ab2fca54c';
 const GELATO_CONCURRENT = '0xc65d82ece367ef06bf2ab791b3f3cf037dc0e816';
+const GELATO_SYNC_FEE = '0xb539068872230f20456cf38ec52ef2f91af4ae49';
+const GELATO_NAMES: Record<string, string> = { [GELATO_1BALANCE]: 'GelatoRelay1BalanceERC2771', [GELATO_CONCURRENT]: 'GelatoRelay1BalanceConcurrentERC2771', [GELATO_SYNC_FEE]: 'GelatoRelayERC2771' };
 const word = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.slice(2)).toLowerCase().padStart(64, '0');
 const approve = `0x095ea7b3${word(EVIL)}${'f'.repeat(64)}`;
 const transfer = (to: string, amount: bigint) => `0xa9059cbb${word(to)}${word(amount)}`;
@@ -36,7 +38,7 @@ const gelato = (primaryType: string, relay: string, m: Record<string, unknown> =
   const concurrent = primaryType.includes('Concurrent');
   return {
     types: { EIP712Domain: D712, [primaryType]: [{ name: 'chainId', type: 'uint256' }, { name: 'target', type: 'address' }, { name: 'data', type: 'bytes' }, { name: 'user', type: 'address' }, concurrent ? { name: 'userSalt', type: 'bytes32' } : { name: 'userNonce', type: 'uint256' }, { name: 'userDeadline', type: 'uint256' }] },
-    primaryType, domain: { name: 'GelatoRelay', version: '1', chainId: 137, verifyingContract: relay },
+    primaryType, domain: { name: GELATO_NAMES[relay] ?? 'GelatoRelay', version: '1', chainId: 137, verifyingContract: relay },
     message: { chainId: '137', target: USDC_E, data: transfer(BOB, 5_000_000n), user: ALICE, ...(concurrent ? { userSalt: `0x${'ab'.repeat(32)}` } : { userNonce: '0' }), userDeadline: '0', ...m },
   };
 };
@@ -65,7 +67,7 @@ test('A forward request is previewed as the call it makes as you, with its warni
   // OpenZeppelin 4's MinimalForwarder, without a deadline.
   const oz4 = await sign(forward({}, true));
   assert.equal(oz4.decoding.decoder, 'meta_tx_oz4');
-  assert.equal(detail(oz4, 'Valid until'), undefined);
+  assert.equal(detail(oz4, 'Valid until'), 'no expiry');
 });
 
 test("Polygon's MetaTransaction calls the token itself, on the chain its salt names", async () => {
@@ -103,7 +105,9 @@ test("A call that would fail now is a caution that nothing moves, not the transa
   const p = await sign(forward({ data: transfer(EVIL, 7_000_000n) }), deps);
   assert.ok(codes(p).includes('meta_tx_fails'));
   assert.ok(!codes(p).includes('simulation_reverted'));
-  assert.deepEqual(p.assetChanges, []);
+  // Nothing moves now, but the signature stays usable: what it moves when it succeeds is shown, as signed.
+  assert.match(p.warnings.find(w => w.code === 'meta_tx_fails')!.message, /stays valid until .*, until it is used/);
+  assert.deepEqual(p.assetChanges.map(c => [c.direction, c.amount, c.symbol, c.basis]), [['out', '7', 'USDC', 'requested']]);
 });
 
 test('The chain is read: a used or later nonce, a target that does not trust the forwarder, an expired deadline, another account', async () => {
@@ -132,10 +136,18 @@ test("Gelato's relays: sponsored calls simulated, sync-fee calls not, the concur
   assert.equal(seen[0].from, GELATO_1BALANCE);
   assert.equal(seen[0].data, `${transfer(BOB, 5_000_000n)}${ALICE.slice(2)}`);
   assert.equal(detail(sponsored, 'Valid until'), 'no expiry');
+  assert.ok(!codes(sponsored).includes('meta_tx_wrong_relay'));
+  // A sync-fee call is simulated too, with no fee, in the relay context's form: data, fee collector, fee token, fee, user.
   seen.length = 0;
-  const fee = await sign(gelato('CallWithSyncFeeERC2771', '0xb539068872230f20456cf38ec52ef2f91af4ae49'), deps);
-  assert.equal(seen.length, 0);
+  const fee = await sign(gelato('CallWithSyncFeeERC2771', GELATO_SYNC_FEE), deps);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].data, `${transfer(BOB, 5_000_000n)}${GELATO_SYNC_FEE.slice(2)}${'e'.repeat(40)}${'0'.repeat(64)}${ALICE.slice(2)}`);
   assert.equal(fee.decoding.decoder, 'meta_tx_gelato_sync_fee');
+  // A request type sent to a relay that doesn't take it, or signed under another name, can't be used there.
+  assert.ok(codes(await sign(gelato('SponsoredCallERC2771', GELATO_SYNC_FEE))).includes('meta_tx_wrong_relay'));
+  const renamed = gelato('SponsoredCallERC2771', GELATO_1BALANCE);
+  renamed.domain.name = 'Anything';
+  assert.ok(codes(await sign(renamed)).includes('meta_tx_wrong_relay'));
   // A relay that isn't Gelato's.
   assert.ok(codes(await sign(gelato('SponsoredCallERC2771', EVIL))).includes('meta_tx_unknown_relay'));
   // The concurrent relay marks the call's struct hash used.
@@ -169,4 +181,51 @@ test('Real meta-transactions recover to their users over the digest computed her
     assert.equal(p.decoding.decoder, decoder);
     assert.match(p.title, title);
   }
+});
+
+test('Ninth review: what signers read the same is read the same; the chain is what is signed; hostile values do not crash', async () => {
+  // Odd-length hex (signers pad it with a 0) and whole JSON numbers past 2^53.
+  const odd = await sign(forward({ data: `0x${approve.slice(3)}` }));
+  assert.equal(odd.decoding.decoder, 'meta_tx_oz5');
+  assert.match(odd.title, /Allow 0xba5E…beef to spend unlimited USDC/);
+  assert.equal((await sign(gelato('SponsoredCallERC2771', GELATO_1BALANCE, { userDeadline: 1e21 }))).decoding.decoder, 'meta_tx_gelato_sponsored');
+  // A value that doesn't read as signers read it: a danger, not the generic preview.
+  const text = await sign(forward({ data: 'transfer everything' }));
+  assert.equal(text.decoding.decoder, 'meta_tx_unreadable');
+  assert.ok(text.warnings.some(w => w.code === 'meta_tx_unreadable' && w.severity === 'danger'));
+  // Polygon's chain is its salt: a chainId the domain types leave out isn't signed.
+  const untyped = polygon();
+  (untyped.domain as Record<string, unknown>).chainId = 1;
+  const p = await sign(untyped);
+  assert.equal(p.network?.kind === 'evm' && p.network.chainId, 137);
+  (untyped.domain as Record<string, unknown>).chainId = 0;
+  assert.equal((await sign(untyped)).decoding.decoder, 'meta_tx_polygon');
+  // Chains of 0, fractions and numbers past 2^256 don't throw.
+  for (const g of [gelato('SponsoredCallERC2771', GELATO_1BALANCE, { chainId: '0' }), { ...gelato('SponsoredCallERC2771', GELATO_1BALANCE), domain: { name: 'GelatoRelay1BalanceERC2771', version: '1', chainId: 137.5, verifyingContract: GELATO_1BALANCE } },
+    gelato('SponsoredCallConcurrentERC2771', GELATO_CONCURRENT, { userDeadline: `1${'0'.repeat(78)}` })]) await sign(g, { tokens: new StaticTokenRegistry(), rpc: rpcOf({}) });
+  const zero = forward();
+  zero.domain.chainId = 0;
+  const z = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(zero)] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  assert.ok(codes(z).includes('meta_tx_chain_unknown'));
+});
+
+test('Ninth review: the gas signed, the latest state, the wallet chain, a target that does not answer, a trace', async () => {
+  const seen: SimulationRequest[] = [];
+  const deps: Dependencies = { tokens: new StaticTokenRegistry(), simulator: { simulate: async r => { seen.push(r); return { status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [] }; } } };
+  // OpenZeppelin's forwarders give the call exactly the gas signed: the run is given that and what the transaction needs first.
+  await sign(forward(), deps);
+  assert.ok(seen[0].gas !== undefined && seen[0].gas > 100_000n + 21_000n && seen[0].gas < 100_000n + 40_000n, String(seen[0].gas));
+  // A past block named for the preview isn't used for a signature: the latest state is, and the note says so.
+  seen.length = 0;
+  const past = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(forward())] }, { now: NOW, chainId: 1, block: 20_000_000 }, deps);
+  assert.equal(seen[0].at, undefined);
+  assert.ok(past.decoding.notes.some(n => /previewed against the latest block/.test(n)));
+  // Signed for another chain than the wallet's.
+  assert.ok(codes(await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(polygon())] }, { now: NOW, chainId: 1 }, deps)).includes('chain_mismatch'));
+  // A target that doesn't answer isTrustedForwarder: OpenZeppelin 5's forwarder refuses it.
+  const silent = await sign(forward(), { tokens: new StaticTokenRegistry(), rpc: rpcOf({ '0x7ecebe00': `0x${word(3n)}`, '0x572b6c05': '0x' }) });
+  assert.match(silent.warnings.find(w => w.code === 'meta_tx_untrusted')!.message, /doesn't answer isTrustedForwarder.*refuses/);
+  // A trace asked for: shown, or why not.
+  const traced = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(forward())] }, { now: NOW, chainId: 1, trace: true }, deps);
+  assert.ok(traced.trace || traced.decoding.notes.some(n => /^No trace/.test(n)));
 });
