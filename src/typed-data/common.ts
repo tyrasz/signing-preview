@@ -89,11 +89,16 @@ export function str(value: unknown): string {
   return String(value);
 }
 
+/**
+ * An unsigned integer, read as the digest is computed (typedDataDigest, viem): BigInt() of a string, which takes
+ * surrounding whitespace and 0x, 0o or 0b, and an empty string as 0; a whole JSON number, however large. Read
+ * otherwise, the same signed message could show other amounts than it signs.
+ */
 export function big(value: unknown): bigint | null {
   try {
-    if (typeof value === 'bigint') return value;
-    if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value);
-    if (typeof value === 'string' && /^(0x[0-9a-fA-F]+|\d+)$/.test(value)) return BigInt(value);
+    if (typeof value === 'bigint') return value >= 0n ? value : null;
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return BigInt(value);
+    if (typeof value === 'string' && value.length <= 200) { const v = BigInt(value); return v >= 0n ? v : null; }
   } catch { /* fallthrough */ }
   return null;
 }

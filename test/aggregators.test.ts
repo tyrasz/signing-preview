@@ -152,3 +152,30 @@ test('Uniswap-style forks: a referrer after the recipient, and Algebra’s fee-l
   assert.equal(algebra.title, 'Swap 50 USDC for at least 49.9 USDT on a Uniswap-style router (0x0000…0f0f)');
   assert.equal(detail(algebra, 'Pool fees'), undefined);
 });
+
+test("Tenth review: OKX's trim of the output, its other entry points, and a zero receiver", async () => {
+  const OKX = '0x8feab81d36e7576107d5de0758c1b839be31b4f6', EVIL = '0xba5ed0000000000000000000000000000000beef', ZERO = '0x0000000000000000000000000000000000000000';
+  const BR = '(uint256 fromToken, address toToken, uint256 fromTokenAmount, uint256 minReturnAmount, uint256 deadLine) baseRequest';
+  const A = parseAbi([
+    `function dagSwapTo(uint256 orderId, address receiver, ${BR}, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[] paths) payable returns (uint256)`,
+    `function smartSwapTo(uint256 orderId, address receiver, ${BR}, uint256[] batchesAmount, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[][] batches, (uint256 pathIndex, address payer, address fromToken, address toToken, uint256 fromTokenAmountMax, uint256 toTokenAmountMax, uint256 salt, uint256 deadLine, bool isPushOrder, bytes extension)[] extraData) payable returns (uint256)`,
+    'function swapWrap(uint256 orderId, uint256 rawdata) payable',
+  ]);
+  const base = { fromToken: BigInt(USDT), toToken: USDC as Hex, fromTokenAmount: 1_000_000_000n, minReturnAmount: 900_000_000n, deadLine: 0n };
+  const dag = (receiver: string) => encodeFunctionData({ abi: A, functionName: 'dagSwapTo', args: [1n, receiver as Hex, base, []] });
+  // A trim of 10% (rate 100 of 1000) to EVIL, expecting nothing (so all of it is above), as the router reads it
+  // from the right: its flag, rate and address last; before it, its flag and the output expected.
+  const trimWords = `${'777777771111'}${'0'.repeat(12)}${'0'.repeat(40)}${'777777771111'}${(100).toString(16).padStart(12, '0')}${EVIL.slice(2)}`;
+  const trimmed = await send(OKX, `${dag(ALICE)}${trimWords}` as Hex);
+  assert.ok(codes(trimmed).includes('okx_trim'));
+  assert.match(detail(trimmed, 'Positive slippage') ?? '', /up to 10% of it goes to 0xba5e…beef/i);
+  // smartSwapTo to another address: its receiver is read.
+  const smart = await send(OKX, encodeFunctionData({ abi: A, functionName: 'smartSwapTo', args: [1n, EVIL, base, [], [], []] }));
+  assert.equal(smart.decoding.decoder, 'okx_dex');
+  assert.ok(codes(smart).includes('recipient_not_sender'));
+  // A zero receiver is the sender.
+  assert.ok(!codes(await send(OKX, dag(ZERO))).includes('recipient_not_sender'));
+  // swapWrap: wrapping 1 ETH (top bit clear), unwrapping (set).
+  assert.match((await send(OKX, encodeFunctionData({ abi: A, functionName: 'swapWrap', args: [1n, 10n ** 18n] }), 10n ** 18n)).title, /^Swap 1 ETH for at least 1 WETH/);
+  assert.match((await send(OKX, encodeFunctionData({ abi: A, functionName: 'swapWrap', args: [1n, (1n << 255n) | 10n ** 18n] }))).title, /^Swap 1 WETH for at least 1 ETH/);
+});

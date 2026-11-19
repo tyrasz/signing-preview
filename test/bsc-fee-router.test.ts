@@ -21,9 +21,9 @@ test('Swaps through the BNB Chain fee router: what you pay, the least you get, t
   assert.equal(p.title, 'Swap 0.04 BNB for at least 24 USDT (swap router 0xd36b…6deb)');
   assert.equal(detail(p, 'Fee'), '0.6% to 0x69aa…46d2');
   assert.deepEqual(p.assetChanges.map(c => [c.direction, c.amount, c.symbol]), [['out', '0.04', 'BNB'], ['in', '24', 'USDT']]);
-  // The native coin out: the fee comes out of the minimum.
+  // The native coin out: the minimum is what you get, checked after the fee (as the node runs a real call).
   const out = await send(call(USDT, NATIVE, 10n ** 19n, 10n ** 16n));
-  assert.match(out.title, /for at least 0\.00994 BNB/);
+  assert.match(out.title, /for at least 0\.01 BNB/);
   assert.ok(codes(await send(call(USDT, NATIVE, 10n ** 19n, 0n))).includes('no_slippage_limit'));
   assert.ok(codes(await send(call(USDT, NATIVE, 10n ** 19n, 1n, { bps: 150n }))).includes('large_fee_portion'));
   assert.ok(codes(await send(call(NATIVE, USDT, 10n ** 16n, 1n), 10n ** 15n)).includes('value_mismatch'));

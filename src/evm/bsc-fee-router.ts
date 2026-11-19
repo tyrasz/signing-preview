@@ -9,9 +9,10 @@
 // router's own Swap(sender, srcToken, dstToken, dstReceiver, amount, returnAmount) events (2026-11-19, 200 of the
 // latest): in 200 of 200 the sender paid exactly `amount` (as value, or as a token transfer) and received what it
 // bought (dstReceiver was the sender in all of them); in 164 of 164 with a token output it received at least
-// `minReturn`; with the native coin out, the fee is taken from what the swap returns after `minReturn` is checked
-// (in 4 of 36 the sender got less than it), so the least received is `minReturn` less the fee. The two words after
-// the fee receiver were zero in all 200: calls where they aren't are left to the other decoders.
+// `minReturn`. With the native coin out, `minReturn` is checked after the fee too: run on the chain's node
+// (eth_simulateV1), a real call paid exactly `minReturn` and one asking a wei more reverted
+// (INSUFFICIENT_OUTPUT_AMOUNT). The two words after the fee receiver were zero in all 200: calls where they aren't
+// are left to the other decoders.
 import { formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import type { AssetChange } from '../types.ts';
@@ -36,8 +37,8 @@ export const bscFeeRouterAdapter: Adapter = async (tx, env) => {
     return info ? { text: `${formatUnits(raw, info.decimals)} ${info.symbol}`, change: { amount: formatUnits(raw, info.decimals), symbol: info.symbol, raw: raw.toString(), asset: token, basis: 'requested' as const, standard: 'erc20' as const }, info }
       : { text: `${raw} base units of ${shortAddress(token)}`, change: undefined, info };
   };
-  // With the native coin out, the fee comes out of what the swap returns after the minimum is checked.
-  const least = dst === NATIVE ? minReturn - (minReturn * feeBps) / 10_000n : minReturn;
+  // The minimum is checked on what you get, after the fee.
+  const least = minReturn;
   const [paid, got] = await Promise.all([read(src, amount), read(dst, least)]);
   const b = new PreviewBuilder().detail('Contract', `Swap router (${ROUTER}), its code unpublished`, ROUTER)
     .detail('You pay', paid.text, src === NATIVE ? undefined : src).detail('You receive at least', got.text, dst === NATIVE ? undefined : dst)

@@ -181,6 +181,10 @@ const OKX_ABI = parseAbi([
   `function dagSwapTo(uint256 orderId, address receiver, ${BASE_REQUEST}, ${ROUTER_PATH}) payable returns (uint256)`,
   `function smartSwapByOrderId(uint256 orderId, ${BASE_REQUEST}, uint256[] batchesAmount, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[][] batches, (uint256 pathIndex, address payer, address fromToken, address toToken, uint256 fromTokenAmountMax, uint256 toTokenAmountMax, uint256 salt, uint256 deadLine, bool isPushOrder, bytes extension)[] extraData) payable returns (uint256)`,
   `function uniswapV3SwapToWithBaseRequest(uint256 orderId, address receiver, ${BASE_REQUEST}, uint256[] pools) payable returns (uint256)`,
+  `function smartSwapTo(uint256 orderId, address receiver, ${BASE_REQUEST}, uint256[] batchesAmount, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[][] batches, (uint256 pathIndex, address payer, address fromToken, address toToken, uint256 fromTokenAmountMax, uint256 toTokenAmountMax, uint256 salt, uint256 deadLine, bool isPushOrder, bytes extension)[] extraData) payable returns (uint256)`,
+  `function unxswapToWithBaseRequest(uint256 orderId, address receiver, ${BASE_REQUEST}, bytes32[] pools) payable returns (uint256)`,
+  `function swapWrapToWithBaseRequest(uint256 orderId, address receiver, ${BASE_REQUEST}) payable`,
+  'function swapWrap(uint256 orderId, uint256 rawdata) payable',
   'function unxswapByOrderId(uint256 srcToken, uint256 amount, uint256 minReturn, bytes32[] pools) payable returns (uint256)',
   'function unxswapTo(uint256 srcToken, uint256 amount, uint256 minReturn, address receiver, bytes32[] pools) payable returns (uint256)',
   'function uniswapV3SwapTo(uint256 receiver, uint256 amount, uint256 minReturn, uint256[] pools) payable returns (uint256)',
@@ -198,7 +202,13 @@ const OKX_COMMISSION: Record<string, { side: 'from' | 'to'; referrers: number | 
   '88880afc2aaa': { side: 'from', referrers: 'multiple' }, '88880afc2bbb': { side: 'to', referrers: 'multiple' },
 };
 const OKX_OTHER_FLAGS = ['777777771111', '777777772222', '92527fff1a65', '92527fff1a64', 'ac3a7da8b1c6'];
-function okxCommission(data: Hex, swapLength: number): { side: 'from' | 'to'; token: string; referrers: { address: string; rate: bigint }[] } | null {
+interface OkxCommission { side: 'from' | 'to'; token: string; referrers: { address: string; rate: bigint }[] }
+/**
+ * A trim, left of any commission: of what the swap returns above expectAmountOut, up to trimRate/1000 (at most 10%)
+ * goes to trimAddress (with the dual flag, chargeRate/1000 of that to chargeAddress) before the minimum is checked.
+ */
+interface OkxTrim { rate: bigint; address: string; expectAmountOut: bigint; chargeRate: bigint; chargeAddress?: string }
+function okxExtra(data: Hex, swapLength: number): { commission: OkxCommission | null; trim: OkxTrim | null } {
   const size = (data.length - 2) / 2;
   const word = (end: number) => data.slice(2 + (end - 32) * 2, 2 + end * 2).toLowerCase();
   let end = size - ((size - 4) % 32), flag: string | undefined;
@@ -206,18 +216,36 @@ function okxCommission(data: Hex, swapLength: number): { side: 'from' | 'to'; to
     const f = word(at).slice(0, 12);
     if (OKX_COMMISSION[f] || OKX_OTHER_FLAGS.includes(f)) { end = at; flag = f; break; }
   }
-  const kind = flag ? OKX_COMMISSION[flag] : undefined;
-  if (!kind || end - 64 < swapLength) return null;
-  const tokenWord = word(end - 32);
-  const count = kind.referrers === 'multiple' ? parseInt(tokenWord.slice(2, 4), 16) : kind.referrers;
-  if (count < 1 || count > 8 || end - 32 * (count + 1) < swapLength) return null;
-  const referrers: { address: string; rate: bigint }[] = [];
-  for (let i = 0; i < count; i++) {
-    const w = i === 0 ? word(end) : word(end - 32 - 32 * i);
-    if (w.slice(0, 12) !== flag) return null;
-    referrers.push({ address: `0x${w.slice(24)}`, rate: BigInt(`0x${w.slice(12, 24)}`) });
+  if (!flag) return { commission: null, trim: null };
+  // The commission, rightmost: its first referrer's word, the token's, then the others'.
+  let commission: OkxCommission | null = null, commissionWords = 0;
+  const kind = OKX_COMMISSION[flag];
+  if (kind && end - 64 >= swapLength) {
+    const tokenWord = word(end - 32);
+    const count = kind.referrers === 'multiple' ? parseInt(tokenWord.slice(2, 4), 16) : kind.referrers;
+    if (count >= 1 && count <= 8 && end - 32 * (count + 1) >= swapLength) {
+      const referrers: { address: string; rate: bigint }[] = [];
+      for (let i = 0; i < count; i++) {
+        const w = i === 0 ? word(end) : word(end - 32 - 32 * i);
+        if (w.slice(0, 12) !== flag) break;
+        referrers.push({ address: `0x${w.slice(24)}`, rate: BigInt(`0x${w.slice(12, 24)}`) });
+      }
+      if (referrers.length === count) { commission = { side: kind.side, token: `0x${tokenWord.slice(24)}`, referrers }; commissionWords = count + 1; }
+    }
   }
-  return { side: kind.side, token: `0x${tokenWord.slice(24)}`, referrers };
+  // The trim, just left of it.
+  const trimEnd = end - 32 * commissionWords;
+  let trim: OkxTrim | null = null;
+  if (trimEnd - 64 >= swapLength) {
+    const first = word(trimEnd), f = first.slice(0, 12);
+    const dual = f === '777777772222';
+    if ((f === '777777771111' || dual) && word(trimEnd - 32).slice(0, 12) === f && (!dual || (trimEnd - 96 >= swapLength && word(trimEnd - 64).slice(0, 12) === f))) {
+      const third = dual ? word(trimEnd - 64) : undefined;
+      trim = { rate: BigInt(`0x${first.slice(12, 24)}`), address: `0x${first.slice(24)}`, expectAmountOut: BigInt(`0x${word(trimEnd - 32).slice(24)}`),
+        chargeRate: third ? BigInt(`0x${third.slice(12, 24)}`) : 0n, ...(third && { chargeAddress: `0x${third.slice(24)}` }) };
+    }
+  }
+  return { commission, trim };
 }
 
 /** The output token of a chain of v2/v3 pools from `input`, each pool in a word's low 160 bits (token0/token1 read on-chain). */
@@ -237,7 +265,13 @@ const okxAdapter: Adapter = async (tx, env) => {
   if (req) {
     const args = call.args as readonly unknown[];
     src = addressOf(req.fromToken); dst = req.toToken; amount = req.fromTokenAmount; minReturn = req.minReturnAmount;
-    if (call.functionName === 'dagSwapTo' || call.functionName === 'uniswapV3SwapToWithBaseRequest') receiver = args[1] as string;
+    if (['dagSwapTo', 'uniswapV3SwapToWithBaseRequest', 'smartSwapTo', 'unxswapToWithBaseRequest', 'swapWrapToWithBaseRequest'].includes(call.functionName)) receiver = args[1] as string;
+  } else if (call.functionName === 'swapWrap') {
+    // Wrapping or unwrapping the native coin, one for one: the top bit unwraps; the amount is the low 128 bits.
+    const raw = (call.args as readonly bigint[])[1];
+    const unwrap = (raw >> 255n) & 1n;
+    amount = raw & ((1n << 128n) - 1n); minReturn = amount;
+    src = unwrap ? weth : NATIVE_ALIASES[0]; dst = unwrap ? NATIVE_ALIASES[0] : weth;
   } else if (call.functionName === 'uniswapV3SwapTo') {
     const [to, amt, min, pools] = call.args as readonly [bigint, bigint, bigint, readonly bigint[]];
     receiver = addressOf(to); amount = amt; minReturn = min;
@@ -257,6 +291,7 @@ const okxAdapter: Adapter = async (tx, env) => {
     // Bit 254 of the last pool (bit 255 is its direction): the WETH out is paid as ETH (checked against receipts).
     if (dst && sameAddress(dst, weth) && (pools[pools.length - 1] >> 254n) & 1n) dst = NATIVE_ALIASES[0];
   }
+  if (/^0x0{40}$/.test(receiver)) receiver = tx.from;
   const sent = await amountOf(env, tx.chainId, src, amount);
   const least = dst ? await amountOf(env, tx.chainId, dst, minReturn) : `${minReturn} base units of the output token`;
   b.detail('You send', sent).detail('You receive at least', least);
@@ -265,7 +300,8 @@ const okxAdapter: Adapter = async (tx, env) => {
   let commission = '';
   let swapLength = 0;
   try { swapLength = (encodeFunctionData({ abi: OKX_ABI, functionName: call.functionName, args: call.args } as never).length - 2) / 2; } catch { swapLength = 0; }
-  const c = swapLength ? okxCommission(tx.data, swapLength) : null;
+  const extra = swapLength ? okxExtra(tx.data, swapLength) : { commission: null, trim: null };
+  const c = extra.commission;
   if (c) {
     const total = c.referrers.reduce((t, r) => t + r.rate, 0n);
     const percent = `${formatUnits(total, 7)}%`;
@@ -275,6 +311,13 @@ const okxAdapter: Adapter = async (tx, env) => {
       b.detail('Commission', `${commission} (${percent}) to ${to}, paid on top of what you send`, c.referrers.map(r => r.address).join(','));
     } else b.detail('Commission', `${percent} of what the swap returns, to ${to}`, c.referrers.map(r => r.address).join(','));
     if (total >= 10_000_000n) b.warn('caution', 'large_fee_portion', `The app takes a ${percent} commission on this swap (to ${to}).`);
+  }
+  const t = extra.trim;
+  if (t && t.rate > 0n) {
+    const above = dst ? await amountOf(env, tx.chainId, dst, t.expectAmountOut) : `${t.expectAmountOut} base units`;
+    const percent = `${formatUnits(t.rate, 1)}%`;
+    b.detail('Positive slippage', `of what the swap returns above ${above}, up to ${percent} of it goes to ${shortAddress(t.address)}${t.chargeAddress && t.chargeRate > 0n ? ` (${formatUnits(t.chargeRate, 1)}% of that to ${shortAddress(t.chargeAddress)})` : ''}`, t.address);
+    b.warn('caution', 'okx_trim', `The app keeps part of what the swap returns: anything above ${above}, up to ${percent} of the whole, goes to ${shortAddress(t.address)} before you are paid. You still get at least the minimum.`);
   }
   if (!sameAddress(receiver, tx.from)) {
     b.detail('Recipient', receiver);

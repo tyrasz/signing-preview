@@ -35,7 +35,7 @@ test('Delta orders: sell and buy, the partner fee taken before the least shown, 
   const partner = BigInt(BOB) << 96n;
   const fee = await sign(order({ partnerAndFee: String(partner | 100n) }));
   assert.equal(fee.title, 'Sell 1,000 USDC for at least 0.297 WETH (Velora Delta)');
-  assert.match(detail(fee, 'Partner fee') ?? '', /^1% to 0xb0b0…0002/);
+  assert.equal(detail(fee, 'Partner'), '0xb0b0…0002: a 1% fee');
   // A buy order: exactly that much, paying at most.
   assert.equal((await sign(order({ kind: 1 }))).title, 'Buy 0.3 WETH for at most 1,000 USDC (Velora Delta)');
   // Bridged to another chain: nothing arrives here.
@@ -51,4 +51,40 @@ test('Delta orders: sell and buy, the partner fee taken before the least shown, 
   const odd = order();
   odd.types = { ...odd.types, Order: odd.types.Order.slice(1) };
   assert.notEqual((await sign(odd)).decoding.decoder, 'velora_delta_order');
+});
+
+test('Tenth review: fees as Velora takes them, the bridge terms read, values read as signed, a permit', async () => {
+  const EVIL = '0xba5ed0000000000000000000000000000000beef', partner = BigInt(EVIL) << 96n;
+  // An expected amount of 0 with the partner taking the surplus: settled at the minimum, nothing is left for you.
+  const drained = await sign(order({ expectedAmount: '0', partnerAndFee: String(partner | 0x100n) }));
+  assert.equal(drained.title, 'Sell 1,000 USDC for at least 0 WETH (Velora Delta)');
+  assert.ok(drained.warnings.some(w => w.code === 'velora_expected_below_minimum' && w.severity === 'danger'));
+  assert.equal(detail(drained, 'Partner'), '0xba5e…beef: the rest of any surplus over the expected amount');
+  // With no partner, Velora's half: 0.15 WETH.
+  assert.match((await sign(order({ expectedAmount: '0' }))).title, /at least 0\.15 WETH/);
+  // Across: a handler that isn't Across's keeps ETH or WETH; a relayer fee as large as the amount; decimals off.
+  const across = (handler: string, maxFee: bigint, scalingFactor = 0) => order({ bridge: { protocolSelector: '0x2e09f389', destinationChainId: '8453', outputToken: '0x4200000000000000000000000000000000000006', scalingFactor,
+    protocolData: `0x${handler.slice(2).padStart(64, '0')}${maxFee.toString(16).padStart(64, '0')}` } });
+  const handled = await sign(across(EVIL, 0n));
+  assert.ok(codes(handled).includes('velora_bridge_recipient'));
+  assert.ok(!codes(await sign(across('0x0f7ae28de1c8532170ad4ee566b5801485c13a0e', 10n ** 15n))).includes('velora_bridge_recipient'));
+  assert.ok(codes(await sign(across('0x0f7ae28de1c8532170ad4ee566b5801485c13a0e', 10n ** 30n))).includes('velora_bridge_fee'));
+  assert.ok(codes(await sign(across('0x0f7ae28de1c8532170ad4ee566b5801485c13a0e', 0n, -18))).includes('velora_bridge_scaling'));
+  // Another bridge's terms aren't read: said.
+  const relay = await sign(order({ bridge: { protocolSelector: '0xb8829306', destinationChainId: '1', outputToken: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', scalingFactor: 0, protocolData: '0x1234' } }));
+  assert.ok(codes(relay).includes('velora_bridge_unread'));
+  assert.equal(relay.decoding.status, 'partial');
+  // Numbers as BigInt reads them (whitespace, as viem signs them): the bridge and the fee aren't lost.
+  const spaced = await sign(order({ partnerAndFee: ` ${partner | 200n}`, bridge: { protocolSelector: '0x2e09f389', destinationChainId: ' 8453', outputToken: '0x4200000000000000000000000000000000000006', scalingFactor: 0, protocolData: `0x${'0'.repeat(128)}` } }));
+  assert.match(spaced.title, /bridged to Base/);
+  assert.equal(detail(spaced, 'Partner'), '0xba5e…beef: a 2% fee');
+  // A beneficiary or value that doesn't read is a danger, not the owner.
+  const bad = await sign(order({ beneficiary: 'bad000000000000000000000000000000000000bad' }));
+  assert.equal(bad.decoding.decoder, 'velora_delta_order');
+  assert.ok(bad.warnings.some(w => w.code === 'velora_order_unreadable' && w.severity === 'danger'));
+  // A permit in the order is how the settlement takes the token: no allowance check claims otherwise.
+  const permitted = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(order({ permit: '0x01' }))] }, { now: NOW, chainId: 42161 },
+    { tokens: new StaticTokenRegistry(), rpc: { has: () => true, call: async () => `0x${'0'.repeat(64)}` } });
+  assert.ok(permitted.decoding.notes.some(n => /carries a permit \(1 bytes\).*through Permit2/.test(n)));
+  assert.equal(detail(permitted, 'Can move now'), undefined);
 });
