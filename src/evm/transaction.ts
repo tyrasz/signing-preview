@@ -16,7 +16,7 @@ import { seaportTxAdapter } from './seaport.ts';
 import { safeExecAdapter } from './safe.ts';
 import { seaDropAdapter } from './seadrop.ts';
 import { lifiAdapter } from './lifi.ts';
-import { relayAdapter } from './relay.ts';
+import { relayAdapter, relayProxyAdapter, relayRouterAdapter } from './relay.ts';
 import { binanceWalletAdapter } from './binance-wallet.ts';
 import { hyperlendIsolatedAdapter } from './hyperlend-isolated.ts';
 import { beaconDepositAdapter } from './beacon-deposit.ts';
@@ -42,6 +42,8 @@ export const ADAPTERS: Adapter[] = [
   seaDropAdapter,
   lifiAdapter,
   relayAdapter,
+  relayProxyAdapter,
+  relayRouterAdapter,
   binanceWalletAdapter,
   hyperlendIsolatedAdapter,
   beaconDepositAdapter,

@@ -25,13 +25,14 @@ import { morphoAuthorizationAdapter } from './typed-data/morpho.ts';
 import { cometAuthorizationAdapter } from './typed-data/comet.ts';
 import { snapshotAdapter } from './typed-data/snapshot.ts';
 import { governanceAdapter } from './typed-data/governance.ts';
+import { relayMulticallAdapter } from './typed-data/relay.ts';
 import { previewMessage } from './message.ts';
 import { readAttribution } from './attribution.ts';
 import { previewSignedOperation } from './userop-hash.ts';
 import { previewSupertransaction, previewTypedSupertransaction } from './supertransaction.ts';
 import { previewPermissionRequests } from './permissions.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, relayMulticallAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign', 'wallet_requestExecutionPermissions'] as const;

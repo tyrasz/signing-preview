@@ -4,6 +4,7 @@ import { tokenSourceWarnings } from '../evm/common.ts';
 import type { TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv, type TypedData } from './common.ts';
 import { canMoveNow } from './exposure.ts';
+import { isRelayWitness, relayCalls } from './relay.ts';
 
 /** One eth_call's 32-byte words, or undefined without an RPC (or on failure). */
 async function words(env: TypedEnv, chainId: number | null, to: string, data: string): Promise<bigint[] | undefined> {
@@ -132,6 +133,16 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
       }
       const order = data.primaryType.includes('Witness') ? await uniswapXOrder(m.witness, env, chainId, spender, lines.join(', '), b) : null;
       if (order) { offChainNote(); return result(order.title, order.summary, 'uniswapx_order', 'full'); }
+      // Relay's gasless request: the tokens go to its router, which makes the calls the witness carries (src/typed-data/relay.ts).
+      if (data.primaryType === 'PermitBatchWitnessTransferFrom' && isRelayWitness(data.types) && m.witness && typeof m.witness === 'object' && env.signer) {
+        const w = m.witness as Record<string, unknown>;
+        const titles = await relayCalls(w, w.call3Values, env, chainId, env.signer, b, spender);
+        if (titles) {
+          offChainNote();
+          return result(`Relay: move ${lines.join(', ')} into its router for ${titles.length === 1 ? 'a call' : `${titles.length} calls`}: ${titles.slice(0, 3).join('; ')}${titles.length > 3 ? '; …' : ''}`,
+            `A Relay request (Permit2): ${lines.join(', ')} go to Relay's router, which makes the ${titles.length} signed call${titles.length === 1 ? '' : 's'} for you and sends what is left to ${shortAddress(str(w.refundTo))}.`, 'relay_permit2', 'full');
+        }
+      }
       if (data.primaryType.includes('Witness')) b.warn('info', 'permit2_witness', 'The signature also commits to extra order data (a "witness"), typically a swap or intent order.');
       offChainNote();
       return result(`Permit2: let ${shortAddress(spender)} take ${lines.join(', ')}`, 'Signs a one-time Permit2 transfer; the spender can pull these tokens once.', 'permit2_transfer', data.primaryType.includes('Witness') ? 'partial' : 'full');
