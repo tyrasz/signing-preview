@@ -1,0 +1,99 @@
+{
+  "chainId": 56,
+  "tx": "0xdac90c7bf9d729234f99bcd9cf99556ea31aa89624defd568820e8dfa5d6d5fa",
+  "signer": "0x31b48a54ff888fbadee33ac1154475d828ca2d14",
+  "signature": "0xa74ec21d9286c420b8a4b62d14273b4d9f3df40cc361e8f232fcf8c4a5dc34334b11d13c33eb7cce76f79c0b3b9ba8a2d786fc64ac796b43473047d810d353ad1b",
+  "typedData": {
+    "types": {
+      "EIP712Domain": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "string"
+        },
+        {
+          "name": "chainId",
+          "type": "uint256"
+        },
+        {
+          "name": "verifyingContract",
+          "type": "address"
+        }
+      ],
+      "Order": [
+        {
+          "name": "salt",
+          "type": "uint256"
+        },
+        {
+          "name": "maker",
+          "type": "address"
+        },
+        {
+          "name": "signer",
+          "type": "address"
+        },
+        {
+          "name": "taker",
+          "type": "address"
+        },
+        {
+          "name": "tokenId",
+          "type": "uint256"
+        },
+        {
+          "name": "makerAmount",
+          "type": "uint256"
+        },
+        {
+          "name": "takerAmount",
+          "type": "uint256"
+        },
+        {
+          "name": "expiration",
+          "type": "uint256"
+        },
+        {
+          "name": "nonce",
+          "type": "uint256"
+        },
+        {
+          "name": "feeRateBps",
+          "type": "uint256"
+        },
+        {
+          "name": "side",
+          "type": "uint8"
+        },
+        {
+          "name": "signatureType",
+          "type": "uint8"
+        }
+      ]
+    },
+    "primaryType": "Order",
+    "domain": {
+      "name": "predict.fun CTF Exchange",
+      "version": "1",
+      "chainId": 56,
+      "verifyingContract": "0x8bc070bedab741406f4b1eb65a72bee27894b689"
+    },
+    "message": {
+      "salt": "1327987602",
+      "maker": "0x31B48a54Ff888FbAdee33Ac1154475d828ca2D14",
+      "signer": "0x31B48a54Ff888FbAdee33Ac1154475d828ca2D14",
+      "taker": "0x0000000000000000000000000000000000000000",
+      "tokenId": "62076515833708015660861695061825882846158335013754718779328515419177345401988",
+      "makerAmount": "2000000000000000000",
+      "takerAmount": "4009090000000000000",
+      "expiration": "1795082560",
+      "nonce": "0",
+      "feeRateBps": "200",
+      "side": 0,
+      "signatureType": 0
+    }
+  }
+}

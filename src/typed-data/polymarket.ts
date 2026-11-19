@@ -14,6 +14,10 @@
 // collateral. A share pays at most 1. The maker holds the funds: the signer's own account (EOA), its Polymarket proxy
 // wallet, its Safe, or (V2) a contract that checks the signature (ERC-1271).
 // ClobAuth (domain "ClobAuthDomain" version 1, Polymarket's clob-client) signs in to the order book's API.
+//
+// predict.fun on BNB Chain runs Polymarket's first exchange (verified on Sourcify as CTFExchange: the same Order, a 10%
+// maximum fee rate, the same fee formula) under the domain "predict.fun CTF Exchange" version 1, with USDT (18 decimals)
+// as collateral and its own ConditionalTokens: its orders are read the same way.
 import { formatTimestamp, formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
 import type { TokenInfo } from '../types.ts';
@@ -27,6 +31,11 @@ export const POLYMARKET = {
 };
 const PUSD: TokenInfo = { address: '0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb', symbol: 'pUSD', decimals: 6, name: 'Polymarket USD', source: 'builtin' };
 const USDC_E: TokenInfo = { address: '0x2791bca1f2de4661ed88a30c99a7a9449aa84174', symbol: 'USDC.e', decimals: 6, name: 'USD Coin (PoS)', source: 'builtin' };
+/** predict.fun's exchange on BNB Chain (its FeeModuleV3, 0xdcff…91a1, names it; getCollateral() is BNB Chain's USDT). */
+const PREDICT = {
+  name: 'predict.fun CTF Exchange', chainId: 56, exchanges: ['0x8bc070bedab741406f4b1eb65a72bee27894b689'], ctf: '0x22da1810b194ca018378464a58f6ac2b10c9d244',
+  collateral: { address: '0x55d398326f99059ff775485246999027b3197955', symbol: 'USDT', decimals: 18, name: 'Tether USD', source: 'builtin' } as TokenInfo,
+};
 const V1 = 'uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType';
 const V2 = 'uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder';
 const CLOB_MESSAGE = 'This message attests that I control the given wallet';
@@ -36,14 +45,17 @@ const SIGNATURE_TYPES = ['its own key (EOA)', 'its Polymarket proxy wallet', 'it
 
 /** A price per share, to 4 places. */
 const price = (cash: bigint, shares: bigint) => shares === 0n ? 'no' : (Number(cash * 1_000_000n / shares) / 1_000_000).toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
-const shares = (v: bigint) => `${formatUnits(v, 6)} share${v === 1_000_000n ? '' : 's'}`;
+const sharesOf = (decimals: number) => (v: bigint) => `${formatUnits(v, decimals)} share${v === 10n ** BigInt(decimals) ? '' : 's'}`;
 
 export const polymarketAdapter: TypedAdapter = async (data, env) => {
   const name = str(data.domain.name);
   if (name === 'ClobAuthDomain' && data.primaryType === 'ClobAuth') return clobAuth(data, env);
   const fields = data.types.Order?.map(f => `${f.type} ${f.name}`).join(',');
-  if (name !== 'Polymarket CTF Exchange' || data.primaryType !== 'Order' || (fields !== V1 && fields !== V2)) return null;
+  const predict = name === PREDICT.name && fields === V1;
+  if (!predict && (name !== 'Polymarket CTF Exchange' || data.primaryType !== 'Order' || (fields !== V1 && fields !== V2))) return null;
+  if (predict && data.primaryType !== 'Order') return null;
   const v2 = fields === V2;
+  const venue = predict ? 'predict.fun' : 'Polymarket', home = predict ? PREDICT.chainId : 137, ctf = predict ? PREDICT.ctf : POLYMARKET.ctf;
   const m = data.message;
   const maker = str(m.maker).toLowerCase(), signer = str(m.signer).toLowerCase(), taker = v2 ? ZERO : str(m.taker).toLowerCase();
   const tokenId = big(m.tokenId), makerAmount = big(m.makerAmount), takerAmount = big(m.takerAmount), side = big(m.side), sigType = big(m.signatureType);
@@ -52,10 +64,11 @@ export const polymarketAdapter: TypedAdapter = async (data, env) => {
   const chainId = domainChainId(data);
   const network = chainId !== null ? { kind: 'evm' as const, chainId, name: chainName(chainId) } : null;
   const exchange = str(data.domain.verifyingContract).toLowerCase();
-  const known = (v2 ? POLYMARKET.v2 : POLYMARKET.v1).includes(exchange);
-  const live = known && chainId === 137;
-  const collateral = v2 ? PUSD : USDC_E;
-  const cash = (v: bigint) => `${formatUnits(v, 6)} ${collateral.symbol}`;
+  const known = (predict ? PREDICT.exchanges : v2 ? POLYMARKET.v2 : POLYMARKET.v1).includes(exchange);
+  const live = known && chainId === home;
+  const collateral = predict ? PREDICT.collateral : v2 ? PUSD : USDC_E;
+  const cash = (v: bigint) => `${formatUnits(v, collateral.decimals)} ${collateral.symbol}`;
+  const shares = sharesOf(collateral.decimals);
   const b = new PreviewBuilder();
   const buy = side === 0n;
   const cashAmount = buy ? makerAmount! : takerAmount!, shareAmount = buy ? takerAmount! : makerAmount!;
@@ -66,7 +79,8 @@ export const polymarketAdapter: TypedAdapter = async (data, env) => {
     .detail(buy ? 'You pay' : 'You sell', buy ? cash(makerAmount!) : shares(makerAmount!), makerAmount!.toString())
     .detail(buy ? 'You get' : 'You get at least', buy ? shares(takerAmount!) : cash(takerAmount!), takerAmount!.toString())
     .detail('Price', `${each} ${collateral.symbol} a share${buy ? ' (at most)' : ' (at least)'}`)
-    .detail('Funds from', `${maker} (${SIGNATURE_TYPES[Number(sigType)] ?? `signature type ${sigType}`})`, maker);
+    // predict.fun's exchange checks an EOA-type order with OpenZeppelin's SignatureChecker, which also takes a contract's ERC-1271.
+    .detail('Funds from', `${maker} (${predict && sigType === 0n ? 'its own account: a key, or a contract that checks the signature (ERC-1271)' : SIGNATURE_TYPES[Number(sigType)] ?? `signature type ${sigType}`})`, maker);
   if (v2) {
     // The fee is the operator's, up to the exchange's maximum rate of the trade's cash value.
     const [maxRate] = live ? await callWords(env, 137, exchange, '0x4a2a11f5') ?? [] : [];
@@ -83,43 +97,43 @@ export const polymarketAdapter: TypedAdapter = async (data, env) => {
     b.detail('Fee', `up to ${Number(feeRate) / 100}% of the trade (the rate times the lower of the price and 1 minus it), taken from what you get`, feeRate!.toString())
       .detail('Expires', expiration === 0n ? 'never: it stays fillable until filled or cancelled' : formatTimestamp(Number(expiration) * 1000), expiration!.toString());
     if (taker !== ZERO) b.detail('Only fillable by', taker);
-    if (known) b.warn('info', 'polymarket_legacy_exchange', "It is signed for Polymarket's first exchange, which has had no trades since its upgrade of 2026-04-28 (trading moved to CTF Exchange V2): it will most likely never be filled.");
+    if (known && !predict) b.warn('info', 'polymarket_legacy_exchange', "It is signed for Polymarket's first exchange, which has had no trades since its upgrade of 2026-04-28 (trading moved to CTF Exchange V2): it will most likely never be filled.");
     if (feeRate! > 1000n) b.warn('info', 'polymarket_fee_refused', `Its fee rate, ${Number(feeRate) / 100}%, is above the exchange's 10% maximum: it refuses the order.`);
     if (expiration! > 0n && expiration! * 1000n < BigInt(env.now)) b.warn('info', 'polymarket_expired', 'It has already expired: the exchange refuses it.');
     if (taker !== ZERO) b.warn('info', 'polymarket_private', `Only ${shortAddress(taker)} can fill it.`);
   }
-  if (!known) b.warn('caution', 'polymarket_exchange_unknown', `It is signed for ${shortAddress(exchange)}, not one of Polymarket's exchanges: what that contract does with it isn't known here.`);
-  if (chainId !== null && chainId !== 137) b.warn('caution', 'polymarket_chain', `It is signed for ${chainName(chainId)}; Polymarket's exchanges are on Polygon.`);
+  if (!known) b.warn('caution', 'polymarket_exchange_unknown', `It is signed for ${shortAddress(exchange)}, not one of ${venue}'s exchanges: what that contract does with it isn't known here.`);
+  if (chainId !== null && chainId !== home) b.warn('caution', 'polymarket_chain', `It is signed for ${chainName(chainId)}; ${venue}'s exchanges are on ${chainName(home)}.`);
   // A share pays out at most 1: a buy above that loses money whatever happens; a sell for (almost) nothing gives the shares away.
   if (buy && cashAmount > shareAmount) b.warn('danger', 'polymarket_overpay', `It pays ${each} ${collateral.symbol} a share, more than a share can ever pay out (1 ${collateral.symbol}): you lose money whatever the outcome.`);
   if (!buy && takerAmount === 0n) b.warn('danger', 'polymarket_sell_for_nothing', `It sells ${shares(makerAmount!)} for nothing: anyone can take them.`);
   // Under 0.001 a share (Polymarket's smallest tick) is no price: the shares are given away.
-  else if (!buy && cashAmount * 1000n < shareAmount) b.warn('danger', 'polymarket_sell_for_nothing', `It sells ${shares(makerAmount!)} for ${cash(takerAmount!)}, under 0.001 ${collateral.symbol} a share, below any price on Polymarket's book: in effect, it gives them away.`);
+  else if (!buy && cashAmount * 1000n < shareAmount) b.warn('danger', 'polymarket_sell_for_nothing', `It sells ${shares(makerAmount!)} for ${cash(takerAmount!)}, under 0.001 ${collateral.symbol} a share, below any price on ${venue}'s book: in effect, it gives them away.`);
   else if (!buy && cashAmount * 100n < shareAmount) b.warn('caution', 'polymarket_sell_cheap', `It sells for ${each} ${collateral.symbol} a share, under a cent: check it is the price you meant.`);
   if (sigType === 0n && maker !== signer) b.warn('info', 'polymarket_signer_mismatch', `It is signed as an EOA order, but its maker (${shortAddress(maker)}) isn't its signer (${shortAddress(signer)}): the exchange refuses it.`);
   if (env.signer && env.signer !== signer) b.warn('caution', 'polymarket_other_signer', `Its signer is ${shortAddress(signer)}, but ${shortAddress(env.signer)} is asked to sign it.`);
-  // With Polygon's RPC: whether it can still be filled, and what the maker holds for it.
+  // With the chain's RPC: whether it can still be filled, and what the maker holds for it.
   if (live) {
     if (v2) {
-      const [pausedAt] = await callWords(env, 137, exchange, `0x234d81b9${pad(maker)}`) ?? [];
+      const [pausedAt] = await callWords(env, home, exchange, `0x234d81b9${pad(maker)}`) ?? [];
       if (pausedAt !== undefined && pausedAt > 0n) b.warn('info', 'polymarket_user_paused', `The maker has paused trading on the exchange (from block ${pausedAt}): from then on, the exchange refuses its orders.`);
     } else {
-      const [current] = await callWords(env, 137, exchange, `0x7ecebe00${pad(maker)}`) ?? [];
+      const [current] = await callWords(env, home, exchange, `0x7ecebe00${pad(maker)}`) ?? [];
       if (current !== undefined && current !== nonce) b.warn('info', 'polymarket_nonce', current > nonce! ? `Its nonce (${nonce}) is behind the maker's (${current}): it was cancelled with all the maker's orders, and the exchange refuses it.` : `Its nonce (${nonce}) is ahead of the maker's (${current}): the exchange refuses it until the maker raises theirs.`);
     }
-    if (buy) await canMoveNow(env, b, 137, maker, collateral.address, collateral, makerAmount!, { address: exchange, name: "Polymarket's exchange" }, 'Can be spent now');
+    if (buy) await canMoveNow(env, b, home, maker, collateral.address, collateral, makerAmount!, { address: exchange, name: `${venue}'s exchange` }, 'Can be spent now');
     else {
-      const operator = !v2 && exchange === POLYMARKET.v1[1] ? POLYMARKET.negRiskAdapter : exchange;
-      const [held] = await callWords(env, 137, POLYMARKET.ctf, `0x00fdd58e${pad(maker)}${pad(tokenId!)}`) ?? [];
-      const [approved] = await callWords(env, 137, POLYMARKET.ctf, `0xe985e9c5${pad(maker)}${pad(operator)}`) ?? [];
+      const operator = !predict && !v2 && exchange === POLYMARKET.v1[1] ? POLYMARKET.negRiskAdapter : exchange;
+      const [held] = await callWords(env, home, ctf, `0x00fdd58e${pad(maker)}${pad(tokenId!)}`) ?? [];
+      const [approved] = await callWords(env, home, ctf, `0xe985e9c5${pad(maker)}${pad(operator)}`) ?? [];
       if (held !== undefined) b.detail('Shares held', `${shares(held)}${held < makerAmount! ? ` (fewer than it sells: it fills only up to ${shares(held)})` : ''}${approved === 0n ? `; ${operator === exchange ? 'the exchange' : 'the neg-risk adapter'} isn't approved for them yet` : ''}`, held.toString());
     }
   }
-  b.note("An order for Polymarket's order book: signing it costs nothing and moves nothing now. Polymarket's operator matches it, partly or whole, and the exchange then moves the funds from the maker.");
+  b.note(`An order for ${venue}'s order book: signing it costs nothing and moves nothing now. ${venue}'s operator matches it, partly or whole, and the exchange then moves the funds from the maker.`);
   return {
-    title: buy ? `Buy ${shares(takerAmount!)} of ${outcome} for ${cash(makerAmount!)} on Polymarket` : `Sell ${shares(makerAmount!)} of ${outcome} for ${cash(takerAmount!)} on Polymarket`,
-    summary: `A Polymarket order (CTF Exchange ${v2 ? (exchange === POLYMARKET.v2[2] ? 'V3' : 'V2') : 'V1'}${exchange === POLYMARKET.v2[1] || exchange === POLYMARKET.v1[1] ? ', neg-risk' : ''}): ${buy ? 'buy' : 'sell'} ${shares(shareAmount)} at ${each} ${collateral.symbol} a share${expiration === 0n ? ', until filled or cancelled' : `, until ${formatTimestamp(Number(expiration) * 1000)}`}.`,
-    decoder: 'polymarket_order', status: 'full', b, network,
+    title: buy ? `Buy ${shares(takerAmount!)} of ${outcome} for ${cash(makerAmount!)} on ${venue}` : `Sell ${shares(makerAmount!)} of ${outcome} for ${cash(takerAmount!)} on ${venue}`,
+    summary: `A ${venue} order (${predict ? 'its CTF Exchange' : `CTF Exchange ${v2 ? (exchange === POLYMARKET.v2[2] ? 'V3' : 'V2') : 'V1'}${exchange === POLYMARKET.v2[1] || exchange === POLYMARKET.v1[1] ? ', neg-risk' : ''}`}): ${buy ? 'buy' : 'sell'} ${shares(shareAmount)} at ${each} ${collateral.symbol} a share${expiration === 0n ? ', until filled or cancelled' : `, until ${formatTimestamp(Number(expiration) * 1000)}`}.`,
+    decoder: predict ? 'predict_fun_order' : 'polymarket_order', status: 'full', b, network,
   };
 };
 

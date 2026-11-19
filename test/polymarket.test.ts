@@ -66,3 +66,20 @@ test("The first exchange's orders: no longer traded there; the order book's sign
   assert.ok(codes(auth).includes('clob_auth'));
   assert.ok(!codes(auth).includes('clob_auth_message'));
 });
+
+test("predict.fun on BNB Chain: Polymarket's first exchange under its own domain, with USDT (18 decimals) as collateral", async () => {
+  const { readFileSync } = await import('node:fs');
+  const { recoverAddress } = await import('viem');
+  const { typedDataDigest } = await import('../src/typed-data/common.ts');
+  const f = JSON.parse(readFileSync(new URL('./fixtures/predict-fun-order.json', import.meta.url), 'utf8'));
+  assert.equal((await recoverAddress({ hash: typedDataDigest(f.typedData)!, signature: f.signature })).toLowerCase(), f.signer);
+  const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [f.signer, JSON.stringify(f.typedData)] }, { now: NOW, chainId: 56 }, { tokens: new StaticTokenRegistry() });
+  assert.equal(p.decoding.decoder, 'predict_fun_order');
+  assert.match(p.title, /^(Buy|Sell) [\d.,]+ shares? of outcome token .* for [\d.,]+ USDT on predict\.fun$/);
+  assert.ok(!codes(p).includes('polymarket_exchange_unknown') && !codes(p).includes('polymarket_legacy_exchange'));
+  // Another exchange under the same name, or the order on another chain: cautioned.
+  const elsewhere = { ...f.typedData, domain: { ...f.typedData.domain, verifyingContract: '0xb0b0000000000000000000000000000000000002' } };
+  assert.ok(codes(await previewRequest({ method: 'eth_signTypedData_v4', params: [f.signer, JSON.stringify(elsewhere)] }, { now: NOW, chainId: 56 }, { tokens: new StaticTokenRegistry() })).includes('polymarket_exchange_unknown'));
+  const onPolygon = { ...f.typedData, domain: { ...f.typedData.domain, chainId: 137 } };
+  assert.ok(codes(await previewRequest({ method: 'eth_signTypedData_v4', params: [f.signer, JSON.stringify(onPolygon)] }, { now: NOW, chainId: 137 }, { tokens: new StaticTokenRegistry() })).includes('polymarket_chain'));
+});
