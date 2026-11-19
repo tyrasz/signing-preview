@@ -52,6 +52,21 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
   const result = (title: string, summary: string, decoder: string, status: TypedDecoded['status']): TypedDecoded => ({ title, summary, decoder, status, b, network });
   const offChainNote = () => b.note('This is an off-chain signature: it costs no gas now, but anyone holding it can submit it later to use the permission.');
 
+  // ERC-721 permits (EIP-4494, Uniswap V3's positions: Permit(address spender,uint256 tokenId,uint256 nonce,uint256
+  // deadline)): approval of one NFT, signed by its owner (ownerOf(tokenId)); no owner or value in the message.
+  if (data.primaryType === 'Permit' && m.spender !== undefined && m.tokenId !== undefined && m.value === undefined && m.allowed === undefined) {
+    const collection = str(data.domain.verifyingContract), spender = str(m.spender), id = big(m.tokenId);
+    b.detail('Collection', `${str(data.domain.name) || 'unnamed'} (${collection})`, collection).detail('Token ID', String(id ?? str(m.tokenId))).detail('Spender', spender);
+    deadline(b, env, 'Signature valid until', m.deadline);
+    const owner = id !== null ? (await words(env, chainId, collection, `0x6352211e${w(id.toString(16))}`))?.[0] : undefined;
+    const ownerAddress = owner !== undefined ? `0x${owner.toString(16).padStart(40, '0')}` : undefined;
+    if (ownerAddress) b.detail('Owner', ownerAddress);
+    if (ownerAddress && env.signer && !sameAddress(ownerAddress, env.signer)) b.warn('info', 'nft_permit_not_owner', `${shortAddress(ownerAddress)} owns this NFT, not ${shortAddress(env.signer)}: the permit works only if the signer is approved for it.`);
+    b.warn('caution', 'nft_permit', `${shortAddress(spender)} will be able to transfer this NFT out of your wallet${/uniswap v3 positions/i.test(str(data.domain.name)) ? ': for a Uniswap position, all the liquidity and fees in it' : ''}. The collection's name comes from the signing domain.`);
+    offChainNote();
+    return result(`Allow ${shortAddress(spender)} to transfer ${str(data.domain.name) || shortAddress(collection)} #${id ?? str(m.tokenId)}`, `Signs a gasless approval (ERC-721 permit) letting ${shortAddress(spender)} transfer one NFT of yours.`, 'erc721_permit', 'full');
+  }
+
   if (data.primaryType === 'Permit' && (m.spender !== undefined)) {
     const tokenAddress = str(data.domain.verifyingContract);
     const info = await token(env, chainId, tokenAddress);
