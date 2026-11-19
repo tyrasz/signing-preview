@@ -15,6 +15,7 @@ import { writeFileSync } from 'node:fs';
 import { previewRequest } from '../src/preview.ts';
 import { rpcUrlFor, StaticTokenRegistry } from '../src/chains.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
+import { readAttribution } from '../src/attribution.ts';
 import { ChainedSignatures, ContractAbiResolver, SourcifyAbiSource } from '../src/abi.ts';
 import type { AbiResolver, ContractAbi, Dependencies, Preview, SignatureCandidate, SignatureResolver } from '../src/types.ts';
 
@@ -35,13 +36,16 @@ const TOP_CONTRACTS = Number(arg('top', '150')); // opaque contracts looked up o
 const rpc = new JsonRpcClient(Object.fromEntries(CHAINS.map(c => [c.id, c.url])), { timeoutMs: 30_000, retries: 6, retryDelayMs: 500 });
 
 interface RawTx { hash: string; from: string; to: string | null; input: string; value: string; type: string; authorizationList?: unknown[] }
-interface Row { hash: string; from: string; block: number; to: string | null; selector: string; type: string; status: Preview['decoding']['status'] | 'error'; decoder: string; title: string; shape: Shape; eip7702: string[] }
+interface Row { hash: string; from: string; block: number; to: string | null; selector: string; type: string; status: Preview['decoding']['status'] | 'error'; decoder: string; title: string; shape: Shape; eip7702: string[]; attributed: boolean }
 /**
  * abi: 4-byte selector + 32-byte words (or empty); packed: any other length, i.e. custom encoding no ABI describes
  * (typically trading bots); vanity: ABI-shaped, but the selector starts with zero bytes, mined to save gas (bots).
  */
 type Shape = 'abi' | 'packed' | 'vanity';
-const shapeOf = (data: string): Shape => {
+const shapeOf = (input: string): Shape => {
+  // An ERC-8021 attribution suffix (src/attribution.ts) is the app's or wallet's, not the call's encoding.
+  const suffix = readAttribution(input);
+  const data = suffix ? input.slice(0, input.length - suffix.bytes * 2) : input;
   if (data === '0x') return 'abi';
   const bytes = (data.length - 2) / 2;
   if (bytes < 4 || (bytes - 4) % 32 !== 0) return 'packed';
@@ -96,7 +100,7 @@ async function blockAt(chainId: number, ts: number, latest: number): Promise<num
 
 function preview(chainId: number, t: RawTx, ts: number, block: number, deps: Dependencies): Promise<Row> {
   const selector = t.input.length >= 10 ? t.input.slice(0, 10) : t.input === '0x' ? 'none' : 'short';
-  const base = { hash: t.hash, from: t.from.toLowerCase(), block, to: t.to?.toLowerCase() ?? null, selector, type: t.type, shape: shapeOf(t.input) };
+  const base = { hash: t.hash, from: t.from.toLowerCase(), block, to: t.to?.toLowerCase() ?? null, selector, type: t.type, shape: shapeOf(t.input), attributed: t.to !== null && readAttribution(t.input) !== undefined };
   const tx = { from: t.from, ...(t.to && { to: t.to }), data: t.input, value: t.value, chainId: '0x' + chainId.toString(16), ...(t.authorizationList && { authorizationList: t.authorizationList }) };
   return previewRequest({ method: 'eth_sendTransaction', params: [tx] }, { now: ts * 1000 }, deps)
     .then(p => ({ ...base, status: p.decoding.status, decoder: p.decoding.decoder, title: p.title, eip7702: p.warnings.map(w => w.code).filter(c => c.startsWith('eip7702_')) }))
@@ -195,6 +199,8 @@ for (const chain of CHAINS) {
   // Signed authorizations in real blocks: the sender's own account (eip7702_delegation / _revoke) or a sponsored one.
   const auth = Object.fromEntries(count(setCode.flatMap(r => [...new Set(r.eip7702)]), c => c));
   if (setCode.length) console.log(`  EIP-7702 set-code transactions: ${setCode.length} (${pct(setCode.length, rows2.length)}); authorizations: ${Object.entries(auth).map(([c, n]) => `${c.replace('eip7702_', '')} in ${n}`).join(', ') || 'none read'}`);
+  const attributed = rows2.filter(r => r.attributed).length;
+  if (attributed) console.log(`  ERC-8021 attribution suffixes: ${attributed} (${pct(attributed, rows2.length)})`);
   const decoders = count(rows2, r => r.decoder);
   const types = count(rows2, r => r.type);
   const errors = rows2.filter(r => r.status === 'error');
@@ -207,7 +213,7 @@ for (const chain of CHAINS) {
   for (const e of errors.slice(0, 5)) console.log(`  ERROR ${e.hash}: ${e.title}`);
   (report.chains as unknown[]).push({
     chain: chain.name, chainId: chain.id, fromBlock: start, toBlock: latest, sampledBlocks: picks.length, transactions: rows2.length, systemTransactions: system.length,
-    opaqueShapes: shapes, abiShaped: { transactions: abiShaped.length, opaque: abiOpaque }, setCodeTransactions: setCode.length, setCodeAuthorizations: auth, senders,
+    opaqueShapes: shapes, abiShaped: { transactions: abiShaped.length, opaque: abiOpaque }, setCodeTransactions: setCode.length, setCodeAuthorizations: auth, attributed, senders,
     offline: pass1, online: pass2, decoders, txTypes: types, errors: errors.map(e => ({ hash: e.hash, message: e.title })),
     opaqueContracts: stillTop.slice(0, 50).map(([address, txs]) => ({ address, txs, selectors: count(still.filter(r => r.to === address), r => r.selector).slice(0, 5) })),
     opaqueSelectors: count(still, r => r.selector).slice(0, 50),

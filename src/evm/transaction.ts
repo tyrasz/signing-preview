@@ -21,6 +21,8 @@ import { binanceWalletAdapter } from './binance-wallet.ts';
 import { hyperlendIsolatedAdapter } from './hyperlend-isolated.ts';
 import { beaconDepositAdapter } from './beacon-deposit.ts';
 import { lendingManagerAdapter } from './lending-managers.ts';
+import { eip3009TxAdapter } from './eip3009.ts';
+import { readAttribution } from '../attribution.ts';
 import { orbitInboxAdapter } from './orbit-inbox.ts';
 import { aggregatorAdapters } from './aggregators.ts';
 import { uniswapForkAdapter, uniswapRoutersAdapter } from './uniswap-routers.ts';
@@ -58,6 +60,7 @@ export const ADAPTERS: Adapter[] = [
   hyperlendPoolAdapter,
   hyperlendGatewayAdapter,
   creditDelegationAdapter,
+  eip3009TxAdapter,
   erc20Adapter,
   universalRouterAdapter,
   abiAdapter,
@@ -154,6 +157,9 @@ export async function decodeTransaction(tx: Tx, deps: Dependencies, context: Pre
 export async function previewTransaction(tx: Tx, deps: Dependencies, context: PreviewContext, method: string, preset?: PresetSimulation, decoded?: Decoded): Promise<Preview> {
   const d = decoded ?? await decodeTransaction(tx, deps, context);
   const b = d.b;
+  // Who the app or wallet says brought it (ERC-8021): a suffix the contract ignores.
+  const attribution = tx.to ? readAttribution(tx.data) : undefined;
+  if (attribution) b.detail('Attribution (ERC-8021)', attribution.parts.join('; '));
   if (!CHAINS[tx.chainId]) b.warn('caution', 'unsupported_chain', `Chain ${tx.chainId} is not one of the supported networks (Ethereum, Arbitrum One, HyperEVM). Token names and routes were not checked for it.`);
   if (context.account && !sameAddress(context.account, tx.from)) b.warn('danger', 'sender_mismatch', `The transaction's sender (${tx.from}) is not the connected account (${context.account}).`);
   if (context.chainId && context.chainId !== tx.chainId) b.warn('caution', 'chain_mismatch', `The transaction targets ${chainName(tx.chainId)}, but the wallet is on ${chainName(context.chainId)}.`);

@@ -12,19 +12,26 @@ export const PACKED_ENTRY_POINTS: Record<string, string> = {
   '0x4337084d9e255ff0702461cf8895ce9e3b5ff108': 'EntryPoint v0.8',
   '0x433709009b8330fda32311df1c2afa402ed8d009': 'EntryPoint v0.9',
 };
+/** EntryPoint v0.6, whose UserOperation struct has each gas field on its own. */
+const V06 = '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789';
+const COMMON = ['function depositTo(address account) payable', 'function withdrawTo(address withdrawAddress, uint256 withdrawAmount)'] as const;
 const ABI = parseAbi([
   'function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)',
-  'function depositTo(address account) payable',
-  'function withdrawTo(address withdrawAddress, uint256 withdrawAmount)',
+  ...COMMON,
+]);
+const ABI_V06 = parseAbi([
+  'function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)',
+  ...COMMON,
 ]);
 /** UserOperations whose calls are decoded; the rest of a bundle is listed by account. */
 const DECODED_OPS = 5;
 
 export const entryPointAdapter: Adapter = async (tx, env) => {
-  const name = tx.to && PACKED_ENTRY_POINTS[tx.to.toLowerCase()];
+  const to = tx.to?.toLowerCase();
+  const name = to === V06 ? 'EntryPoint v0.6' : to && PACKED_ENTRY_POINTS[to];
   if (!name) return null;
   let call;
-  try { call = decodeFunctionData({ abi: ABI, data: tx.data }); } catch { return null; }
+  try { call = to === V06 ? decodeFunctionData({ abi: ABI_V06, data: tx.data }) : decodeFunctionData({ abi: ABI, data: tx.data }); } catch { return null; }
   const b = new PreviewBuilder().detail('Contract', `${name} (${tx.to})`, tx.to!);
   const native = CHAINS[tx.chainId];
   const amount = (v: bigint) => `${formatUnits(v, native?.nativeDecimals ?? 18)} ${native?.nativeSymbol ?? 'native'}`;
@@ -50,6 +57,9 @@ export const entryPointAdapter: Adapter = async (tx, env) => {
     if (i >= DECODED_OPS) { b.detail(`UserOperation ${i + 1}`, `from ${who}`, sender); continue; }
     const d = op.callData === '0x' ? decoded({ title: 'no calls', summary: '', decoder: 'erc4337_entry_point', status: 'full' })
       : await decodeTransaction({ chainId: tx.chainId, from: sender, to: sender, data: op.callData.toLowerCase() as Hex, value: 0n, ...(op.initCode !== '0x' && { codeInPlace: true }) }, env.deps, env.context);
+    // Decoded as the account's own transaction, its title speaks to the account; when another account's operation is
+    // submitted, it is said of that account.
+    if (!sameAddress(sender, tx.from)) d.title = d.title.replace(/ from your account$/, '').replace(/^Call your own account/, 'Call its own account');
     inner.push(d);
     b.detail(`UserOperation ${i + 1}`, `from ${who}: ${d.title}`, sender);
     // (The caution that a run used the caller's state, from a Safe the operation's calls run execTransaction on, is said once.)
@@ -59,7 +69,7 @@ export const entryPointAdapter: Adapter = async (tx, env) => {
   if (own < ops.length) b.warn('info', 'erc4337_bundle', `This submits ${ops.length - own === 1 ? 'a UserOperation' : `${ops.length - own} UserOperations`} of other accounts, as a bundler does: you pay the gas now, and the EntryPoint refunds it to ${sameAddress(beneficiary, tx.from) ? 'you' : shortAddress(beneficiary)} from the accounts' deposits.`);
   const statuses = inner.map(d => d.status);
   return decoded({
-    title: ops.length === 1 ? `Submit a UserOperation: ${inner[0]?.title ?? 'no calls'}` : `Submit ${ops.length} UserOperations (an ERC-4337 bundle)`,
+    title: ops.length === 1 ? `Submit ${sameAddress(ops[0].sender, tx.from) ? 'a' : `${shortAddress(ops[0].sender)}'s`} UserOperation: ${inner[0]?.title ?? 'no calls'}` : `Submit ${ops.length} UserOperations (an ERC-4337 bundle)`,
     summary: `Runs ${ops.length === 1 ? 'a UserOperation' : `${ops.length} UserOperations`} through the ${name}${ops.length === 1 ? ` from ${sameAddress(ops[0].sender, tx.from) ? 'your account' : shortAddress(ops[0].sender)}` : ''}.`,
     decoder: 'erc4337_entry_point', status: statuses.includes('opaque') || statuses.includes('partial') || ops.length > DECODED_OPS ? 'partial' : 'full', b,
   });
