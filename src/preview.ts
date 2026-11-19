@@ -18,11 +18,12 @@ import { safeTxAdapter } from './typed-data/safe.ts';
 import { cowOrderAdapter, oneInchOrderAdapter } from './typed-data/orders.ts';
 import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts';
 import { kernelEnableAdapter } from './typed-data/kernel-enable.ts';
+import { delegationAdapter } from './typed-data/delegation.ts';
 import { previewMessage } from './message.ts';
 import { previewSignedOperation } from './userop-hash.ts';
 import { previewSupertransaction, previewTypedSupertransaction } from './supertransaction.ts';
 
-export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, genericTypedDataAdapter];
+export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, genericTypedDataAdapter];
 
 /** Methods that ask the user to sign something. Everything else passes through an interceptor untouched. */
 export const SIGNING_METHODS = ['eth_sendTransaction', 'eth_signTransaction', 'wallet_sendCalls', 'eth_signTypedData_v4', 'eth_signTypedData_v3', 'eth_signTypedData', 'personal_sign', 'eth_sign'] as const;
@@ -120,7 +121,7 @@ const SKIPPED_IN_BATCH = "This call was not simulated: it may depend on the call
  * call sees what the earlier ones did (an approval before a swap). Simulating them one by one would show the swap
  * as failing.
  */
-async function previewBatch(raw: unknown, context: PreviewContext, deps: Dependencies): Promise<Preview> {
+export async function previewBatch(raw: unknown, context: PreviewContext, deps: Dependencies): Promise<Preview> {
   if (!raw || typeof raw !== 'object' || !Array.isArray((raw as Record<string, unknown>).calls)) throw new RequestError('wallet_sendCalls needs { calls: [...] }');
   const batch = raw as { chainId?: string; from?: string; atomicRequired?: boolean; calls: unknown[] };
   if (batch.calls.length === 0 || batch.calls.length > 32) throw new RequestError('wallet_sendCalls must contain 1 to 32 calls');
