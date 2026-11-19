@@ -11,6 +11,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V09 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
+import { simulateOperation } from '../src/erc4337-sim.ts';
 import type { Dependencies, Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
 import { codes, detail, NOW } from './helpers.ts';
 import { testChain } from './evm-chain.ts';
@@ -1370,8 +1371,10 @@ test('From Amsterdam on, calls that fail only for want of gas for new state run 
   const p = await ask(on(true));
   const notes = p.decoding.notes.join(' | ');
   assert.ok(!codes(p).includes('userop_execution_reverts'), `${codes(p)} ${notes}`);
-  assert.match(notes, /Its calls run out of gas unless the bundle's transaction carries gas beyond the 16,777,216 a transaction's code runs on, which from Amsterdam on pays for new state only/);
-  assert.match(notes, /on a transaction carrying 16,777,216 gas more for new state, as bundlers send such operations; sent without it, the calls fail and the account still pays for the gas/);
+  assert.match(notes, /Its calls fail, with no revert reason, unless the bundle's transaction carries gas beyond the 16,777,216 a transaction's code runs on, which from Amsterdam on pays for new state only/);
+  assert.match(notes, /The run shown is the local EVM's, on a transaction carrying 16,777,216 gas more for new state, over this chain's latest state in the next block/);
+  // Whether the bundle carries it is the bundler's choice: the preview says what happens if it doesn't.
+  assert.match(p.warnings.find(w => w.code === 'userop_needs_state_gas')?.message ?? '', /succeed only in a bundle whose transaction carries gas beyond the 16,777,216 .* sees them run out of gas: the operation is still included, and the account pays for the gas/);
   // The new state, paid from the reservoir, isn't in the gas the EntryPoint counts (234,960 here, with validation and
   // the 50,000 of pre-verification): well under the 1.1 million it costs.
   const used = BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
@@ -1379,5 +1382,16 @@ test('From Amsterdam on, calls that fail only for want of gas for new state run 
   // Before Amsterdam (headers without the hash) there is no reservoir: the calls fail, as they would on-chain.
   const q = await ask(on(false));
   assert.ok(codes(q).includes('userop_execution_reverts'), codes(q).join());
-  assert.ok(!q.decoding.notes.some(n => /Its calls run out of gas unless/.test(n)));
+  assert.ok(!q.decoding.notes.some(n => /Its calls fail, with no revert reason, unless/.test(n)));
+  // Calls that revert with a reason failed for that reason, not for gas: not run again.
+  const REVERTER = '0x00000000000000000000000000000000c0de8038';
+  await chain.putCode(REVERTER, '0x600160005260206000fd');
+  const reverting = { ...op, callData: call('execute', [REVERTER, 0n, '0x']) };
+  const r = await previewRequest({ method: 'personal_sign', params: [userOpHash(readOperation(reverting, '0.7')!, EP, SEPOLIA, '0.7'), OWNER] }, { now: NOW, chainId: SEPOLIA, userOperation: { entryPoint: EP, operation: reverting } }, on(true));
+  assert.ok(codes(r).includes('userop_execution_reverts') && !codes(r).includes('userop_needs_state_gas'), codes(r).join());
+  // An operation after one that ran with the reservoir (a supertransaction's next, on the same chain) runs where that
+  // one runs so: in the local EVM.
+  const after = await simulateOperation({ chainId: SEPOLIA, entryPoint: EP, sender: account, nonce: 0n, initCode: '0x', callData: sendUsdc, callGasLimit: 200_000n, verificationGasLimit: 200_000n, preVerificationGas: 50_000n, maxFeePerGas: 2_000_000_000n, maxPriorityFeePerGas: 1_000_000_000n, paymasterAndData: '0x', signer: OWNER,
+    before: [{ chainId: SEPOLIA, from: OWNER, to: WRITER, data: '0x', value: 0n, gas: 2n * 16_777_216n }] }, on(true));
+  assert.equal(after?.afterReservoir, true);
 });

@@ -90,9 +90,16 @@ test("Past 400 earlier transactions, a replay keeps those that logged the bundle
   receipts.get(earlier[60].hash)!.logs.push(event(OTHER, SYNC));
   const own = [transfer(USDC, ACCOUNT, OTHER, 1n), event(PAIR, SYNC), event(V4, V4_SWAP)];
   const kept = keptEarlier(earlier, receipts, own, 400);
-  assert.equal(kept.length, 401);
-  assert.deepEqual(kept.slice(0, 2), [91, 289]);
+  // No more than 400 all told: the 91st, then the latest 399.
+  assert.equal(kept.length, 400);
+  assert.deepEqual(kept.slice(0, 2), [91, 290]);
   assert.equal(kept.at(-1), 688);
+  // More related ones than room: the latest of them.
+  const busy = new Map(earlier.map((t, i) => [t.hash, { logs: i % 2 ? [event(PAIR, SYNC)] : [] as Log[] }]));
+  const most = keptEarlier(earlier, busy, own, 400);
+  assert.equal(most.length, 400);
+  assert.ok(most.every((i, n) => n === 0 || i > most[n - 1]));
+  assert.ok(most.slice(0, -1).every(i => i % 2 === 1 || i >= 689 - 400), String(most.slice(0, 5)));
   // No more than the cap: all of them, in order.
   assert.deepEqual(keptEarlier(earlier.slice(0, 3), receipts, own, 400), [0, 1, 2]);
 });

@@ -3033,6 +3033,8 @@ export interface OperationRun {
    * (its reservoir), where the calls failed without it and succeeded with it, run in the local EVM (withStateReservoir).
    */
   reservoir?: bigint;
+  /** Run in the local EVM after an earlier operation that needed that reservoir (see runOperation). */
+  afterReservoir?: boolean;
   /** The `after` calls' results. */
   after?: SimulationResult[];
   /** What was simulated for `result` (and the `after` calls): for tracing it. */
@@ -3117,6 +3119,15 @@ async function suggestedTip(deps: Dependencies, chainId: number): Promise<bigint
  * failure that isn't the EntryPoint's own.
  */
 export async function simulateOperation(op: OperationInput, deps: Dependencies): Promise<OperationRun | null> {
+  const run = await simulateOperationOnce(op, deps);
+  // Calls that failed with no revert data (as running out of gas does), from Amsterdam on: run again with the
+  // reservoir for new state its bundler can give them (withStateReservoir), once, with the stand-in finally chosen.
+  if (!run || run.rejected || run.executed || run.postOpReverted || run.revertReason) return run;
+  const again = await withStateReservoir(op, deps, run);
+  return again ? { ...run, ...again, revertReason: undefined, postOpReverted: undefined } : run;
+}
+
+async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Promise<OperationRun | null> {
   const sim = deps.simulator;
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
   const ep = SIMULATIONS[entryPoint];
@@ -3365,8 +3376,6 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const own = stub.cosigners?.some(c => c.digest);
   let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
-  // Calls that fail for want of gas for new state, from Amsterdam on: run again with the reservoir bundlers give them.
-  if (result && !result.rejected && !result.executed && !result.postOpReverted) result = await withStateReservoir(op, sim!, result, ep!.version, deps) ?? result;
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
   const unpaid = stub.unpaid || (stub.wallet && result?.rejected?.startsWith('AA21') && await refusesUnpaid());
   return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.lastForm && { lastForm: true }), ...(stub.fallback && { fallback: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
@@ -3448,19 +3457,25 @@ export const ORDINARY_GAS_CAP = 16_777_216n;
  * the reservoir, and were charged 450,574 gas; the 7 signed with 2,000,000 came in bundles of 2.4 million, paid for the
  * same state out of their call gas, and were charged 1,677,857. The chain's node gives a simulation's whole gas as
  * ordinary gas (src/evm/transaction.ts), so the first kind ran out of gas in its calls there, where on the chain it
- * succeeded. Where an operation's calls failed, they are run again in the local EVM (which meters the reservoir) on a
- * transaction carrying ORDINARY_GAS_CAP more for new state: if they succeed so, that run is the operation's, as its
- * bundler sends it. (The reservoir's size changes nothing the account pays, so long as it holds the new state.)
+ * succeeded. Where an operation's calls failed with no revert data (as running out of gas does: a revert with a reason
+ * isn't this), they are run again in the local EVM (which meters the reservoir), on the same stand-in, on a
+ * transaction carrying ORDINARY_GAS_CAP more for new state: if they succeed so, that run is the operation's, as a
+ * bundler sending it so runs it, and the preview warns that one sending it without the reservoir sees the calls fail
+ * (userop_needs_state_gas). The reservoir's size changes nothing the account pays, so long as it holds the new state.
+ * (The node's run was at its latest block, the local EVM's at the latest when it runs: a block apart at most.)
  */
-async function withStateReservoir(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, run: OperationRun, version: '0.6' | '0.7' | '0.8' | '0.9', deps: Dependencies): Promise<OperationRun | null> {
-  const [req] = run.requests ?? [];
-  if ((op.chainId !== 1 && op.chainId !== 11155111) || !sim.trace || !req || (req.gas ?? 0n) > ORDINARY_GAS_CAP) return null;
+async function withStateReservoir(op: OperationInput, deps: Dependencies, run: OperationRun): Promise<OperationRun | null> {
+  const sim = deps.simulator, [req] = run.requests ?? [], version = SIMULATIONS[op.entryPoint.toLowerCase()]?.version;
+  if ((op.chainId !== 1 && op.chainId !== 11155111) || !sim?.trace || !req || !version) return null;
   const at = op.at ?? await pinLatest(deps.rpc, op.chainId);
   if (!at?.header.amsterdam) return null;
-  const local = { simulate: async (q: SimulationRequest) => (await sim.trace!([q]))?.[0] ?? null, simulateBatch: (qs: SimulationRequest[]) => sim.trace!(qs) };
-  const again = await runOperation({ ...op, at }, local, { ...req, gas: 2n * ORDINARY_GAS_CAP }, version).catch(() => null);
+  const again = await runOperation({ ...op, at }, localSimulator(sim), { ...req, gas: 2n * ORDINARY_GAS_CAP }, version).catch(() => null);
   return again && !again.rejected && again.executed && !again.postOpReverted ? { ...again, reservoir: ORDINARY_GAS_CAP } : null;
 }
+
+/** The local EVM as a simulator (Simulator.trace's runs, without their traces' use). */
+const localSimulator = (sim: NonNullable<Dependencies['simulator']>): NonNullable<Dependencies['simulator']> =>
+  ({ simulate: async (q: SimulationRequest) => (await sim.trace!([q]))?.[0] ?? null, simulateBatch: (qs: SimulationRequest[]) => sim.trace!(qs) });
 
 async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, req: SimulationRequest, version: '0.6' | '0.7' | '0.8' | '0.9'): Promise<OperationRun | null> {
   const entryPoint = op.entryPoint.toLowerCase(), sender = op.sender.toLowerCase();
@@ -3468,6 +3483,10 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   const requests = [req, ...(op.after ?? []).map(a => (op.at ? { ...a, at: op.at } : a))];
   // Earlier operations run first, for their state; the results are the operation's and those after it.
   const before = (op.before ?? []).map(a => (op.at ? { ...a, at: op.at } : a));
+  // An earlier operation that ran with a reservoir for new state (withStateReservoir: a request over the cap) runs so
+  // only in the local EVM, the node giving all of a simulation's gas to the code; this one runs after it there.
+  const afterReservoir = before.some(b => (b.gas ?? 0n) > ORDINARY_GAS_CAP) && !!sim.trace;
+  if (afterReservoir) sim = localSimulator(sim);
   const results = before.length ? (await sim.simulateBatch!([...before, ...requests]))?.slice(before.length) : requests.length > 1 ? await sim.simulateBatch!(requests) : [await sim.simulate(req)];
   const r = results?.[0];
   if (!r) return null;
@@ -3505,5 +3524,5 @@ async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['s
   const ownDeposit = !paymaster || op.paymasterAndData.slice(0, 42).toLowerCase() === sender;
   const transfers = withoutGas(r, sender, entryPoint, ownDeposit ? paid : 0n);
   return { result: { ...r, transfers }, executed: success, ...(revertReason && { revertReason }), ...(postOpReverted && { postOpReverted }),
-    paid, gasUsed: actualGasUsed, account: validity(accountData), ...(paymaster && { paymaster: validity(paymasterData) }), ...(results!.length > 1 && { after: results!.slice(1) as SimulationResult[] }), requests };
+    paid, gasUsed: actualGasUsed, account: validity(accountData), ...(paymaster && { paymaster: validity(paymasterData) }), ...(results!.length > 1 && { after: results!.slice(1) as SimulationResult[] }), requests, ...(afterReservoir && { afterReservoir: true }) };
 }

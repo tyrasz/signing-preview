@@ -389,9 +389,9 @@ async function replay(item: string): Promise<void> {
   // the simulated block's gas limit holds them as it held the real ones.
   // An OP Stack block's L1 info deposit (its first transaction) stays: the L1 values it sets are what a paymaster
   // pricing L1 data reads (a bundle on OP Mainnet came out 0.47% low on the parent block's).
-  // At most 400 of them run (a public node's room for one simulated block), the last 400 and before them those that
-  // logged what the bundle logs from the same contracts (keptEarlier): an earlier trade in the pool an operation swaps
-  // through. How many were left out is reported.
+  // At most 400 of them run (the harness's room for one simulated block, since its first runs): those that logged
+  // what the bundle logs from the same contracts, an earlier trade in the pool an operation swaps through, and the
+  // latest of the others (keptEarlier). How many were left out is reported.
   const all = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR) : [];
   let earlier = all;
   if (all.length > 400) {
@@ -948,7 +948,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && { leftOut }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && !state && { leftOut }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),

@@ -200,7 +200,6 @@ test('OKX Wallet’s account whose key is a passkey, asked by anyone but the acc
   } finally { await chain.evm.stateManager.putStorage(at(account), hexToBytes(TYPE), type); }
 });
 
-/** The request simulateOperation makes first for `op` (what it stands in with), on the test chain, signed by `signer`. */
 test('OKX Wallet’s account whose key is an Ethereum key checked by OKX’s EIP-191 verifier: asked by that key, its own form, which the verifier’s real code takes', async () => {
   // BNB Chain, 2026-11-19: of the account's three admin keys, two passkeys and this one, the operation was signed
   // by this one (its hash, validUntil, then r, s, v over the EIP-191 form of the account's digest). Taken for one of
@@ -232,6 +231,7 @@ test('OKX Wallet’s account whose key is an Ethereum key checked by OKX’s EIP
   } finally { await chain.putCode(IMPLEMENTATION, original); }
 });
 
+/** The request simulateOperation makes first for `op` (what it stands in with), on the test chain, signed by `signer`. */
 async function standInRequest(op: Record<string, unknown>, signer: string, version: '0.6' | '0.7' = '0.7'): Promise<SimulationRequest> {
   const tried: SimulationRequest[] = [];
   const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return null; } };
