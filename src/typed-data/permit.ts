@@ -5,6 +5,7 @@ import type { TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedDecoded, type TypedEnv, type TypedData } from './common.ts';
 import { canMoveNow } from './exposure.ts';
 import { isRelayWitness, relayCalls } from './relay.ts';
+import { settlerSwap, settlerWitness } from './settler.ts';
 
 /** One eth_call's 32-byte words, or undefined without an RPC (or on failure). */
 async function words(env: TypedEnv, chainId: number | null, to: string, data: string): Promise<bigint[] | undefined> {
@@ -133,6 +134,9 @@ export const permitAdapter: TypedAdapter = async (data, env) => {
       }
       const order = data.primaryType.includes('Witness') ? await uniswapXOrder(m.witness, env, chainId, spender, lines.join(', '), b) : null;
       if (order) { offChainNote(); return result(order.title, order.summary, 'uniswapx_order', 'full'); }
+      // 0x's gasless swap: the witness binds the recipient, the token bought and the least it gives (src/typed-data/settler.ts).
+      const settler = settlerWitness(data.types, data.primaryType, m);
+      if (settler) { const swap = await settlerSwap(settler, env, chainId, spender, lines.join(', '), b); offChainNote(); return result(swap.title, swap.summary, 'settler_swap', 'full'); }
       // Relay's gasless request: the tokens go to its router, which makes the calls the witness carries (src/typed-data/relay.ts).
       if (data.primaryType === 'PermitBatchWitnessTransferFrom' && isRelayWitness(data.types) && m.witness && typeof m.witness === 'object' && env.signer) {
         const w = m.witness as Record<string, unknown>;
