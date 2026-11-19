@@ -1,0 +1,74 @@
+{
+  "chainId": 56,
+  "tx": "0x4681baa231477353a944e4cda90bd86e46e118b22662763ecddee1a88f53ea4a",
+  "signer": "0x9f529b37800023b3fe2c9da0aa86f4b45f03c17f",
+  "signature": "0x6ffd07c5a274c47f7ac4dce8f85c25d12ad34e57ad1b9a2c20c30dc91e968bfe7d80f1d8661ba7f59b5742fdabd9177cd50f387753cb2ae203327b504e5f301f1c",
+  "typedData": {
+    "types": {
+      "EIP712Domain": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "string"
+        },
+        {
+          "name": "chainId",
+          "type": "uint256"
+        },
+        {
+          "name": "verifyingContract",
+          "type": "address"
+        }
+      ],
+      "ForwardRequest": [
+        {
+          "name": "from",
+          "type": "address"
+        },
+        {
+          "name": "to",
+          "type": "address"
+        },
+        {
+          "name": "value",
+          "type": "uint256"
+        },
+        {
+          "name": "gas",
+          "type": "uint256"
+        },
+        {
+          "name": "nonce",
+          "type": "uint256"
+        },
+        {
+          "name": "deadline",
+          "type": "uint48"
+        },
+        {
+          "name": "data",
+          "type": "bytes"
+        }
+      ]
+    },
+    "primaryType": "ForwardRequest",
+    "domain": {
+      "name": "LumyForwarder",
+      "version": "1",
+      "chainId": 56,
+      "verifyingContract": "0xC0231947bED09926C80Eb89Ab91Baa6b4a0464E5"
+    },
+    "message": {
+      "from": "0x9f529b37800023b3fe2C9da0aa86F4B45F03c17F",
+      "to": "0xDc5a3aF2c85cf20837e4eA08a0Bb6c9cc5157fB0",
+      "value": "0",
+      "gas": "200000",
+      "nonce": "171",
+      "deadline": "1795077596",
+      "data": "0xa9059cbb000000000000000000000000329252abaee065f1691d2d5ece642863c0ddbf41000000000000000000000000000000000000000000000048b394df4418fd0800"
+    }
+  }
+}

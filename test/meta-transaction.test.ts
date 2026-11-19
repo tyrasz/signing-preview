@@ -157,3 +157,16 @@ test('Shapes that are not exactly these are left to the other decoders', async (
   const bad = polygon({ from: 'not an address' });
   assert.notEqual((await sign(bad)).decoding.decoder, 'meta_tx_polygon');
 });
+
+test('Real meta-transactions recover to their users over the digest computed here, and are read as their calls', async () => {
+  const { recoverAddress } = await import('viem');
+  const { typedDataDigest } = await import('../src/typed-data/common.ts');
+  const { readFileSync } = await import('node:fs');
+  for (const [file, decoder, title] of [['meta-tx-polygon-usdt0.json', 'meta_tx_polygon', /^Gasless call as you: Send 111 USDT0/], ['meta-tx-oz5-bsc.json', 'meta_tx_oz5', /^Gasless call as you: Send 1341105786420000000000 base units of token 0xdc5a/]] as const) {
+    const f = JSON.parse(readFileSync(new URL(`./fixtures/${file}`, import.meta.url), 'utf8'));
+    assert.equal((await recoverAddress({ hash: typedDataDigest(f.typedData)!, signature: f.signature })).toLowerCase(), f.signer, file);
+    const p = await sign(f.typedData, { tokens: new StaticTokenRegistry() }, f.signer);
+    assert.equal(p.decoding.decoder, decoder);
+    assert.match(p.title, title);
+  }
+});

@@ -1,0 +1,54 @@
+{
+  "chainId": 137,
+  "tx": "0x258f4a08715d34cd5e05a30e59a6215b2aafe1f05906d26eaa2f58ce40a0b686",
+  "signer": "0x762ecb49d56796e5153f033e896aeadf3913dc4d",
+  "signature": "0x3a3a833dbc5ffd75d469b19a711f9cd24d68fa23c1b5f8a3788b1ecd4ba8624a61884467f9a1876591503248f469754521946e78349691c96da24065f451f8121c",
+  "typedData": {
+    "types": {
+      "EIP712Domain": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "version",
+          "type": "string"
+        },
+        {
+          "name": "verifyingContract",
+          "type": "address"
+        },
+        {
+          "name": "salt",
+          "type": "bytes32"
+        }
+      ],
+      "MetaTransaction": [
+        {
+          "name": "nonce",
+          "type": "uint256"
+        },
+        {
+          "name": "from",
+          "type": "address"
+        },
+        {
+          "name": "functionSignature",
+          "type": "bytes"
+        }
+      ]
+    },
+    "primaryType": "MetaTransaction",
+    "domain": {
+      "name": "USDT0",
+      "version": "1",
+      "verifyingContract": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+      "salt": "0x0000000000000000000000000000000000000000000000000000000000000089"
+    },
+    "message": {
+      "nonce": "0",
+      "from": "0x762eCb49D56796E5153f033E896aeadF3913DC4D",
+      "functionSignature": "0xa9059cbb0000000000000000000000003f62b511954c211c114c3d543bff36dedf5fb44b00000000000000000000000000000000000000000000000000000000069db9c0"
+    }
+  }
+}
