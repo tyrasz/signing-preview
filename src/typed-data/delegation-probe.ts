@@ -41,12 +41,20 @@ export const SELECTORS = {
   setApprovalForAll: sel('setApprovalForAll(address,bool)'), increaseAllowance: sel('increaseAllowance(address,uint256)'), transferOwnership: sel('transferOwnership(address)'),
   permit2Approve: sel('approve(address,address,uint160,uint48)'), permit2Lockdown: sel('lockdown((address,address)[])'), permit2Invalidate: sel('invalidateNonces(address,address,uint48)'),
   redeemDelegations: sel('redeemDelegations(bytes[],bytes32[],bytes[])'),
+  safeTransferFrom1155: sel('safeTransferFrom(address,address,uint256,uint256,bytes)'), safeBatchTransferFrom: sel('safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)'),
+  transferAndCall: sel('transferAndCall(address,uint256,bytes)'), send777: sel('send(address,uint256,bytes)'), authorizeOperator: sel('authorizeOperator(address)'),
 };
+export const PERMIT2_ADDRESS = '0x000000000022d473030f116ddee9f6b43ac78ba3';
 /** The account's own functions that run any call or change who controls it (DeleGatorCore, HybridDeleGator, MultiSigDeleGator, EIP7702StatelessDeleGator). */
 const SELF_CONTROL = ['execute(bytes32,bytes)', 'executeFromExecutor(bytes32,bytes)', 'execute((address,uint256,bytes))', 'executeBatch((address,uint256,bytes)[])',
   'upgradeToAndCall(address,bytes)', 'upgradeToAndCallAndRetainStorage(address,bytes)', 'transferOwnership(address)', 'withdrawDeposit(address,uint256)',
   'addKey(string,uint256,uint256)', 'removeKey(string)', 'updateSigners(address,string[],uint256[],uint256[])', 'addSigner(address)', 'removeSigner(address)',
-  'replaceSigner(address,address)', 'updateThreshold(uint256)', 'updateMultiSigParameters(address[],uint256,bool)'].map(s => [sel(s), s.replace(/\(.*/, '')] as [string, string]);
+  'replaceSigner(address,address)', 'updateThreshold(uint256)', 'updateMultiSigParameters(address[],uint256,bool)',
+  // DeleGatorCore's own redeemDelegations (onlyEntryPointOrSelf) forwards to the DelegationManager, which with no
+  // delegations has the account run any call.
+  'redeemDelegations(bytes[],bytes32[],bytes[])'].map(s => [sel(s), s.replace(/\(.*/, '')] as [string, string]);
+/** Control functions that, with fixed data, run only the fixed calls inside them (not a hand-over when exact). */
+const RUNS_FIXED = new Set(['execute(bytes32,bytes)', 'executeFromExecutor(bytes32,bytes)', 'execute((address,uint256,bytes))', 'executeBatch((address,uint256,bytes)[])'].map(sel));
 
 const word = (v: bigint | string) => (typeof v === 'bigint' ? v.toString(16) : v.toLowerCase().replace(/^0x/, '')).padStart(64, '0');
 const at = (data: string, start: number, bytes: number) => data.slice(2 + start * 2, 2 + (start + bytes) * 2);
@@ -88,7 +96,7 @@ export function ruleOf(enforcer: string, t: string): Rule | null {
     case '0xe475d14d61756d6e940b74c20d2e44eb70c71a8d': // ERC20Streaming
     case '0x56c97ae02f233b29fa03502ecc0457266d9be00e':
     case '0x474e3ae7e169e940607cc624da8a15eb120139ab': // ERC20PeriodTransfer
-      return { mode: 'single', allows: transferOn(addr(0)) };
+      return { mode: 'single', targets: [addr(0)], allows: transferOn(addr(0)) };
     case '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9': // NativeTokenPeriodTransfer: the value only
     case '0xd10b97905a320b13a0608f7e9cc506b56747df19': // NativeTokenStreaming
     case '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320': // NativeTokenTransferAmount
@@ -140,9 +148,21 @@ export function passes(rules: (Rule | null)[], e: Exec): boolean {
 
 const collect = <T>(rules: (Rule | null)[], f: (r: Rule) => T[] | undefined): T[] => rules.flatMap(r => !r ? [] : [...(f(r) ?? []), ...(r.groups ?? []).flatMap(g => collect(g, f))]);
 
-/** The data an attacker would send for a call, with the caveats' pinned bytes laid over it, and the data they fix outright. */
+/** The sets of pins a call can satisfy at once: the top-level caveats' and, for an OR, each group's in turn. */
+function pinSets(rules: (Rule | null)[]): { start: number; value: string }[][] {
+  let sets: { start: number; value: string }[][] = [[]];
+  for (const r of rules) {
+    if (!r) continue;
+    // A pin beyond 4 KB of call data no realistic call satisfies (and laying it would be huge).
+    const own = (r.pins ?? []).filter(p => p.start + p.value.length / 2 <= 4096);
+    if (r.groups?.length) sets = sets.flatMap(set => r.groups!.flatMap(g => pinSets(g).map(gs => [...set, ...gs]))).slice(0, 64);
+    else if (own.length) sets = sets.map(set => [...set, ...own]);
+  }
+  return sets;
+}
+
+/** The data an attacker would send for a call, with each set of the caveats' pinned bytes laid over it, and the data they fix outright. */
 function variants(template: string, rules: (Rule | null)[], withFixed: boolean): string[] {
-  const pins = collect(rules, r => r.pins);
   const lay = (data: string, list: { start: number; value: string }[]) => {
     let d = data.slice(2);
     for (const p of list) {
@@ -152,8 +172,13 @@ function variants(template: string, rules: (Rule | null)[], withFixed: boolean):
     }
     return `0x${d}`;
   };
-  const args = pins.filter(p => p.start > 0), heads = pins.filter(p => p.start === 0);
-  const out = new Set<string>([template, ...pins.map(p => lay(template, [p])), lay(template, args), ...heads.map(h => lay(template, [...args, h]))]);
+  const out = new Set<string>([template]);
+  for (const pins of pinSets(rules)) {
+    const args = pins.filter(p => p.start > 0), heads = pins.filter(p => p.start === 0);
+    for (const p of pins) out.add(lay(template, [p]));
+    out.add(lay(template, args));
+    for (const h of heads) out.add(lay(template, [...args, h]));
+  }
   if (withFixed) for (const d of collect(rules, r => r.datas)) out.add(d);
   return [...out];
 }
@@ -171,6 +196,8 @@ export interface Probe {
   nativeTo?: { target: string; perCall: bigint | null; plain: boolean }[];
   /** Token functions that move or approve the account's tokens: on any token (null) or the targets named, the recipient and amount free (null) or fixed. */
   tokens?: { on: string[] | null; recipient: string | null; amount: bigint | null; functions: string[] };
+  /** An approval on Permit2 it can make (for any token): of the delegate (ATTACKER), or of the spender pinned. */
+  permit2?: { spender: string };
   /** Targets named on which any function can be called. */
   anyFunction?: string[];
 }
@@ -180,9 +207,12 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   const out: Probe = {};
   // A call tried with the caveats' pins laid over it, and the data they fix: it must still be the function tried
   // (sameFunction), but for native coin to an EOA, which takes any data.
-  const tries = (target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true) => {
+  const fixed = new Set(collect(rules, r => r.datas));
+  const tries = (target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true, fixedRunsCalls = true) => {
     for (const batch of [false, true]) for (const t of templates) for (const data of variants(t, rules, withFixed)) {
       if (sameFunction && selectorOf(data) !== selectorOf(t)) continue;
+      // An exact execute(…) on the account runs only the calls fixed inside it: those are simulated, not a hand-over.
+      if (!fixedRunsCalls && fixed.has(data) && RUNS_FIXED.has(selectorOf(data))) continue;
       if (passes(rules, { target, value, data, batch })) return data;
     }
     return null;
@@ -190,8 +220,8 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   // Any call as the account: its own control functions on itself, the DelegationManager's redeemDelegations.
   // (each with one to six argument words: some rules check the call's length)
   const lengths = (selector: string) => [1, 2, 3, 6].map(n => `${selector}${'0'.repeat(64 * n)}`);
-  for (const [s, name] of SELF_CONTROL) if (!out.control && tries(account, 0n, lengths(s), false)) out.control = ['your account itself', `its ${name}`];
-  if (!out.control && tries(manager, 0n, lengths(SELECTORS.redeemDelegations), false)) out.control = ['the DelegationManager', 'redeemDelegations, which with no delegations has your account run any call'];
+  for (const [s, name] of SELF_CONTROL) if (!out.control && tries(account, 0n, lengths(s), true, true, false)) out.control = ['your account itself', `its ${name}`];
+  if (!out.control && tries(manager, 0n, lengths(SELECTORS.redeemDelegations), true)) out.control = ['the DelegationManager', 'redeemDelegations, which with no delegations has your account run any call'];
   // Native coin: to an address the delegate picks (an EOA takes any data), else to a target named.
   const named = [...new Set(collect(rules, r => r.targets))].filter(t => t !== account && t !== manager);
   const data = ['0x', `0x12345678${'0'.repeat(64)}`];
@@ -209,21 +239,34 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
     if (reach.length) out.nativeTo = reach;
   }
   // Tokens: move or approve them, to the delegate (or as pinned), on any token, else on the targets named.
-  const templates: [string, string, number][] = [
-    ['transfer', `${SELECTORS.transfer}${word(ATTACKER)}${word(MAX)}`, 4], ['approve', `${SELECTORS.approve}${word(ATTACKER)}${word(MAX)}`, 4],
-    ['transferFrom', `${SELECTORS.transferFrom}${word(account)}${word(ATTACKER)}${word(MAX)}`, 36], ['setApprovalForAll', `${SELECTORS.setApprovalForAll}${word(ATTACKER)}${word(1n)}`, 4],
-    ['increaseAllowance', `${SELECTORS.increaseAllowance}${word(ATTACKER)}${word(MAX)}`, 4]];
+  // [name, data, the recipient's byte offset, the amount's (null: everything)]
+  const bytesArg = (n: number) => `${word(BigInt(32 * n))}${word(0n)}`;
+  const templates: [string, string, number, number | null][] = [
+    ['transfer', `${SELECTORS.transfer}${word(ATTACKER)}${word(MAX)}`, 4, 36], ['approve', `${SELECTORS.approve}${word(ATTACKER)}${word(MAX)}`, 4, 36],
+    ['transferFrom', `${SELECTORS.transferFrom}${word(account)}${word(ATTACKER)}${word(MAX)}`, 36, 68], ['setApprovalForAll', `${SELECTORS.setApprovalForAll}${word(ATTACKER)}${word(1n)}`, 4, null],
+    ['increaseAllowance', `${SELECTORS.increaseAllowance}${word(ATTACKER)}${word(MAX)}`, 4, 36],
+    ['safeTransferFrom', `${SELECTORS.safeTransferFrom}${word(account)}${word(ATTACKER)}${word(1n)}`, 36, null],
+    ['safeTransferFrom', `${SELECTORS.safeTransferFromData}${word(account)}${word(ATTACKER)}${word(1n)}${bytesArg(4)}`, 36, null],
+    ['safeTransferFrom (ERC-1155)', `${SELECTORS.safeTransferFrom1155}${word(account)}${word(ATTACKER)}${word(1n)}${word(MAX)}${bytesArg(5)}`, 36, 100],
+    ['safeBatchTransferFrom', `${SELECTORS.safeBatchTransferFrom}${word(account)}${word(ATTACKER)}${word(160n)}${word(224n)}${word(288n)}${word(1n)}${word(1n)}${word(1n)}${word(MAX)}${word(0n)}`, 36, null],
+    ['transferAndCall', `${SELECTORS.transferAndCall}${word(ATTACKER)}${word(MAX)}${bytesArg(3)}`, 4, 36], ['send', `${SELECTORS.send777}${word(ATTACKER)}${word(MAX)}${bytesArg(3)}`, 4, 36],
+    ['authorizeOperator', `${SELECTORS.authorizeOperator}${word(ATTACKER)}`, 4, null]];
   const tokenCalls = (target: string) => {
     const found: { name: string; recipient: string; amount: bigint }[] = [];
-    for (const [name, t, at_] of templates) {
+    for (const [name, t, to, amount] of templates) {
       const d = tries(target, 0n, [t], true);
-      if (d) found.push({ name, recipient: `0x${at(d, at_, 32).slice(24)}`, amount: name === 'setApprovalForAll' ? MAX : BigInt(`0x${at(d, at_ + 32, 32) || '0'}`) });
+      if (d) found.push({ name, recipient: `0x${at(d, to, 32).slice(24)}`, amount: amount === null ? MAX : BigInt(`0x${at(d, amount, 32) || '0'}`) });
     }
     return found;
   };
+  // Permit2: an approval there of the delegate, for any token, lets it take every token the account approved to Permit2.
+  const permit2 = tries(PERMIT2_ADDRESS, 0n, [`${SELECTORS.permit2Approve}${word(SOME_TOKEN)}${word(ATTACKER)}${word((1n << 160n) - 1n)}${word((1n << 48n) - 1n)}`], true);
+  if (permit2) out.permit2 = { spender: `0x${at(permit2, 36, 32).slice(24)}` };
   const summary = (on: string[] | null, found: { name: string; recipient: string; amount: bigint }[]) => {
-    const open = found.find(f => f.recipient === ATTACKER && f.amount === MAX);
-    return { on, recipient: open || found.some(f => f.recipient === ATTACKER) ? null : found[0].recipient, amount: open || found.some(f => f.amount === MAX) ? null : found[0].amount, functions: [...new Set(found.map(f => f.name))] };
+    // An amount of 2^128 - 1 or more is unlimited (as format.ts's isUnlimited reads it).
+    const unlimited = (v: bigint) => v >= (1n << 128n) - 1n;
+    const open = found.find(f => f.recipient === ATTACKER && unlimited(f.amount));
+    return { on, recipient: open || found.some(f => f.recipient === ATTACKER) ? null : found[0].recipient, amount: open || found.some(f => unlimited(f.amount)) ? null : found[0].amount, functions: [...new Set(found.map(f => f.name))] };
   };
   const any = tokenCalls(SOME_TOKEN);
   if (any.length) out.tokens = summary(null, any);

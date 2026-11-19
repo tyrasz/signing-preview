@@ -34,10 +34,12 @@ test('A V2 buy: the price, no fee now, no expiry on chain, what can be spent now
   assert.equal(p.decoding.decoder, 'polymarket_order');
   assert.equal(p.title, 'Buy 10 shares of outcome token 11468772…019030 for 5 pUSD on Polymarket');
   assert.equal(detail(p, 'Price'), '0.5 pUSD a share (at most)');
-  assert.equal(detail(p, 'Fee'), "none now (the exchange's maximum fee rate is 0)");
+  // A maximum fee rate of 0 is no limit on V2 (Fees.sol): the operator sets the fee.
+  assert.match(detail(p, 'Fee')!, /with no cap \(the exchange's maximum fee rate is 0, which it takes as no limit\), paid on top/);
+  assert.ok(codes(p).includes('polymarket_fee_uncapped'));
   assert.match(detail(p, 'Expires')!, /^never on chain/);
   assert.equal(detail(p, 'Can be spent now'), '5 pUSD (the permitted amount; you hold 57 pUSD)');
-  assert.equal(p.attention, 'none');
+  assert.equal(p.attention, 'info');
 });
 
 test('A V2 sell for nothing, a buy above 1 a share, under a cent, another exchange', async () => {
@@ -46,6 +48,7 @@ test('A V2 sell for nothing, a buy above 1 a share, under a cent, another exchan
   assert.equal(detail(nothing, 'Shares held'), '40 shares');
   assert.equal((await sign(v2({ makerAmount: '12000000', takerAmount: '10000000' }))).warnings.find(w => w.code === 'polymarket_overpay')!.severity, 'danger');
   assert.ok(codes(await sign(v2({ side: 1, makerAmount: '40000000', takerAmount: '100000' }))).includes('polymarket_sell_cheap'));
+  assert.equal((await sign(v2({ side: 1, makerAmount: '1000000000', takerAmount: '49' }))).warnings.find(w => w.code === 'polymarket_sell_for_nothing')!.severity, 'danger');
   assert.ok(codes(await sign(v2({}, '0x2222222222222222222222222222222222222222'))).includes('polymarket_exchange_unknown'));
 });
 

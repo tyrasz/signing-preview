@@ -23,7 +23,7 @@ import { normalizeTransaction, previewTransaction } from '../evm/transaction.ts'
 import type { ApprovalChange, AssetChange, Preview, TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
 import { canMoveNow } from './exposure.ts';
-import { batchRule, probe, ruleOf, type Rule } from './delegation-probe.ts';
+import { ATTACKER, batchRule, probe, ruleOf, type Rule } from './delegation-probe.ts';
 
 export const DELEGATION_MANAGER = '0xdb9b1e94b5b69df7e401ddbede43491141047db3';
 const ANY_DELEGATE = '0x0000000000000000000000000000000000000a11';
@@ -163,7 +163,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     for (const c of configs) sum.set(c.address, (sum.get(c.address) ?? 0n) + c.amount);
     const nativeCap = configs.some(c => c.nativeCoin) ? sum.get('0x0000000000000000000000000000000000000000') : undefined;
     const erc20 = configs.some(c => !c.nativeCoin);
-    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: true }),
+    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: !isUnlimited(nativeCap) }),
       text: `only ${[erc20 && 'transfer() calls on these tokens', nativeCap !== undefined && `plain ${native} transfers`].filter(Boolean).join(', or ')}, up to: ${configs.map(c => c.text).join('; ')}` };
   } },
   '0x3790e6b7233f779b09da74c72b6e94813925b9af': { name: 'ERC721TransferEnforcer', read: t => ({ name: 'ERC721TransferEnforcer', kind: 'scope', text: `only transferring NFT #${word(t, 20)} of ${shortAddress(addr(t, 0))} (transferFrom or safeTransferFrom), to anyone` }) },
@@ -222,11 +222,11 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     const amount = word(t, 0), period = word(t, 32), start = word(t, 64);
     // It checks only the value each call sends, not what is called (its comment expects no call data, but nothing
     // checks that: MetaMask pairs it with ExactCalldataEnforcer(0x)).
-    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: true, text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
+    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: !isUnlimited(amount), text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
   } },
   '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320': { name: 'NativeTokenTransferAmountEnforcer', read: (t, _, native) => {
     const amount = word(t, 0);
-    return { name: 'NativeTokenTransferAmountEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: true, text: `${nativeOf(amount, native)} sent with the calls, in all` };
+    return { name: 'NativeTokenTransferAmountEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: !isUnlimited(amount), text: `${nativeOf(amount, native)} sent with the calls, in all` };
   } },
   '0x92bf12322527caa612fd31a0e810472bbb106a8f': { name: 'ValueLteEnforcer', read: (t, _, native) => ({ name: 'ValueLteEnforcer', kind: 'limit', nativeLimit: true, text: `at most ${nativeOf(word(t, 0), native)} sent with each call` }) },
   '0xbd7b277507723490cd50b12eaafe87c616be6880': { name: 'NativeBalanceChangeEnforcer', read: balanceChange('native') },
@@ -331,11 +331,14 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   if (anyone && redeemers) who = redeemers.length === 1 ? shortAddress(redeemers[0]) : `the ${redeemers.length} redeemers it names`;
   // How often: once with an IdEnforcer, a count with LimitedCalls, else as often as its other caveats allow.
   const once = known.some(r => r.once), count = known.reduce<bigint | undefined>((m, r) => r.redemptions !== undefined && (m === undefined || r.redemptions < m) ? r.redemptions : m, undefined);
-  const bounded = once || count !== undefined;
+  // (A count of more than 10,000 is no bound in practice.)
+  const bounded = once || (count !== undefined && count <= 10_000n);
   // What its caveats leave open: the calls an attacker would make, tried against every caveat's rule
   // (src/typed-data/delegation-probe.ts). Caps on the totals (a token's, the native coin's) bound what gets through.
-  const cappedTokens = new Set(known.filter(r => r.kind === 'scope').flatMap(r => r.tokens?.map(t => t.address) ?? []));
-  const p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens });
+  const cappedTokens = new Set(known.filter(r => r.kind === 'scope').flatMap(r => r.tokens?.filter(t => !isUnlimited(t.amount)).map(t => t.address) ?? []));
+  let p: ReturnType<typeof probe>;
+  try { p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens }); }
+  catch { p = { control: ['what its caveats allow', "which this preview couldn't work out from them"] }; }
   const nativeTotal = known.some(r => r.nativeTotal), nativePerRedemption = known.some(r => r.nativePerRedemption);
   const full = !!p.control;
   const account = root ? `your account ${shortAddress(delegator)}` : 'the account at the root of the delegation it passes on';
@@ -351,7 +354,8 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
     if (p.tokens) {
       const to = p.tokens.recipient ? ` to ${shortAddress(p.tokens.recipient)} only` : ' to anyone';
       const fns = p.tokens.functions.join(', ');
-      const open = !p.tokens.recipient && p.tokens.amount === null;
+      // Any amount is all of it, whoever it goes to; on any token, all of every token.
+      const open = p.tokens.amount === null;
       const info = p.tokens.on?.length === 1 ? await token(p.tokens.on[0]) : undefined;
       const units = (v: bigint) => info ? `${formatUnits(v, info.decimals)} ${info.symbol}` : `${v} base units`;
       if (p.tokens.recipient && p.tokens.amount !== null && p.tokens.on && bounded) {
@@ -363,6 +367,7 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
         else b.warn('caution', 'delegation_any_function', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, ${amount}: if ${p.tokens.on.length === 1 ? 'it is a token' : 'they are tokens'}, ${p.tokens.amount === null ? `all of your balance of ${p.tokens.on.length === 1 ? 'it' : 'them'}` : 'that much of it each time'}${unless}.`);
       }
     }
+    if (p.permit2) b.warn('danger', 'delegation_permit2', `${who} can approve ${p.permit2.spender === ATTACKER ? 'itself' : shortAddress(p.permit2.spender)} on Permit2, for any token and amount: every token your account has approved to Permit2 can then be taken${unless}.`);
     if (p.anyFunction?.length && (!p.tokens || p.tokens.on)) b.warn('caution', 'delegation_any_function', `${who} can call any function on ${p.anyFunction.map(shortAddress).join(', ')}, as your account: if ${p.anyFunction.length === 1 ? 'it is a token' : 'one is a token'}, all of your balance of it, transferred or approved to anyone${unless}.`);
     // Native coin: per call, or with no cap, unless a total caps it (a native period, stream or amount; per-redemption
     // and per-call caps only when the redemptions are bounded too). To a target named, only in a plain transfer or to

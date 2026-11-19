@@ -257,3 +257,35 @@ test('Second review: routes to full control, coin and tokens the probes find', a
     [{ enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 17n)}${word(86_400n)}${word(BigInt(NOW / 1000))}` }, exactData('0x'), targets(ALICE)],
   ]) assert.notEqual((await sign(delegation(BOB, [...caveats, until]))).attention, 'danger', JSON.stringify(caveats.map(c => c.enforcer)));
 });
+
+test('Third review: other token functions, Permit2, fixed control calls, OR pins, unlimited caps, a huge pin', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const zero = { enforcer: E.valueLte, terms: `0x${word(0n)}` };
+  const attention = async (caveats: { enforcer: string; terms: string }[]) => (await sign(delegation(BOB, [...caveats, until]))).attention;
+  const att = (fn: string) => toFunctionSelector(`function ${fn}`);
+  const methods = (...s: string[]) => ({ enforcer: E.methods, terms: `0x${s.map(x => x.slice(2)).join('')}` });
+  const exactData = (d: string) => ({ enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: d });
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  // Token functions beyond ERC-20's, and Permit2.
+  for (const fn of ['safeTransferFrom(address,address,uint256,uint256,bytes)', 'safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)', 'safeTransferFrom(address,address,uint256)', 'transferAndCall(address,uint256,bytes)', 'authorizeOperator(address)'])
+    assert.equal(await attention([methods(att(fn)), zero]), 'danger', fn);
+  assert.equal(await attention([methods(att('approve(address,address,uint160,uint48)')), zero]), 'danger');
+  assert.equal(await attention([{ enforcer: E.targets, terms: '0x000000000022d473030f116ddee9f6b43ac78ba3' }, zero]), 'danger');
+  // Fixed calls that hand the account over; the account's own redeemDelegations.
+  const owner = encodeFunctionData({ abi: parseAbi(['function transferOwnership(address)']), args: [BOB] });
+  assert.equal(await attention([exactData(owner), zero]), 'danger');
+  assert.equal(await attention([{ enforcer: E.exact, terms: `0x${ALICE.slice(2).toLowerCase()}${word(0n)}${owner.slice(2)}` }]), 'danger');
+  assert.equal(await attention([{ enforcer: E.targets, terms: `0x${ALICE.slice(2).toLowerCase()}` }, methods(att('redeemDelegations(bytes[],bytes32[],bytes[])'))]), 'danger');
+  // An unlimited approval pinned to one spender, on every token; an unlimited cap is none.
+  assert.equal(await attention([exactData(encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), args: [BOB, (1n << 256n) - 1n] })), zero]), 'danger');
+  assert.equal(await attention([{ enforcer: E.erc20Amount, terms: `0x${USDC.slice(2)}${word((1n << 256n) - 1n)}` }]), 'caution');
+  assert.equal(await attention([exactData('0x'), { enforcer: '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320', terms: `0x${word((1n << 256n) - 1n)}` }]), 'danger');
+  assert.equal(await attention([exactData('0x'), { enforcer: E.valueLte, terms: `0x${word(10n ** 18n)}` }, { enforcer: E.limitedCalls, terms: `0x${word((1n << 256n) - 1n)}` }]), 'danger');
+  // OR groups' pins laid group by group, in either order.
+  const SAFE = '0x5afe000000000000000000000000000000005afe';
+  const or = (...groups: { enforcer: string; terms: string }[][]) => ({ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [groups.map(g => ({ caveats: g.map(c => ({ ...c, args: '0x' })) })) as never]) });
+  const g1 = [calldata(4, BOB.slice(2).toLowerCase().padStart(64, '0')), calldata(36, word(10n ** 30n))], g2 = [calldata(4, SAFE.slice(2).padStart(64, '0')), { enforcer: E.targets, terms: `0x${SAFE.slice(2)}` }];
+  assert.equal(await attention([or(g1, g2), zero]), await attention([or(g2, g1), zero]));
+  // A pin far beyond any call doesn't crash the preview.
+  assert.ok(await attention([or([calldata(2 ** 40, '0x01')], [])]));
+});

@@ -8,7 +8,7 @@
 //   SpendPermissionBatch(address account,uint48 period,uint48 start,uint48 end,PermissionDetails[] permissions)
 //   PermissionDetails(address spender,address token,uint160 allowance,uint256 salt,bytes extraData)
 import { encodeFunctionData, parseAbi, type Hex } from 'viem';
-import { formatTimestamp, formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
+import { formatTimestamp, formatUnits, isUnlimited, PreviewBuilder, shortAddress } from '../format.ts';
 import { chainName, CHAINS } from '../chains.ts';
 import { tokenSourceWarnings } from '../evm/common.ts';
 import type { TokenInfo } from '../types.ts';
@@ -25,6 +25,8 @@ const BATCH = 'address account,uint48 period,uint48 start,uint48 end,PermissionD
 const DETAILS = 'address spender,address token,uint160 allowance,uint256 salt,bytes extraData';
 const ABI = parseAbi(['struct SpendPermission { address account; address spender; address token; uint160 allowance; uint48 period; uint48 start; uint48 end; uint256 salt; bytes extraData; }', 'function isRevoked(SpendPermission spendPermission) view returns (bool)', 'function isApproved(SpendPermission spendPermission) view returns (bool)']);
 
+/** An amount, also from a JSON number past 2^53 (only its magnitude matters then). */
+const amountOf = (v: unknown) => big(v) ?? (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? BigInt(v.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 })) : null);
 /** "a day", "a week", "every 30 days", or "in all" when one period covers the whole window. */
 const per = (period: bigint, start: bigint, end: bigint) => period >= end - start ? 'in all' : period === 86_400n ? 'a day' : period === 604_800n ? 'a week' : period === 3_600n ? 'an hour' : `every ${duration(period)}`;
 
@@ -40,7 +42,7 @@ export const spendPermissionAdapter: TypedAdapter = async (data, env) => {
   const account = str(m.account).toLowerCase();
   const period = big(m.period), start = big(m.start), end = big(m.end);
   const items = (batch ? Array.isArray(m.permissions) ? m.permissions as Record<string, unknown>[] : [] : [m])
-    .map(p => ({ spender: str(p?.spender).toLowerCase(), token: str(p?.token).toLowerCase(), allowance: big(p?.allowance), salt: big(p?.salt), extraData: str(p?.extraData) }));
+    .map(p => ({ spender: str(p?.spender).toLowerCase(), token: str(p?.token).toLowerCase(), allowance: amountOf(p?.allowance), salt: big(p?.salt), extraData: str(p?.extraData) }));
   if (!ADDRESS.test(account) || period === null || start === null || end === null || !items.length || items.some(p => !ADDRESS.test(p.spender) || !ADDRESS.test(p.token) || p.allowance === null)) return null;
   const b = new PreviewBuilder();
   const manager = str(data.domain.verifyingContract).toLowerCase();
@@ -59,13 +61,23 @@ export const spendPermissionAdapter: TypedAdapter = async (data, env) => {
     const isNative = p.token === NATIVE, info = await token(p.token);
     const amount = (v: bigint) => isNative ? `${formatUnits(v, CHAINS[chainId ?? 0]?.nativeDecimals ?? 18)} ${native}` : info ? `${formatUnits(v, info.decimals)} ${info.symbol}` : `${v} base units of ${shortAddress(p.token)}`;
     const symbol = isNative ? native : info?.symbol ?? shortAddress(p.token);
-    const unlimited = p.allowance! >= UINT160_MAX;
+    // 2^128 - 1 or more is unlimited, as format.ts's isUnlimited reads it (a uint160's largest is one such).
+    const unlimited = isUnlimited(p.allowance!);
     b.detail(`Spender${label}`, p.spender).detail(`Token${label}`, isNative ? `${native} (native coin)` : info ? `${info.symbol} (${p.token})` : p.token, p.token)
       .detail(`Allowance${label}`, `${unlimited ? `unlimited ${symbol}` : amount(p.allowance!)} ${window}`, p.allowance!.toString());
     if (p.extraData && p.extraData !== '0x') b.detail(`Extra data${label}`, p.extraData.length > 2 + 64 * 2 ? `${p.extraData.slice(0, 66)}… (${(p.extraData.length - 2) / 2} bytes)` : p.extraData);
     if (chainId !== null && !isNative) tokenSourceWarnings(b, chainId, info);
     if (unlimited) b.warn('danger', 'spend_permission_unlimited', `${shortAddress(p.spender)} may take any amount of your ${symbol}, ${window === 'in all' ? 'at any time' : `again ${window}`}: all of it, and any you receive while the permission lasts.`);
     bySpender.set(p.spender, [...bySpender.get(p.spender) ?? [], unlimited ? `unlimited ${symbol}` : amount(p.allowance!)]);
+    // The allowance comes back each period: what it allows over its whole window (to a century, for one with no end).
+    if (!unlimited && window !== 'in all') {
+      const from = start > nowS ? start : nowS, until = end - from > 100n * 365n * 86_400n ? from + 100n * 365n * 86_400n : end;
+      const periods = until > from ? (until - from + period - 1n) / period : 0n;
+      const total = p.allowance! * periods;
+      if (periods > 1n) b.detail(`In all${label}`, `up to ${isUnlimited(total) ? `unlimited ${symbol}` : amount(total)} over ${end >= UINT48_MAX ? 'the next century' : 'its window'} (${amount(p.allowance!)} ${window}, ${periods.toLocaleString('en-US')} periods)`, total.toString());
+      // A period under an hour returns the allowance so often that it is no limit in practice.
+      if (period < 3_600n && periods > 1n) b.warn('danger', 'spend_permission_unlimited', `Its allowance comes back every ${duration(period)}: ${shortAddress(p.spender)} may take ${amount(p.allowance!)} that often, which is no limit in practice: all of your ${symbol}.`);
+    }
     // What it could take now: the allowance against the balance (no ERC-20 approval is needed: the manager has the account give one each time).
     if (chainId !== null && start <= nowS && nowS < end) {
       const name = `Can move now${label}`;

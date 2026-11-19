@@ -70,7 +70,9 @@ export const polymarketAdapter: TypedAdapter = async (data, env) => {
   if (v2) {
     // The fee is the operator's, up to the exchange's maximum rate of the trade's cash value.
     const [maxRate] = live ? await callWords(env, 137, exchange, '0x4a2a11f5') ?? [] : [];
-    b.detail('Fee', maxRate === undefined ? `set when it is matched, up to the exchange's maximum rate (5% unless changed), ${buy ? 'paid on top of what you pay' : 'taken from what you get'}` : maxRate === 0n ? 'none now (the exchange\'s maximum fee rate is 0)' : `set when it is matched, up to ${Number(maxRate) / 100}% of the trade, ${buy ? 'paid on top of what you pay' : 'taken from what you get'}`, maxRate?.toString());
+    // A maximum rate of 0 is no limit (Fees.sol: "No limit enforced if rate is 0"): the operator then sets any fee.
+    b.detail('Fee', maxRate === undefined ? `set by Polymarket's operator when it is matched, up to the exchange's maximum rate (none if that is 0), ${buy ? 'paid on top of what you pay' : 'taken from what you get'}` : maxRate === 0n ? `set by Polymarket's operator when it is matched, with no cap (the exchange's maximum fee rate is 0, which it takes as no limit), ${buy ? 'paid on top of what you pay: up to what you hold and have approved' : 'taken from what you get: up to all of it'}` : `set by Polymarket's operator when it is matched, up to ${Number(maxRate) / 100}% of the trade, ${buy ? 'paid on top of what you pay' : 'taken from what you get'}`, maxRate?.toString());
+    if (maxRate === 0n) b.warn('info', 'polymarket_fee_uncapped', `The exchange's maximum fee rate is 0, which it takes as no limit: Polymarket's operator, who matches the order, sets its fee${buy ? ', charged to you on top of the price, up to what you hold and have approved the exchange for' : ', out of what you get'}. You rely on Polymarket for it.`);
     b.detail('Expires', 'never on chain: it stays fillable until filled, cancelled on Polymarket, or you pause trading on the exchange (pauseUser)');
     if (timestamp! > 0n) b.detail('Created', formatTimestamp(Number(timestamp! > 10n ** 12n ? timestamp! : timestamp! * 1000n)), timestamp!.toString());
     const builder = str(m.builder).toLowerCase(), metadata = str(m.metadata).toLowerCase();
@@ -91,6 +93,8 @@ export const polymarketAdapter: TypedAdapter = async (data, env) => {
   // A share pays out at most 1: a buy above that loses money whatever happens; a sell for (almost) nothing gives the shares away.
   if (buy && cashAmount > shareAmount) b.warn('danger', 'polymarket_overpay', `It pays ${each} ${collateral.symbol} a share, more than a share can ever pay out (1 ${collateral.symbol}): you lose money whatever the outcome.`);
   if (!buy && takerAmount === 0n) b.warn('danger', 'polymarket_sell_for_nothing', `It sells ${shares(makerAmount!)} for nothing: anyone can take them.`);
+  // Under 0.001 a share (Polymarket's smallest tick) is no price: the shares are given away.
+  else if (!buy && cashAmount * 1000n < shareAmount) b.warn('danger', 'polymarket_sell_for_nothing', `It sells ${shares(makerAmount!)} for ${cash(takerAmount!)}, under 0.001 ${collateral.symbol} a share, below any price on Polymarket's book: in effect, it gives them away.`);
   else if (!buy && cashAmount * 100n < shareAmount) b.warn('caution', 'polymarket_sell_cheap', `It sells for ${each} ${collateral.symbol} a share, under a cent: check it is the price you meant.`);
   if (sigType === 0n && maker !== signer) b.warn('info', 'polymarket_signer_mismatch', `It is signed as an EOA order, but its maker (${shortAddress(maker)}) isn't its signer (${shortAddress(signer)}): the exchange refuses it.`);
   if (env.signer && env.signer !== signer) b.warn('caution', 'polymarket_other_signer', `Its signer is ${shortAddress(signer)}, but ${shortAddress(env.signer)} is asked to sign it.`);

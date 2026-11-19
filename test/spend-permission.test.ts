@@ -63,3 +63,17 @@ test('A batch: several spenders and tokens in one signature, sharing the window;
   assert.equal(detail(p, 'Can move now 2'), '0.1 ETH (the permitted amount; you hold 2 ETH)');
   assert.equal(detail(p, 'Period'), 'none: the allowance is for the whole window');
 });
+
+test('An allowance of 2^128 is unlimited; one that comes back every second is no limit; the total over the window', async () => {
+  assert.equal((await sign(single({ allowance: (1n << 128n).toString() }))).warnings.find(w => w.code === 'spend_permission_unlimited')!.severity, 'danger');
+  const often = await sign(single({ period: 1 }));
+  assert.equal(often.warnings.find(w => w.code === 'spend_permission_unlimited')!.severity, 'danger');
+  const weekly = await sign(single({}));
+  assert.match(detail(weekly, 'In all')!, /^up to 500 USDC over its window \(100 USDC a week, 5 periods\)$/);
+  assert.ok(!codes(weekly).includes('spend_permission_unlimited'));
+  // An allowance sent as a JSON number past 2^53 is still read.
+  const raw = JSON.stringify(single({})).replace('"allowance":"100000000"', '"allowance":1e40');
+  const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, raw] }, { now: NOW, chainId: 1 }, deps());
+  assert.equal(p.decoding.decoder, 'coinbase_spend_permission');
+  assert.ok(codes(p).includes('spend_permission_unlimited'));
+});
