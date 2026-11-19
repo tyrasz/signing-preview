@@ -249,7 +249,7 @@ const TX_DETAILS = /^Network fee\b/;
 const FAILS = new Set(['simulation_reverted', 'batch_will_fail', 'batch_partial_failure']);
 
 /** "Can move now" for native coin: the cap against the account's balance (eth_getBalance), or nothing without an RPC. */
-async function nativeCanMoveNow(env: TypedEnv, b: PreviewBuilder, chainId: number, account: string, cap: bigint, native: string, label: string): Promise<void> {
+export async function nativeCanMoveNow(env: TypedEnv, b: PreviewBuilder, chainId: number, account: string, cap: bigint, native: string, label: string): Promise<void> {
   let balance: bigint;
   try {
     if (!env.deps.rpc?.has(chainId)) return;
