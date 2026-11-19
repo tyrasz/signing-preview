@@ -1341,3 +1341,43 @@ test('The caller’s state and a run’s own merge account by account and slot b
   // Nothing of its own: the caller's, keyed and slotted as simulators take them.
   assert.deepEqual(mergeOverrides(given, undefined), { '0x0000000000000000000000000000000000000001': { code: '0xbb', balance: '0x5' }, [account]: { balance: '0x9', stateDiff: { [`0x${'0'.repeat(63)}1`]: '0x07', [`0x${'0'.repeat(63)}2`]: '0x08' } }, [BOB]: { code: '0xcc' } });
 });
+
+test('From Amsterdam on, calls that fail only for want of gas for new state run again with the reservoir bundlers give them', async () => {
+  // Sepolia, 2026-11-19: a Safe app's operations signed with a call gas limit of 700,000 came in bundles of about 18
+  // million gas, whose 1.2 million over the cap paid for the new state their calls wrote; the chain's node, which
+  // gives a simulation's whole gas to the code, ran them out of gas (5 of 433 replayed, shown failing). Here an
+  // operation whose call writes ten new slots on a call gas limit of 200,000: under Amsterdam's rules that state
+  // (about 1.1 million gas) costs more than the call is given, unless the transaction carries gas over the cap for it.
+  const SEPOLIA = 11155111, WRITER = '0x00000000000000000000000000000000c0de8037';
+  await chain.putCode(WRITER, `0x${Array.from({ length: 10 }, (_, i) => `600160${(i + 1).toString(16).padStart(2, '0')}55`).join('')}00`);
+  // The test chain as Sepolia, its blocks Amsterdam's (their headers carry a block access list hash) or not.
+  const as = (amsterdam: boolean): typeof fetch => async (url, init) => {
+    const body = JSON.parse(String(init!.body)) as { id: number; method: string } | { id: number; method: string }[];
+    const blocks = new Set((Array.isArray(body) ? body : [body]).filter(c => c.method === 'eth_getBlockByNumber').map(c => c.id));
+    const res = await chain.fetchImpl(url, init);
+    if (!amsterdam || !blocks.size) return res;
+    const out = await res.json() as { id: number; result?: Record<string, unknown> | null } | { id: number; result?: Record<string, unknown> | null }[];
+    const add = (r: { id: number; result?: Record<string, unknown> | null }) => blocks.has(r.id) && r.result ? { ...r, result: { ...r.result, blockAccessListHash: `0x${'11'.repeat(32)}`, slotNumber: '0x1' } } : r;
+    return new Response(JSON.stringify(Array.isArray(out) ? out.map(add) : add(out)), { headers: { 'content-type': 'application/json' } });
+  };
+  const on = (amsterdam: boolean): Dependencies => {
+    const fetchImpl = as(amsterdam);
+    return { tokens: new StaticTokenRegistry({}), rpc: new JsonRpcClient({ [SEPOLIA]: URL_ }, { fetchImpl }),
+      simulator: new RpcSimulator({ [SEPOLIA]: URL_ }, { fetchImpl, fork: new ForkSimulator({ [SEPOLIA]: URL_ }, { fetchImpl }) }) };
+  };
+  const op = operation({ callData: call('execute', [WRITER, 0n, '0x']), callGasLimit: numberToHex(200_000n) });
+  const ask = (deps_: Dependencies) => previewRequest({ method: 'personal_sign', params: [userOpHash(readOperation(op, '0.7')!, EP, SEPOLIA, '0.7'), OWNER] }, { now: NOW, chainId: SEPOLIA, userOperation: { entryPoint: EP, operation: op } }, deps_);
+  const p = await ask(on(true));
+  const notes = p.decoding.notes.join(' | ');
+  assert.ok(!codes(p).includes('userop_execution_reverts'), `${codes(p)} ${notes}`);
+  assert.match(notes, /Its calls run out of gas unless the bundle's transaction carries gas beyond the 16,777,216 a transaction's code runs on, which from Amsterdam on pays for new state only/);
+  assert.match(notes, /on a transaction carrying 16,777,216 gas more for new state, as bundlers send such operations; sent without it, the calls fail and the account still pays for the gas/);
+  // The new state, paid from the reservoir, isn't in the gas the EntryPoint counts (234,960 here, with validation and
+  // the 50,000 of pre-verification): well under the 1.1 million it costs.
+  const used = BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+  assert.ok(used < 400_000n, String(used));
+  // Before Amsterdam (headers without the hash) there is no reservoir: the calls fail, as they would on-chain.
+  const q = await ask(on(false));
+  assert.ok(codes(q).includes('userop_execution_reverts'), codes(q).join());
+  assert.ok(!q.decoding.notes.some(n => /Its calls run out of gas unless/.test(n)));
+});

@@ -1,5 +1,6 @@
 // Passkey accounts whose stand-ins the survey of 2026-11-15 found missing or off: a build of Coinbase Smart Wallet
-// another factory deploys (Base), OKX Wallet's account whose key is OKX's passkey verifier's (OP Mainnet), Trust
+// another factory deploys (Base), OKX Wallet's account whose key is OKX's passkey verifier's (OP Mainnet) or an
+// Ethereum key its EIP-191 verifier checks (BNB Chain, beside two passkeys), Trust
 // Wallet's Barz passkey accounts (BNB Chain), and a ZeroDev passkey account whose last operation is beyond the usual
 // lookup (Arbitrum One). Each account's code is its real code read from the chain (test/fixtures), at its own address,
 // run by the fork simulator on test/evm-chain.ts (in a file of its own: the fork simulator keeps the code it reads at an
@@ -7,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getContractAddress, hashMessage, keccak256, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getContractAddress, hashMessage, keccak256, numberToHex, parseAbi, recoverAddress, sha256, stringToHex, type Hex } from 'viem';
 import { p256 } from '@noble/curves/nist';
 import { createAddressFromString as at, hexToBytes, setLengthLeft, unpadBytes } from '@ethereumjs/util';
 import { previewRequest } from '../src/preview.ts';
@@ -17,7 +18,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { CHAIN_PROFILES, ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, simulateOperation, STUB_SIGNATURE, walletForm, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, okxDigest, simulateOperation, STUB_SIGNATURE, walletForm, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
 import type { Dependencies, Preview, SimulationRequest } from '../src/types.ts';
 import { NOW } from './helpers.ts';
 import { compiled, testChain } from './evm-chain.ts';
@@ -200,6 +201,37 @@ test('OKX Wallet’s account whose key is a passkey, asked by anyone but the acc
 });
 
 /** The request simulateOperation makes first for `op` (what it stands in with), on the test chain, signed by `signer`. */
+test('OKX Wallet’s account whose key is an Ethereum key checked by OKX’s EIP-191 verifier: asked by that key, its own form, which the verifier’s real code takes', async () => {
+  // BNB Chain, 2026-11-19: of the account's three admin keys, two passkeys and this one, the operation was signed
+  // by this one (its hash, validUntil, then r, s, v over the EIP-191 form of the account's digest). Taken for one of
+  // the passkeys, the stand-in ran a passkey's checks: 9,101 gas (6.6%) over the operation's own.
+  const fx = fixture('okx-eip191-verifier.json');
+  const IMPLEMENTATION = '0x36d3cbd83961868398d056efbf50f5ce15528c0d', original = fixture('okx-passkey-verifier.json').codes[IMPLEMENTATION];
+  await install(fx);
+  try {
+    const account = fx.account as string, key = fx.key as string;
+    // What the real signature is: the key's own signature over the EIP-191 form of the account's digest.
+    const sig = fx.operation.signature as Hex, digest = okxDigest(fx.operation.hash, BigInt(`0x${sig.slice(66, 78)}`));
+    assert.equal((await recoverAddress({ hash: hashMessage({ raw: digest }), signature: `0x${sig.slice(78)}` })).toLowerCase(), key);
+    assert.equal(sig.slice(0, 66), keccak256(key as Hex));
+    await funded(account);
+    const callData = concatHex(['0x8dd7712f', encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'to', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }], [[{ to: usdc as Hex, value: 0n, data: transfer }]])]);
+    const op = operation({ sender: account, callData });
+    const p = await preview(op, key, '0.7', bnb);
+    assert.ok(whole(p) && /ecrecover attributes it to the signer\)/.test(whole(p)!) && !/doesn't accept/.test(whole(p)!), notes(p));
+    assert.deepEqual(usdcChange(p), ['out 50']);
+    // Laid out as the real one: the key's hash, validUntil, then 65 bytes.
+    const { args } = decodeFunctionData({ abi: parseAbi(['function simulateHandleOp((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) op, address target, bytes targetCallData)']), data: (await standInRequest(op, key)).data as Hex });
+    const mine = (args[0] as { signature: Hex }).signature;
+    assert.equal(mine.length, sig.length);
+    assert.equal(mine.slice(0, 66), sig.slice(0, 66));
+    // The account itself asked (a passkey wallet's way): one of its passkeys' stand-in, as before (not this key's).
+    const passkey = (decodeFunctionData({ abi: parseAbi(['function simulateHandleOp((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) op, address target, bytes targetCallData)']), data: (await standInRequest(op, account)).data as Hex }).args[0] as { signature: Hex }).signature;
+    assert.notEqual(passkey.slice(0, 66), sig.slice(0, 66));
+    assert.ok(passkey.length > sig.length);
+  } finally { await chain.putCode(IMPLEMENTATION, original); }
+});
+
 async function standInRequest(op: Record<string, unknown>, signer: string, version: '0.6' | '0.7' = '0.7'): Promise<SimulationRequest> {
   const tried: SimulationRequest[] = [];
   const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return null; } };

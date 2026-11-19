@@ -2,7 +2,7 @@
 // (scripts/userop-tokens.ts), and what a replay has warm (src/simulation.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareTokens, DEPOSIT, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Log } from '../scripts/userop-tokens.ts';
+import { compareTokens, DEPOSIT, keptEarlier, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Log } from '../scripts/userop-tokens.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 
 const word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
@@ -73,4 +73,26 @@ test("A replay's warm addresses and slots (a bundle's earlier operations') are i
   await sim.simulate({ chainId: 8453, from: ACCOUNT, to: SAFE, data: '0x', value: 0n, accessList: [{ address: WETH, storageKeys: [] }] });
   const call = (bodies.find(b => b.method === 'eth_simulateV1')!.params[0] as { blockStateCalls: { calls: { accessList?: unknown }[] }[] }).blockStateCalls[0].calls[0];
   assert.deepEqual(call.accessList, [{ address: WETH, storageKeys: [] }, { address: OTHER, storageKeys: [] }, { address: USDT, storageKeys: [slot] }]);
+});
+
+test("Past 400 earlier transactions, a replay keeps those that logged the bundle's own contracts' events, not its tokens'", () => {
+  // Ethereum, block 26,449,645: the operation's bundle was its 689th transaction; the 91st had traded in the same
+  // DacityCoin/WETH pair (Sync, Swap) and Uniswap v4 pool. With only the last 400 run first, the operation met the
+  // pool without that trade: 0.4% short in USDC and 6% over in gas, and judged as if it had met the block.
+  const PAIR = '0x2405e4c5417321976256018b683b31383cd9acba', V4 = '0x000000000004444c5dc75cb358380d2e3de08a90', USDC = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+  const SYNC = '0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1', V4_SWAP = '0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f';
+  const event = (address: string, topic: string): Log => ({ address, topics: [topic, word(ACCOUNT)], data: '0x' });
+  const earlier = Array.from({ length: 689 }, (_, i) => ({ hash: `0x${i.toString(16).padStart(64, '0')}` }));
+  const receipts = new Map(earlier.map(t => [t.hash, { logs: [] as Log[] }]));
+  receipts.get(earlier[91].hash)!.logs.push(event(PAIR, SYNC), event(V4, V4_SWAP));
+  // Moving the same token, or another pool's events, isn't trading in the bundle's pool.
+  receipts.get(earlier[50].hash)!.logs.push(transfer(USDC, OTHER, ACCOUNT, 5n));
+  receipts.get(earlier[60].hash)!.logs.push(event(OTHER, SYNC));
+  const own = [transfer(USDC, ACCOUNT, OTHER, 1n), event(PAIR, SYNC), event(V4, V4_SWAP)];
+  const kept = keptEarlier(earlier, receipts, own, 400);
+  assert.equal(kept.length, 401);
+  assert.deepEqual(kept.slice(0, 2), [91, 289]);
+  assert.equal(kept.at(-1), 688);
+  // No more than the cap: all of them, in order.
+  assert.deepEqual(keptEarlier(earlier.slice(0, 3), receipts, own, 400), [0, 1, 2]);
 });

@@ -15,7 +15,7 @@
 import { bytesToHex, concatHex, decodeAbiParameters, decodeFunctionData, decodeFunctionResult, encodeAbiParameters, getAddress, getContractAddress, hashMessage, hashTypedData, keccak256, encodeFunctionData, hexToBytes, numberToHex, parseAbi, parseAbiParameters, recoverAddress, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
 import { p256 } from '@noble/curves/nist';
 import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
-import type { BlockAt } from './block.ts';
+import { pinLatest, type BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { ecrecoverPrice } from './chains.ts';
 import { KERNEL_ENABLE_FIELDS, KERNEL_V3_IMPLEMENTATIONS } from './typed-data/kernel-enable.ts';
@@ -1649,7 +1649,7 @@ async function cosigned7702Stub(c: StubContext): Promise<Stub> {
 // the account itself, as most first operations make) failed with NonAdminSelfCall where the signed one succeeded.
 // A key's type can also be a contract that checks its signatures (an external verifier): the account calls it
 // (selector 0x9b2c81d3) with the key's hash, the digest and the rest of the signature, and takes its answer. One is
-// OKX's passkey verifier (OKX_PASSKEY_VERIFIER, below).
+// OKX's passkey verifier (OKX_PASSKEY_VERIFIER, below); another checks an Ethereum key's personal_sign (OKX_EIP191_VERIFIER).
 export const OKX_IMPLEMENTATION = '0x36d3cbd83961868398d056efbf50f5ce15528c0d';
 /**
  * OKX's passkey verifier (unpublished: an ERC-1967 proxy, EIP-712 domain "SmartWallet" 1.0.0, at this address on every
@@ -1663,6 +1663,16 @@ export const OKX_IMPLEMENTATION = '0x36d3cbd83961868398d056efbf50f5ce15528c0d';
  */
 export const OKX_PASSKEY_VERIFIER = '0xa9215f1afa5e2a5bb924f53186934b5da3459fe8';
 const OKX_PASSKEY_VERIFIER_CODE = '0x47f00fd16ccfdcec08617373f524a5e68ac8a29a';
+/**
+ * Another external verifier a key's type can name (unpublished, 2,118 bytes and not a proxy, at this address on BNB
+ * Chain, Ethereum, Base and Arbitrum One): an Ethereum key that signs the account's digest as personal_sign does. Its
+ * code recovers the signer from the digest's EIP-191 form (OpenZeppelin's ECDSA: low s), and takes the key whose hash
+ * is that address's, as a type-1 key's is: key hash | validUntil | r, s, v. Read from an operation on BNB Chain
+ * (0x7b5b…5ec2, block 134,520,450), whose signature recovers so to the key's address. Taken for one of the account's
+ * passkeys (the key most likely to sign where the signer asked wasn't recognized as one of its keys), its stand-in ran
+ * the passkey's checks: 9,101 gas (6.6%) over the operation's own.
+ */
+export const OKX_EIP191_VERIFIER = '0xd963ba3b7c1ca15abf60606c9bea4ab545cffe99';
 /** Its storage root (CUSTOM_STORAGE_ROOT()): a key's type is at keccak256(key hash, root + 1), its settings at keccak256(key hash, root + 2). */
 const OKX_STORAGE_ROOT = 0x653ff6dcbda533c3c7d8ffb646da3e510d0de40f237170c4da3f874472aecb00n;
 const okxSlot = (key: Hex, n: bigint) => keccak256(concatHex([key, `0x${(OKX_STORAGE_ROOT + n).toString(16).padStart(64, '0')}`]));
@@ -1677,7 +1687,8 @@ export const okxDigest = (userOpHash: Hex, validUntil: bigint): Hex =>
 type OkxKey = { hash: Hex; type: bigint; settings: bigint };
 /**
  * The stand-ins for an OKX account with these keys, in the order to try them:
- * - the signer's own key, if its address is one: the Ethereum key's form, which ecrecover's stand-in signs;
+ * - the signer's own key, if its address is one (an Ethereum key, the account's own or OKX_EIP191_VERIFIER's): the
+ *   Ethereum key's form, which ecrecover's stand-in signs;
  * - else, for the key most likely to sign (a passkey before an Ethereum key, an admin before others, unexpired
  *   before expired), a stand-in key registered in the account's storage for the run with that key's type and
  *   settings: the real key can't stand, as a passkey's public key is only in its signatures and an Ethereum key's
@@ -1714,11 +1725,14 @@ async function okxStubs(c: StubContext, keys: OkxKey[], deployed: boolean): Prom
   const passkey = (key: Hex) => concatHex([key, until, assertion]);
   const verified = (key: Hex) => concatHex([key, until, encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [assertion, STUB_COSIGNATURE])]);
   const own = keccak256(c.signer as Hex);
-  if (keys.some(k => k.hash === own && k.type === 1n)) return [{ signature: ecdsa(own) }];
+  // An Ethereum key, whether the account recovers it itself or OKX's EIP-191 verifier does: the same layout, which
+  // ecrecover's stand-in answers over either digest.
+  const EIP191 = BigInt(OKX_EIP191_VERIFIER), isEthereum = (k: OkxKey) => k.type === 1n || k.type === EIP191;
+  if (keys.some(k => k.hash === own && isEthereum(k))) return [{ signature: ecdsa(own) }];
   const VERIFIED = BigInt(OKX_PASSKEY_VERIFIER), isPasskey = (k: OkxKey) => k.type === 2n || k.type === VERIFIED;
   const expired = (k: OkxKey) => { const at = (k.settings >> 160n) & 0xffffffffffn; return at !== 0n && at <= now; };
   const rank = (k: OkxKey) => (isPasskey(k) ? 0 : 4) + (expired(k) ? 2 : 0) + (k.settings & OKX_ADMIN ? 0 : 1);
-  const key = keys.filter(k => k.type === 1n || isPasskey(k)).sort((a, b) => rank(a) - rank(b))[0];
+  const key = keys.filter(k => isEthereum(k) || isPasskey(k)).sort((a, b) => rank(a) - rank(b))[0];
   if (!key) return [{ signature: STUB_SIGNATURE }];
   // A key of the verifier's type: the verifier's key for the account (its cosigner), where it runs its known code.
   const verifier = key.type === VERIFIED ? await okxVerifierCosigner(c) : undefined;
@@ -3012,6 +3026,11 @@ export interface OperationRun {
   origin?: { by: 'factory' | 'account'; rejected: string; bundler?: string; tried: number; of?: number };
   /** What to say where the account accepts the stand-in (Stub's `note`). */
   note?: string;
+  /**
+   * From Amsterdam on: the gas the run's transaction carried for new state beyond the cap on what its code runs on
+   * (its reservoir), where the calls failed without it and succeeded with it, run in the local EVM (withStateReservoir).
+   */
+  reservoir?: bigint;
   /** The `after` calls' results. */
   after?: SimulationResult[];
   /** What was simulated for `result` (and the `after` calls): for tracing it. */
@@ -3344,6 +3363,8 @@ export async function simulateOperation(op: OperationInput, deps: Dependencies):
   const own = stub.cosigners?.some(c => c.digest);
   let result = (op.digest && standIn === 'ecdsa') || own ? await attempt(recover(stub.cosigners, standIn === 'ecdsa' ? op.digest : undefined)) : null;
   if (!op.supertransaction && (!result || result.account?.signatureFailed || result.rejected?.startsWith('AA23'))) result = await attempt(recover(stub.cosigners?.map(({ digest: _, ...c }) => c)));
+  // Calls that fail for want of gas for new state, from Amsterdam on: run again with the reservoir bundlers give them.
+  if (result && !result.rejected && !result.executed && !result.postOpReverted) result = await withStateReservoir(op, sim!, result, ep!.version, deps) ?? result;
   const why = stub.why ?? (op.supertransaction && result?.account?.signatureFailed ? SUPERTRANSACTION_WHY : undefined);
   const unpaid = stub.unpaid || (stub.wallet && result?.rejected?.startsWith('AA21') && await refusesUnpaid());
   return result && { ...result, standIn, ...(stub.walletForm && { walletForm: true }), ...(stub.lastForm && { lastForm: true }), ...(stub.fallback && { fallback: true }), ...(stub.madeUp && { madeUp: true }), ...(why && { why }), ...(stub.unsure && { unsure: true }), ...(stub.note && { note: stub.note }), ...(unpaid && { unpaid: true }), ...(origin && { origin }) };
@@ -3412,6 +3433,31 @@ export function entryPointGasFloor(op: Pick<OperationInput, 'callGasLimit' | 've
   const pm = op.paymasterAndData.length >= 42 && !/^0x0{40}/.test(op.paymasterAndData);
   const pmGas = version !== '0.6' && op.paymasterAndData.length >= 2 + 2 * 52 ? BigInt(`0x${op.paymasterAndData.slice(42, 74)}`) + BigInt(`0x${op.paymasterAndData.slice(74, 106)}`) : 0n;
   return ((pm && version === '0.6' ? 3n : 1n) * op.verificationGasLimit + op.callGasLimit + pmGas + op.preVerificationGas) * 65n / 64n + 100_000n;
+}
+
+/** EIP-7825: the most gas a transaction's code runs on; from Amsterdam on, what its gas limit holds beyond pays for new state only (EIP-8037). */
+export const ORDINARY_GAS_CAP = 16_777_216n;
+/**
+ * From Amsterdam on (Ethereum and Sepolia, where a block's header says so), new state is metered apart (EIP-8037):
+ * what a transaction's gas limit holds over ORDINARY_GAS_CAP is a reservoir that new state is paid from first, out of
+ * sight of gasleft(), so not out of an operation's own call gas limit, and not counted in the gas the EntryPoint
+ * charges it. Bundlers on Sepolia send operations so: of 22 operations of one Safe app (2026-11-19), the 15 signed
+ * with a call gas limit of 700,000 came in bundles of 17.9-18.0 million gas, writing 1.2 million gas of new state from
+ * the reservoir, and were charged 450,574 gas; the 7 signed with 2,000,000 came in bundles of 2.4 million, paid for the
+ * same state out of their call gas, and were charged 1,677,857. The chain's node gives a simulation's whole gas as
+ * ordinary gas (src/evm/transaction.ts), so the first kind ran out of gas in its calls there, where on the chain it
+ * succeeded. Where an operation's calls failed, they are run again in the local EVM (which meters the reservoir) on a
+ * transaction carrying ORDINARY_GAS_CAP more for new state: if they succeed so, that run is the operation's, as its
+ * bundler sends it. (The reservoir's size changes nothing the account pays, so long as it holds the new state.)
+ */
+async function withStateReservoir(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, run: OperationRun, version: '0.6' | '0.7' | '0.8' | '0.9', deps: Dependencies): Promise<OperationRun | null> {
+  const [req] = run.requests ?? [];
+  if ((op.chainId !== 1 && op.chainId !== 11155111) || !sim.trace || !req || (req.gas ?? 0n) > ORDINARY_GAS_CAP) return null;
+  const at = op.at ?? await pinLatest(deps.rpc, op.chainId);
+  if (!at?.header.amsterdam) return null;
+  const local = { simulate: async (q: SimulationRequest) => (await sim.trace!([q]))?.[0] ?? null, simulateBatch: (qs: SimulationRequest[]) => sim.trace!(qs) };
+  const again = await runOperation({ ...op, at }, local, { ...req, gas: 2n * ORDINARY_GAS_CAP }, version).catch(() => null);
+  return again && !again.rejected && again.executed && !again.postOpReverted ? { ...again, reservoir: ORDINARY_GAS_CAP } : null;
 }
 
 async function runOperation(op: OperationInput, sim: NonNullable<Dependencies['simulator']>, req: SimulationRequest, version: '0.6' | '0.7' | '0.8' | '0.9'): Promise<OperationRun | null> {

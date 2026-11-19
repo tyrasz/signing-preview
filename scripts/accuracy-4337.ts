@@ -50,16 +50,17 @@ import { liveDependencies } from '../src/server.ts';
 import type { Dependencies } from '../src/types.ts';
 import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
-import { stateBefore } from '../src/block.ts';
+import { headerOf, stateBefore, type BlockAt, type RpcHeader } from '../src/block.ts';
+import { ForkSimulator } from '../src/fork-simulator.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ORDINARY_GAS_CAP, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SUPER_TX_ARRAY_TYPEHASH } from '../src/supertransaction.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { deployedFallbackHandler, safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
 import { chainName, EVM_RPCS, OP_STACK, rpcUrlFor } from '../src/chains.ts';
-import { compareTokens, movedAlike, TRANSFER, type Compared } from './userop-tokens.ts';
+import { compareTokens, keptEarlier, movedAlike, TRANSFER, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
@@ -87,6 +88,8 @@ const MEE_OWNERS = process.argv.includes('--mee-owners');
 const meeOwnerKey = (nonce: bigint) => { const key = nonce >> 64n; return key >> 168n !== 0n && (key & ((1n << 168n) - 1n)) === 0n; };
 // The chain's *_RPC_URL replaces its public RPC (empty counts as unset, as an unset CI secret is; EVM_RPCS).
 const URL_: string = rpcUrlFor(CHAIN, process.env) ?? (() => { throw new Error(`no RPC for chain ${CHAIN}`); })();
+/** The local EVM, for bundles on an Amsterdam block (Ethereum's and Sepolia's rules: see the preview's simulator below). */
+const LOCAL = CHAIN === 1 || CHAIN === 11155111 ? new ForkSimulator({ [CHAIN]: URL_ }, {}) : undefined;
 /**
  * How long the chain's public node keeps a block's state, in seconds, where that is short: an operation whose block is
  * older by its turn is skipped (its state would go partway through the replay), and the queue runs newest first.
@@ -342,7 +345,7 @@ const CHROME_EXTRA_KEY = Buffer.from('"other_keys_can_be_added_here"').toString(
 /** How many operations of one bundle are replayed (each after the bundle's earlier ones). */
 const BUNDLE_MAX = 5;
 /** A block's receipts, read once for the operations replayed from it. */
-const BLOCK_RECEIPTS = new Map<string, Promise<{ transactionHash: string; gasUsed?: Hex; effectiveGasPrice?: Hex }[]>>();
+const BLOCK_RECEIPTS = new Map<string, Promise<{ transactionHash: string; gasUsed?: Hex; effectiveGasPrice?: Hex; logs: { address: string; topics: string[]; data: string }[] }[]>>();
 const blockReceipts = (number: Hex) => {
   if (!BLOCK_RECEIPTS.has(number)) { BLOCK_RECEIPTS.set(number, call('eth_getBlockReceipts', [number])); if (BLOCK_RECEIPTS.size > 64) BLOCK_RECEIPTS.delete(BLOCK_RECEIPTS.keys().next().value!); }
   return BLOCK_RECEIPTS.get(number)!;
@@ -386,7 +389,16 @@ async function replay(item: string): Promise<void> {
   // the simulated block's gas limit holds them as it held the real ones.
   // An OP Stack block's L1 info deposit (its first transaction) stays: the L1 values it sets are what a paymaster
   // pricing L1 data reads (a bundle on OP Mainnet came out 0.47% low on the parent block's).
-  const earlier = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR).slice(-400) : [];
+  // At most 400 of them run (a public node's room for one simulated block), the last 400 and before them those that
+  // logged what the bundle logs from the same contracts (keptEarlier): an earlier trade in the pool an operation swaps
+  // through. How many were left out is reported.
+  const all = PREFIX ? block.transactions.slice(0, Number(tx.transactionIndex)).filter(t => !SYSTEM.has(t.type) || t.from.toLowerCase() === L1_INFO_DEPOSITOR) : [];
+  let earlier = all;
+  if (all.length > 400) {
+    const receipts = new Map((await blockReceipts(r.blockNumber).catch(() => [])).map(x => [x.transactionHash.toLowerCase(), x]));
+    earlier = keptEarlier(all, receipts, r.logs ?? [], 400).map(i => all[i]);
+  }
+  const leftOut = all.length - earlier.length;
   const before: SimulationRequest[] = earlier
     .map(t => ({ chainId: CHAIN, from: t.from.toLowerCase(), to: t.to, data: t.input, value: BigInt(t.value), ...(t.authorizationList?.length && { authorizationList: t.authorizationList as SimulationRequest['authorizationList'] }) }));
   // The same as they ran: each at the price it paid (its receipt's), with its own gas limit and access list. What an
@@ -493,7 +505,14 @@ async function replay(item: string): Promise<void> {
   // 0.001 gwei tip where operations offered 0.0015), and a swap taxed by the priority fee came out 1% apart.
   const bundlePrice = r.effectiveGasPrice ? BigInt(r.effectiveGasPrice) : undefined;
   const atBundlePrice = (q: SimulationRequest) => bundlePrice !== undefined && q.gasPrice !== undefined && q.to?.toLowerCase() === EP ? { ...q, gasPrice: bundlePrice } : q;
-  const simulator = { simulate: (q: SimulationRequest) => node.simulate(atBundlePrice(q)), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(qs.map(atBundlePrice)) };
+  // From Amsterdam on, a bundle's gas over the cap pays for new state only, which the node doesn't simulate: where an
+  // operation's calls fail, the preview runs it again in the local EVM with that reservoir (src/erc4337-sim.ts,
+  // withStateReservoir). Here on the replayed block: its state before the bundle (read from its access list), what
+  // the bundle runs first, and what the bundle had warm.
+  const replayAt = (): BlockAt => ({ block: parent, header: headerOf(CHAIN, block as unknown as RpcHeader), required: true, ...(state && { state }), before: prefix });
+  const warmed = (q: SimulationRequest): SimulationRequest => warm.length ? { ...q, accessList: [...(q.accessList ?? []), ...warm.map(w => (typeof w === 'string' ? { address: w, storageKeys: [] } : w))] } : q;
+  const simulator = { simulate: (q: SimulationRequest) => node.simulate(atBundlePrice(q)), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(qs.map(atBundlePrice)),
+    ...(state && LOCAL && { trace: (qs: SimulationRequest[]) => LOCAL.trace(qs.map(q => warmed({ ...atBundlePrice(q), at: replayAt() }))) }) };
   const deps = { ...liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
   // A node that no longer serves the parent block's state (Ethereum's public RPC keeps about 128 blocks) would leave
@@ -676,12 +695,16 @@ async function replay(item: string): Promise<void> {
     }
   }
   // OKX Wallet's account, signed by an Ethereum key: its hash, validUntil, then the signature over the account's
-  // own digest of the operation's hash (src/erc4337-sim.ts, okxStubs); the key's hash is its address's.
+  // own digest of the operation's hash (src/erc4337-sim.ts, okxStubs), or over that digest's EIP-191 form for a key
+  // OKX's EIP-191 verifier checks (OKX_EIP191_VERIFIER); the key's hash is its address's.
   if (!module && op.signature.length === 2 + 206) {
-    try {
-      const a = (await recoverAddress({ hash: okxDigest(digest, BigInt(`0x${op.signature.slice(66, 78)}`)), signature: `0x${op.signature.slice(78)}` })).toLowerCase();
-      if (keccak256(a as Hex) === op.signature.slice(0, 66).toLowerCase()) { const i = signers.indexOf(a); if (i >= 0) signers.splice(i, 1); signers.unshift(a); }
-    } catch { /* not that form */ }
+    const own = okxDigest(digest, BigInt(`0x${op.signature.slice(66, 78)}`));
+    for (const hash of [own, hashMessage({ raw: own })]) {
+      try {
+        const a = (await recoverAddress({ hash, signature: `0x${op.signature.slice(78)}` })).toLowerCase();
+        if (keccak256(a as Hex) === op.signature.slice(0, 66).toLowerCase()) { const i = signers.indexOf(a); if (i >= 0) signers.splice(i, 1); signers.unshift(a); break; }
+      } catch { /* not that form */ }
+    }
   }
   // Ambire's account, signed in its Standard mode ({r}{s}{v}, then 0x01): over the EIP-712 digest of
   // AmbireOperation(account, the operation's hash) (src/erc4337-sim.ts, AMBIRE_IMPLEMENTATION). Who signed is a key
@@ -883,7 +906,9 @@ async function replay(item: string): Promise<void> {
   // chain, the preview's difference is its own. (Reported with the outcome; nothing is judged by it.)
   let minedOutcome: string | undefined;
   if (whole && succeeded === reverts) {
-    const run = (await node.simulateBatch([mined]).catch(() => null))?.[0], own = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
+    // (A bundle over the cap on an Amsterdam block in the local EVM, which meters what it holds for new state.)
+    const local = simulator.trace && BigInt(tx.gas) > ORDINARY_GAS_CAP ? simulator.trace : undefined;
+    const run = (await (local ? local([mined]) : node.simulateBatch([mined])).catch(() => null))?.[0], own = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
     minedOutcome = !run ? 'not run' : run.status !== 'success' ? `its bundle reverted here: ${String(run.revertReason ?? '').slice(0, 80)}`
       : !own ? 'its operation not run here' : (BigInt(`0x${own.data.slice(66, 130)}`) === 1n) === succeeded ? 'as on the chain' : `as the preview did, ${succeeded ? 'failing' : 'succeeding'}: the state or the run isn't the chain's`;
   }
@@ -919,7 +944,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && { leftOut }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
@@ -1055,6 +1080,7 @@ const range = [...blocks].sort((a, b) => a - b);
 console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
+if (PREFIX && count(r => !!r.leftOut)) say(`  (for ${count(r => !!r.leftOut)}, of more than 400 earlier transactions in the block only the last 400 and those that logged the bundle's contracts' events ran first: ${rows.reduce((sum, r) => sum + Number(r.leftOut ?? 0), 0)} left out)`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | not whole, the node failed it ${count(r => !!r.nodeFailed)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 if (count(r => !!r.session)) say(`  session keys' operations (SmartSession): ${count(r => !!r.session)} (${['OwnableValidator', 'K1MeeValidator'].map(v => `through ${v} ${count(r => r.sessionValidator === v)}`).join(', ')}), the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
 if (count(r => !!r.meeOwner)) say(`  owners' operations through their own K1MeeValidator in simple mode (Biconomy Nexus): ${count(r => !!r.meeOwner)}, the stand-in validated for ${count(r => !!r.meeOwner && r.standIn === 'validated')}`);

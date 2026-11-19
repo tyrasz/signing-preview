@@ -79,3 +79,25 @@ export const movedAlike = (run: readonly Log[], receipt: readonly Log[], token: 
   const mined = transfersOf(receipt, token, account);
   return mined !== '' && transfersOf(run, token, account) === mined;
 };
+
+const APPROVAL = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
+const APPROVAL_FOR_ALL = '0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31';
+/**
+ * Which of a block's earlier transactions a replay runs before a bundle, where it runs no more than `max` of them
+ * (scripts/accuracy-4337.ts): the last `max`, and before them every one whose receipt logs an event the bundle's own
+ * receipt logs, from the same contract: a pool's Sync and Swap, a singleton's Swap (Uniswap v4's PoolManager, for
+ * any pool: wider than needed, never narrower), another bundle's EntryPoint events. Not a token's Transfer or
+ * Approval, nor a wrapper's Deposit or Withdrawal, which any transaction moving the token logs. Indexes into
+ * `earlier`, in order. On Ethereum (2026-11-19) an operation 689th in its block swapped through a pool the block's
+ * 91st transaction had traded in: with only the last 400 run before it, it met the pool without that trade and came
+ * out 0.4% short in USDC and 6% over in gas, and was judged as if it had met the block.
+ */
+export function keptEarlier(earlier: readonly { hash: string }[], receipts: ReadonlyMap<string, { logs: readonly Log[] }>, own: readonly Log[], max: number): number[] {
+  if (earlier.length <= max) return earlier.map((_, i) => i);
+  const plain = new Set([TRANSFER, APPROVAL, APPROVAL_FOR_ALL, DEPOSIT, WITHDRAWAL]);
+  const key = (l: Log) => `${l.address.toLowerCase()} ${l.topics[0]}`;
+  const mine = new Set(own.filter(l => l.topics[0] && !plain.has(l.topics[0])).map(key));
+  const from = earlier.length - max, kept: number[] = [];
+  for (let i = 0; i < from; i++) if (receipts.get(earlier[i].hash.toLowerCase())?.logs.some(l => mine.has(key(l)))) kept.push(i);
+  return [...kept, ...Array.from({ length: max }, (_, j) => from + j)];
+}
