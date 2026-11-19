@@ -65,6 +65,29 @@ test('OKX DEX router: the request it carries, and pool-only swaps with the outpu
   assert.equal((await unx(1n << 254n)).title, 'Swap 100 USDC for at least 0.03 ETH on OKX DEX');
 });
 
+test("OKX DEX router: its commission after the call's arguments, read as the router reads it; its routers on BNB Chain, Base and Polygon", async () => {
+  const OKX = '0x8feab81d36e7576107d5de0758c1b839be31b4f6';
+  const A = parseAbi(['function dagSwapTo(uint256 orderId, address receiver, (uint256 fromToken, address toToken, uint256 fromTokenAmount, uint256 minReturnAmount, uint256 deadLine) baseRequest, (address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[] paths) payable returns (uint256)']);
+  const call = (from = USDC) => encodeFunctionData({ abi: A, functionName: 'dagSwapTo', args: [1n, ALICE, { fromToken: BigInt(from), toToken: USDT, fromTokenAmount: 100_545_500n, minReturnAmount: 99_000_000n, deadLine: 0n }, []] });
+  const ref1 = '0x7797000000000000000000000000000000002aa3', ref2 = '0x542e00000000000000000000000000000000f152';
+  const flagWord = (flag: string, rate: bigint, who: string) => `${flag}${rate.toString(16).padStart(12, '0')}${who.slice(2)}`;
+  // Dual commission from the input, 0.4% and 0.05% (rates in billionths), the token word between: the router takes
+  // amount × rate / (1 − total) on top, 0.4545 USDC here (as a real Base call paid, 0.403999 + 0.050501).
+  const dual = `${call()}${flagWord('22220afc2aaa', 500_000n, ref2)}${USDC.slice(2).padStart(64, '0')}${flagWord('22220afc2aaa', 4_000_000n, ref1)}` as Hex;
+  const p = await send(OKX, dual);
+  assert.equal(detail(p, 'Commission'), '0.4545 USDC (0.45%) to 0x7797…2aa3, 0x542e…f152, paid on top of what you send');
+  assert.match(p.summary, /plus a 0\.4545 USDC commission/);
+  // From the output: a rate only. A raw suffix after it (ERC-8021, not word-aligned) is skipped, as the router skips it.
+  const out = await send(OKX, `${call()}${USDT.slice(2).padStart(64, '0')}${flagWord('3ca20afc2bbb', 5_000_000n, ref1)}aabbcc` as Hex);
+  assert.equal(detail(out, 'Commission'), '0.5% of what the swap returns, to 0x7797…2aa3');
+  // 1% or more is a caution; no commission, no detail.
+  assert.ok(codes(await send(OKX, `${call()}${USDC.slice(2).padStart(64, '0')}${flagWord('3ca20afc2aaa', 20_000_000n, ref1)}` as Hex)).includes('large_fee_portion'));
+  assert.equal(detail(await send(OKX, call()), 'Commission'), undefined);
+  // The routers on other chains (each verified on Sourcify as DexRouter).
+  for (const [router, chainId] of [['0x5994814f2c4040b863a0125a45de152a8c2a4dec', '0x38'], ['0x67d03631fe51b741c0c00c4e16eb662ac84381df', '0x2105'], ['0x3c4829196bfadff4394726b45159aeaac6fcd41c', '0x89']] as const)
+    assert.equal((await send(router, call(), 0n, chainId)).decoding.decoder, 'okx_dex', chainId);
+});
+
 test('Uniswap V2 Router02, V3 SwapRouter and SwapRouter02: swaps, ETH in and out, exact output, and a recipient elsewhere', async () => {
   const A = parseAbi([
     'function swapExactETHForTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable',

@@ -1,7 +1,7 @@
 // The busiest swap and bridge routers left unreadable without an Etherscan key: 1inch's Aggregation Router v6,
 // MetaMask's Swaps and Bridge routers, and Across's SpokePool. Each gets a headline from its calldata ("Swap 100 USDC
 // for at least 99.8 USDT on 1inch", "Bridge 0.5 ETH to Base through Across"); the simulation shows what moves.
-import { decodeFunctionData, parseAbi, type Hex } from 'viem';
+import { decodeFunctionData, encodeFunctionData, parseAbi, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { builtinTokens, CHAINS } from '../chains.ts';
 import { wrappedNative } from './universal-router.ts';
@@ -173,7 +173,7 @@ const acrossAdapter: Adapter = async (tx, env) => {
 };
 
 // --- OKX DEX router (Ethereum; Arbitrum One, identified by its selectors and checked against receipts) ---
-const OKX: Record<string, number> = { '0x8feab81d36e7576107d5de0758c1b839be31b4f6': 1, '0x09f94b5fc68e227c323a6fbae3bd98c97fd8c849': 42161 };
+const OKX: Record<string, number> = { '0x8feab81d36e7576107d5de0758c1b839be31b4f6': 1, '0x09f94b5fc68e227c323a6fbae3bd98c97fd8c849': 42161, '0x5994814f2c4040b863a0125a45de152a8c2a4dec': 56, '0x67d03631fe51b741c0c00c4e16eb662ac84381df': 8453, '0x3c4829196bfadff4394726b45159aeaac6fcd41c': 137 };
 const BASE_REQUEST = '(uint256 fromToken, address toToken, uint256 fromTokenAmount, uint256 minReturnAmount, uint256 deadLine) baseRequest';
 const ROUTER_PATH = '(address[] mixAdapters, address[] assetTo, uint256[] rawData, bytes[] extraData, uint256 fromToken)[] paths';
 const OKX_ABI = parseAbi([
@@ -185,6 +185,40 @@ const OKX_ABI = parseAbi([
   'function unxswapTo(uint256 srcToken, uint256 amount, uint256 minReturn, address receiver, bytes32[] pools) payable returns (uint256)',
   'function uniswapV3SwapTo(uint256 receiver, uint256 amount, uint256 minReturn, uint256[] pools) payable returns (uint256)',
 ]);
+
+/**
+ * The commission an OKX router call carries after its arguments (the router's ExtraDataLib, verified on Sourcify): read
+ * from the right, as the router reads it. The last word that starts with one of its flags (commission, trim, Permit2,
+ * refund address) ends the extra data; a commission is there when that word's flag is one. Its word holds the flag,
+ * the first referrer's rate (in billionths) and address; the word before, the token; then any further referrers'.
+ */
+const OKX_COMMISSION: Record<string, { side: 'from' | 'to'; referrers: number | 'multiple' }> = {
+  '3ca20afc2aaa': { side: 'from', referrers: 1 }, '3ca20afc2bbb': { side: 'to', referrers: 1 },
+  '22220afc2aaa': { side: 'from', referrers: 2 }, '22220afc2bbb': { side: 'to', referrers: 2 },
+  '88880afc2aaa': { side: 'from', referrers: 'multiple' }, '88880afc2bbb': { side: 'to', referrers: 'multiple' },
+};
+const OKX_OTHER_FLAGS = ['777777771111', '777777772222', '92527fff1a65', '92527fff1a64', 'ac3a7da8b1c6'];
+function okxCommission(data: Hex, swapLength: number): { side: 'from' | 'to'; token: string; referrers: { address: string; rate: bigint }[] } | null {
+  const size = (data.length - 2) / 2;
+  const word = (end: number) => data.slice(2 + (end - 32) * 2, 2 + end * 2).toLowerCase();
+  let end = size - ((size - 4) % 32), flag: string | undefined;
+  for (let at = end; at - 32 >= swapLength; at -= 32) {
+    const f = word(at).slice(0, 12);
+    if (OKX_COMMISSION[f] || OKX_OTHER_FLAGS.includes(f)) { end = at; flag = f; break; }
+  }
+  const kind = flag ? OKX_COMMISSION[flag] : undefined;
+  if (!kind || end - 64 < swapLength) return null;
+  const tokenWord = word(end - 32);
+  const count = kind.referrers === 'multiple' ? parseInt(tokenWord.slice(2, 4), 16) : kind.referrers;
+  if (count < 1 || count > 8 || end - 32 * (count + 1) < swapLength) return null;
+  const referrers: { address: string; rate: bigint }[] = [];
+  for (let i = 0; i < count; i++) {
+    const w = i === 0 ? word(end) : word(end - 32 - 32 * i);
+    if (w.slice(0, 12) !== flag) return null;
+    referrers.push({ address: `0x${w.slice(24)}`, rate: BigInt(`0x${w.slice(12, 24)}`) });
+  }
+  return { side: kind.side, token: `0x${tokenWord.slice(24)}`, referrers };
+}
 
 /** The output token of a chain of v2/v3 pools from `input`, each pool in a word's low 160 bits (token0/token1 read on-chain). */
 async function poolChainOutput(env: AdapterEnv, chainId: number, input: string, pools: bigint[]): Promise<string | null> {
@@ -226,12 +260,28 @@ const okxAdapter: Adapter = async (tx, env) => {
   const sent = await amountOf(env, tx.chainId, src, amount);
   const least = dst ? await amountOf(env, tx.chainId, dst, minReturn) : `${minReturn} base units of the output token`;
   b.detail('You send', sent).detail('You receive at least', least);
+  // A commission to the app's referrers, after the arguments: from what you send, on top of it (the router takes
+  // amount × rate / (1 − total rate)), or from what the swap returns.
+  let commission = '';
+  let swapLength = 0;
+  try { swapLength = (encodeFunctionData({ abi: OKX_ABI, functionName: call.functionName, args: call.args } as never).length - 2) / 2; } catch { swapLength = 0; }
+  const c = swapLength ? okxCommission(tx.data, swapLength) : null;
+  if (c) {
+    const total = c.referrers.reduce((t, r) => t + r.rate, 0n);
+    const percent = `${formatUnits(total, 7)}%`;
+    const to = c.referrers.map(r => shortAddress(r.address)).join(', ');
+    if (c.side === 'from' && total < 1_000_000_000n) {
+      commission = await amountOf(env, tx.chainId, c.token, (amount * total) / (1_000_000_000n - total));
+      b.detail('Commission', `${commission} (${percent}) to ${to}, paid on top of what you send`, c.referrers.map(r => r.address).join(','));
+    } else b.detail('Commission', `${percent} of what the swap returns, to ${to}`, c.referrers.map(r => r.address).join(','));
+    if (total >= 10_000_000n) b.warn('caution', 'large_fee_portion', `The app takes a ${percent} commission on this swap (to ${to}).`);
+  }
   if (!sameAddress(receiver, tx.from)) {
     b.detail('Recipient', receiver);
     b.warn('caution', 'recipient_not_sender', `The tokens you buy go to ${shortAddress(receiver)}, not to you.`);
   }
   if (minReturn <= 1n) b.warn('caution', 'no_slippage_limit', 'Nothing limits the price: the minimum received is zero, so the swap would go through at any rate.');
-  return decoded({ title: `Swap ${sent} for at least ${least} on OKX DEX`, summary: `Swaps ${sent} through OKX's DEX router, for at least ${least}.`, decoder: 'okx_dex', status: dst ? 'full' : 'partial', b });
+  return decoded({ title: `Swap ${sent} for at least ${least} on OKX DEX`, summary: `Swaps ${sent}${commission ? `, plus a ${commission} commission,` : ''} through OKX's DEX router, for at least ${least}.`, decoder: 'okx_dex', status: dst ? 'full' : 'partial', b });
 };
 
 // --- KyberSwap MetaAggregationRouterV2 (same address on Ethereum, Arbitrum One and HyperEVM; ABI verified on Sourcify) ---
