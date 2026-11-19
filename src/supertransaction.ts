@@ -6,7 +6,7 @@
 // quote from the MEE node) supplies them as context.meeOperations; they are hashed as their EntryPoint hashes them, the
 // tree is rebuilt from them, and each is previewed only where it is shown to be a leaf: all of them making up the root
 // exactly, or (for a wallet holding only some of them) each with a proof that reaches it.
-import { encodeAbiParameters, hashMessage, keccak256, type Hex } from 'viem';
+import { concatHex, encodeAbiParameters, hashMessage, hashStruct, keccak256, stringToHex, type Hex } from 'viem';
 import { attentionOf, formatDuration, formatTimestamp, PreviewBuilder, sameAddress, shortAddress } from './format.ts';
 import { chainName } from './chains.ts';
 import { previewMessage } from './message.ts';
@@ -15,6 +15,8 @@ import { describeOperation, paymasterOf, type DescribedOperation, type Operation
 import { merkleTrees, proofRoot } from './typed-data/safe.ts';
 import { combineChanges } from './operation-changes.ts';
 import type { AssetChange, Dependencies, Preview, PreviewContext, SimulationRequest } from './types.ts';
+import type { SupertransactionProof } from './erc4337-sim.ts';
+import { typedDataDigest, type TypedData } from './typed-data/common.ts';
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const HASH = /^0x[0-9a-fA-F]{64}$/;
@@ -111,9 +113,157 @@ export async function previewSupertransaction(method: string, params: unknown[],
   else b.warn('danger', 'mee_supertransaction_partial', `This supertransaction's hash covers more than the ${count} supplied with it: ${ops.length === 1 ? 'its proof shows it is' : 'their proofs show they are'} among its leaves, but its other leaves are only hashes here, so what those operations do, and on which chains, isn't shown. Every one of them runs with this one signature. Only sign it if your wallet shows every operation in the supertransaction and you have checked each.`);
   if (method === 'eth_sign') b.warn('info', 'eth_sign_supertransaction', "eth_sign signs raw data; here that data is the supertransaction's hash, which K1MeeValidator also takes without the personal_sign prefix.");
 
-  // Each operation previewed whole on its chain, signed as one of the supertransaction's: the stand-in in simple
-  // mode, with the root and the operation's proof (src/erc4337-sim.ts, smartSessionStub). A signature in it is left
-  // out: the key's over the root doesn't exist yet. Operations on one chain are simulated in the order they run, each
+  // Each operation previewed whole on its chain (runOperations), signed as one of the supertransaction's: the
+  // stand-in in simple mode, with the root and the operation's proof (src/erc4337-sim.ts, smartSessionStub).
+  const prepared: Prepared[] = ops.map((o, i) => {
+    const proof = tree ? tree.proofs[i] : o.proof!;
+    return { chainId: o.chainId, entryPoint: o.entryPoint, ep: o.ep!, op: o.op!, hash: o.hash!, ...(o.bounds && { bounds: o.bounds }),
+      supertransaction: { root, proof, ...(o.bounds && { bounds: o.bounds }) },
+      details: [...(o.leaf !== o.hash ? [["Leaf (MEE's hash of it and its time bounds)", o.leaf!, o.leaf!] as Detail] : []), ['Proof', proof.length ? proof.join(', ') : "none (the hash is the operation's own)"] as Detail] };
+  });
+  const { titles, assetChanges } = await runOperations(prepared, digest, signer, context, deps, b);
+  if (signer && context.account && signer !== context.account.toLowerCase()) b.warn('danger', 'signer_mismatch', `The request asks ${signer} to sign, but the connected account is ${context.account}.`);
+  const many = titles.length === 1 ? titles[0] : `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}`;
+  return {
+    schema: 'signing-preview/1', method, kind: 'message', network,
+    title: `Sign a supertransaction: ${many}${tree ? '' : ', and others not shown'}`,
+    summary: `Authorizes ${tree ? '' : 'at least '}${count} of a Biconomy MEE supertransaction with one signature, on ${where}${tree ? '' : ' (and operations not shown, on any chain)'}: ${titles.join('; ')}.`,
+    details: b.details, assetChanges, warnings: b.warnings, attention: attentionOf(b.warnings),
+    decoding: { status: 'partial', decoder: 'mee_supertransaction', notes: b.notes },
+    ...(b.trace && { trace: b.trace }),
+  };
+}
+
+// MEE 3 (Biconomy's K1MeeValidator 1.1.0, Nexus 1.3.1's default validator, verified on Sourcify): the wallet signs a
+// supertransaction as EIP-712 typed data. Its domain is the account's name alone (EIP712Domain(string name), "Nexus":
+// no chain, version or account; the validator rebuilds it from the account's eip712Domain()), its primary type SuperTx,
+// whose items are its operations, each a MeeUserOp(bytes32 userOpHash, uint256 lowerBoundTimestamp, uint256
+// upperBoundTimestamp): an array of them (SuperTx(MeeUserOp[] meeUserOps), the type hash the validator knows), or a
+// struct whose fields are items of any struct type, operations among them. Each operation carries the outer type's
+// hash, every item's hash and its own index among them (simple mode: src/erc4337-sim.ts, k1meeOwnTyped); the validator
+// checks its own item (its hash and time bounds) is the one at its index, rebuilds the digest and checks the owner's
+// signature over it. An operation's hash binds its account, chain and EntryPoint; the typed data shows nothing else of
+// it, so the operations come from the wallet (its quote from the MEE node), as for a supertransaction's hash, in
+// context.meeOperations, and each is previewed where its hash is one of the items.
+/** keccak256("SuperTx(MeeUserOp[] meeUserOps)MeeUserOp(bytes32 userOpHash,uint256 lowerBoundTimestamp,uint256 upperBoundTimestamp)"): K1MeeValidator 1.1.0's SUPER_TX_MEE_USER_OP_ARRAY_TYPEHASH. */
+export const SUPER_TX_ARRAY_TYPEHASH = '0x18920ab59b79e66eb8250f08215198bc72e5a4b3822706ea145ae8f0cbb22526';
+const MEE_USER_OP_FIELDS = [['userOpHash', 'bytes32'], ['lowerBoundTimestamp', 'uint256'], ['upperBoundTimestamp', 'uint256']];
+/** A typed value with its integers as bigints (typed data carries them as strings or numbers), for hashStruct. */
+function coerce(types: TypedData['types'], type: string, value: unknown): unknown {
+  if (type.endsWith(']')) return Array.isArray(value) ? value.map(v => coerce(types, type.slice(0, type.lastIndexOf('[')), v)) : value;
+  if (/^u?int\d*$/.test(type) && (typeof value === 'string' || typeof value === 'number')) return BigInt(value);
+  const struct = types[type];
+  if (struct && value && typeof value === 'object') return Object.fromEntries(struct.map(f => [f.name, coerce(types, f.type, (value as Record<string, unknown>)[f.name])]));
+  return value;
+}
+/** EIP-712's encodeType: the type, then the struct types it refers to (directly or not), sorted by name. */
+function encodeType(types: TypedData['types'], primary: string): string {
+  const deps = new Set<string>();
+  const walk = (t: string) => { for (const f of types[t] ?? []) { const base = f.type.replace(/(\[\d*\])+$/, ''); if (types[base] && base !== primary && !deps.has(base)) { deps.add(base); walk(base); } } };
+  walk(primary);
+  return [primary, ...[...deps].sort()].map(t => `${t}(${(types[t] ?? []).map(f => `${f.type} ${f.name}`).join(',')})`).join('');
+}
+/**
+ * eth_signTypedData of a MEE 3 supertransaction (above). Null when the typed data isn't one (a SuperTx in that shape,
+ * under a domain of only a name), so the caller previews it otherwise.
+ */
+export async function previewTypedSupertransaction(method: string, data: TypedData, signer: string | null, context: PreviewContext, deps: Dependencies): Promise<Preview | null> {
+  const superTx = data.types.SuperTx, meeOp = data.types.MeeUserOp;
+  if (data.primaryType !== 'SuperTx' || !superTx?.length) return null;
+  if (!meeOp || meeOp.length !== 3 || !meeOp.every((f, i) => f.name === MEE_USER_OP_FIELDS[i][0] && f.type === MEE_USER_OP_FIELDS[i][1])) return null;
+  const domainKeys = Object.keys(data.domain);
+  if (domainKeys.length !== 1 || domainKeys[0] !== 'name' || typeof data.domain.name !== 'string') return null;
+  if (data.types.EIP712Domain && (data.types.EIP712Domain.length !== 1 || data.types.EIP712Domain[0].name !== 'name')) return null;
+  const digest = typedDataDigest(data);
+  if (!digest) return null;
+  // The items: the array's operations, or the struct's fields (each a struct, an operation or another entry).
+  const array = superTx.length === 1 && superTx[0].type === 'MeeUserOp[]';
+  if (!array && !superTx.every(f => data.types[f.type])) return null;
+  type Item = { label: string; type: string; value: Record<string, unknown>; hash: Hex };
+  let items: Item[];
+  try {
+    const raw = array ? (Array.isArray(data.message[superTx[0].name]) ? data.message[superTx[0].name] as Record<string, unknown>[] : null) : superTx.map(f => data.message[f.name] as Record<string, unknown>);
+    if (!raw || !raw.length || raw.some(v => !v || typeof v !== 'object')) return null;
+    items = raw.map((value, i) => {
+      const type = array ? 'MeeUserOp' : superTx[i].type;
+      return { label: array ? `${superTx[0].name}[${i}]` : superTx[i].name, type, value, hash: hashStruct({ data: coerce(data.types, type, value), primaryType: type, types: data.types } as unknown as Parameters<typeof hashStruct>[0]) };
+    });
+  } catch { return null; }
+  // The digest the validator rebuilds from the items (HashLib.compareAndGetFinalHash), which must be the typed data's.
+  const outerTypeHash = array ? SUPER_TX_ARRAY_TYPEHASH : keccak256(stringToHex(encodeType(data.types, 'SuperTx')));
+  const structHash = array ? keccak256(concatHex([outerTypeHash, keccak256(concatHex(items.map(x => x.hash)))])) : keccak256(concatHex([outerTypeHash, ...items.map(x => x.hash)]));
+  const domainSeparator = keccak256(concatHex([keccak256(stringToHex('EIP712Domain(string name)')), keccak256(stringToHex(data.domain.name))]));
+  if (keccak256(concatHex(['0x1901', domainSeparator, structHash])) !== digest) return null;
+  const itemHashes = items.map(x => x.hash);
+
+  // The wallet's operations, hashed as their EntryPoints hash them, each matched to the item with its hash.
+  const supplied = context.meeOperations ?? [];
+  const nowS = BigInt(Math.floor((context.now ?? Date.now()) / 1000));
+  const matched = new Map<number, Prepared>(), unmatched: number[] = [];
+  for (const [k, o] of supplied.entries()) {
+    const entryPoint = o.entryPoint.toLowerCase(), ep = HASH_ENTRY_POINTS[entryPoint];
+    const op = ep && Number.isSafeInteger(o.chainId) && o.chainId > 0 ? readOperation(o.operation, ep.version) : null;
+    let hash: Hex | null = null;
+    try { hash = op && ep ? userOpHash(op, entryPoint, o.chainId, ep.version) : null; } catch { hash = null; }
+    const i = hash ? items.findIndex(x => x.type === 'MeeUserOp' && String(x.value.userOpHash).toLowerCase() === hash) : -1;
+    if (i < 0 || matched.has(i) || !op || !ep || !hash) { unmatched.push(k); continue; }
+    const bounds = { lowerBoundTimestamp: BigInt(items[i].value.lowerBoundTimestamp as string), upperBoundTimestamp: BigInt(items[i].value.upperBoundTimestamp as string) };
+    matched.set(i, { chainId: o.chainId, entryPoint, ep, op, hash, bounds, supertransaction: { root: digest, proof: [], bounds, typed: { outerTypeHash, itemHashes, itemIndex: i } },
+      details: [['Item', `${i + 1} of ${items.length} (${items[i].label}): MEE's hash of it and its time bounds`, items[i].hash]] });
+  }
+  const opItems = items.flatMap((x, i) => x.type === 'MeeUserOp' ? [i] : []);
+  const unshown = opItems.filter(i => !matched.has(i)), others = items.flatMap((x, i) => x.type === 'MeeUserOp' ? [] : [i]);
+  const ops = [...matched.entries()].sort(([a], [b]) => a - b).map(([, p]) => p);
+
+  const b = new PreviewBuilder();
+  const chains = [...new Set(ops.map(o => o.chainId))];
+  const network = context.chainId ? { kind: 'evm' as const, chainId: context.chainId, name: chainName(context.chainId) } : ops[0] ? { kind: 'evm' as const, chainId: ops[0].chainId, name: chainName(ops[0].chainId) } : null;
+  b.detail('Supertransaction', `${items.length} item${items.length === 1 ? '' : 's'}${others.length ? `, ${others.length} of them not operations` : ''}, under the domain "${data.domain.name}"`, outerTypeHash);
+  b.note("This is an off-chain signature; it costs no gas now. Biconomy's MEE node submits each operation in the supertransaction on its chain, with the supertransaction's items and the signature (K1MeeValidator 1.1.0's simple mode), which the account's validator checks over this typed data, its own item among the items.");
+  b.warn('info', 'mee_supertransaction_domain', `Its EIP-712 domain is only a name ("${data.domain.name}": no chain, no account), so the signature is the same for every account of the signer's with that name, on every chain: each operation's hash is what binds it to its account, chain and EntryPoint. Every operation listed here can run, where its account's validator takes this signer's signature.`);
+  if (data.domain.name !== 'Nexus') b.warn('caution', 'mee_supertransaction_domain_name', `The domain's name is "${data.domain.name}": Biconomy Nexus accounts name themselves "Nexus", and their validator rebuilds the domain from the account's own name, so a Nexus account doesn't take this signature.`);
+  const count = (n: number) => `${n} operation${n === 1 ? '' : 's'}`;
+  if (!unshown.length && !others.length && ops.length) b.warn('info', 'mee_supertransaction_verified', `The wallet supplied the ${count(ops.length)} this supertransaction covers, on ${chains.map(chainName).join(', ')}, and ${ops.length === 1 ? 'its hash is its only item' : 'their hashes are its items exactly'}: the signature authorizes ${ops.length === 1 ? 'it' : 'these'} and nothing else. ${ops.length === 1 ? 'It' : 'Each'} can run once submitted with the items (by Biconomy's MEE node, or anyone else holding this signature and the operation), within its time bounds.`);
+  else b.warn('danger', 'mee_supertransaction_partial', `This supertransaction covers ${unshown.length ? `${count(unshown.length)} ${ops.length ? 'besides the ones supplied, ' : ''}shown only by ${unshown.length === 1 ? 'its hash' : 'their hashes'} (${unshown.map(i => `item ${i + 1}`).join(', ')}): what ${unshown.length === 1 ? 'it does, and on which chain, isn\'t' : 'they do, and on which chains, isn\'t'} shown` : ''}${unshown.length && others.length ? '; and ' : ''}${others.length ? `${others.length} item${others.length === 1 ? '' : 's'} that ${others.length === 1 ? "isn't an operation" : "aren't operations"} (${others.map(i => `${items[i].label}: ${items[i].type}`).join(', ')}), which this preview doesn't read` : ''}. Every one of them is authorized with this one signature. Only sign it if your wallet shows everything in the supertransaction and you have checked each.`);
+  if (unmatched.length) b.warn('caution', 'mee_operation_not_in_supertransaction', `${unmatched.map(k => `Operation ${k + 1}`).join(', ')} supplied with it ${unmatched.length === 1 ? "isn't" : "aren't"} among its items (${unmatched.length === 1 ? 'its hash isn\'t' : 'their hashes aren\'t'} one of them): not previewed, and not authorized by this signature.`);
+  for (const i of unshown) {
+    const v = items[i].value, until = BigInt(v.upperBoundTimestamp as string);
+    b.detail(`Item ${i + 1} (${items[i].label})`, `an operation with hash ${String(v.userOpHash)}, valid ${until === 0n ? 'with no expiry' : `until ${formatTimestamp(Number(until) * 1000)}`}${until !== 0n && until < nowS ? ' (expired)' : ''}`, String(v.userOpHash));
+  }
+  const { titles, assetChanges } = ops.length ? await runOperations(ops, digest, signer, context, deps, b) : { titles: [], assetChanges: [] };
+  if (signer && context.account && signer !== context.account.toLowerCase()) b.warn('danger', 'signer_mismatch', `The request asks ${signer} to sign, but the connected account is ${context.account}.`);
+  b.detail('EIP-712 digest', digest);
+  const hidden = unshown.length + others.length;
+  const many = titles.length === 1 ? titles[0] : titles.length ? `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}` : `${count(opItems.length)} not shown`;
+  return {
+    schema: 'signing-preview/1', method, kind: 'typed_data', network,
+    title: `Sign a supertransaction: ${many}${titles.length && hidden ? ', and others not shown' : ''}`,
+    summary: `Authorizes ${hidden ? 'at least ' : ''}${titles.length ? `${count(titles.length)} of a Biconomy MEE supertransaction with one signature (typed data, MEE 3), on ${chains.map(chainName).join(', ')}: ${titles.join('; ')}` : `a Biconomy MEE supertransaction of ${count(opItems.length)} with one signature (typed data, MEE 3), none of which were supplied: only their hashes are shown`}${titles.length && hidden ? ' (and items not shown)' : ''}.`,
+    details: b.details, assetChanges, warnings: b.warnings, attention: attentionOf(b.warnings),
+    decoding: { status: 'partial', decoder: 'mee_supertransaction', notes: b.notes },
+    ...(b.trace && { trace: b.trace }),
+  };
+}
+
+/** A detail shown with an operation: its label, value and raw value. */
+type Detail = [string, string, string?];
+/** An operation of a supertransaction, ready to be previewed whole (runOperations). */
+interface Prepared {
+  chainId: number; entryPoint: string; ep: NonNullable<(typeof HASH_ENTRY_POINTS)[string]>; op: NonNullable<ReturnType<typeof readOperation>>; hash: Hex;
+  bounds?: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint };
+  /** What its signature is in the stand-in (simple mode): the root and its proof, or the typed supertransaction's items. */
+  supertransaction: SupertransactionProof;
+  /** Its own details, after its hash (its leaf and proof, or its item). */
+  details: Detail[];
+}
+/**
+ * Each of a supertransaction's operations previewed whole on its chain, as `signer` signs `digest` (what the wallet is
+ * asked to sign), under the operations' details in `b`: the titles, and every operation's balance changes.
+ */
+async function runOperations(ops: Prepared[], digest: Hex, signer: string | null, context: PreviewContext, deps: Dependencies, b: PreviewBuilder): Promise<{ titles: string[]; assetChanges: AssetChange[] }> {
+  const chains = [...new Set(ops.map(o => o.chainId))];
+  const nowS = BigInt(Math.floor((context.now ?? Date.now()) / 1000));
+  // A signature in it is left out: the key's over what it signs doesn't exist yet. Operations on one chain are simulated in the order they run, each
   // on the state the ones before it leave (a wrap, then a send of what it wrapped: alone, the send fails): as
   // supplied, but an account's operations under one nonce key in their nonce's order, the only one the EntryPoint
   // runs them in. Where the simulator can't run several calls in order, or past a chain's first IN_ORDER, each is
@@ -124,14 +274,14 @@ export async function previewSupertransaction(method: string, params: unknown[],
   const ran = new Map<number, SimulationRequest[]>(), ranOf = new Map<number, SimulationRequest[]>();
   const results: { d: DescribedOperation; ob: PreviewBuilder; after: number[]; needed: number[]; ordered: boolean; alone?: AssetChange[] }[] = [];
   for (const [k, i] of order.entries()) {
-    const o = ops[i], op = o.op!, ep = o.ep!, proof = tree ? tree.proofs[i] : o.proof!;
+    const o = ops[i], op = o.op, ep = o.ep;
     const pm = paymasterOf(op.paymasterAndData, ep.version === '0.7');
     const input: Operation = {
       chainId: o.chainId, entryPoint: o.entryPoint, entryPointName: ep.name, sender: op.sender, nonce: op.nonce, initCode: op.initCode, callData: op.callData, paymaster: pm.paymaster,
       gas: { verification: op.verificationGasLimit, call: op.callGasLimit, preVerification: op.preVerificationGas, maxFee: op.maxFeePerGas, maxPriority: op.maxPriorityFeePerGas, ...pm, v06: ep.version === '0.6' },
       // (Its time bounds too, where its leaf is MEE's hash of them: an account's own K1MeeValidator checks that leaf
       // and returns the bounds as the operation's validity.)
-      userOpHash: o.hash!, paymasterAndData: op.paymasterAndData, digest, supertransaction: { root, proof, ...(o.bounds && { bounds: o.bounds }) },
+      userOpHash: o.hash, paymasterAndData: op.paymasterAndData, digest, supertransaction: o.supertransaction,
       // The other operations' accounts on its chain: what it moves of theirs is theirs to lose (an app's operation
       // can take your account's tokens with an allowance one of yours grants it).
       alsoFor: ops.filter(x => x.chainId === o.chainId && !sameAddress(x.op!.sender, op.sender)).map(x => x.op!.sender),
@@ -160,12 +310,11 @@ export async function previewSupertransaction(method: string, params: unknown[],
   const titles: string[] = [];
   const changes: { label: string; chainId: number; sender: string; changes: AssetChange[] }[] = [];
   for (const [i, o] of ops.entries()) {
-    const op = o.op!, proof = tree ? tree.proofs[i] : o.proof!;
+    const op = o.op;
     const { d, ob, after, needed, ordered, alone } = results[i];
     const label = `Operation ${i + 1} (${chainName(o.chainId)})`;
-    ob.detail('UserOperation hash', o.hash!, o.hash!);
-    if (o.leaf !== o.hash) ob.detail("Leaf (MEE's hash of it and its time bounds)", o.leaf!, o.leaf!);
-    ob.detail('Proof', proof.length ? proof.join(', ') : 'none (the hash is the operation\'s own)');
+    ob.detail('UserOperation hash', o.hash, o.hash);
+    for (const [label, value, raw] of o.details) ob.detail(label, value, raw);
     // The time bounds of a timed leaf (K1MeeValidator's validAfter and validUntil, 0 for no end).
     if (o.bounds) {
       const { lowerBoundTimestamp: from, upperBoundTimestamp: until } = o.bounds;
@@ -211,17 +360,7 @@ export async function previewSupertransaction(method: string, params: unknown[],
   else if (!inOrder && chains.some(c => ops.filter(o => o.chainId === c).length > 1)) b.note("Each operation was simulated alone on its chain's state now: this simulator can't run several in order, so one that depends on another of the same chain is shown failing.");
   // Every operation's balance changes, each on its chain; an account's incoming amounts only where it is the only
   // one (or the connected one): see combineChanges.
-  const assetChanges = combineChanges(changes, b, context.account);
-  if (signer && context.account && signer !== context.account.toLowerCase()) b.warn('danger', 'signer_mismatch', `The request asks ${signer} to sign, but the connected account is ${context.account}.`);
-  const many = titles.length === 1 ? titles[0] : `${titles.length} operations on ${chains.length} chain${chains.length === 1 ? '' : 's'}`;
-  return {
-    schema: 'signing-preview/1', method, kind: 'message', network,
-    title: `Sign a supertransaction: ${many}${tree ? '' : ', and others not shown'}`,
-    summary: `Authorizes ${tree ? '' : 'at least '}${count} of a Biconomy MEE supertransaction with one signature, on ${where}${tree ? '' : ' (and operations not shown, on any chain)'}: ${titles.join('; ')}.`,
-    details: b.details, assetChanges, warnings: b.warnings, attention: attentionOf(b.warnings),
-    decoding: { status: 'partial', decoder: 'mee_supertransaction', notes: b.notes },
-    ...(b.trace && { trace: b.trace }),
-  };
+  return { titles, assetChanges: combineChanges(changes, b, context.account) };
 }
 
 /**

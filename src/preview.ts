@@ -20,7 +20,7 @@ import { creditDelegationTypedAdapter } from './typed-data/credit-delegation.ts'
 import { kernelEnableAdapter } from './typed-data/kernel-enable.ts';
 import { previewMessage } from './message.ts';
 import { previewSignedOperation } from './userop-hash.ts';
-import { previewSupertransaction } from './supertransaction.ts';
+import { previewSupertransaction, previewTypedSupertransaction } from './supertransaction.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, permitAdapter, kernelEnableAdapter, genericTypedDataAdapter];
 
@@ -92,6 +92,9 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   let data;
   try { data = parseTypedData(raw); } catch (error) { throw new RequestError(error instanceof Error ? error.message : String(error)); }
   const env = { deps, context, signer: typeof signer === 'string' && ADDRESS.test(signer) ? signer.toLowerCase() : null, now: context.now ?? Date.now() };
+  // A Biconomy MEE 3 supertransaction (src/supertransaction.ts), previewed with the operations it covers.
+  const superTx = await previewTypedSupertransaction(method, data, env.signer, context, deps);
+  if (superTx) return superTx;
   let result = null;
   for (const adapter of TYPED_DATA_ADAPTERS) {
     result = await adapter(data, env);

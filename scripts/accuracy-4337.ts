@@ -52,8 +52,9 @@ import { NATIVE_LOG_ADDRESS, RpcSimulator } from '../src/simulation.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
 import { stateBefore } from '../src/block.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
+import { SUPER_TX_ARRAY_TYPEHASH } from '../src/supertransaction.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { deployedFallbackHandler, safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
@@ -292,6 +293,30 @@ async function k1meeOwnSimple(sig: Hex): Promise<{ root: Hex; proof: Hex[]; boun
   } catch { return undefined; }
 }
 const K1MEE_OWNER = parseAbi(['function getOwner(address smartAccount) view returns (address)']);
+/**
+ * An operation K1MeeValidator 1.1.0 validates in simple mode (MEE 3, Nexus 1.3.1's default validator; src/erc4337-sim.ts,
+ * k1meeOwnTyped): 0x177eee00, then the supertransaction's outer type hash, the operation's item index, the offsets of
+ * the items and of the signature, its time bounds packed in one word, the items' hashes and the owner's signature over
+ * the supertransaction's EIP-712 digest. Only for that layout exactly (encoded again, the same bytes).
+ */
+function k1meeTypedSimple(sig: Hex): { outerTypeHash: Hex; itemIndex: number; itemHashes: Hex[]; bounds: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint }; signature: Hex } | undefined {
+  const s = sig.toLowerCase();
+  if (!s.startsWith('0x177eee00')) return undefined;
+  const body = s.slice(10), at = (i: number) => BigInt(`0x${body.slice(i * 2, i * 2 + 64) || '0'}`);
+  try {
+    const outerTypeHash = `0x${body.slice(0, 64)}` as Hex, itemIndex = Number(at(32)), itemsAt = Number(at(64)), sigAt = Number(at(96)), packed = at(128);
+    if (itemsAt !== 0xa0) return undefined;
+    const n = Number(at(itemsAt));
+    if (n < 1 || n > 64 || itemIndex >= n) return undefined;
+    const itemHashes = Array.from({ length: n }, (_, i) => `0x${body.slice(itemsAt * 2 + 64 + i * 64, itemsAt * 2 + 128 + i * 64)}` as Hex);
+    const length = Number(at(sigAt)), signature = `0x${body.slice(sigAt * 2 + 64, sigAt * 2 + 64 + length * 2)}` as Hex;
+    const bounds = { lowerBoundTimestamp: packed >> 128n, upperBoundTimestamp: packed & ((1n << 128n) - 1n) };
+    const typed = { outerTypeHash, itemHashes, itemIndex };
+    return k1meeOwnTyped(signature, { root: '0x', proof: [], bounds, typed }) === s ? { ...typed, bounds, signature } : undefined;
+  } catch { return undefined; }
+}
+const EIP712_DOMAIN = parseAbi(['function eip712Domain() view returns (bytes1 fields, string name, string version, uint256 chainId, address verifyingContract, bytes32 salt, uint256[] extensions)']);
+const MEE_USER_OP = [{ name: 'userOpHash', type: 'bytes32' }, { name: 'lowerBoundTimestamp', type: 'uint256' }, { name: 'upperBoundTimestamp', type: 'uint256' }];
 
 type Row = Record<string, unknown>;
 const rows: Row[] = [];
@@ -519,6 +544,30 @@ async function replay(item: string): Promise<void> {
     meeOwner = bare ? meeKept : ownSimple.message ?? meeKept;
     supertransaction = { root: ownSimple.root, proof: ownSimple.proof, bare, bounds: ownSimple.bounds };
   }
+  // An operation K1MeeValidator 1.1.0 validates in simple mode (MEE 3), signed by its owner: replayed as the typed data
+  // the owner signed (eth_signTypedData_v4), with the operation as context.meeOperations (src/supertransaction.ts,
+  // previewTypedSupertransaction). It can be rebuilt only where the operation is the supertransaction's only item (the
+  // array of MeeUserOps): other items are only hashes in its signature, and typed data holds what they hash.
+  let typedSuper: { typed: Record<string, unknown>; digest: Hex } | undefined;
+  const typedSimple = !session && !ownSimple ? k1meeTypedSimple(op.signature) : undefined;
+  if (typedSimple) {
+    if (VERSION !== '0.6' && VERSION !== '0.7') return skip("a MEE 3 supertransaction's operation through EntryPoint v0.8 or later (its hash is typed data's, which src/supertransaction.ts doesn't compute)");
+    if (typedSimple.outerTypeHash !== SUPER_TX_ARRAY_TYPEHASH || typedSimple.itemHashes.length !== 1) return skip("a MEE 3 supertransaction's operation with other items (only their hashes are in its signature: the typed data its owner signed can't be rebuilt)");
+    let name: string;
+    try { name = decodeFunctionResult({ abi: EIP712_DOMAIN, functionName: 'eip712Domain', data: await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x84b0196e' }, 'latest']) as Hex })[1]; } catch { return skip('a read of its state failed'); }
+    const hash = userOpHash(readOperation(rpcForm(op), VERSION)!, EP, CHAIN, VERSION);
+    const { lowerBoundTimestamp, upperBoundTimestamp } = typedSimple.bounds;
+    const typed = { domain: { name }, types: { EIP712Domain: [{ name: 'name', type: 'string' }], SuperTx: [{ name: 'meeUserOps', type: 'MeeUserOp[]' }], MeeUserOp: MEE_USER_OP }, primaryType: 'SuperTx',
+      message: { meeUserOps: [{ userOpHash: hash, lowerBoundTimestamp: lowerBoundTimestamp.toString(), upperBoundTimestamp: upperBoundTimestamp.toString() }] } };
+    const digest = hashTypedData({ ...typed, message: { meeUserOps: [{ userOpHash: hash, lowerBoundTimestamp, upperBoundTimestamp }] } } as never);
+    // (Its owner: whom the signature recovers to over that digest, which it does only where the typed data is the one signed.)
+    const owner = await recoverAddress({ hash: digest, signature: typedSimple.signature }).then(a => a.toLowerCase(), () => undefined);
+    const kept = String(await atParent.call(CHAIN, 'eth_call', [{ to: K1MEE_VALIDATOR_110, data: encodeFunctionData({ abi: K1MEE_OWNER, functionName: 'getOwner', args: [sender as Hex] }) }, 'latest']).catch(() => '0x'));
+    meeKept = /^0x0{24}[0-9a-f]{40}$/i.test(kept) ? `0x${kept.slice(26)}`.toLowerCase() : undefined;
+    if (!owner || owner !== meeKept) return skip("a MEE 3 supertransaction's operation whose typed data couldn't be rebuilt (its signature doesn't recover to the account's owner over it)");
+    meeOwner = owner;
+    typedSuper = { typed, digest };
+  }
   // A Kernel v3 account's operation in enable mode (its nonce's first byte 0x01): the owner signs, as typed data, the
   // validator or permission it installs (the Enable), which signs the operation (a dApp's session key, mostly); its
   // signature carries what it installs and both signatures, as the dApp's SDK builds it. It is previewed with that
@@ -570,6 +619,12 @@ async function replay(item: string): Promise<void> {
     const typed = safeOpTyped(op, fallback, (module.signaturePrefix?.length ?? 0) / 2);
     digest = hashTypedData(typed as never);
     request = signer => ({ method: 'eth_signTypedData_v4', params: [signer, JSON.stringify(typed)] });
+  } else if (typedSuper) {
+    kind = 'supertransaction';
+    digest = typedSuper.digest;
+    ctx = { ...context, meeOperations: [{ chainId: CHAIN, entryPoint: EP, operation: rpcForm(op) }] };
+    const json = JSON.stringify(typedSuper.typed);
+    request = signer => ({ method: 'eth_signTypedData_v4', params: [signer, json] });
   } else if (supertransaction && (VERSION === '0.6' || VERSION === '0.7')) {
     // A K1MeeValidator session's operation in simple mode, or an account's own: the supertransaction's hash its key
     // (its owner) signed (above), with the operation's time bounds where its leaf is MEE's hash of them.

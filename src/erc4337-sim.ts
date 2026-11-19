@@ -2095,7 +2095,15 @@ const SESSION_VALIDATOR_NAMES: Record<string, string> = { [K1MEE_VALIDATOR]: "Bi
  * in it; `bounds`, the operation's time bounds, where its leaf is MEE's hash of its hash and them (meeLeaf in
  * src/supertransaction.ts), as an account's own K1MeeValidator checks it (nexusStub).
  */
-export interface SupertransactionProof { root: Hex; proof: readonly Hex[]; bounds?: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint } }
+export interface SupertransactionProof {
+  root: Hex; proof: readonly Hex[]; bounds?: { lowerBoundTimestamp: bigint; upperBoundTimestamp: bigint };
+  /**
+   * A supertransaction signed as EIP-712 typed data, as K1MeeValidator 1.1.0 takes it (MEE 3: src/supertransaction.ts,
+   * previewTypedSupertransaction): its outer type's hash, its items' hashes (the operation's, its MeeUserOp's, among
+   * them at `itemIndex`). `root` is then the typed data's digest, which the owner signs, and `proof` is empty.
+   */
+  typed?: { outerTypeHash: Hex; itemHashes: readonly Hex[]; itemIndex: number };
+}
 /**
  * Why an account refused the stand-in for a supertransaction signer's, where no stand-in says why (simulateOperation):
  * the root's signature is stood in for only in K1MeeValidator's simple mode, a session's or a Nexus account's own.
@@ -2235,8 +2243,8 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
 // accounts), on BNB Chain 17 of 12,952 in 40,000 (14 of 5 EIP-7702 accounts), on Polygon none in 20,000; none in
 // on-chain or permit mode (whose root the owner signs in a transaction or an ERC-2612 permit, which aren't previewed
 // as a supertransaction's). Accounts on a later Nexus (0x0000…7e9d on Base, 0x54f2…7fb2 on Ethereum: 7 operations of
-// 2 accounts in those spans) validate through K1MeeValidator 1.1.0, whose supertransaction hash is EIP-712's: not
-// stood in for.
+// 2 accounts in those spans) validate through K1MeeValidator 1.1.0, whose supertransaction is EIP-712 typed data:
+// Nexus 1.3.1's is stood in for (k1meeOwnTyped; src/supertransaction.ts, previewTypedSupertransaction).
 // The stand-in, for an operation its default validator validates: asked to sign a supertransaction's hash (with its
 // operations: src/supertransaction.ts), simple mode with that root, the operation's proof and its time bounds (0 and
 // 0 where it was supplied without them: its leaf is then its hash, which the validator doesn't check, and it refuses
@@ -2249,8 +2257,14 @@ async function smartSessionStub(c: StubContext, module: string): Promise<Stub[]>
 // stand-in asked of the account itself is recovered as no one there, as any signature would be, and the preview says
 // no signature validates through that validator. Other modes and validators get STUB_SIGNATURE (a session key's
 // operation, whose nonce names SmartSession, smartSessionStub).
-/** Nexus implementations whose default validator (an immutable of their code) is K1MeeValidator 1.0.3. */
-const NEXUS_K1MEE_IMPLEMENTATIONS = new Set(['0x00000000383e8cbe298514674ea60ee1d1de50ac']);
+/** Biconomy's K1MeeValidator 1.1.0 (verified on Sourcify, Base; the same address on every chain here): MEE 3's. */
+export const K1MEE_VALIDATOR_110 = '0x0000000002d3cc5642a748b6783f32c032616e03';
+/**
+ * Nexus implementations, and their default validator (an immutable of their code): Nexus 1.2's K1MeeValidator 1.0.3;
+ * Nexus 1.3.1's (verified on Sourcify, Base; the same address on every chain here) 1.1.0, whose simple mode takes a
+ * supertransaction signed as EIP-712 typed data (k1meeOwnTyped).
+ */
+const NEXUS_K1MEE_IMPLEMENTATIONS: Record<string, string> = { '0x00000000383e8cbe298514674ea60ee1d1de50ac': K1MEE_VALIDATOR, '0x0000000020fe2f30453074ad916edeb653ec7e9d': K1MEE_VALIDATOR_110 };
 /** NexusBootstrap 1.2.1 (verified on Sourcify; its default validator K1MeeValidator), which the factory's accounts are set up through. */
 const NEXUS_BOOTSTRAP = '0x0000003edf18913c01cbc482c978bbd3d6e8ffa3';
 const NEXUS = parseAbi(['function createAccount(bytes initData, bytes32 salt)', 'function getOwner(address smartAccount) view returns (address)']);
@@ -2272,18 +2286,33 @@ export function k1meeOwnSimple(signature: Hex, tree: SupertransactionProof): Hex
   return concatHex(['0x177eee00', encodeAbiParameters(K1MEE_OWN_SIMPLE, [tree.root, tree.bounds?.lowerBoundTimestamp ?? 0n, tree.bounds?.upperBoundTimestamp ?? 0n, tree.proof, signature])]);
 }
 /**
+ * K1MeeValidator 1.1.0's simple mode (SimpleValidatorLib, HashLib.parsePackedSigDataHead), the owner's 65-byte
+ * `signature` over the supertransaction's EIP-712 digest: 0x177eee00, then the outer type's hash, the operation's item
+ * index, the offsets of the item hashes (0xa0) and of the signature, the time bounds packed in one word (the lower in
+ * its upper 128 bits), the item hashes and the signature (each with its length, as abi.encode lays out bytes32[] and
+ * bytes). Word by word a real operation's layout on Base, with its signature (2026-11-18).
+ */
+export function k1meeOwnTyped(signature: Hex, tree: SupertransactionProof & { typed: NonNullable<SupertransactionProof['typed']> }): Hex {
+  const { outerTypeHash, itemHashes, itemIndex } = tree.typed;
+  const w = (v: bigint) => v.toString(16).padStart(64, '0');
+  const lower = tree.bounds?.lowerBoundTimestamp ?? 0n, upper = tree.bounds?.upperBoundTimestamp ?? 0n;
+  const sigAt = 0xa0n + 0x20n + 0x20n * BigInt(itemHashes.length);
+  const sig = signature.slice(2), padded = sig.padEnd(Math.ceil(sig.length / 64) * 64, '0');
+  return `0x177eee00${outerTypeHash.slice(2)}${w(BigInt(itemIndex))}${w(0xa0n)}${w(sigAt)}${w((lower << 128n) | upper)}${w(BigInt(itemHashes.length))}${itemHashes.map(h => h.slice(2)).join('')}${w(BigInt(sig.length / 2))}${padded}` as Hex;
+}
+/**
  * A Nexus account's stand-in (see above): `owner`, the owner its validator keeps for it (read from K1MeeValidator),
  * or, for an account its factory deploys in the operation, the one its set-up installs (`deploying`; `none` where
  * its set-up is NexusBootstrap's without the default validator, which then keeps no owner for it).
  */
-async function nexusStub(c: StubContext, deploying?: { owner?: string; none?: boolean }): Promise<Stub[]> {
+async function nexusStub(c: StubContext, deploying?: { owner?: string; none?: boolean }, validator = K1MEE_VALIDATOR): Promise<Stub[]> {
   const key = c.nonce.toString(16).padStart(64, '0');
   if (key.slice(6, 8) !== '00' || !/^0{40}$/.test(key.slice(8, 48))) return [{ signature: STUB_SIGNATURE }];
   const sender = c.sender.toLowerCase();
   let owner = deploying?.owner?.toLowerCase();
   if (!deploying && c.deps.rpc?.has(c.chainId)) {
     try {
-      const out = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: K1MEE_VALIDATOR, data: encodeFunctionData({ abi: NEXUS, functionName: 'getOwner', args: [c.sender as Hex] }) }, 'latest']));
+      const out = String(await c.deps.rpc.call(c.chainId, 'eth_call', [{ to: validator, data: encodeFunctionData({ abi: NEXUS, functionName: 'getOwner', args: [c.sender as Hex] }) }, 'latest']));
       if (/^0x0{24}[0-9a-f]{40}$/i.test(out)) owner = `0x${out.slice(26)}`.toLowerCase();
     } catch { /* not read */ }
   }
@@ -2317,12 +2346,23 @@ async function nexusStub(c: StubContext, deploying?: { owner?: string; none?: bo
   // validator tries first or second: each for the precompile's price, as a real signature's recovery costs.)
   const cosigners = [{ signature: STUB_COSIGNATURE, signer: keyless ? ECRECOVER_NOBODY : signer, ...(c.digest && { digest: c.digest }) }];
   const unsure = keyless && keyed === undefined;
+  // K1MeeValidator 1.1.0 (Nexus 1.3.1's) takes a supertransaction signed as EIP-712 typed data, 1.0.3 its hash signed
+  // as a message: the stand-in is in the form of what the wallet is asked to sign, which the other version refuses.
+  const typedValidator = validator === K1MEE_VALIDATOR_110;
+  const other = tree && !!tree.typed !== typedValidator
+    ? typedValidator ? "; its K1MeeValidator (1.1.0, MEE 3) takes a supertransaction signed as EIP-712 typed data, not its hash signed as a message" : "; its K1MeeValidator (1.0.3) takes a supertransaction's hash signed as a message, not its EIP-712 typed data (K1MeeValidator 1.1.0's)" : '';
+  if (tree?.typed) return [{
+    signature: k1meeOwnTyped(STUB_COSIGNATURE, tree as Parameters<typeof k1meeOwnTyped>[1]), cosigners, why: `${why}${other}`, ...(unsure && { unsure }),
+    note: "The account's owner signs the supertransaction as EIP-712 typed data (its domain only the account's name, Nexus: no chain or account in it), which the account's own validator (Nexus's default, Biconomy's K1MeeValidator 1.1.0) checks with this operation's item, its hash and time bounds, among the supertransaction's items (simple mode), as Biconomy's MEE node submits it: the stand-in carries the items and the bounds, which the validator returns as the operation's validity.",
+  }];
   if (tree) return [{
-    signature: k1meeOwnSimple(STUB_COSIGNATURE, tree), cosigners, why, ...(unsure && { unsure }),
+    signature: k1meeOwnSimple(STUB_COSIGNATURE, tree), cosigners, why: `${why}${other}`, ...(unsure && { unsure }),
     note: "The account's owner signs the supertransaction's hash, which the account's own validator (Nexus's default, Biconomy's K1MeeValidator) checks with this operation's proof, its leaf MEE's hash of the operation's hash and its time bounds (simple mode), as Biconomy's MEE node submits it: the stand-in carries the hash, the proof and the bounds, which the validator returns as the operation's validity.",
   }];
   return [{ signature: STUB_COSIGNATURE, cosigners, why, ...(unsure && { unsure }),
-    note: `The account's owner signs the operation's hash itself, which its validator (Nexus's default, Biconomy's K1MeeValidator) takes as it is (its plain form). Sent through Biconomy's MEE node, the owner would sign a supertransaction's hash instead, a Merkle root of its operations' hashes, and the operation would carry it, its time bounds and its proof (simple mode): ${NEXUS_SIMPLE_COSTS}. To preview that request, sign the supertransaction's hash with its operations (and their time bounds) in context.meeOperations.` }];
+    note: typedValidator
+      ? "The account's owner signs the operation's hash itself, which its validator (Nexus 1.3.1's default, Biconomy's K1MeeValidator 1.1.0) takes as it is (its plain form). Sent through Biconomy's MEE node, the owner would sign the supertransaction as EIP-712 typed data instead, its items the operations' hashes and time bounds, and the operation would carry them (simple mode), whose validation costs about 4,600 gas more than simulated here with one item and about 190 more for each further one (the real signatures of both, on Nexus 1.3.1's and the validator's own code). To preview that request, sign its typed data with its operations in context.meeOperations."
+      : `The account's owner signs the operation's hash itself, which its validator (Nexus's default, Biconomy's K1MeeValidator) takes as it is (its plain form). Sent through Biconomy's MEE node, the owner would sign a supertransaction's hash instead, a Merkle root of its operations' hashes, and the operation would carry it, its time bounds and its proof (simple mode): ${NEXUS_SIMPLE_COSTS}. To preview that request, sign the supertransaction's hash with its operations (and their time bounds) in context.meeOperations.` }];
 }
 /**
  * What simple mode costs over the plain form, the proof and the longer signature copied and checked: operations
@@ -2629,7 +2669,7 @@ const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<St
   // Send's account (see sendStub).
   [SEND_IMPLEMENTATION]: sendStub,
   // Biconomy's Nexus 1.2, its default validator K1MeeValidator (see nexusStub).
-  ...Object.fromEntries([...NEXUS_K1MEE_IMPLEMENTATIONS].map(i => [i, (c: StubContext) => nexusStub(c)])),
+  ...Object.fromEntries(Object.entries(NEXUS_K1MEE_IMPLEMENTATIONS).map(([i, validator]) => [i, (c: StubContext) => nexusStub(c, undefined, validator)])),
 };
 
 const BICONOMY_PROXY = '0x608060405230546000808092368280378136915af43d82803e156020573d90f35b3d90fd';
