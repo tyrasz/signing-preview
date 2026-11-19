@@ -270,10 +270,10 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
 };
 
 /** Warnings of a call's own transaction that don't apply where a redeemer submits it (its fee, nonce and sender). */
-const TX_ONLY = new Set(['fee_below_base_fee', 'nonce_replaces', 'nonce_used', 'nonce_gap', 'gas_limit_above_cap', 'tip_above_fee_cap', 'insufficient_funds_for_gas', 'hyperevm_small_blocks', 'hyperevm_big_blocks', 'pending_transactions', 'sender_mismatch', 'chain_mismatch']);
-const TX_DETAILS = /^Network fee\b/;
+export const TX_ONLY = new Set(['fee_below_base_fee', 'nonce_replaces', 'nonce_used', 'nonce_gap', 'gas_limit_above_cap', 'tip_above_fee_cap', 'insufficient_funds_for_gas', 'hyperevm_small_blocks', 'hyperevm_big_blocks', 'pending_transactions', 'sender_mismatch', 'chain_mismatch']);
+export const TX_DETAILS = /^Network fee\b/;
 /** Warnings that a call would fail, said once for the delegation (delegation_calls_fail): the signer pays nothing for it. */
-const FAILS = new Set(['simulation_reverted', 'batch_will_fail', 'batch_partial_failure']);
+export const FAILS = new Set(['simulation_reverted', 'batch_will_fail', 'batch_partial_failure']);
 
 /** A caveat's rule on the calls it lets through (src/typed-data/delegation-probe.ts); null when its terms don't read. */
 function ruleFor(enforcer: string, t: string): Rule | null {
