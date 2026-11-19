@@ -5,7 +5,7 @@
 // at Send's implementation and SmartSession's addresses).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
@@ -470,4 +470,42 @@ test('Frak’s passkey wallets (Kernel v2.4, MultiWebAuthNValidatorV2 as default
   const data = encodeFunctionData({ abi: ABI, functionName: 'initialize', args: [FRAK, concatHex([other, `0x${'11'.repeat(32)}`, `0x${'22'.repeat(32)}`])] });
   await simulateOperation({ ...op, sender: NEW, initCode: concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: [KERNEL_V24, data, 0n] })]), signer: NEW }, { rpc: node, simulator } as never);
   assert.equal(frakForm(tried[0].signature).id, other);
+});
+
+test('Splits’ Smart Vault with two passkey signers: the first asserts over the light hash, the last over the operation’s', async () => {
+  // Base, 2026-11-18: both assertions over the operation's hash, and the vault refused the first.
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const VAULT = '0x9e5666ff764a12619d270976da617354488860a2', HASH = `0x${'4a'.repeat(32)}` as Hex, PM = '0x2cc0c7981d846b9f2a16276556f6e8cb52bfb633';
+  const passkeySigner = (k: number) => `0x${k.toString(16).padStart(64, '0')}${'77'.repeat(32)}`; // (slot1, slot2): a passkey's x, y
+  const tried: Hex[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}15ec0fa66a0d96a64d67c58368641fbe9325f3fa`;
+    if (method === 'eth_call') {
+      const { to, data } = params[0] as { to: string; data: Hex };
+      if (to === EP) return HASH; // getUserOpHash
+      if (data.startsWith('0xb715be81') || data.startsWith('0xe75235b8')) return `0x${2n.toString(16).padStart(64, '0')}`; // getSignerCount, getThreshold
+      return passkeySigner(Number(BigInt(`0x${data.slice(10)}`)) + 1); // getSigner(index)
+    }
+    throw new Error(`unexpected ${method}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const callData = '0x12345678' as Hex, nonce = 7n;
+  await simulateOperation({ chainId: 8453, entryPoint: EP, sender: VAULT, nonce, initCode: '0x', callData, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n,
+    paymasterAndData: concatHex([PM, `0x${'00'.repeat(32)}`]), signer: VAULT }, { rpc: node, simulator } as never);
+  const GAS = { name: 'gasLimits', type: 'tuple', components: ['maxPriorityFeePerGas', 'preVerificationGas', 'callGasLimit', 'verificationGasLimit'].map(name => ({ name, type: 'uint256' }))
+    .concat([{ name: 'paymaster', type: 'address' }, { name: 'paymasterVerificationGasLimit', type: 'uint256' }, { name: 'paymasterPostOpGasLimit', type: 'uint256' }]) };
+  const [sig] = decodeAbiParameters([{ type: 'tuple', components: [GAS, { name: 'signatures', type: 'tuple[]', components: [{ name: 'signerIndex', type: 'uint8' }, { name: 'signatureData', type: 'bytes' }] }] }] as const, `0x${tried[0].slice(4)}`) as unknown as [{ gasLimits: Record<string, unknown>; signatures: { signerIndex: number; signatureData: Hex }[] }];
+  const challenge = (data: Hex) => JSON.parse((decodeAbiParameters([{ type: 'tuple', components: [{ name: 'a', type: 'bytes' }, { name: 'c', type: 'string' }, { name: 'i', type: 'uint256' }, { name: 't', type: 'uint256' }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }], data)[0] as { c: string }).c).challenge;
+  const max = (1n << 256n) - 1n;
+  const light = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'tuple', components: [{ type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'address' }, { type: 'uint256' }, { type: 'uint256' }] }, { type: 'address' }, { type: 'uint256' }],
+    [keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }], [VAULT, nonce, keccak256(callData)])), [max, max, max, max, PM, max, max], EP, 8453n]));
+  assert.equal(sig.signatures.length, 2);
+  assert.equal(challenge(sig.signatures[0].signatureData), Buffer.from(light.slice(2), 'hex').toString('base64url'));
+  assert.equal(challenge(sig.signatures[1].signatureData), Buffer.from(HASH.slice(2), 'hex').toString('base64url'));
 });

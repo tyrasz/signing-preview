@@ -2404,6 +2404,8 @@ async function nexusDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]
 // WebAuthn assertion (webauthn-sol's struct, the hash as its challenge) checked by P256VERIFY, FreshCryptoLib after.
 // With one signer (all seen on Base) the gas limits aren't read, and its SDK leaves them zero.
 export const SPLITS_VAULT_IMPLEMENTATION = '0x15ec0fa66a0d96a64d67c58368641fbe9325f3fa';
+/** The EntryPoint Splits' Smart Vault names (entryPoint(): v0.7's), in its light hash. */
+const SPLITS_ENTRY_POINT = '0x0000000071727de22e5e9d8baf0edac6f37da032';
 const SPLITS = parseAbi(['function createAccount(address owner, (bytes32 slot1, bytes32 slot2)[] signers, uint8 threshold, uint256 salt)', 'function getSignerCount() view returns (uint8)', 'function getThreshold() view returns (uint8)', 'function getSigner(uint8 index) view returns ((bytes32 slot1, bytes32 slot2))']);
 const SPLITS_SIGNATURE = [{ type: 'tuple', components: [
   { name: 'gasLimits', type: 'tuple', components: [{ name: 'maxPriorityFeePerGas', type: 'uint256' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'callGasLimit', type: 'uint256' }, { name: 'verificationGasLimit', type: 'uint256' }, { name: 'paymaster', type: 'address' }, { name: 'paymasterVerificationGasLimit', type: 'uint256' }, { name: 'paymasterPostOpGasLimit', type: 'uint256' }] },
@@ -2434,18 +2436,26 @@ async function splitsVaultStub(c: StubContext, deploying?: { signers: readonly {
     const last = signers.find(s => s.address === c.signer) ?? (c.signer === c.sender && hash ? signers.find(s => s.passkey) : undefined) ?? signers.find(s => !s.passkey) ?? signers[0];
     if (!last || (last.passkey && !hash)) return [{ signature: STUB_SIGNATURE }];
     const others = signers.filter(s => s !== last && (!s.passkey || hash)).sort((a, b) => Number(a.passkey) - Number(b.passkey)).slice(0, Math.max(threshold - 1, 0));
-    // In signing order, EOAs first: the ecrecover stand-in recovers theirs over the light hash as over any other,
-    // where a passkey's assertion names its challenge, which here is the operation's hash (so one passkey, signing
-    // last, validates; a second, over the light hash, would not).
+    // In signing order, EOAs first: all but the last signer sign the light hash (the account, nonce and calls, with the
+    // gas limits in the signature, the EntryPoint and the chain: _getLightUserOpHash), the last the operation's. The
+    // ecrecover stand-in recovers an EOA's over either; a passkey's assertion names its challenge, so a passkey
+    // signing last asserts over the operation's hash and one before it over the light hash. (Asserting over the
+    // operation's hash, a vault's first of two passkeys was refused on Base, 2026-11-18.)
     const order = [last, ...others].sort((a, b) => Number(a.passkey) - Number(b.passkey));
-    const cosigners: { signature: Hex; signer: string }[] = [];
-    const passkey = () => encodeAbiParameters([WEBAUTHN_AUTH], [webAuthnAuth(hash!, 'app.splits.org', ',"crossOrigin":false')]);
-    const part = (s: typeof last) => { if (s.passkey) return passkey(); if (s === last) return STUB_SIGNATURE; const signature = stubSignature(cosigners.length + 1); cosigners.push({ signature, signer: s.address! }); return signature; };
-    const wrappers = order.map(s => ({ signerIndex: s.index, signatureData: part(s) }));
     const pm = c.paymasterAndData && c.paymasterAndData.length >= 42 ? `0x${c.paymasterAndData.slice(2, 42)}` as Hex : `0x${'00'.repeat(20)}` as Hex;
     const max = (1n << 256n) - 1n;
-    const gasLimits = wrappers.length > 1 ? { maxPriorityFeePerGas: max, preVerificationGas: max, callGasLimit: max, verificationGasLimit: max, paymaster: pm, paymasterVerificationGasLimit: max, paymasterPostOpGasLimit: max }
+    const gasLimits = order.length > 1 ? { maxPriorityFeePerGas: max, preVerificationGas: max, callGasLimit: max, verificationGasLimit: max, paymaster: pm, paymasterVerificationGasLimit: max, paymasterPostOpGasLimit: max }
       : { maxPriorityFeePerGas: 0n, preVerificationGas: 0n, callGasLimit: 0n, verificationGasLimit: 0n, paymaster: `0x${'00'.repeat(20)}` as Hex, paymasterVerificationGasLimit: 0n, paymasterPostOpGasLimit: 0n };
+    const light = order.length > 1 && order.slice(0, -1).some(s => s.passkey)
+      ? keccak256(encodeAbiParameters(parseAbiParameters('bytes32, (uint256, uint256, uint256, uint256, address, uint256, uint256), address, uint256'),
+        [keccak256(encodeAbiParameters(parseAbiParameters('address, uint256, bytes32'), [c.sender as Hex, c.nonce, keccak256(c.callData ?? '0x')])),
+          [gasLimits.maxPriorityFeePerGas, gasLimits.preVerificationGas, gasLimits.callGasLimit, gasLimits.verificationGasLimit, gasLimits.paymaster, gasLimits.paymasterVerificationGasLimit, gasLimits.paymasterPostOpGasLimit],
+          SPLITS_ENTRY_POINT, BigInt(c.chainId)]))
+      : undefined;
+    const cosigners: { signature: Hex; signer: string }[] = [];
+    const passkey = (challenge: Hex) => encodeAbiParameters([WEBAUTHN_AUTH], [webAuthnAuth(challenge, 'app.splits.org', ',"crossOrigin":false')]);
+    const part = (s: typeof last, final: boolean) => { if (s.passkey) return passkey(final ? hash! : light!); if (s === last) return STUB_SIGNATURE; const signature = stubSignature(cosigners.length + 1); cosigners.push({ signature, signer: s.address! }); return signature; };
+    const wrappers = order.map((s, i) => ({ signerIndex: s.index, signatureData: part(s, i === order.length - 1) }));
     const signature = concatHex(['0x00', encodeAbiParameters(SPLITS_SIGNATURE, [{ gasLimits, signatures: wrappers }])]);
     return [{ signature, ...(cosigners.length && { cosigners }), ...(signers.some(s => s.passkey && (s === last || others.includes(s))) && { p256: true }) }];
   } catch { return [{ signature: STUB_SIGNATURE }]; }
