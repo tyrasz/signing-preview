@@ -11,6 +11,7 @@ import { PreviewBuilder, formatTimestamp, shortAddress } from '../format.ts';
 import { chainName } from '../chains.ts';
 import { big, domainChainId, str, type TypedAdapter } from './common.ts';
 import { callWords, pad } from './exposure.ts';
+import { keyAccount, signedTrue } from './morpho.ts';
 
 const FIELDS = 'address owner,address manager,bool isAllowed,uint256 nonce,uint256 expiry';
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -19,7 +20,7 @@ export const cometAuthorizationAdapter: TypedAdapter = async (data, env) => {
   if (data.primaryType !== 'Authorization' || data.types.Authorization?.map(f => `${f.type} ${f.name}`).join(',') !== FIELDS) return null;
   const m = data.message;
   const owner = str(m.owner).toLowerCase(), manager = str(m.manager).toLowerCase();
-  const grant = m.isAllowed === true || m.isAllowed === 'true' || m.isAllowed === 1 || m.isAllowed === '1';
+  const grant = signedTrue(m.isAllowed);
   const nonce = big(m.nonce), expiry = big(m.expiry);
   if (!ADDRESS.test(owner) || !ADDRESS.test(manager) || nonce === null || expiry === null) return null;
   const chainId = domainChainId(data);
@@ -28,6 +29,7 @@ export const cometAuthorizationAdapter: TypedAdapter = async (data, env) => {
   const b = new PreviewBuilder();
   b.detail('Market', `${name || 'unnamed'} (${market})`, market).detail('Account', owner).detail(grant ? 'Manager' : 'Manager removed', manager)
     .detail('Nonce', nonce.toString()).detail('Valid until', expiry >= 1n << 40n ? 'no deadline' : formatTimestamp(Number(expiry) * 1000), expiry.toString());
+  if (typeof m.isAllowed !== 'boolean') b.warn('caution', 'comet_bool', `Its isAllowed is ${JSON.stringify(m.isAllowed)}, not true or false: wallets sign anything but false (or 0) as true, so it is read as a grant.`);
   if (env.signer && env.signer !== owner) b.warn('info', 'comet_other_owner', `It authorizes for ${shortAddress(owner)}, but ${shortAddress(env.signer)} is asked to sign it: the market takes only the owner's own signature.`);
   if (expiry * 1000n <= BigInt(env.now)) b.warn('info', 'comet_expired', 'Its expiry has passed: the market refuses it.');
   // With an RPC: whether it is a Comet market (its name() and baseToken()), the nonce, and what the manager is.
@@ -41,11 +43,11 @@ export const cometAuthorizationAdapter: TypedAdapter = async (data, env) => {
       const [already] = await callWords(env, chainId, market, `0xa1654379${pad(owner)}${pad(manager)}`) ?? [];
       if (already !== undefined && (already === 1n) === grant) b.warn('info', 'comet_unchanged', grant ? `${shortAddress(manager)} is already a manager: it changes nothing but the nonce.` : `${shortAddress(manager)} isn't a manager: it changes nothing but the nonce.`);
     } else b.warn('caution', 'comet_market_unknown', `${shortAddress(market)} doesn't answer as a Compound III market (baseToken()): what it does with this isn't known here.`);
-    try { eoa = String(await env.deps.rpc.call(chainId, 'eth_getCode', [manager, 'latest'])) === '0x'; } catch { eoa = undefined; }
+    eoa = await keyAccount(env.deps, chainId, manager);
   }
   if (grant) {
     const what = `${shortAddress(manager)} can transfer your collateral and ${name ? `${name}'s base asset` : 'base asset'} to anyone, withdraw them to any address, and borrow against your collateral, until you revoke it (allow)`;
-    if (eoa) b.warn('danger', 'comet_authorize', `${what}. It is an account with no code, not a contract: a person or a key, not Compound's Bulker. Don't sign it unless you mean to hand this position over.`);
+    if (eoa) b.warn('danger', 'comet_authorize', `${what}. It is an account with no contract code of its own (no code, or an EIP-7702 delegation): a person or a key, not Compound's Bulker. Don't sign it unless you mean to hand this position over.`);
     else b.warn('caution', 'comet_authorize', `${what}. Compound's app asks for this for its Bulker; sign it only for a contract you trust${eoa === undefined ? " (whether it is a contract wasn't read)" : ''}.`);
   }
   b.note('An off-chain signature: it costs nothing now. Anyone can submit it to the market (allowBySig).');

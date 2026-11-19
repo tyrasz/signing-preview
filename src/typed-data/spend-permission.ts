@@ -69,20 +69,30 @@ export const spendPermissionAdapter: TypedAdapter = async (data, env) => {
     if (chainId !== null && !isNative) tokenSourceWarnings(b, chainId, info);
     if (unlimited) b.warn('danger', 'spend_permission_unlimited', `${shortAddress(p.spender)} may take any amount of your ${symbol}, ${window === 'in all' ? 'at any time' : `again ${window}`}: all of it, and any you receive while the permission lasts.`);
     bySpender.set(p.spender, [...bySpender.get(p.spender) ?? [], unlimited ? `unlimited ${symbol}` : amount(p.allowance!)]);
-    // The allowance comes back each period: what it allows over its whole window (to a century, for one with no end).
-    if (!unlimited && window !== 'in all') {
-      const from = start > nowS ? start : nowS, until = end - from > 100n * 365n * 86_400n ? from + 100n * 365n * 86_400n : end;
-      const periods = until > from ? (until - from + period - 1n) / period : 0n;
-      const total = p.allowance! * periods;
+    // The allowance comes back each period, periods counted from `start` (getCurrentPeriod): what it allows over its
+    // whole window (to a century, for one with no end), from the period now on.
+    let total: bigint | undefined;
+    if (!unlimited && window !== 'in all' && period > 0n && end > start) {
+      const until = end - start > 100n * 365n * 86_400n ? start + 100n * 365n * 86_400n : end;
+      const first = nowS > start ? (nowS - start) / period : 0n, last = (until - 1n - start) / period;
+      const periods = last >= first ? last - first + 1n : 0n;
+      total = p.allowance! * periods;
       if (periods > 1n) b.detail(`In all${label}`, `up to ${isUnlimited(total) ? `unlimited ${symbol}` : amount(total)} over ${end >= UINT48_MAX ? 'the next century' : 'its window'} (${amount(p.allowance!)} ${window}, ${periods.toLocaleString('en-US')} periods)`, total.toString());
-      // A period under an hour returns the allowance so often that it is no limit in practice.
-      if (period < 3_600n && periods > 1n) b.warn('danger', 'spend_permission_unlimited', `Its allowance comes back every ${duration(period)}: ${shortAddress(p.spender)} may take ${amount(p.allowance!)} that often, which is no limit in practice: all of your ${symbol}.`);
     }
     // What it could take now: the allowance against the balance (no ERC-20 approval is needed: the manager has the account give one each time).
+    let held: bigint | undefined;
     if (chainId !== null && start <= nowS && nowS < end) {
       const name = `Can move now${label}`;
-      if (isNative) await nativeCanMoveNow(env, b, chainId, account, unlimited ? UINT160_MAX : p.allowance!, native, name);
-      else await canMoveNow(env, b, chainId, account, p.token, info, unlimited ? UINT160_MAX : p.allowance!, undefined, name);
+      if (isNative) {
+        await nativeCanMoveNow(env, b, chainId, account, unlimited ? UINT160_MAX : p.allowance!, native, name);
+        try { if (env.deps.rpc?.has(chainId)) held = BigInt(await env.deps.rpc.call(chainId, 'eth_getBalance', [account, 'latest']) as string); } catch { held = undefined; }
+      } else held = (await canMoveNow(env, b, chainId, account, p.token, info, unlimited ? UINT160_MAX : p.allowance!, undefined, name))?.balance;
+    }
+    // A period under an hour returns the allowance so often that it is no limit in practice, unless its total over the
+    // window stays under what the account holds.
+    if (!unlimited && period > 0n && period < 3_600n && total !== undefined && total > p.allowance!) {
+      if (isUnlimited(total) || (held !== undefined && total >= held)) b.warn('danger', 'spend_permission_unlimited', `Its allowance comes back every ${duration(period)}: ${shortAddress(p.spender)} may take ${amount(p.allowance!)} that often, ${amount(total)} over its window${held !== undefined ? `, more than the ${amount(held)} you hold` : ''}: no limit in practice.`);
+      else if (held === undefined) b.warn('caution', 'spend_permission_frequent', `Its allowance comes back every ${duration(period)}: ${amount(total)} over its window (what you hold wasn't read).`);
     }
     // Revoked already: the signature can't approve it (approve returns false for a revoked permission).
     if (!batch && chainId !== null && manager === SPEND_PERMISSION_MANAGER) {

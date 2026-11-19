@@ -8,21 +8,25 @@
 import { decodeFunctionData, parseAbi } from 'viem';
 import { PreviewBuilder, shortAddress } from '../format.ts';
 import { decoded, type Adapter } from './common.ts';
-import { MORPHO } from '../typed-data/morpho.ts';
+import { isMorpho, keyAccount } from '../typed-data/morpho.ts';
 
 const MORPHO_ABI = parseAbi(['function setAuthorization(address authorized, bool newIsAuthorized)']);
-const COMET_ABI = parseAbi(['function allow(address manager, bool isAllowed)']);
+const COMET_ABI = parseAbi(['function allow(address manager, bool isAllowed)', 'function approve(address spender, uint256 amount)']);
+const MAX = (1n << 256n) - 1n;
 
 export const lendingManagerAdapter: Adapter = async (tx, env) => {
   if (!tx.to || tx.data.length < 10) return null;
   const to = tx.to.toLowerCase();
-  const morpho = to === MORPHO && tx.data.startsWith('0xeecea000');
-  const comet = !morpho && tx.data.startsWith('0x110496e5');
+  const morpho = tx.data.startsWith('0xeecea000') && await isMorpho(env.deps, tx.chainId, to);
+  // A Compound III market's approve takes only 0 or the largest amount, and is allow (CometExt.approve).
+  const comet = !morpho && (tx.data.startsWith('0x110496e5') || tx.data.startsWith('0x095ea7b3'));
   if (!morpho && !comet) return null;
   let who: string, grant: boolean;
   try {
     const call = morpho ? decodeFunctionData({ abi: MORPHO_ABI, data: tx.data }) : decodeFunctionData({ abi: COMET_ABI, data: tx.data });
-    [who, grant] = [String(call.args[0]).toLowerCase(), Boolean(call.args[1])];
+    const flag = call.args[1];
+    if (call.functionName === 'approve' && flag !== 0n && flag !== MAX) return null;
+    [who, grant] = [String(call.args[0]).toLowerCase(), typeof flag === 'bigint' ? flag === MAX : Boolean(flag)];
   } catch { return null; }
   const rpc = env.deps.rpc?.has(tx.chainId) ? env.deps.rpc : undefined;
   if (comet) {
@@ -32,9 +36,8 @@ export const lendingManagerAdapter: Adapter = async (tx, env) => {
       if (!/^0x0{24}[0-9a-f]{40}$/i.test(base) || /^0x0+$/.test(base)) return null;
     } catch { return null; }
   }
-  let eoa: boolean | undefined;
-  try { if (rpc) eoa = String(await rpc.call(tx.chainId, 'eth_getCode', [who, 'latest'])) === '0x'; } catch { eoa = undefined; }
-  const b = new PreviewBuilder().detail('Contract', morpho ? `Morpho (${MORPHO})` : `Compound III market (${to})`, to).detail(grant ? (morpho ? 'Authorized' : 'Manager') : 'Removed', who);
+  const eoa = await keyAccount(env.deps, tx.chainId, who);
+  const b = new PreviewBuilder().detail('Contract', morpho ? `Morpho (${to})` : `Compound III market (${to})`, to).detail(grant ? (morpho ? 'Authorized' : 'Manager') : 'Removed', who);
   const what = morpho
     ? `${shortAddress(who)} can withdraw your supply and collateral from every Morpho market and borrow against your collateral, sending it all to any address, until you revoke it`
     : `${shortAddress(who)} can transfer your collateral and base asset in this market to anyone, withdraw them to any address, and borrow against your collateral, until you revoke it`;

@@ -38,3 +38,24 @@ test('A revocation; a used nonce; a passed deadline; another contract', async ()
   assert.ok(codes(await sign(auth({ deadline: String(NOW / 1000 - 1) }))).includes('morpho_expired'));
   assert.ok(codes(await sign(auth({}, '0x2222222222222222222222222222222222222222'))).includes('morpho_contract_unknown'));
 });
+
+test('Fourth review: Morpho on another chain, by its domain; non-boolean flags; an EIP-7702 account', async () => {
+  const { encodeAbiParameters, keccak256, toHex } = await import('viem');
+  const ARB_MORPHO = '0x6c247b1f6182318877311737bac0844baa518f5e';
+  const separator = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }], [keccak256(toHex('EIP712Domain(uint256 chainId,address verifyingContract)')), 42161n, ARB_MORPHO]));
+  const d: Dependencies = { rpc: { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getCode') return `0xef0100${'1'.repeat(40)}`;
+    const { data } = params[0] as { data: string };
+    if (data === '0x3644e515') return separator;
+    return data.startsWith('0x70ae92d2') ? `0x${word(3n)}` : `0x${word(0n)}`;
+  } } };
+  const arb = { ...auth(), domain: { chainId: 42161, verifyingContract: ARB_MORPHO } };
+  const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(arb)] }, { now: NOW, chainId: 42161 }, d);
+  assert.ok(!codes(p).includes('morpho_contract_unknown'));
+  // An EIP-7702 account is a key, not a contract: a danger.
+  assert.equal(p.warnings.find(w => w.code === 'morpho_authorize')!.severity, 'danger');
+  // "false" as a string is signed as true by ethers: read as a grant, with a caution.
+  const odd = await sign({ ...auth(), message: { ...auth().message, isAuthorized: 'false' } });
+  assert.match(odd.title, /^Authorize/);
+  assert.ok(codes(odd).includes('morpho_bool'));
+});

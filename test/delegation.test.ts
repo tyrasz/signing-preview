@@ -289,3 +289,30 @@ test('Third review: other token functions, Permit2, fixed control calls, OR pins
   // A pin far beyond any call doesn't crash the preview.
   assert.ok(await attention([or([calldata(2 ** 40, '0x01')], [])]));
 });
+
+test('Fourth review: far pins, many OR groups, exact calldata on the account, unbounded streams and caps, sub-hourly periods', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const zero = { enforcer: E.valueLte, terms: `0x${word(0n)}` };
+  const attention = async (caveats: { enforcer: string; terms: string }[]) => (await sign(delegation(BOB, [...caveats, until]))).attention;
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  const exactData = (d: string) => ({ enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: d });
+  const targets = (...a: string[]) => ({ enforcer: E.targets, terms: `0x${a.map(x => x.slice(2).toLowerCase()).join('')}` });
+  // A pin past 4 KB is met by padding the call.
+  assert.equal(await attention([calldata(4096, 'de'.repeat(32))]), 'danger');
+  // 65 OR groups: the last one, open, is still found.
+  const or = (groups: { enforcer: string; terms: string }[][]) => ({ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [groups.map(g => ({ caveats: g.map(c => ({ ...c, args: '0x' })) })) as never]) });
+  const EVIL = '0x0000000000000000000000000000000000e0e0e0';
+  const many = Array.from({ length: 64 }, (_, i) => [targets('0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a'), calldata(4, word(BigInt(i)))]);
+  assert.equal(await attention([or([...many, [calldata(4, EVIL.slice(2).padStart(64, '0'))]]), zero]), 'danger');
+  // A fixed execute(…) on the account, by ExactCalldata: not simulated, so not taken as a fixed call.
+  const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), args: [EVIL as `0x${string}`, (1n << 256n) - 1n] });
+  const exec = encodeFunctionData({ abi: parseAbi(['function execute(bytes32,bytes)']), args: [`0x${'0'.repeat(64)}`, `0x${USDC.slice(2)}${word(0n)}${approve.slice(2)}`] });
+  assert.equal(await attention([exactData(exec), targets(ALICE)]), 'danger');
+  // Streams and caps that cap nothing.
+  assert.equal(await attention([exactData('0x'), { enforcer: '0xd10b97905a320b13a0608f7e9cc506b56747df19', terms: `0x${word((1n << 256n) - 1n)}${word((1n << 256n) - 1n)}${word(0n)}${word(1n)}` }]), 'danger');
+  assert.equal(await attention([exactData('0x'), { enforcer: E.valueLte, terms: `0x${word((1n << 255n) - 1n)}` }, { enforcer: '0xc8b5d93463c893401094cc70e66a206fb5987997', terms: `0x${word(1n)}` }]), 'danger');
+  assert.equal(await attention([exactData('0x'), { enforcer: E.valueLte, terms: `0x${word(10n ** 30n)}` }, { enforcer: E.limitedCalls, terms: `0x${word(10_000n)}` }]), 'danger');
+  // An allowance that comes back every second is no cap.
+  assert.equal(await attention([exactData('0x'), { enforcer: '0x9bc0faf4aca5ae429f4c06aeeac517520cb16bd9', terms: `0x${word(10n ** 18n)}${word(1n)}${word(BigInt(NOW / 1000))}` }]), 'danger');
+  assert.notEqual(await attention([{ enforcer: '0x474e3ae7e169e940607cc624da8a15eb120139ab', terms: `0x${USDC.slice(2)}${word(10n ** 9n)}${word(1n)}${word(BigInt(NOW / 1000))}` }, zero]), 'none');
+});

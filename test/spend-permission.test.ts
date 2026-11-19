@@ -77,3 +77,14 @@ test('An allowance of 2^128 is unlimited; one that comes back every second is no
   assert.equal(p.decoding.decoder, 'coinbase_spend_permission');
   assert.ok(codes(p).includes('spend_permission_unlimited'));
 });
+
+test('Fourth review: a small frequent allowance under the balance; periods counted from start; a period of 0', async () => {
+  const small = await sign(single({ allowance: '10000', period: 1800, end: now + 30 * 86_400 }));
+  assert.ok(!codes(small).includes('spend_permission_unlimited'));
+  assert.match(detail(small, 'In all')!, /^up to 14\.41 USDC over its window \(0\.01 USDC every 30 minutes, 1,441 periods\)$/);
+  // Started 23 hours ago, a day each, ending in 2 hours: this period and the next.
+  const aligned = await sign(single({ period: 86_400, start: now - 23 * 3600, end: now + 2 * 3600 }));
+  assert.match(detail(aligned, 'In all')!, /\(100 USDC a day, 2 periods\)$/);
+  const zero = await sign(single({ period: 0 }));
+  assert.ok(codes(zero).includes('spend_permission_invalid'));
+});

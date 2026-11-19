@@ -71,6 +71,8 @@ interface CaveatRead {
   nativeTotal?: boolean;
   /** It caps the native coin each redemption sends (NativeBalanceChangeEnforcer's fall): a total only with the redemptions bounded. */
   nativePerRedemption?: boolean;
+  /** Its allowance comes back more often than hourly: no cap in practice. */
+  subHourly?: boolean;
   /** Caveats inside it that this preview doesn't know (LogicalOrWrapperEnforcer's groups). */
   unread?: number;
   /** The only addresses that may redeem it (RedeemerEnforcer). */
@@ -104,7 +106,7 @@ async function erc20Streaming(t: string, token: (address: string) => Promise<Tok
 /** "each day", or "in all" for a period that never ends (MetaMask's allowances use 2^256 - 1). */
 export const every = (s: bigint) => s >= 1n << 64n ? 'in all' : `each ${duration(s)}`;
 export const duration = (s: bigint) => {
-  const [n, unit] = s > 0n && s % 86_400n === 0n ? [s / 86_400n, 'day'] : s > 0n && s % 3_600n === 0n ? [s / 3_600n, 'hour'] : [s, 'second'];
+  const [n, unit] = s > 0n && s % 86_400n === 0n ? [s / 86_400n, 'day'] : s > 0n && s % 3_600n === 0n ? [s / 3_600n, 'hour'] : s > 0n && s % 60n === 0n ? [s / 60n, 'minute'] : [s, 'second'];
   return n === 1n ? unit : `${n} ${unit}s`;
 };
 const pad = (v: string | bigint) => (typeof v === 'bigint' ? v.toString(16) : v.slice(2)).padStart(64, '0');
@@ -150,20 +152,21 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
   '0x56c97ae02f233b29fa03502ecc0457266d9be00e': { name: 'ERC20StreamingEnforcer', read: async (t, token) => erc20Streaming(t, token) },
   '0x474e3ae7e169e940607cc624da8a15eb120139ab': { name: 'ERC20PeriodTransferEnforcer', read: async (t, token) => {
     const address = addr(t, 0), amount = word(t, 20), period = word(t, 52), start = word(t, 84), info = await token(address);
-    return { name: 'ERC20PeriodTransferEnforcer', kind: 'scope', tokens: [{ address, amount }], text: `only transfer() calls on ${info?.symbol ?? shortAddress(address)}: ${amountOf(amount, info, address)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
+    return { name: 'ERC20PeriodTransferEnforcer', kind: 'scope', tokens: [{ address, amount }], ...(period < 3_600n && { subHourly: true }), text: `only transfer() calls on ${info?.symbol ?? shortAddress(address)}: ${amountOf(amount, info, address)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
   } },
   '0xfb2f1a9bd76d3701b730e5d69c3219d42d80ebb7': { name: 'MultiTokenPeriodEnforcer', read: async (t, token, native) => {
     const configs = await Promise.all(Array.from({ length: Math.floor(t.length / 232) }, async (_, i) => {
       const o = i * 116, address = addr(t, o), amount = word(t, o + 20), period = word(t, o + 52), start = word(t, o + 84);
       const nativeCoin = /^0x0{40}$/.test(address), info = nativeCoin ? undefined : await token(address);
-      return { address, amount, nativeCoin, text: `${nativeCoin ? nativeOf(amount, native) : amountOf(amount, info, address)} ${every(period)} from ${formatTimestamp(Number(start) * 1000)}` };
+      return { address, amount, period, nativeCoin, text: `${nativeCoin ? nativeOf(amount, native) : amountOf(amount, info, address)} ${every(period)} from ${formatTimestamp(Number(start) * 1000)}` };
     }));
     // Each configuration has its own allowance (the redeemer picks one by index): two for one token add up.
     const sum = new Map<string, bigint>();
     for (const c of configs) sum.set(c.address, (sum.get(c.address) ?? 0n) + c.amount);
     const nativeCap = configs.some(c => c.nativeCoin) ? sum.get('0x0000000000000000000000000000000000000000') : undefined;
+    const subHourly = configs.some(c => c.period < 3_600n);
     const erc20 = configs.some(c => !c.nativeCoin);
-    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: !isUnlimited(nativeCap) }),
+    return { name: 'MultiTokenPeriodEnforcer', kind: 'scope', tokens: [...sum].filter(([a]) => !/^0x0{40}$/.test(a)).map(([address, amount]) => ({ address, amount })), ...(nativeCap !== undefined && { native: nativeCap, nativeLimit: true, nativeTotal: !isUnlimited(nativeCap) && !subHourly }), ...(subHourly && { subHourly: true }),
       text: `only ${[erc20 && 'transfer() calls on these tokens', nativeCap !== undefined && `plain ${native} transfers`].filter(Boolean).join(', or ')}, up to: ${configs.map(c => c.text).join('; ')}` };
   } },
   '0x3790e6b7233f779b09da74c72b6e94813925b9af': { name: 'ERC721TransferEnforcer', read: t => ({ name: 'ERC721TransferEnforcer', kind: 'scope', text: `only transferring NFT #${word(t, 20)} of ${shortAddress(addr(t, 0))} (transferFrom or safeTransferFrom), to anyone` }) },
@@ -192,7 +195,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
   '0x4803a326dded6ddbc60e659e5ed12d85c7582811': { name: 'NativeTokenPaymentEnforcer', read: (t, _, native) => ({ name: 'NativeTokenPaymentEnforcer', kind: 'condition', text: `whoever redeems it must pay ${nativeOf(word(t, 20), native)} to ${shortAddress(addr(t, 0))}` }) },
   '0xd10b97905a320b13a0608f7e9cc506b56747df19': { name: 'NativeTokenStreamingEnforcer', read: (t, _, native) => {
     const initial = word(t, 0), max = word(t, 32), rate = word(t, 64), start = word(t, 96);
-    return { name: 'NativeTokenStreamingEnforcer', kind: 'limit', native: max, nativeLimit: true, nativeTotal: true, text: `${native} sent with the calls: ${nativeOf(initial, native)} from ${formatTimestamp(Number(start) * 1000)}, then ${nativeOf(rate, native)} more each second, ${nativeOf(max, native)} at most` };
+    return { name: 'NativeTokenStreamingEnforcer', kind: 'limit', native: max, nativeLimit: true, nativeTotal: !isUnlimited(initial) && (!isUnlimited(max) || !isUnlimited(rate)), text: `${native} sent with the calls: ${nativeOf(initial, native)} from ${formatTimestamp(Number(start) * 1000)}, then ${nativeOf(rate, native)} more each second, ${nativeOf(max, native)} at most` };
   } },
   '0xeaa1be91f0ea417820a765df9c5be542286bffdc': { name: 'ERC20MultiOperationIncreaseBalanceEnforcer', read: async (t, token) => {
     const address = addr(t, 0), info = await token(address);
@@ -222,7 +225,7 @@ export const ENFORCERS: Record<string, { name: string; read: Reader }> = {
     const amount = word(t, 0), period = word(t, 32), start = word(t, 64);
     // It checks only the value each call sends, not what is called (its comment expects no call data, but nothing
     // checks that: MetaMask pairs it with ExactCalldataEnforcer(0x)).
-    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: !isUnlimited(amount), text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
+    return { name: 'NativeTokenPeriodTransferEnforcer', kind: 'limit', native: amount, nativeLimit: true, nativeTotal: !isUnlimited(amount) && period >= 3_600n, ...(period < 3_600n && { subHourly: true }), text: `${native} sent with the calls: ${nativeOf(amount, native)} ${every(period)}, from ${formatTimestamp(Number(start) * 1000)}` };
   } },
   '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320': { name: 'NativeTokenTransferAmountEnforcer', read: (t, _, native) => {
     const amount = word(t, 0);
@@ -335,7 +338,7 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   const bounded = once || (count !== undefined && count <= 10_000n);
   // What its caveats leave open: the calls an attacker would make, tried against every caveat's rule
   // (src/typed-data/delegation-probe.ts). Caps on the totals (a token's, the native coin's) bound what gets through.
-  const cappedTokens = new Set(known.filter(r => r.kind === 'scope').flatMap(r => r.tokens?.filter(t => !isUnlimited(t.amount)).map(t => t.address) ?? []));
+  const cappedTokens = new Set(known.filter(r => r.kind === 'scope' && !r.subHourly).flatMap(r => r.tokens?.filter(t => !isUnlimited(t.amount)).map(t => t.address) ?? []));
   let p: ReturnType<typeof probe>;
   try { p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens }); }
   catch { p = { control: ['what its caveats allow', "which this preview couldn't work out from them"] }; }
@@ -358,11 +361,11 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
       const open = p.tokens.amount === null;
       const info = p.tokens.on?.length === 1 ? await token(p.tokens.on[0]) : undefined;
       const units = (v: bigint) => info ? `${formatUnits(v, info.decimals)} ${info.symbol}` : `${v} base units`;
-      if (p.tokens.recipient && p.tokens.amount !== null && p.tokens.on && bounded) {
-        // A recipient and an amount pinned, a bounded number of times: a fixed transfer, in effect.
-        b.warn('info', 'delegation_fixed_transfer', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, for ${units(p.tokens.amount)}, ${once ? 'once' : `at most ${count} time${count === 1n ? '' : 's'}`}.`);
+      if (p.tokens.recipient && p.tokens.amount !== null && p.tokens.on && (once || count === 1n)) {
+        // A recipient and an amount pinned, once: a fixed transfer, in effect.
+        b.warn('info', 'delegation_fixed_transfer', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, for ${units(p.tokens.amount)}, once.`);
       } else {
-        const amount = p.tokens.amount === null ? 'for any amount' : `for ${units(p.tokens.amount)} each time${bounded ? '' : ', as many times as wanted'}`;
+        const amount = p.tokens.amount === null ? 'for any amount' : `for ${units(p.tokens.amount)} each time${bounded ? `, up to ${count === 1n ? 'once' : `${count} times`} (${units(p.tokens.amount * (count ?? 1n))} in all)` : ', as many times as wanted'}`;
         if (!p.tokens.on) b.warn(open ? 'danger' : 'caution', 'delegation_any_contract', `Its caveats don't limit which contract is called: ${who} can call ${fns} on any token your account holds${to}, ${amount}${open ? ': all of every token' : ''}${unless}.`);
         else b.warn('caution', 'delegation_any_function', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, ${amount}: if ${p.tokens.on.length === 1 ? 'it is a token' : 'they are tokens'}, ${p.tokens.amount === null ? `all of your balance of ${p.tokens.on.length === 1 ? 'it' : 'them'}` : 'that much of it each time'}${unless}.`);
       }
@@ -372,7 +375,11 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
     // Native coin: per call, or with no cap, unless a total caps it (a native period, stream or amount; per-redemption
     // and per-call caps only when the redemptions are bounded too). To a target named, only in a plain transfer or to
     // an EOA (a call to a contract takes coin only into a payable function).
-    const capped = (perCall: bigint | null) => nativeTotal || (bounded && (perCall !== null || nativePerRedemption));
+    // A cap per call is a total of the cap times the redemptions; that much or more than the account holds is no cap.
+    let balance: bigint | undefined;
+    try { if (chainId !== null && env.deps.rpc?.has(chainId)) balance = BigInt(await env.deps.rpc.call(chainId, 'eth_getBalance', [delegator, 'latest']) as string); } catch { balance = undefined; }
+    const below = (total: bigint) => !isUnlimited(total) && (balance === undefined ? total < 10n ** 24n : total < balance);
+    const capped = (perCall: bigint | null) => nativeTotal || (bounded && ((perCall !== null && below(perCall * (once ? 1n : count!))) || nativePerRedemption));
     const each = (perCall: bigint | null) => perCall === null ? '' : `, up to ${nativeOf(perCall, native)} each time, as many times as wanted`;
     if (p.native && !capped(p.native.perCall)) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}: nothing caps the total, so all of it${unless}.`);
     else if (p.nativeTo) {

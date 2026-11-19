@@ -56,3 +56,12 @@ test('The same grants sent as transactions: Morpho setAuthorization, Compound al
   // allow(address,bool) on a contract that isn't a market: not read as one.
   assert.ok(!codes(await send(CUSDC, allow, '0x6080', false)).includes('comet_authorize'));
 });
+
+test("Fourth review: a market's approve of the largest amount is allow", async () => {
+  const { encodeFunctionData, parseAbi } = await import('viem');
+  const approve = (amount: bigint) => encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), args: [BOB, amount] });
+  const send = (data: string) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: CUSDC, data, value: '0x0', chainId: '0x1' }] }, { now: NOW, chainId: 1, account: ALICE }, deps('0x'));
+  const p = await send(approve((1n << 256n) - 1n));
+  assert.equal(p.warnings.find(w => w.code === 'comet_authorize')!.severity, 'danger');
+  assert.match((await send(approve(0n))).title, /^Remove 0xb0b0…0002 as a manager/);
+});

@@ -25,6 +25,8 @@ export interface Rule {
   pins?: { start: number; value: string }[];
   /** Whole call data it fixes (ExactCalldata and the exact enforcers). */
   datas?: string[];
+  /** Its calls are exact executions (target, value and data), which the preview simulates. */
+  simulated?: boolean;
   /** Contracts it names (AllowedTargets, OwnershipTransfer), tried for what else can be called on them. Not an exact
    * execution's target: its call is fixed, and simulated. */
   targets?: string[];
@@ -76,13 +78,16 @@ export function ruleOf(enforcer: string, t: string): Rule | null {
     }
     case '0xc2b0d624c1c4319760c96503ba27c347f3260f55': { // AllowedCalldata
       const start = Number(big(0)), value = t.slice(64);
+      // Past 4 KB, the bytes aren't laid over the calls tried: any call padded with them (the function ignores data
+      // past its arguments) passes, up to the ~1 MB of call data a block can carry; beyond that, none can.
+      if (start + value.length / 2 > 4096) return { mode: 'single', allows: () => start + value.length / 2 <= 1_000_000 };
       return { mode: 'single', pins: [{ start, value }], allows: e => at(e.data, start, value.length / 2) === value };
     }
     case '0x99f2e9bf15ce5ec84685604836f71ab835dbbded': // ExactCalldata
       return { mode: 'single', datas: [`0x${t}`], allows: e => e.data === `0x${t}` };
     case '0x146713078d39ecc1f5338309c28405ccf85abfbb': { // ExactExecution
       const target = addr(0), value = big(20), data = `0x${t.slice(104)}`;
-      return { mode: 'single', datas: [data], allows: e => e.target === target && e.value === value && e.data === data };
+      return { mode: 'single', datas: [data], simulated: true, allows: e => e.target === target && e.value === value && e.data === data };
     }
     case '0x1e141e455d08721dd5bcda1baa6ea5633afd5017': // ExactExecutionBatch
     case '0x982fd5c86bbf425d7d1451f974192d4525113dfd': // ExactCalldataBatch (data only: any target, any value)
@@ -132,7 +137,7 @@ const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
 
 /** A batch enforcer's rule, from its executions: exact ones fix target, value and data; ExactCalldataBatch only data. */
 export function batchRule(executions: { target: string; value: bigint; data: string }[], dataOnly: boolean): Rule {
-  return { mode: 'batch', datas: executions.map(x => x.data),
+  return { mode: 'batch', datas: executions.map(x => x.data), simulated: !dataOnly,
     allows: e => executions.some(x => x.data === e.data && (dataOnly || (x.target === e.target && x.value === e.value))) };
 }
 
@@ -148,17 +153,15 @@ export function passes(rules: (Rule | null)[], e: Exec): boolean {
 
 const collect = <T>(rules: (Rule | null)[], f: (r: Rule) => T[] | undefined): T[] => rules.flatMap(r => !r ? [] : [...(f(r) ?? []), ...(r.groups ?? []).flatMap(g => collect(g, f))]);
 
-/** The sets of pins a call can satisfy at once: the top-level caveats' and, for an OR, each group's in turn. */
+/** The sets of pins a call can satisfy at once: the top-level caveats' and, for an OR, each of its groups' (every
+ * combination across several ORs while there are at most 256; past that, each group of each OR on its own). */
 function pinSets(rules: (Rule | null)[]): { start: number; value: string }[][] {
-  let sets: { start: number; value: string }[][] = [[]];
-  for (const r of rules) {
-    if (!r) continue;
-    // A pin beyond 4 KB of call data no realistic call satisfies (and laying it would be huge).
-    const own = (r.pins ?? []).filter(p => p.start + p.value.length / 2 <= 4096);
-    if (r.groups?.length) sets = sets.flatMap(set => r.groups!.flatMap(g => pinSets(g).map(gs => [...set, ...gs]))).slice(0, 64);
-    else if (own.length) sets = sets.map(set => [...set, ...own]);
-  }
-  return sets;
+  const top = rules.flatMap(r => r && !r.groups ? (r.pins ?? []).filter(p => p.start + p.value.length / 2 <= 4096) : []);
+  const ors = rules.filter((r): r is Rule => !!r?.groups?.length).map(r => r.groups!.flatMap(g => pinSets(g)));
+  if (!ors.length) return [top];
+  const size = ors.reduce((n, o) => n * Math.max(o.length, 1), 1);
+  if (size <= 256) return ors.reduce<{ start: number; value: string }[][]>((sets, o) => sets.flatMap(set => o.map(g => [...set, ...g])), [top]);
+  return ors.flatMap(o => o.map(g => [...top, ...g]));
 }
 
 /** The data an attacker would send for a call, with each set of the caveats' pinned bytes laid over it, and the data they fix outright. */
@@ -207,7 +210,8 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   const out: Probe = {};
   // A call tried with the caveats' pins laid over it, and the data they fix: it must still be the function tried
   // (sameFunction), but for native coin to an EOA, which takes any data.
-  const fixed = new Set(collect(rules, r => r.datas));
+  // Exact executions' calls (simulated by the preview): an execute(…) among them runs only the calls fixed inside it.
+  const fixed = new Set(collect(rules, r => r.simulated ? r.datas : undefined));
   const tries = (target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true, fixedRunsCalls = true) => {
     for (const batch of [false, true]) for (const t of templates) for (const data of variants(t, rules, withFixed)) {
       if (sameFunction && selectorOf(data) !== selectorOf(t)) continue;
@@ -229,7 +233,7 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   const nativeTo = (target: string) => {
     const full = tries(target, MAX, data, true, false);
     if (full) return { perCall: null, plain: full === '0x' };
-    for (const c of perCallCaps.filter(c => c > 0n)) { const d = tries(target, c, data, true, false); if (d) return { perCall: c, plain: d === '0x' }; }
+    for (const c of perCallCaps.filter(c => c > 0n)) { const d = tries(target, c, data, true, false); if (d) return { perCall: c >= (1n << 128n) - 1n ? null : c, plain: d === '0x' }; }
     return undefined;
   };
   const toAnyone = nativeTo(ATTACKER);
