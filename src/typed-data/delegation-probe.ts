@@ -34,6 +34,8 @@ export interface Rule {
   groups?: (Rule | null)[][];
   /** The most native coin one call may send (ValueLteEnforcer). */
   valueCap?: bigint;
+  /** The exact executions it allows (ExactExecution, ExactExecutionBatch): read for what they do where not simulated. */
+  execs?: { target: string; value: bigint; data: string }[];
 }
 
 const sel = (sig: string): string => toFunctionSelector(`function ${sig}`);
@@ -110,7 +112,7 @@ export function ruleOf(enforcer: string, t: string): Rule | null {
       return { mode: 'single', datas: [`0x${t}`], allows: e => e.data === `0x${t}` };
     case '0x146713078d39ecc1f5338309c28405ccf85abfbb': { // ExactExecution
       const target = addr(0), value = big(20), data = `0x${t.slice(104)}`;
-      return { mode: 'single', datas: [data], simulated: true, allows: e => e.target === target && e.value === value && e.data === data };
+      return { mode: 'single', datas: [data], simulated: true, execs: [{ target, value, data }], allows: e => e.target === target && e.value === value && e.data === data };
     }
     case '0x1e141e455d08721dd5bcda1baa6ea5633afd5017': // ExactExecutionBatch
     case '0x982fd5c86bbf425d7d1451f974192d4525113dfd': // ExactCalldataBatch (data only: any target, any value)
@@ -164,7 +166,7 @@ const FAR_PIN = 4096;
 
 /** A batch enforcer's rule, from its executions: exact ones fix target, value and data; ExactCalldataBatch only data. */
 export function batchRule(executions: { target: string; value: bigint; data: string }[], dataOnly: boolean): Rule {
-  return { mode: 'batch', datas: executions.map(x => x.data), simulated: !dataOnly,
+  return { mode: 'batch', datas: executions.map(x => x.data), simulated: !dataOnly, ...(!dataOnly && { execs: executions }),
     allows: e => executions.some(x => x.data === e.data && (dataOnly || (x.target === e.target && x.value === e.value))) };
 }
 
@@ -191,33 +193,53 @@ const lay = (data: string, list: Pin[]) => {
   return `0x${d}`;
 };
 
+/** What the search for calls did: whether it tried every combination of OR groups, and the bytes it laid so far. */
+interface Search { incomplete: boolean; work: number }
+/** Hex characters of call data laid in all, before the search stops (and says it didn't finish). */
+const WORK = 40_000_000;
+/** The call tried: where it goes, with what value, in which mode. */
+type Attempt = { target: string; value: bigint; batch: boolean };
+
 /**
  * The sets of pins a call can satisfy at once: the top-level caveats' and, for an OR, each of its groups'. Every
- * combination across several ORs while there are at most 256; past that, a search one OR at a time: each OR's group
- * that changes the call tried least, and each group of each OR with the others at theirs.
+ * combination across several ORs while there are at most 256; past that (and the search says it is incomplete), one OR
+ * at a time: each OR's group that changes the call least among those that pass on their own, and each group of each
+ * OR with the others at theirs.
  */
-function pinSets(rules: (Rule | null)[], template: string): Pin[][] {
+function pinSets(rules: (Rule | null)[], template: string, e: Attempt, search: Search): Pin[][] {
   const top = rules.flatMap(r => r && !r.groups ? (r.pins ?? []).filter(p => p.start < FAR_PIN) : []);
-  const ors = rules.filter((r): r is Rule => !!r?.groups?.length).map(r => r.groups!.flatMap(g => pinSets(g, template)));
+  const ors = rules.filter((r): r is Rule => !!r?.groups?.length).map(r => r.groups!.flatMap(g => pinSets(g, template, e, search).map(pins => ({ pins, group: g }))));
   if (!ors.length) return [top];
   const size = ors.reduce((n, o) => n * Math.max(o.length, 1), 1);
-  if (size <= 256) return ors.reduce<Pin[][]>((sets, o) => sets.flatMap(set => o.map(g => [...set, ...g])), [top]);
+  if (size <= 256) return ors.reduce<Pin[][]>((sets, o) => sets.flatMap(set => o.map(g => [...set, ...g.pins])), [top]);
+  search.incomplete = true;
   const base = lay(template, top);
-  const changed = (pins: Pin[]) => { const d = lay(base, pins); let n = Math.abs(d.length - base.length); for (let i = 0; i < Math.min(d.length, base.length); i++) if (d[i] !== base[i]) n++; return n; };
-  const best = ors.map(o => o.reduce<Pin[] | undefined>((a, g) => a === undefined || changed(g) < changed(a) ? g : a, undefined) ?? []);
+  // Bytes a set of pins changes in the call, counted over the pins alone.
+  const changed = (pins: Pin[]) => pins.reduce((n, p) => {
+    const from = 2 + p.start * 2, old = base.slice(from, from + p.value.length);
+    let d = p.value.length - old.length;
+    for (let i = 0; i < old.length; i++) if (old[i] !== p.value[i]) d++;
+    return n + d;
+  }, 0);
+  const passing = (a: { pins: Pin[]; group: (Rule | null)[] }) => { search.work += base.length; return passes(a.group, { ...e, data: lay(base, a.pins) }); };
+  const best = ors.map(o => {
+    const able = o.filter(passing);
+    return (able.length ? able : o).reduce<{ pins: Pin[] } | undefined>((a, g) => a === undefined || changed(g.pins) < changed(a.pins) ? g : a, undefined)?.pins ?? [];
+  });
   const sets = [[...top, ...best.flat()]];
-  ors.forEach((o, i) => { for (const g of o) sets.push([...top, ...best.flatMap((b, j) => j === i ? g : b)]); });
+  ors.forEach((o, i) => { for (const g of o) sets.push([...top, ...best.flatMap((b, j) => j === i ? g.pins : b)]); });
   return sets;
 }
 
 /** The data an attacker would send for a call, with each set of the caveats' pinned bytes laid over it, and the data they fix outright. */
-function variants(template: string, rules: (Rule | null)[], withFixed: boolean): string[] {
+function variants(template: string, rules: (Rule | null)[], withFixed: boolean, e: Attempt, search: Search): string[] {
   const out = new Set<string>([template]);
-  for (const pins of pinSets(rules, template)) {
+  const add = (pins: Pin[]) => { if (search.work > WORK) { search.incomplete = true; return; } const d = lay(template, pins); search.work += d.length; out.add(d); };
+  for (const pins of pinSets(rules, template, e, search)) {
     const args = pins.filter(p => p.start > 0), heads = pins.filter(p => p.start === 0);
-    for (const p of pins) out.add(lay(template, [p]));
-    out.add(lay(template, args));
-    for (const h of heads) out.add(lay(template, [...args, h]));
+    for (const p of pins) add([p]);
+    add(args);
+    for (const h of heads) add([...args, h]);
   }
   if (withFixed) for (const d of collect(rules, r => r.datas)) out.add(d);
   return [...out];
@@ -240,8 +262,13 @@ export interface Probe {
   permit2?: { spender: string };
   /** Targets named on which any function can be called. */
   anyFunction?: string[];
-  /** Fixed data for the account's own execute(…) that the preview doesn't simulate (a LogicalOr group's exact execution, an ExactCalldata), which runs only the calls fixed in it. */
-  unsimulated?: string[];
+  /**
+   * Fixed calls the preview doesn't simulate that the caveats let through: those an execute(…) on the account runs (its
+   * data fixed by a LogicalOr group's exact execution or an ExactCalldata), and exact executions inside an OR.
+   */
+  unsimulated?: { target: string; value: bigint; data: string }[];
+  /** The search didn't try every combination of the caveats' OR groups (or ran out of room): what they allow may be more. */
+  incomplete?: boolean;
 }
 
 /** The attacker's calls against the caveats' rules: what gets through. */
@@ -251,7 +278,8 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   // (sameFunction), but for native coin to an EOA, which takes any data.
   // The exact executions' calls the preview simulates (a top-level caveat's, not one inside an OR): an execute(…) among
   // them runs only the calls fixed inside it, a hand-over only if one of those is (handsOver).
-  const fixed = new Set(capped.simulated ?? []), fixedData = new Set(collect(rules, r => r.datas)), unsimulated = new Set<string>();
+  const fixed = new Set(capped.simulated ?? []), fixedData = new Set(collect(rules, r => r.datas)), unsimulated = new Map<string, { target: string; value: bigint; data: string }>();
+  const search: Search = { incomplete: false, work: 0 };
   const handsOver = (data: string, depth: number): boolean => {
     const inner = depth < 4 ? innerCalls(data) : null;
     return inner === null || inner.some(c => (c.target === account && CONTROL.has(selectorOf(c.data)) && (!RUNS_FIXED.has(selectorOf(c.data)) || handsOver(c.data, depth + 1)))
@@ -259,12 +287,12 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   };
   // Every call that gets through, of those tried (passing); the first (tries).
   function* passing(target: string, value: bigint, templates: string[], withFixed: boolean, sameFunction = true, fixedRunsCalls = true) {
-    for (const batch of [false, true]) for (const t of templates) for (const data of variants(t, rules, withFixed)) {
+    for (const batch of [false, true]) for (const t of templates) for (const data of variants(t, rules, withFixed, { target, value, batch }, search)) {
       if (sameFunction && selectorOf(data) !== selectorOf(t)) continue;
       // An execute(…) on the account with data a caveat fixes runs only the calls fixed inside it: not a hand-over
       // unless one of those is. Simulated when it is the exact execution the preview runs, else said (unsimulated).
       if (!fixedRunsCalls && (fixed.has(data) || fixedData.has(data)) && RUNS_FIXED.has(selectorOf(data)) && !handsOver(data, 0)) {
-        if (!fixed.has(data) && passes(rules, { target, value, data, batch })) unsimulated.add(data);
+        if (!fixed.has(data) && passes(rules, { target, value, data, batch })) for (const c of innerCalls(data) ?? []) unsimulated.set(`${c.target}:${c.value}:${c.data}`, c);
         continue;
       }
       if (passes(rules, { target, value, data, batch })) yield data;
@@ -334,7 +362,14 @@ export function probe(rules: (Rule | null)[], account: string, manager: string, 
   // Any function on a target named.
   const free = named.filter(t => tries(t, 0n, [`0x5eedf00d${'0'.repeat(128)}`], false));
   if (free.length) out.anyFunction = free;
-  if (unsimulated.size) out.unsimulated = [...unsimulated];
+  // Exact executions the preview doesn't simulate (inside an OR), where the caveats let them through: what they do.
+  // (An execute(…) on the account among them is read above, by the calls inside it.)
+  for (const x of collect(rules, r => r.execs)) {
+    if (fixed.has(x.data) || (x.target === account && RUNS_FIXED.has(selectorOf(x.data)))) continue;
+    if ([false, true].some(batch => passes(rules, { ...x, batch }))) unsimulated.set(`${x.target}:${x.value}:${x.data}`, x);
+  }
+  if (unsimulated.size) out.unsimulated = [...unsimulated.values()];
+  if (search.incomplete) out.incomplete = true;
   return out;
 }
 

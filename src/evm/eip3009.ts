@@ -31,7 +31,7 @@ export const eip3009TxAdapter: Adapter = async (tx, env) => {
   // State and time as of the block it runs after: a replay's own block, else now (a past block's state would also
   // show its nonce unused, but only a replay names its time, so a past block alone skips the reads).
   const replay = env.context.replay;
-  const now = replay ? Number(replay.at.header.timestamp) * 1000 : env.context.now ?? Date.now();
+  const now = Math.floor(replay ? Number(replay.at.header.timestamp) * 1000 : env.context.now ?? Date.now());
   const readable = env.deps.rpc?.has(tx.chainId) && !replay && env.context.block === undefined;
   /** Whether the nonce is used or cancelled already (authorizationState); undefined when not read. */
   const used = async (authorizer: string, nonce: string) => {

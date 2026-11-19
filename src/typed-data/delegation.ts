@@ -23,7 +23,7 @@ import { decodeTransaction, normalizeTransaction, previewTransaction } from '../
 import type { ApprovalChange, AssetChange, Preview, TokenInfo } from '../types.ts';
 import { big, domainChainId, str, type TypedAdapter, type TypedEnv } from './common.ts';
 import { canMoveNow } from './exposure.ts';
-import { ATTACKER, batchRule, innerCalls, probe, ruleOf, type Rule } from './delegation-probe.ts';
+import { ATTACKER, batchRule, probe, ruleOf, type Rule } from './delegation-probe.ts';
 
 export const DELEGATION_MANAGER = '0xdb9b1e94b5b69df7e401ddbede43491141047db3';
 const ANY_DELEGATE = '0x0000000000000000000000000000000000000a11';
@@ -31,8 +31,12 @@ const ROOT_AUTHORITY = `0x${'f'.repeat(64)}`;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 /** An end (a timestamp, a block) this far off is none: 2^40 seconds is past the year 36,000. */
 const FAR = 1n << 40n;
-/** A total of native coin this large (10^10 coins of 18 decimals, past any chain's supply here) caps nothing, where the balance isn't read. */
-const NO_CAP = 10n ** 28n;
+/** A total of native coin this large (a million coins of 18 decimals) caps nothing in practice, where the balance isn't read. */
+const NO_CAP = 10n ** 24n;
+/** Scope caveats whose rules the probe models whole: a fixed transfer under these alone is all the delegation allows. */
+const MODELLED = new Set(['AllowedTargetsEnforcer', 'AllowedMethodsEnforcer', 'AllowedCalldataEnforcer', 'ExactCalldataEnforcer', 'ERC20TransferAmountEnforcer', 'ERC20StreamingEnforcer', 'ERC20PeriodTransferEnforcer']);
+/** Fixed calls decoded for delegation_unsimulated_calls; past these, the rest isn't read (a danger). */
+const UNSIMULATED_CALLS = 20;
 /** The addresses MetaMask redeems its users' permissions from (@metamask/7715-permission-types 2.0.0's METAMASK_FACILITATOR_ADDRESSES). */
 export const METAMASK_FACILITATORS = new Set(['0xb01caea8c6c47bbf4f4b4c5080ca642043359c2e', '0xc066ac5d385419b1a8c43a0e146fa439837a8b8c', '0xb42f812a44c22cc6b861478900401ee759ebead6']);
 const HEX = /^0x([0-9a-fA-F]{2})*$/;
@@ -351,6 +355,8 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   try { p = probe(rules, delegator, manager === DELEGATION_MANAGER ? DELEGATION_MANAGER : manager, { tokens: cappedTokens, simulated }); }
   catch { p = { control: ['what its caveats allow', "which this preview couldn't work out from them"] }; }
   const nativeTotal = known.some(r => r.nativeTotal);
+  // The smallest native total a caveat sets (in all, or per period).
+  const nativeCap = known.reduce<bigint | undefined>((m, r) => r.nativeTotal && r.native !== undefined && (m === undefined || r.native < m) ? r.native : m, undefined);
   // The smallest per-redemption cap on the account's own balance's fall (a cap on another address's balance is none).
   const perRedemption = known.reduce<bigint | undefined>((m, r) => r.nativePerRedemption !== undefined && r.balanceOf === delegator && (m === undefined || r.nativePerRedemption < m) ? r.nativePerRedemption : m, undefined);
   const full = !!p.control;
@@ -362,11 +368,14 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
   else if (!caveats.length) b.warn('danger', 'delegation_unrestricted', `It has no caveats: ${anyCall}, at any time, as often as wanted: move every token and coin it holds, approve spenders, change its owners. This is full control of the account. Don't sign it unless you mean to hand the account over.`);
   else if (full && !scopes.length) b.warn('danger', 'delegation_unrestricted', `None of its caveats restricts what is called: ${anyCall}${limits.length ? `, within these limits only: ${limits.join('; ')}` : ''}${unless}: move its other tokens and coin, approve spenders, change its owners.`);
   else if (full) b.warn('danger', 'delegation_unrestricted', `Its caveats let calls reach ${p.control![0]} (${p.control![1]}): through it, ${anyCall}${unless}: move every token and coin it holds, approve spenders, change its owners.`);
-  // Whether what it allows is only fixed: a transfer whose recipient and amount are pinned, once, and nothing else open.
+  // Whether what it allows is only fixed: a transfer whose recipient and amount are pinned, once, and nothing else
+  // open, under caveats the probe models whole (no OR groups, no exact executions), its search complete.
   let fixedOnly = false;
+  if (p.incomplete && root && !self && !full) b.warn('caution', 'delegation_search_partial', `Its caveats combine in more ways than this preview tries (OR groups whose combinations number more than 256, or calls too long to try them all): what ${who} can do by picking one group of each may be more than is shown.`);
   if (root && !self && !full) {
     // (Coin sent with a call to a contract named counts only where it lands: in a plain transfer or an EOA, below.)
-    fixedOnly = !p.native && !p.permit2 && !p.anyFunction?.length && !p.unsimulated?.length;
+    fixedOnly = !p.incomplete && !exact && !unknown.length && !rules.some(r => r?.groups) && scopes.every(r => MODELLED.has(r.name))
+      && !p.native && !p.permit2 && !p.anyFunction?.length && !p.unsimulated?.length;
     // Tokens moved or approved: on any token is the account's every token.
     if (p.tokens) {
       const to = p.tokens.recipient ? ` to ${shortAddress(p.tokens.recipient)} only` : ' to anyone';
@@ -375,7 +384,7 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
       const open = p.tokens.amount === null;
       const info = p.tokens.on?.length === 1 ? await token(p.tokens.on[0]) : undefined;
       const units = (v: bigint) => info ? `${formatUnits(v, info.decimals)} ${info.symbol}` : `${v} base units`;
-      if (p.tokens.recipient && p.tokens.amount !== null && p.tokens.on && (once || count === 1n)) {
+      if (p.tokens.recipient && p.tokens.amount !== null && p.tokens.on && (once || count === 1n) && !p.incomplete) {
         // A recipient and an amount pinned, once: a fixed transfer, in effect.
         b.warn('info', 'delegation_fixed_transfer', `${who} can call ${fns} on ${p.tokens.on.map(shortAddress).join(', ')}${to}, for ${units(p.tokens.amount)}, once.`);
       } else {
@@ -403,34 +412,45 @@ export const delegationAdapter: TypedAdapter = async (data, env) => {
     const fmt = (v: bigint) => `${formatUnits(v, CHAINS[chainId ?? 0]?.nativeDecimals ?? 18)} ${native}`;
     const each = (perCall: bigint | null) => { const c = [perCall, perRedemption].filter((x): x is bigint => x !== null && x !== undefined && !isUnlimited(x)).reduce<bigint | undefined>((a, x) => a === undefined || x < a ? x : a, undefined); return c === undefined ? '' : `, up to ${fmt(c)} each time`; };
     const often = bounded && times !== undefined ? `, ${times === 1n ? 'once' : `${times} times`}` : ', as many times as wanted';
-    if (p.native && !nativeTotal) {
+    if (p.native && nativeTotal && nativeCap !== undefined) {
+      // A total a caveat sets (in all or per period): no cap in practice past a million coins (with the balance unread)
+      // or past 2^128; a caution where it is as much as the account holds.
+      if (isUnlimited(nativeCap) || (balance === undefined && nativeCap >= NO_CAP)) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${often}: its caveats cap it at ${fmt(nativeCap)}, no cap in practice, so all of it${unless}.`);
+      else if (balance !== undefined && nativeCap >= balance) b.warn('caution', 'delegation_native_limited', `${who} can send your account's ${native} to any address: up to ${fmt(nativeCap)} as its caveats set it, as much as the ${fmt(balance)} you hold, so all of it${unless}.`);
+    } else if (p.native) {
       const limit = limitOf(p.native.perCall);
       if (limit === undefined) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: nothing caps the total, so all of it${unless}.`);
       else if (balance !== undefined && limit >= balance) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: up to ${fmt(limit)} in all, as much as the ${fmt(balance)} you hold, so all of it${unless}.`);
       else if (balance === undefined && limit >= NO_CAP) b.warn('danger', 'delegation_native_unlimited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: up to ${fmt(limit)} in all, no cap in practice, so all of it${unless}.`);
       else b.warn('caution', 'delegation_native_limited', `${who} can send your account's ${native} to any address${each(p.native.perCall)}${often}: up to ${fmt(limit)} in all${balance !== undefined ? ` of the ${fmt(balance)} you hold` : ' (what you hold wasn\'t read)'}${unless}.`);
-    } else if (p.nativeTo && !nativeTotal) {
+    } else if (p.nativeTo) {
       const eoa = async (a: string) => { try { return chainId !== null && !!env.deps.rpc?.has(chainId) && String(await env.deps.rpc.call(chainId, 'eth_getCode', [a, 'latest'])) === '0x'; } catch { return false; } };
-      const reach: { target: string; perCall: bigint | null }[] = [];
+      const reach: { target: string; perCall: bigint | null }[] = [], capped: { target: string; limit: bigint }[] = [];
       for (const r of p.nativeTo) {
-        const limit = limitOf(r.perCall);
-        if ((limit === undefined || limit >= (balance ?? NO_CAP)) && (r.plain || await eoa(r.target))) reach.push(r);
+        // Coin reaches a target named in a plain transfer, or one that is an EOA; one that isn't read could be one.
+        const isEoa = !r.plain && await eoa(r.target), read = chainId !== null && !!env.deps.rpc?.has(chainId);
+        if (r.plain || isEoa || !read) fixedOnly = false;
+        const limit = nativeTotal ? nativeCap : limitOf(r.perCall);
+        if ((r.plain || isEoa) && (limit === undefined || limit >= (balance ?? NO_CAP))) reach.push(r);
+        else if ((r.plain || isEoa) && limit !== undefined) capped.push({ target: r.target, limit });
       }
-      if (reach.length) fixedOnly = false;
+      if (!reach.length && capped.length) b.warn('info', 'delegation_native_to', `${who} can send up to ${capped.map(c => `${fmt(c.limit)} to ${shortAddress(c.target)}`).join(', ')} of your account's ${native}${often}.`);
       if (reach.length) b.warn('caution', 'delegation_native_unlimited', `${who} can send your account's ${native} to ${reach.map(r => shortAddress(r.target)).join(', ')}${each(reach.some(r => r.perCall === null) ? null : reach[0].perCall)}${often}: nothing caps the total below what you hold, so all of it${unless}.`);
     }
-    // Fixed calls through the account's own execute that aren't simulated: what they are, read as the account's calls.
+    // Fixed calls the preview doesn't simulate (an execute(…) on the account with fixed data, exact executions inside
+    // an OR): what they are, each read as the account's own transaction, with what its decoding warns of. Past
+    // UNSIMULATED_CALLS, the rest isn't read: a danger.
     if (p.unsimulated?.length) {
-      // Each call decoded as the account's own transaction; what its decoding warns of, said of it.
       const calls: string[] = [], inner: { severity: 'info' | 'caution' | 'danger'; code: string; message: string }[] = [];
-      for (const d of p.unsimulated.slice(0, 3)) for (const c of (innerCalls(d) ?? []).slice(0, 5)) {
+      for (const c of p.unsimulated.slice(0, UNSIMULATED_CALLS)) {
         try {
           const call = await decodeTransaction({ chainId: chainId ?? 1, from: delegator, to: c.target, data: c.data as Hex, value: c.value }, env.deps, { ...env.context, ...(chainId !== null && { chainId }) });
           calls.push(call.title);
           for (const w of call.b.warnings) if (w.severity !== 'info') inner.push(w);
         } catch { calls.push(`a call to ${shortAddress(c.target)}`); }
       }
-      b.warn('caution', 'delegation_unsimulated_calls', `${who} can have your account run fixed calls through its own execute that aren't simulated here (a caveat inside a LogicalOr, or an ExactCalldata, fixes them): ${calls.join('; ') || 'calls that don\'t read'}${often}${unless}.`);
+      const more = p.unsimulated.length - calls.length;
+      b.warn(more > 0 ? 'danger' : 'caution', 'delegation_unsimulated_calls', `${who} can have your account make fixed calls that aren't simulated here (exact calls inside a LogicalOr, or fixed data for your account's own execute): ${calls.join('; ') || 'calls that don\'t read'}${more > 0 ? `, and ${more} more not read` : ''}${often}${unless}.`);
       for (const w of inner) b.warn(w.severity, w.code, `A fixed call it allows: ${w.message}`);
     }
   }

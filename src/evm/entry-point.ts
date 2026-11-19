@@ -63,7 +63,9 @@ export const entryPointAdapter: Adapter = async (tx, env) => {
     inner.push(d);
     b.detail(`UserOperation ${i + 1}`, `from ${who}: ${d.title}`, sender);
     // (The caution that a run used the caller's state, from a Safe the operation's calls run execTransaction on, is said once.)
-    for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else if (w.severity !== 'info') b.warnings.push({ ...w, message: `UserOperation ${i + 1}: ${w.message}` });
+    // Another account's operation risks that account's assets, not the sender's: its warnings are said as information.
+    const own = sameAddress(sender, tx.from);
+    for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else if (w.severity !== 'info') b.warnings.push({ ...w, ...(!own && { severity: 'info' as const }), message: `UserOperation ${i + 1}${own ? '' : ` (${shortAddress(sender)}'s)`}: ${w.message}` });
   }
   const own = ops.filter(op => sameAddress(op.sender, tx.from)).length;
   if (own < ops.length) b.warn('info', 'erc4337_bundle', `This submits ${ops.length - own === 1 ? 'a UserOperation' : `${ops.length - own} UserOperations`} of other accounts, as a bundler does: you pay the gas now, and the EntryPoint refunds it to ${sameAddress(beneficiary, tx.from) ? 'you' : shortAddress(beneficiary)} from the accounts' deposits.`);

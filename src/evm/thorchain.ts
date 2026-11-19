@@ -79,7 +79,7 @@ export const thorchainAdapter: Adapter = async (tx, env) => {
   if (!known) b.warn('caution', 'thorchain_router_unknown', `${shortAddress(router)} takes a THORChain-style deposit but isn't THORChain's or Maya's router as known here: what it does with the deposit isn't known.`);
   if (native && tx.value === 0n) b.warn('info', 'thorchain_nothing_sent', 'It sends no coin: the router deposits what the transaction sends, whatever its amount says.');
   if (!native && tx.value > 0n) b.warn('info', 'thorchain_unexpected_coin', 'It sends coin with a token deposit: the router refuses it ("unexpected eth").');
-  const now = env.context.replay ? Number(env.context.replay.at.header.timestamp) * 1000 : env.context.now ?? Date.now();
+  const now = Math.floor(env.context.replay ? Number(env.context.replay.at.header.timestamp) * 1000 : env.context.now ?? Date.now());
   if (expiration !== undefined) {
     b.detail('Expires', expiration >= 1n << 40n ? 'never' : formatTimestamp(Number(expiration) * 1000), expiration.toString());
     if (expiration * 1000n <= BigInt(now)) b.warn('info', 'thorchain_expired', 'Its expiry has passed: the router refuses it.');

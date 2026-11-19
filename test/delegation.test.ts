@@ -391,3 +391,56 @@ test('ANY_DELEGATE for a fixed transfer only, once: a caution, not a danger (as 
   const open = await sign(delegation(ANY, [fixed[0], fixed[1], fixed[2], calldata(4, BOB.slice(2).padStart(64, '0')), until]));
   assert.equal(open.warnings.find(w => w.code === 'delegation_any_delegate')?.severity, 'danger');
 });
+
+test('Sixth review: ANY_DELEGATE with an OR, a search past 256 with decoys, exact calls in an OR, long fixed batches, native totals, slow pins', async () => {
+  const until = { enforcer: E.timestamp, terms: `0x${'0'.repeat(32)}${BigInt(NOW / 1000 + 86_400).toString(16).padStart(32, '0')}` };
+  const zero = { enforcer: E.valueLte, terms: `0x${word(0n)}` };
+  const EVIL = '0xe1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1';
+  const calldata = (start: number, value: string) => ({ enforcer: '0xc2b0d624c1c4319760c96503ba27c347f3260f55', terms: `0x${word(BigInt(start))}${value.replace(/^0x/, '')}` });
+  const or = (groups: { enforcer: string; terms: string }[][]) => ({ enforcer: '0xe1302607a3251af54c3a6e69318d6aa07f5eb46c', terms: encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'caveats', type: 'tuple[]', components: [{ name: 'enforcer', type: 'address' }, { name: 'terms', type: 'bytes' }, { name: 'args', type: 'bytes' }] }] }], [groups.map(g => ({ caveats: g.map(c => ({ ...c, args: '0x' })) })) as never]) });
+  const run = async (caveats: { enforcer: string; terms: string }[], delegate = BOB, balance?: bigint) => previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(delegation(delegate, [...caveats, until]))] }, { now: NOW, chainId: 1 }, {
+    tokens: new StaticTokenRegistry(),
+    ...(balance !== undefined && { rpc: { has: () => true, call: async (_c: number, method: string, params: unknown[]) => method === 'eth_getBalance' ? `0x${balance.toString(16)}` : method === 'eth_getCode' ? ((params[0] as string).toLowerCase() === USDC ? '0x6080' : '0x') : (params[0] as { data: string }).data.startsWith('0x70a08231') ? `0x${word(5_000_000_000n)}` : '0x' } }),
+  });
+  const severity = (p: Awaited<ReturnType<typeof run>>, code: string) => p.warnings.find(w => w.code === code)?.severity;
+  const once = { enforcer: E.limitedCalls, terms: `0x${word(1n)}` };
+  const fixedTransfer = [{ enforcer: E.targets, terms: USDC }, calldata(0, '0xa9059cbb'), calldata(4, `${BOB.slice(2).padStart(64, '0')}${word(1_000_000n)}`)];
+  // ANY_DELEGATE stays a danger when another OR group allows what the probe doesn't model (an NFT to anyone).
+  const nft = { enforcer: '0x3790e6b7233f779b09da74c72b6e94813925b9af', terms: `0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d${word(1234n)}` };
+  assert.equal(severity(await run([once, or([fixedTransfer, [nft]])], ANY), 'delegation_any_delegate'), 'danger');
+  // (With an RPC that reads USDC as a contract; without one, coin sent with the call might reach an EOA: a danger.)
+  assert.equal(severity(await run([once, ...fixedTransfer], ANY, 10n ** 18n), 'delegation_any_delegate'), 'caution');
+  assert.equal(severity(await run([once, ...fixedTransfer], ANY), 'delegation_any_delegate'), 'danger');
+  // Past 256 combinations the search says it is partial, and a decoy group (pins close to the call, another target) doesn't hide the open one.
+  const approveOnly = { enforcer: E.methods, terms: toFunctionSelector('function approve(address,uint256)') };
+  const decoys = (n: number, at: number) => Array.from({ length: n }, (_, i) => [calldata(at, word(BigInt(i + 1))), { enforcer: E.targets, terms: '0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a' }]);
+  const spender = or([[calldata(4, EVIL.slice(2).padStart(64, '0')), { enforcer: E.targets, terms: USDC }], ...decoys(16, 4)]);
+  const amount = or([[calldata(36, word((1n << 256n) - 1n))], ...decoys(16, 36)]);
+  const searched = await run([approveOnly, spender, amount, zero]);
+  assert.equal(severity(searched, 'delegation_search_partial'), 'caution');
+  assert.match(searched.warnings.find(w => w.code === 'delegation_any_function')?.message ?? '', /approve on 0xa0b8…eb48.* for any amount/);
+  // An exact execution inside an OR, on a token: its call is named.
+  const drain = encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [EVIL, 5_000_000_000n] });
+  const benign = [{ enforcer: E.targets, terms: '0x4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a' }, calldata(0, '0xdeadbeef'), zero];
+  assert.match((await run([or([benign, [{ enforcer: E.exact, terms: `0x${USDC.slice(2)}${word(0n)}${drain.slice(2)}` }]])])).warnings.find(w => w.code === 'delegation_unsimulated_calls')?.message ?? '', /Send 5,000 USDC/);
+  // A fixed batch through the account's execute: every call read, its warnings carried; past 20, a danger.
+  const call = (target: string, data: string) => ({ target: target as `0x${string}`, value: 0n, callData: data as `0x${string}` });
+  const harmless = call(USDC, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB, 1n] }));
+  const approveAll = call('0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d', encodeFunctionData({ abi: parseAbi(['function setApprovalForAll(address,bool)']), args: [EVIL, true] }));
+  const batch = (calls: ReturnType<typeof call>[]) => encodeFunctionData({ abi: parseAbi(['function execute(bytes32,bytes)']), args: [`0x01${'0'.repeat(62)}`, encodeAbiParameters([{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'callData', type: 'bytes' }] }], [calls])] });
+  const exactData = (d: string) => ({ enforcer: '0x99f2e9bf15ce5ec84685604836f71ab835dbbded', terms: d });
+  const own = { enforcer: E.targets, terms: ALICE.toLowerCase() };
+  assert.ok(codes(await run([exactData(batch([harmless, harmless, harmless, harmless, harmless, approveAll])), own])).includes('approval_for_all'));
+  assert.equal(severity(await run([exactData(batch(Array.from({ length: 22 }, (_, i) => call(USDC, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB, BigInt(i + 1)] }))))), own]), 'delegation_unsimulated_calls'), 'danger');
+  // A native total caveat: a caution where it is all the account holds, a danger past a million coins unread.
+  const plain = exactData('0x');
+  const total = (v: bigint) => ({ enforcer: '0xf71af580b9c3078fbc2bbf16fbb8eed82b330320', terms: `0x${word(v)}` });
+  assert.equal(severity(await run([plain, total(10n ** 21n)], BOB, 10n ** 20n), 'delegation_native_limited'), 'caution');
+  assert.equal(severity(await run([plain, total(10n ** 30n)]), 'delegation_native_unlimited'), 'danger');
+  assert.equal(severity(await run([plain, { enforcer: E.valueLte, terms: `0x${word(10n ** 26n)}` }, { enforcer: E.limitedCalls, terms: `0x${word(10n)}` }]), 'delegation_native_unlimited'), 'danger');
+  // A long pin with many OR groups stays fast.
+  const started = Date.now();
+  const ors = Array.from({ length: 8 }, () => or(Array.from({ length: 17 }, (_, i) => [calldata(36 + 32 * (i % 4), word(BigInt(i)))])));
+  await run([calldata(4, 'ab'.repeat(65_536)), ...ors]);
+  assert.ok(Date.now() - started < 3_000, `took ${Date.now() - started} ms`);
+});

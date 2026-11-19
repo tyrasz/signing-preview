@@ -148,8 +148,11 @@ export async function decodeTransaction(tx: Tx, deps: Dependencies, context: Pre
   // A call to your own account in the transaction that delegates it runs the new delegate's code: decode against that.
   const delegate = tx.to && sameAddress(tx.to, tx.from) && deps.abis ? await ownDelegateAfter(tx) : undefined;
   const env = { deps: delegate ? { ...deps, abis: delegatedAbis(deps.abis!, tx.from, delegate) } : deps, context };
+  // An ERC-8021 attribution at the end is the app's or wallet's, which the contract ignores: the call is read without it.
+  const attribution = tx.to ? readAttribution(tx.data) : undefined;
+  const call = attribution ? { ...tx, data: tx.data.slice(0, tx.data.length - attribution.bytes * 2) as `0x${string}` } : tx;
   for (const adapter of ADAPTERS) {
-    const result = await adapter(tx, env);
+    const result = await adapter(call, env);
     if (result) return result;
   }
   throw new Error('no decoder answered');

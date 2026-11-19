@@ -95,3 +95,25 @@ test("wallet_sendCalls' dataSuffix capability: the suffix is appended to each ca
   assert.equal(ran[0], `${plain}${codes0.slice(2)}`);
   await assert.rejects(previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: USDC, data: plain }], capabilities: { dataSuffix: { value: 'nope' } } }] }, { now: NOW }, d), /dataSuffix/);
 });
+
+test('Sixth review: a dataSuffix is not appended to a call without data; an attribution does not hide an ABI-decoded call; a bundler is told of the operation as information', async () => {
+  const codes0 = '0x626173656170702c6d6f7270686f0e0080218021802180218021802180218021';
+  const plain = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: BOB, value: '0x29a2241af62c0000' }], capabilities: { dataSuffix: { value: encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), args: [BOB as Hex, 1n] }) } } }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  assert.equal(plain.title, 'Send 3 ETH');
+  const VAULT = '0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a';
+  const abi = parseAbi(['function transferOwnership(address newOwner)']);
+  const d: Dependencies = { tokens: new StaticTokenRegistry(), abis: { resolve: async (_c, a) => a.toLowerCase() === VAULT ? { abi, name: 'Vault', source: 'sourcify', verified: true } : null } };
+  const owner = encodeFunctionData({ abi, args: [BOB as Hex] });
+  const tagged = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: VAULT, data: `${owner}${codes0.slice(2)}`, chainId: '0x1' }] }, { now: NOW }, d);
+  assert.equal(tagged.title, 'Call transferOwnership on Vault');
+  assert.ok(codes(tagged).includes('sensitive_function'));
+  // A bundler submitting another account's setApprovalForAll: its warning is about that account.
+  const V06 = '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789';
+  const OP = parseAbi(['function handleOps((address sender, uint256 nonce, bytes initCode, bytes callData, uint256 callGasLimit, uint256 verificationGasLimit, uint256 preVerificationGas, uint256 maxFeePerGas, uint256 maxPriorityFeePerGas, bytes paymasterAndData, bytes signature)[] ops, address beneficiary)']);
+  const approveAll = encodeFunctionData({ abi: parseAbi(['function setApprovalForAll(address,bool)']), args: [BOB as Hex, true] });
+  const call = encodeFunctionData({ abi: parseAbi(['function execute(address dest, uint256 value, bytes func)']), args: ['0xbc4ca0eda7647a8ab7c2061c2e118a18a936f13d', 0n, approveAll] });
+  const data = encodeFunctionData({ abi: OP, functionName: 'handleOps', args: [[{ sender: ALICE as Hex, nonce: 0n, initCode: '0x', callData: call, callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 1n, paymasterAndData: '0x', signature: '0x' }], FACILITATOR as Hex] });
+  const bundle = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: FACILITATOR, to: V06, data, chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
+  assert.equal(bundle.warnings.find(w => w.code === 'approval_for_all')?.severity, 'info');
+  assert.notEqual(bundle.attention, 'danger');
+});
