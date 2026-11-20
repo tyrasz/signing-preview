@@ -39,7 +39,8 @@
 //
 // The signer isn't on the chain: it is the account itself for an EIP-7702 account, else whoever the operation's
 // real signature recovers to (its last 65 bytes, or a Coinbase Smart Wallet's wrapped one), over the personal_sign
-// form or the bare hash, or the account's owner(); tried in turn while the account rejects the stand-in as theirs.
+// form or the bare hash, or the account's owner(); tried in turn while the account rejects the stand-in as theirs
+// (the first three, then the account itself).
 // Public RPCs keep only recent state (Ethereum about 128 blocks, Arbitrum about 30 seconds): --follow replays each
 // new block's operations as it arrives. HyperEVM's public RPC serves only the latest state, so it can't be replayed.
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -53,7 +54,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { headerOf, stateBefore, type BlockAt, type RpcHeader } from '../src/block.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, ORDINARY_GAS_CAP, SHRINCS_IMPLEMENTATIONS, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, OKX_FACTORY, OKX_IMPLEMENTATION, ORDINARY_GAS_CAP, SHRINCS_IMPLEMENTATIONS, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SUPER_TX_ARRAY_TYPEHASH } from '../src/supertransaction.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
@@ -719,10 +720,21 @@ async function replay(item: string): Promise<void> {
   }
   const owner = String(await atParent.call(CHAIN, 'eth_call', [{ to: sender, data: '0x8da5cb5b' }, 'latest']).catch(() => '0x'));
   if (/^0x0{24}[0-9a-f]{40}$/i.test(owner)) add(`0x${owner.slice(26)}`.toLowerCase());
-  // Quip's ShrincsWallet: its owner() signs the ECDSA half of a 3 KB signature, the rest of whose bytes recover as
-  // junk addresses, three of which were tried before it (Base, 2026-11-19: three operations shown rejecting the
-  // stand-in, 33-44% low, where asked of owner() it validates). Its owner first.
-  if (/^0x0{24}[0-9a-f]{40}$/i.test(owner) && SHRINCS_IMPLEMENTATIONS.has(await implementationOf(deps, CHAIN, sender) ?? '')) { const o = `0x${owner.slice(26)}`.toLowerCase(), i = signers.indexOf(o); if (i >= 0) signers.splice(i, 1); signers.unshift(o); }
+  // Long signatures yield junk candidates: addresses read from bytes that happen to parse as a signature. Three are
+  // tried, and the right one came after them for two kinds of account, whose own code says who signs (looked up only
+  // where the candidates are that many, or the account has an owner()):
+  // - Quip's ShrincsWallet: its owner() signs the ECDSA half of a 3 KB signature (Base, 2026-11-19: three operations
+  //   shown rejecting the stand-in, 33-44% low, where asked of owner() it validates). Its owner first.
+  // - OKX Wallet's account signed by a passkey (any signature but its 103-byte Ethereum key's, whose key is put first
+  //   above): a passkey wallet signs as the account itself, which is asked first. On BNB Chain (2026-11-20) 2 of 8
+  //   such operations were shown rejecting the stand-in, 2.3% low, the account never asked; a key of OKX's passkey
+  //   verifier's type carries a cosigner's real signature too, whose address was asked before it.
+  const owned = /^0x0{24}[0-9a-f]{40}$/i.test(owner);
+  const runs = owned || signers.length >= 3 ? await implementationOf(deps, CHAIN, sender) : undefined;
+  const first = (a: string) => { const i = signers.indexOf(a); if (i >= 0) signers.splice(i, 1); signers.unshift(a); };
+  if (owned && SHRINCS_IMPLEMENTATIONS.has(runs ?? '')) first(`0x${owner.slice(26)}`.toLowerCase());
+  // (An account its operation deploys has no code yet: its factory says whose it is.)
+  if ((runs === OKX_IMPLEMENTATION || op.initCode.toLowerCase().startsWith(OKX_FACTORY)) && op.signature.length !== 2 + 206) first(sender);
   // First, a Kernel permission's recorded owner (whose signature recovers to someone else).
   const recorded = code.length > 2 && !module ? await permissionOwner((to, data) => atParent.call(CHAIN, 'eth_call', [{ to, data }, 'latest']) as Promise<string>, sender, BigInt(op.nonce)) : undefined;
   if (recorded) { const i = signers.indexOf(recorded); if (i >= 0) signers.splice(i, 1); signers.unshift(recorded); }
@@ -736,7 +748,11 @@ async function replay(item: string): Promise<void> {
   // preview then has no simulation at all, and runs again without them.
   const ran = (q: Preview) => q.decoding.notes.some(x => /simulat/.test(x)) || q.details.some(d => d.label === 'Gas cost (simulated)');
   let prefixDropped: string | undefined;
-  for (const signer of signers.slice(0, 3)) {
+  // The first three candidates, then the account itself if it wasn't one of them: a passkey wallet of any kind signs
+  // as the account, whatever its signature's bytes recover as.
+  const candidates = signers.slice(0, 3);
+  if (!candidates.includes(sender)) candidates.push(sender);
+  for (const signer of candidates) {
     tried++;
     p = await previewOf(request(signer));
     if (!ran(p) && prefix === ownBefore && pricedBefore) { prefix = pricedBefore; p = await previewOf(request(signer)); }

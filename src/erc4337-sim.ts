@@ -1475,6 +1475,8 @@ async function coinbaseCopyStub(c: StubContext, runs?: string, factory?: string,
   if (at.toLowerCase() !== c.sender.toLowerCase()) return undefined;
   return [{ ...(await coinbaseFor([...owners], c)), note: coinbaseCopyNote(implementation, 'deploying') }];
 }
+/** OKX Wallet's account factory: an operation deploying an account names it in its initCode. */
+export const OKX_FACTORY = '0x5c328f3b5f117ffc693378a2c5b16c4f80f86295';
 /** Stand-ins for accounts a factory is deploying in the operation, by factory (their code doesn't exist yet). */
 const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promise<Stub | Stub[]>> = {
   // Coinbase Smart Wallet's factories (v1 and v1.1).
@@ -1523,7 +1525,7 @@ const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promis
     return { signature: STUB_SIGNATURE };
   },
   // OKX Wallet's account factory (see okxStubs).
-  '0x5c328f3b5f117ffc693378a2c5b16c4f80f86295': okxDeployStub,
+  [OKX_FACTORY]: okxDeployStub,
   // Biconomy's NexusAccountFactory (verified on Sourcify), whose accounts run Nexus 1.2 (its ACCOUNT_IMPLEMENTATION,
   // an immutable of its code, the same on the six chains here): see nexusDeployStub.
   '0x0000006648ed9b2b842552be63af870bc74af837': nexusDeployStub,
