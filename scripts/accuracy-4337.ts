@@ -748,6 +748,8 @@ async function replay(item: string): Promise<void> {
   // preview then has no simulation at all, and runs again without them.
   const ran = (q: Preview) => q.decoding.notes.some(x => /simulat/.test(x)) || q.details.some(d => d.label === 'Gas cost (simulated)');
   let prefixDropped: string | undefined;
+  let prefixUnpriced = false;
+  const earlierUnpaid = (q: Preview) => q.warnings.some(w => w.code === 'userop_simulation_failed' && /insufficient funds for gas \* price \+ value/.test(w.message));
   // The first three candidates, then the account itself if it wasn't one of them: a passkey wallet of any kind signs
   // as the account, whatever its signature's bytes recover as.
   const candidates = signers.slice(0, 3);
@@ -757,6 +759,14 @@ async function replay(item: string): Promise<void> {
     p = await previewOf(request(signer));
     if (!ran(p) && prefix === ownBefore && pricedBefore) { prefix = pricedBefore; p = await previewOf(request(signer)); }
     if (!ran(p) && (prefix === pricedBefore || prefix === ownBefore)) { prefix = before; p = await previewOf(request(signer)); }
+    // The whole operation's run refused for an earlier transaction that can't pay ("insufficient funds for gas * price
+    // + value"), where its calls alone ran: the stand-ins for the signature change what the block's earlier
+    // transactions cost too (a call to ecrecover goes on to the precompile at another address, cold for them: 2,900
+    // gas more each). On Ethereum (block 26,454,693) a payout checked against several signatures, 169,256 gas of its
+    // 191,339, ran out of gas so, and the transfer its sender made next had nothing to send: the node refused the
+    // block, for two operations after it (and for two in a block the day before). Then the earlier transactions
+    // without gas limits or prices, which such a one gets through on.
+    if (earlierUnpaid(p) && (prefix === pricedBefore || prefix === ownBefore)) { prefix = before; prefixUnpriced = true; p = await previewOf(request(signer)); }
     // Then with only the account's own and the other bundles among them, then with none.
     const narrow = async (why: string) => {
       if (related.length > essential.length && related.length < prefix.length) { prefix = related; prefixDropped = `${why}: only the account's own and the other bundles ran first`; p = await previewOf(request(signer)); return; }
@@ -964,7 +974,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && !state && { leftOut }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && !state && { leftOut }), ...(prefixUnpriced && !prefixDropped && { prefixUnpriced }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
@@ -1101,6 +1111,7 @@ console.log('');
 say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle, ${count(bundled)} in bundles of several) of EntryPoint v${VERSION} on ${chainName(CHAIN)}${range.length ? ` (blocks ${range[0]}-${range.at(-1)})` : ''}, replayed on the state before them${PREFIX ? ' (after their block\'s earlier transactions)' : ''}:`);
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 if (PREFIX && count(r => !!r.leftOut)) say(`  (for ${count(r => !!r.leftOut)}, of more than 400 earlier transactions in the block only the last 400 and those that logged the bundle's contracts' events ran first: ${rows.reduce((sum, r) => sum + Number(r.leftOut ?? 0), 0)} left out)`);
+if (PREFIX && count(r => !!r.prefixUnpriced)) say(`  (for ${count(r => !!r.prefixUnpriced)}, the block's earlier transactions ran without their gas limits and prices: with the signature's stand-ins in place one of them couldn't pay on its own limit)`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | not whole, the node failed it ${count(r => !!r.nodeFailed)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 if (count(r => !!r.session)) say(`  session keys' operations (SmartSession): ${count(r => !!r.session)} (${['OwnableValidator', 'K1MeeValidator'].map(v => `through ${v} ${count(r => r.sessionValidator === v)}`).join(', ')}), the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
 if (count(r => !!r.meeOwner)) say(`  owners' operations through their own K1MeeValidator in simple mode (Biconomy Nexus): ${count(r => !!r.meeOwner)}, the stand-in validated for ${count(r => !!r.meeOwner && r.standIn === 'validated')}`);
