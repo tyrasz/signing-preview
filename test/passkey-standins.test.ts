@@ -520,11 +520,12 @@ test('Circle’s modular wallet: its weighted multisig plugin’s 65-byte parts 
   const key = (address: string, weight: bigint) => ({ id: id30(address), data: { weight, credType: 1, addr: address as Hex, publicKeyX: 0n, publicKeyY: 0n } });
   let owners = [passkey(1n)], threshold = 1n;
   const HASH = `0x${'4a'.repeat(32)}` as Hex, callData = '0x34fcd5be' as Hex, nonce = 5n;
+  const NEW = '0x00000000000000000000000000000000c1c1e0a1', FACTORY = '0x0000000df7e6c9dc387cafc5ecbfa6c3a6179add';
   const rpc = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
     if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
     if (method === 'eth_maxPriorityFeePerGas') return '0x0';
     if (method === 'eth_getLogs') return [];
-    if (method === 'eth_getCode') return '0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3';
+    if (method === 'eth_getCode') return (params[0] as string).toLowerCase() === NEW ? '0x' : '0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3';
     if (method === 'eth_getStorageAt') return `0x${MSCA.slice(2).padStart(64, '0')}`;
     if (method === 'eth_call') {
       const { to } = params[0] as { to: string };
@@ -533,10 +534,10 @@ test('Circle’s modular wallet: its weighted multisig plugin’s 65-byte parts 
     }
     throw new Error(`unexpected ${method}`);
   } };
-  const first = async (signer?: string) => {
+  const first = async (signer?: string, sender = SENDER, initCode: Hex = '0x') => {
     const tried: SimulationRequest[] = [];
     const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return { status: 'reverted' as const, returnData: concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA24 signature error'])]), transfers: [] }; } };
-    const run = await simulateOperation({ chainId: 8453, entryPoint: EP, sender: SENDER, nonce, initCode: '0x', callData, callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x', ...(signer && { signer }) }, { rpc, simulator } as never);
+    const run = await simulateOperation({ chainId: 8453, entryPoint: EP, sender, nonce, initCode, callData, callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x', ...(signer && { signer }) }, { rpc, simulator } as never);
     const { args } = decodeFunctionData({ abi: parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]), data: tried[0].data as Hex });
     return { signature: (args[0] as { signature: Hex }).signature.slice(2), overrides: tried[0].stateOverrides ?? {}, note: run?.note, why: run?.why };
   };
@@ -581,6 +582,24 @@ test('Circle’s modular wallet: its weighted multisig plugin’s 65-byte parts 
   // Weights that can't reach the threshold: the plain stand-in.
   threshold = 5n;
   assert.equal(`0x${(await first(KEY)).signature}`, STUB_SIGNATURE);
+
+  // An account Circle's factory deploys in the operation: its owners from what the factory installs the plugin with
+  // (a key of weight 1, a passkey of weight 1, threshold 2). The passkey's id is the last 30 bytes of the hash of its
+  // key; the minimal digest has the operation's initCode in it.
+  const X = 11n, Y = 12n;
+  const install = encodeAbiParameters([{ type: 'address[]' }, { type: 'uint256[]' }, { type: 'tuple[]', components: [{ name: 'x', type: 'uint256' }, { name: 'y', type: 'uint256' }] }, { type: 'uint256[]' }, { type: 'uint256' }], [[KEY], [1n], [{ x: X, y: Y }], [1n], 2n]);
+  const initCode = concatHex([FACTORY, encodeFunctionData({ abi: parseAbi(['function createAccount(bytes32 sender, bytes32 salt, bytes initializingData)']), functionName: 'createAccount',
+    args: [`0x${'00'.repeat(32)}`, `0x${'00'.repeat(32)}`, encodeAbiParameters([{ type: 'address[]' }, { type: 'bytes32[]' }, { type: 'bytes[]' }], [[PLUGIN], [`0x${'ab'.repeat(32)}`], [install]])] })]);
+  const id = keccak256(encodeAbiParameters([{ type: 'uint256' }, { type: 'uint256' }], [X, Y])).slice(6);
+  const deployed = await first(KEY, NEW, initCode);
+  assert.equal(deployed.signature.slice(0, 260), `${STUB_SIGNATURE.slice(2, 130)}3c0000${id}${'82'.padStart(64, '0')}02`);
+  const minimalNew = hashMessage({ raw: keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
+    [NEW, nonce, keccak256(initCode), keccak256(callData), `0x${'00'.repeat(32)}`, 0n, `0x${'00'.repeat(32)}`, keccak256('0x')])), EP as Hex, 8453n])) });
+  assert.match(assertion(deployed.signature.slice(260 + 64)).webAuthnData.clientDataJSON, new RegExp(`"challenge":"${b64(minimalNew)}"`));
+  // Another plugin in the factory's data: nothing known of its form, the plain stand-in.
+  const otherPlugin = concatHex([FACTORY, encodeFunctionData({ abi: parseAbi(['function createAccount(bytes32 sender, bytes32 salt, bytes initializingData)']), functionName: 'createAccount',
+    args: [`0x${'00'.repeat(32)}`, `0x${'00'.repeat(32)}`, encodeAbiParameters([{ type: 'address[]' }, { type: 'bytes32[]' }, { type: 'bytes[]' }], [[OTHER], [`0x${'ab'.repeat(32)}`], [install]])] })]);
+  assert.equal(`0x${(await first(KEY, NEW, otherPlugin)).signature}`, STUB_SIGNATURE);
 });
 
 test('Exa’s account (Modular Account v1, Exactly’s WebauthnOwnerPlugin): the owner’s index, then a passkey’s WebAuthn assertion or an address owner’s signature, which its real code checks', async () => {

@@ -1602,6 +1602,8 @@ async function coinbaseCopyStub(c: StubContext, runs?: string, factory?: string,
 export const OKX_FACTORY = '0x5c328f3b5f117ffc693378a2c5b16c4f80f86295';
 /** Stand-ins for accounts a factory is deploying in the operation, by factory (their code doesn't exist yet). */
 const FACTORY_STUBS: Record<string, (c: StubContext, factoryData: Hex) => Promise<Stub | Stub[]>> = {
+  // Circle's modular wallet being deployed: its owners from the factory's data (circleDeployStub).
+  '0x0000000df7e6c9dc387cafc5ecbfa6c3a6179add': (c, factoryData) => circleDeployStub(c, factoryData),
   // Coinbase Smart Wallet's factories (v1 and v1.1).
   '0x0ba5ed0c6aa8c49038f819e587e2633c4a9f428a': coinbaseDeployStub, '0xba5ed110efdba3d005bfc882d75358acbbb85842': coinbaseDeployStub,
   // Alchemy's Modular Account v2 factory: createAccount (a ModularAccount with its single-signer validation) and
@@ -2783,20 +2785,46 @@ const CIRCLE_WEBAUTHN_PART = [{ type: 'tuple', components: [{ name: 'webAuthnDat
  *   owners can sign before the gas is settled.
  * The stand-in: the signer's part over the operation's own digest (a passkey's where the account itself is asked and
  * has one), and other owners' over the minimal one, the lowest ids first, as many as it takes with the signer's
- * weight. Owners are read from the plugin (ownershipInfoOf); the plain stand-in where they aren't, or the weights
- * can't reach the threshold. A passkey wallet of this kind on Base (2026-11-23) refused the plain stand-in, 2% low.
+ * weight. Owners are read from the plugin (ownershipInfoOf), or for an account its factory is deploying from the
+ * factory's data (circleDeployStub); the plain stand-in where they aren't, or the weights can't reach the threshold.
+ * A passkey wallet of this kind on Base (2026-11-23) refused the plain stand-in, 2% low.
  */
 async function circleMscaStub(c: StubContext): Promise<Stub[]> {
-  const plain: Stub[] = [{ signature: STUB_SIGNATURE }];
   const rpc = c.deps.rpc;
-  if (!rpc?.has(c.chainId)) return plain;
+  if (!rpc?.has(c.chainId)) return [{ signature: STUB_SIGNATURE }];
   try {
-    const hash = await c.hash();
-    if (!hash) return plain;
     const [ids, data, meta] = decodeFunctionResult({ abi: CIRCLE_OWNERS, functionName: 'ownershipInfoOf',
       data: String(await rpc.call(c.chainId, 'eth_call', [{ to: CIRCLE_WEIGHTED_PLUGIN, data: encodeFunctionData({ abi: CIRCLE_OWNERS, functionName: 'ownershipInfoOf', args: [c.sender as Hex] }) }, 'latest'])) as Hex });
-    const owners = ids.map((id, i) => ({ id: BigInt(id), weight: data[i].weight, passkey: data[i].credType === 0, address: data[i].addr.toLowerCase() }));
-    const threshold = meta.thresholdWeight;
+    return await circleStub(c, ids.map((id, i) => ({ id: BigInt(id), weight: data[i].weight, passkey: data[i].credType === 0, address: data[i].addr.toLowerCase() })), meta.thresholdWeight, '0x');
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
+/** Circle's account factory (UpgradableMSCAFactory, verified on Sourcify: it deploys CIRCLE_MSCA and allows CIRCLE_WEIGHTED_PLUGIN). */
+export const CIRCLE_MSCA_FACTORY = '0x0000000df7e6c9dc387cafc5ecbfa6c3a6179add';
+const CIRCLE_CREATE = parseAbi(['function createAccount(bytes32 sender, bytes32 salt, bytes initializingData)']);
+/**
+ * An account Circle's factory is deploying: its owners from what the factory installs the plugin with. The factory's
+ * data is abi.encode(address[] plugins, bytes32[] manifestHashes, bytes[] pluginInstallData), and the plugin's
+ * abi.encode(address[] owners, uint256[] weights, (x, y)[] passkeys, uint256[] passkeyWeights, uint256 threshold).
+ * An address's id is the address; a passkey's, the last 30 bytes of keccak256(abi.encode(x, y)). (From the factory's
+ * and the plugin's sources: no deployment came by to replay, none in Base's last 400,000 blocks on 2026-11-23.)
+ */
+async function circleDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> {
+  try {
+    const [plugins, , installs] = decodeAbiParameters(parseAbiParameters('address[], bytes32[], bytes[]'), decodeFunctionData({ abi: CIRCLE_CREATE, data: factoryData }).args[2]);
+    const at = plugins.findIndex(p => p.toLowerCase() === CIRCLE_WEIGHTED_PLUGIN);
+    if (at < 0) return [{ signature: STUB_SIGNATURE }];
+    const [addresses, weights, keys, keyWeights, threshold] = decodeAbiParameters([{ type: 'address[]' }, { type: 'uint256[]' }, { type: 'tuple[]', components: [{ name: 'x', type: 'uint256' }, { name: 'y', type: 'uint256' }] }, { type: 'uint256[]' }, { type: 'uint256' }], installs[at]);
+    const owners = [...addresses.map((a, i) => ({ id: BigInt(a), weight: weights[i] ?? 0n, passkey: false, address: a.toLowerCase() })),
+      ...keys.map((k, i) => ({ id: BigInt(keccak256(encodeAbiParameters(parseAbiParameters('uint256, uint256'), [k.x, k.y]))) & ((1n << 240n) - 1n), weight: keyWeights[i] ?? 0n, passkey: true, address: `0x${'00'.repeat(20)}` }))];
+    return await circleStub(c, owners, threshold, concatHex([CIRCLE_MSCA_FACTORY, factoryData]));
+  } catch { return [{ signature: STUB_SIGNATURE }]; }
+}
+/** The stand-in for a Circle modular wallet with these owners and threshold (see circleMscaStub); `initCode` is the operation's. */
+async function circleStub(c: StubContext, owners: { id: bigint; weight: bigint; passkey: boolean; address: string }[], threshold: bigint, initCode: Hex): Promise<Stub[]> {
+  const plain: Stub[] = [{ signature: STUB_SIGNATURE }];
+  {
+    const hash = await c.hash();
+    if (!hash) return plain;
     if (!owners.length || threshold === 0n) return plain;
     const signer = c.signer.toLowerCase(), itself = signer === c.sender.toLowerCase();
     // Who sends it: the owner whose address is the signer's; the account's passkey where the account itself is asked.
@@ -2813,7 +2841,7 @@ async function circleMscaStub(c: StubContext): Promise<Stub[]> {
     // What each signs: the operation's hash, and its hash with the gas fields zeroed and no paymaster, each in EIP-191 form.
     const zero = `0x${'00'.repeat(32)}` as Hex;
     const minimalHash = keccak256(encodeAbiParameters(parseAbiParameters('bytes32, address, uint256'), [keccak256(encodeAbiParameters(parseAbiParameters('address, uint256, bytes32, bytes32, bytes32, uint256, bytes32, bytes32'),
-      [c.sender as Hex, c.nonce, keccak256('0x'), keccak256(c.callData ?? '0x'), zero, 0n, zero, keccak256('0x')])), getAddress(c.entryPoint ?? '0x0000000071727de22e5e9d8baf0edac6f37da032'), BigInt(c.chainId)]));
+      [c.sender as Hex, c.nonce, keccak256(initCode), keccak256(c.callData ?? '0x'), zero, 0n, zero, keccak256('0x')])), getAddress(c.entryPoint ?? '0x0000000071727de22e5e9d8baf0edac6f37da032'), BigInt(c.chainId)]));
     const actual = hashMessage({ raw: hash }), minimal = hashMessage({ raw: minimalHash });
     // Each part, by its owner's id: what the 65 bytes are (the offset filled in below), and a passkey's assertion.
     const cosigners: Cosigner[] = [];
@@ -2840,7 +2868,7 @@ async function circleMscaStub(c: StubContext): Promise<Stub[]> {
     return [{ signature: concatHex([...head, ...tail]), ...(tail.length && { p256: true as const }), ...(cosigners.length && { cosigners }),
       ...(mine && others.length && { note: `The account validates this operation through Circle's weighted multisig plugin (${shortAddr(CIRCLE_WEIGHTED_PLUGIN)}), which takes its owners' signatures until their weights reach ${threshold}. The signer's is ${mine.weight}, so ${others.length === 1 ? `another owner (${named(others[0])})` : `other owners (${others.map(named).join(', ')})`}, or others of as much weight, must sign it too before any bundler can include it: ${others.length === 1 ? 'that signature was' : 'those signatures were'} stood in for here.` }),
       ...(!mine && { why: `Circle's weighted multisig plugin (${shortAddr(CIRCLE_WEIGHTED_PLUGIN)}) takes the signatures of the account's owners (${owners.map(o => (o.passkey ? 'a passkey' : shortAddr(o.address))).join(', ')}), and the signer asked isn't one of them${owners.some(o => o.passkey) ? ' (a passkey wallet signs as the account itself)' : ''}` }) }];
-  } catch { return plain; }
+  }
 }
 /** The relying party a Circle passkey stand-in names (its hash is in the assertion; the plugin doesn't check it). */
 const CIRCLE_RP_ID = 'modularwallets.circle.com';
