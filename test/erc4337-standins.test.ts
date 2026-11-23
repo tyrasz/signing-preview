@@ -396,6 +396,71 @@ test('Kernel v3 on ZeroDev’s weighted ECDSA validator: other guardians’ appr
   assert.equal(tried[0], concatHex([stubSignature(1), stubSignature(2), STUB_SIGNATURE]));
 });
 
+test('Kernel v3 on ZeroDev’s weighted validator with typed guardians: an array of indexed signatures, other guardians’ approvals first, then the signer’s', async () => {
+  // Sepolia, 2026-11-23: an account its factory deployed with this validator (0.0.2) as its root reverted on the plain
+  // stand-in, Panic(0x11): the validator reads the signature as abi.encode(bytes[]) and takes the last of none.
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const HANDLE = parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]);
+  const ABI = parseAbi(['function createAccount(bytes data, bytes32 salt)', 'function initialize(bytes21 rootValidator, address hook, bytes validatorData, bytes hookData, bytes[] initConfig)',
+    'function weightedStorage(address kernel)', 'function guardian(uint256 index, address kernel) view returns (bytes1 guardianType, uint24 weight, bytes encodedPublicKey)']);
+  const V2 = '0x144f02c15a8cb2e01d35bf2af8e9efd96401e44b', V1 = '0x2e29537bbaf8ab5dc8037fa4bc3deb2c289498a3', FACTORY = '0x2577507b78c2008ff367261cb6285d44ba5ef2e9';
+  const SENDER = '0x0a8a9d981b3de935e86ed6de35cdeeaafaa93094', NEW = '0xdd6d92da9b78372e6ff9a4ba0ff811368a3b4650';
+  // Guardians by index: two keys of weight 1, a passkey of weight 2.
+  const [g1, g2, outsider] = ['0x1111111111111111111111111111111111111111', '0x2222222222222222222222222222222222222222', '0x4444444444444444444444444444444444444444'] as const;
+  const passkey = `0x${'c1'.repeat(32)}${'82'.repeat(32)}${'ab'.repeat(32)}` as Hex;
+  const guardians: [Hex, number, Hex][] = [['0x01', 1, g1], ['0x01', 1, g2], ['0x02', 2, passkey]];
+  const word = (v: bigint | number) => BigInt(v).toString(16).padStart(64, '0');
+  let validator = V2, threshold = 2;
+  const tried: Hex[] = [];
+  const node = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return (params[0] as string).toLowerCase() === NEW ? '0x' : `0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3`;
+    if (method === 'eth_getStorageAt') return `0x${'00'.repeat(12)}d6cedde84be40893d153be9d467cd6ad37875b28`; // Kernel v3.3
+    if (method === 'eth_call') {
+      const { to, data } = params[0] as { to: string; data: Hex };
+      if (to === EP) return `0x${'4a'.repeat(32)}`; // getUserOpHash
+      if (data === '0xf1f7f0f9') return `0x01${validator.slice(2)}${'00'.repeat(11)}`; // rootValidator()
+      if (to === validator) {
+        const d = decodeFunctionData({ abi: ABI, data });
+        // (totalWeight, threshold, guardianLength); 0.0.1 keeps a delay before the last.
+        if (d.functionName === 'weightedStorage') return `0x${word(4)}${word(threshold)}${validator === V1 ? word(0) : ''}${word(guardians.length)}`;
+        if (d.functionName === 'guardian') { const [type, weight, key] = guardians[Number(d.args[0])]; return encodeAbiParameters([{ type: 'bytes1' }, { type: 'uint24' }, { type: 'bytes' }], [type, weight, key]); }
+      }
+    }
+    throw new Error(`unexpected ${method}`);
+  } };
+  const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const op = { chainId: 11155111, entryPoint: EP, nonce: 0n, callData: '0xe9ae5c53' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
+  const array = (...entries: [number, Hex][]) => encodeAbiParameters([{ type: 'bytes[]' }], [entries.map(([i, signature]) => concatHex([`0x0${i}`, signature]))]);
+  const first = async (signer: string, sender = SENDER, initCode: Hex = '0x') => { tried.length = 0; const run = await simulateOperation({ ...op, sender, initCode, signer }, { rpc: node, simulator } as never); return { signature: tried[0], why: run?.why }; };
+  // g2 signs (index 1, weight 1): g1's approval (index 0) reaches the threshold, then g2's own.
+  assert.equal((await first(g2)).signature, array([0, stubSignature(1)], [1, STUB_SIGNATURE]));
+  assert.equal((await first(g1)).signature, array([1, stubSignature(1)], [0, STUB_SIGNATURE]));
+  // Threshold 1: the signer's alone.
+  threshold = 1;
+  assert.equal((await first(g2)).signature, array([1, STUB_SIGNATURE]));
+  // Someone who is no guardian's key: the keys' approvals to the threshold, then theirs as a key's, which the validator refuses.
+  threshold = 2;
+  const refused = await first(outsider);
+  assert.equal(refused.signature, array([0, stubSignature(1)], [1, stubSignature(2)], [0, STUB_SIGNATURE]));
+  assert.match(refused.why ?? '', /weighted validator \(0x144f…e44b\) takes the signatures of the account's guardians \(0x1111…1111, 0x2222…2222, a passkey\), and the signer asked isn't one of their keys/);
+  // A threshold only the passkey's weight reaches: no stand-in in this form (the plain ones, as before).
+  threshold = 3;
+  assert.equal((await first(g1)).signature, STUB_SIGNATURE);
+  // 0.0.1, whose storage keeps a delay before the count.
+  validator = V1; threshold = 2;
+  assert.equal((await first(g2)).signature, array([0, stubSignature(1)], [1, STUB_SIGNATURE]));
+  // A deploying account: its guardians from the install data (the Sepolia account's form: two keys of weight 100, threshold 100).
+  validator = V2;
+  const validatorData = concatHex(['0x000064', `0x${'00'.repeat(6)}`, encodeAbiParameters([{ type: 'bytes[]' }], [[`0x01000064${g1.slice(2)}`, `0x01000064${g2.slice(2)}`]])]);
+  const data = encodeFunctionData({ abi: ABI, functionName: 'initialize', args: [`0x01${V2.slice(2)}`, `0x${'00'.repeat(20)}`, validatorData, '0x', []] });
+  const initCode = concatHex([FACTORY, encodeFunctionData({ abi: ABI, functionName: 'createAccount', args: [data, `0x${'00'.repeat(32)}`] })]);
+  assert.equal((await first(g2, NEW, initCode)).signature, array([1, STUB_SIGNATURE]));
+});
+
 test('Kresus’s KresusVault: the 0x00 type byte before the owner’s signature, for an existing account and one its factory deploys', async () => {
   // Base, 2026-11-18: an account the factory deployed in the operation reverted on the plain stand-in (InvalidSignatureType).
   const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';

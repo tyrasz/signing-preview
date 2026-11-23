@@ -131,6 +131,27 @@ test('Real grants: who gets the key, what its policies allow, and how much atten
   assert.match(detail(recovery, 'Installs a handler')!, /^ZeroDev's recovery action .* run by delegatecall: as your account itself/);
   assert.equal(recovery.decoding.status, 'partial');
 
+  // The same grant to ZeroDev's weighted validator with typed guardians (0.0.2), its data as the SDK builds it and as an
+  // account on Sepolia (0xdd6d…4650, 2026-11-23) installed it: the threshold, a delay it never reads, then each
+  // guardian's type, weight and key. Here two keys and a passkey, any two of them.
+  const typedData = (guardians: Hex[], threshold: number) => ({ ...fixture('0x17f579f3390de3b59bac621ca4f6292b4c61e558').typedData as { message: object },
+    message: { ...(fixture('0x17f579f3390de3b59bac621ca4f6292b4c61e558').typedData as { message: object }).message, validationId: '0x01144f02c15a8cb2e01d35bf2af8e9efd96401e44b',
+      validatorData: concatHex([`0x${threshold.toString(16).padStart(6, '0')}`, `0x${'00'.repeat(6)}`, encodeAbiParameters([{ type: 'bytes[]' }], [guardians])]) } });
+  const K1 = '0x7615a391849664ac8df2de864de444fbede902e4', K2 = '0xb0b592248dc331186e3c6a071296f0ae5267e9c8', X = `${'c1'.repeat(32)}`, Y = `${'82'.repeat(32)}`;
+  const typed = await sign(typedData([`0x01000064${K1.slice(2)}`, `0x01000064${K2.slice(2)}`, `0x02000064${X}${Y}${'ab'.repeat(32)}`], 200), '0x17f579f3390de3b59bac621ca4f6292b4c61e558');
+  assert.equal(detail(typed, 'Installs'), "validator ZeroDev's weighted validator 0.0.2 (guardians' keys and passkeys) (0x144f02c15a8cb2e01d35bf2af8e9efd96401e44b)");
+  assert.equal(detail(typed, 'Guardian 1'), `${K1} (an ordinary key, weight 100)`);
+  assert.equal(detail(typed, 'Guardian 3'), `a passkey, P-256 public key x 0x${X}, y 0x${Y} (weight 100)`);
+  assert.equal(detail(typed, 'Guardians needed'), 'weight 200 of 300');
+  assert.equal(typed.title, 'Let 3 guardians (keys and passkeys) (together weight 200 of 300) act for your Kernel account');
+  assert.deepEqual(codes(typed), codes(recovery));
+  // One guardian's key alone, as that account's: named as the ECDSA validator's single guardian is.
+  assert.equal((await sign(typedData([`0x01000064${K1.slice(2)}`], 100), '0x17f579f3390de3b59bac621ca4f6292b4c61e558')).title, 'Let guardian key 0x7615…02e4 act for your Kernel account');
+  // Data that isn't the validator's (a guardian of no known type): shown raw, nothing claimed of who holds it.
+  const odd = await sign(typedData([`0x03000064${K1.slice(2)}`], 100), '0x17f579f3390de3b59bac621ca4f6292b4c61e558');
+  assert.match(detail(odd, 'Validator data')!, /^0x000064000000000000/);
+  assert.equal(detail(odd, 'Guardian 1'), undefined);
+
   // An unknown policy, with a handler for a function of its own run by delegatecall (its code runs as the account):
   // named by address, no limit claimed, and danger.
   const unknown = await preview(fixture('0xacec324bf68561acbbafc9daea24bf857de3d5ba'));

@@ -34,7 +34,7 @@ export const KERNEL_V3_IMPLEMENTATIONS: Record<string, string> = {
   '0xd830d15d3dc0c269f3dbaa0f3e8626d33cfdabe1': '0.3.2', '0xd6cedde84be40893d153be9d467cd6ad37875b28': '0.3.3',
 };
 
-type ValidatorKind = 'ecdsa' | 'webauthn' | 'weighted';
+type ValidatorKind = 'ecdsa' | 'webauthn' | 'weighted' | 'weighted-typed';
 /** ZeroDev's validators (its SDK's constants, sources verified on Sourcify): what their install data holds. */
 const VALIDATORS: Record<string, { name: string; kind: ValidatorKind }> = {
   '0x845adb2c711129d4f3966735ed98a9f09fc4ce57': { name: "ZeroDev's ECDSA validator", kind: 'ecdsa' },
@@ -46,7 +46,22 @@ const VALIDATORS: Record<string, { name: string; kind: ValidatorKind }> = {
   '0x56bf68a3eb0b95a4ec0880e5f39cf45cf58dae70': { name: "ZeroDev's multi-chain passkey validator", kind: 'webauthn' },
   '0xf98365fad8403c340b1d5f017b2ebdae641104ff': { name: "ZeroDev's multi-chain passkey validator 0.0.2", kind: 'webauthn' },
   '0xed89244160cfe273800b58b1b534031699dfeeee': { name: "ZeroDev's weighted ECDSA (guardian) validator", kind: 'weighted' },
+  '0x2e29537bbaf8ab5dc8037fa4bc3deb2c289498a3': { name: "ZeroDev's weighted validator 0.0.1 (guardians' keys and passkeys)", kind: 'weighted-typed' },
+  '0x144f02c15a8cb2e01d35bf2af8e9efd96401e44b': { name: "ZeroDev's weighted validator 0.0.2 (guardians' keys and passkeys)", kind: 'weighted-typed' },
 };
+/**
+ * What the install data of ZeroDev's weighted validator with typed guardians sets (0.0.1 and 0.0.2, above): the threshold (3 bytes), a delay (6, which its validation never reads),
+ * then abi.encode(bytes[]), each guardian's type (a byte), weight (3 bytes) and key (an address; or a passkey's x,
+ * y and authenticator id hash).
+ */
+export function readTypedWeighted(data: Hex): { threshold: number; guardians: { type: number; weight: number; key: Hex }[] } | undefined {
+  if (data.length < 2 + 18 + 128) return undefined;
+  try {
+    const [list] = decodeAbiParameters([{ type: 'bytes[]' }], `0x${data.slice(20)}`);
+    if (list.some(g => g.length < 10)) return undefined;
+    return { threshold: Number(BigInt(`0x${data.slice(2, 8)}`)), guardians: list.map(g => ({ type: Number(BigInt(g.slice(0, 4))), weight: Number(BigInt(`0x${g.slice(4, 10)}`)), key: `0x${g.slice(10)}` as Hex })) };
+  } catch { return undefined; }
+}
 type PolicyKind = 'sudo' | 'call' | 'timestamp' | 'gas' | 'rate-limit' | 'rate-limit-reset' | 'signature-caller' | 'erc20-transfer';
 /** Policies whose sources were read (Sourcify; call policy 0.0.5, unpublished, as ZeroDev's SDK encodes it). */
 const POLICIES: Record<string, { name: string; kind: PolicyKind; callVersion?: number }> = {
@@ -350,6 +365,15 @@ function readValidator(validator: string, data: Hex, b: PreviewBuilder): Reading
     if (guardians.length > LIST_MAX) b.detail('Guardians not listed', String(guardians.length - LIST_MAX));
     b.detail('Guardians needed', `weight ${threshold} of ${total}${delay ? `, ${formatDuration(delay * 1000)} after they agree` : ''}`);
     reading.who = guardians.length === 1 ? `guardian key ${shortAddress(guardians[0].toLowerCase())}` : `${guardians.length} guardian keys (together weight ${threshold} of ${total})`;
+  } else if (v?.kind === 'weighted-typed' && readTypedWeighted(data)?.guardians.every(g => (g.type === 1 && g.key.length === 42) || (g.type === 2 && g.key.length === 194))) {
+    // (Each guardian an Ethereum key or a passkey, as the validator itself requires; the delay its data carries it never reads.)
+    const { guardians, threshold } = readTypedWeighted(data)!;
+    const total = guardians.reduce((a, g) => a + g.weight, 0), passkeys = guardians.filter(g => g.type === 2).length;
+    guardians.slice(0, LIST_MAX).forEach((g, i) => b.detail(`Guardian ${i + 1}`, g.type === 1 ? `${g.key.toLowerCase()} (an ordinary key, weight ${g.weight})` : `a passkey, P-256 public key x 0x${g.key.slice(2, 66)}, y 0x${g.key.slice(66, 130)} (weight ${g.weight})`));
+    if (guardians.length > LIST_MAX) b.detail('Guardians not listed', String(guardians.length - LIST_MAX));
+    b.detail('Guardians needed', `weight ${threshold} of ${total}`);
+    const kinds = passkeys === guardians.length ? (guardians.length === 1 ? 'a guardian passkey' : `${guardians.length} guardian passkeys`) : passkeys ? `${guardians.length} guardians (keys and passkeys)` : guardians.length === 1 ? `guardian key ${shortAddress(guardians[0].key.toLowerCase())}` : `${guardians.length} guardian keys`;
+    reading.who = guardians.length === 1 ? kinds : `${kinds} (together weight ${threshold} of ${total})`;
   } else {
     if (data.length > 2) b.detail('Validator data', data.length > 130 ? `${data.slice(0, 130)}…` : data);
     reading.who = `validator ${shortAddress(validator)}`;

@@ -18,7 +18,7 @@ import type { Dependencies, SimulationRequest, SimulationResult } from './types.
 import { pinLatest, type BlockAt } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { chainName, ecrecoverPrice } from './chains.ts';
-import { KERNEL_ENABLE_FIELDS, KERNEL_V3_IMPLEMENTATIONS } from './typed-data/kernel-enable.ts';
+import { KERNEL_ENABLE_FIELDS, KERNEL_V3_IMPLEMENTATIONS, readTypedWeighted } from './typed-data/kernel-enable.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V06_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V06_SLOTS, ENTRY_POINT_SIMULATIONS_V07, ENTRY_POINT_SIMULATIONS_V07_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V07_SLOTS,
   ENTRY_POINT_SIMULATIONS_V08, ENTRY_POINT_SIMULATIONS_V08_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V08_SLOTS, ENTRY_POINT_SIMULATIONS_V09, ENTRY_POINT_SIMULATIONS_V09_IMMUTABLES, ENTRY_POINT_SIMULATIONS_V09_SLOTS } from './entrypoint-simulations.ts';
 
@@ -975,6 +975,9 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
   if (type === '01' && `0x${id}`.toLowerCase() === ZERODEV_WEIGHTED_VALIDATOR) {
     try { const weighted = await weightedStub(c, deploying?.installs.get(`0x01${id}`.toLowerCase())); if (weighted) return weighted; } catch { /* unreadable: the ECDSA forms */ }
   }
+  if (type === '01' && ZERODEV_TYPED_WEIGHTED_VALIDATORS.has(`0x${id}`.toLowerCase())) {
+    try { const weighted = await typedWeightedStub(c, `0x${id}`.toLowerCase(), deploying?.installs.get(`0x01${id}`.toLowerCase())); if (weighted) return weighted; } catch { /* unreadable: the ECDSA forms */ }
+  }
   if (type === '01' && SIGNER_ID_VALIDATORS.has(`0x${id}`.toLowerCase())) {
     const ids = await signerIdsOf(c, `0x01${id}`, deploying);
     if (ids.length) return ids.map(i => ({ signature: concatHex([i, STUB_SIGNATURE]) }));
@@ -1120,6 +1123,68 @@ async function weightedStub(c: StubContext, installData?: Hex): Promise<Stub[] |
   const cosigners = others.map((signer, k) => ({ signature: stubSignature(k + 1), signer, digest: approve }));
   return [{ signature: concatHex([...cosigners.map(x => x.signature), STUB_SIGNATURE]), ...(cosigners.length && { cosigners }),
     ...(!own && { why: `ZeroDev's weighted ECDSA validator (${shortAddr(ZERODEV_WEIGHTED_VALIDATOR)}) takes the signatures of the account's guardians (${guardians.map(g => shortAddr(g.address)).join(', ')}), and the signer asked isn't one of them` }) }];
+}
+/**
+ * ZeroDev's WeightedValidator 0.0.1 and 0.0.2 (its SDK's constants; sources verified on Sourcify, Ethereum, the same
+ * code at the same addresses on the other chains): guardians by index, each an Ethereum key (type 0x01) or a passkey
+ * (0x02) with a weight, and a threshold.
+ */
+export const ZERODEV_TYPED_WEIGHTED_VALIDATORS = new Set(['0x2e29537bbaf8ab5dc8037fa4bc3deb2c289498a3', '0x144f02c15a8cb2e01d35bf2af8e9efd96401e44b']);
+const TYPED_WEIGHTED = parseAbi(['function weightedStorage(address kernel)', 'function guardian(uint256 index, address kernel) view returns (bytes1 guardianType, uint24 weight, bytes encodedPublicKey)']);
+/**
+ * ZeroDev's weighted validator with typed guardians: an operation's signature is abi.encode(bytes[]), each entry a
+ * guardian's index (one byte), then its signature. All but the last approve the operation, EIP-712
+ * Approve(bytes32 callDataAndNonceHash) (domain WeightedValidator, 0.0.1, the chain, the validator), its hash
+ * keccak256(abi.encode(account, callData, nonce)); the last signs the operation's hash, or its EIP-191 form. A
+ * guardian's weight counts once, and the total must reach the threshold. The stand-in: approvals by other guardians,
+ * lowest index first, as many as it takes with the signer's weight, each recovered as its guardian over the Approve
+ * digest; then the signer's. Guardians are read from the validator (weightedStorage, whose last word is how many;
+ * guardian(index, account)), the first 32, or from a deploying account's install data (readTypedWeighted). Undefined
+ * where it would take a passkey guardian's signature (not stood in for here), or nothing is read. The plain stand-in
+ * isn't such an array: the validator read no entries in it and its validation reverted, Panic(0x11), so an account's
+ * calls ran alone (Sepolia, 2026-11-23).
+ */
+async function typedWeightedStub(c: StubContext, validator: string, installData?: Hex): Promise<Stub[] | undefined> {
+  let guardians: { type: number; weight: number; key: Hex }[] = [], threshold = 0;
+  if (installData) {
+    const set = readTypedWeighted(installData);
+    if (!set) return undefined;
+    ({ guardians, threshold } = set);
+  } else {
+    const rpc = c.deps.rpc;
+    if (!rpc?.has(c.chainId)) return undefined;
+    const read = async (data: Hex) => String(await rpc.call(c.chainId, 'eth_call', [{ to: validator, data }, 'latest'])) as Hex;
+    // (totalWeight, threshold, guardianLength; 0.0.1 keeps a delay before the last.)
+    const words = (await read(encodeFunctionData({ abi: TYPED_WEIGHTED, functionName: 'weightedStorage', args: [c.sender as Hex] }))).slice(2).match(/.{64}/g) ?? [];
+    if (words.length < 3) return undefined;
+    threshold = Number(BigInt(`0x${words[1]}`));
+    const count = Math.min(Number(BigInt(`0x${words[words.length - 1]}`)), 32);
+    for (let i = 0; i < count; i++) {
+      const [type, weight, key] = decodeFunctionResult({ abi: TYPED_WEIGHTED, functionName: 'guardian', data: await read(encodeFunctionData({ abi: TYPED_WEIGHTED, functionName: 'guardian', args: [BigInt(i), c.sender as Hex] })) });
+      guardians.push({ type: Number(BigInt(type)), weight, key });
+    }
+  }
+  if (!threshold || !guardians.length) return undefined;
+  const signer = c.signer.toLowerCase();
+  const keyed = (i: number) => guardians[i].type === 1 && guardians[i].key.length === 42;
+  const own = guardians.findIndex((g, i) => keyed(i) && g.key.toLowerCase() === signer);
+  const others: number[] = [];
+  let total = own >= 0 ? guardians[own].weight : 0;
+  for (let i = 0; total < threshold && i < guardians.length && others.length < 15; i++) {
+    if (i === own || !keyed(i)) continue;
+    others.push(i);
+    total += guardians[i].weight;
+  }
+  if (total < threshold) return undefined;
+  const callDataAndNonceHash = keccak256(encodeAbiParameters(parseAbiParameters('address, bytes, uint256'), [c.sender as Hex, c.callData ?? '0x', c.nonce]));
+  const approve = hashTypedData({ domain: { name: 'WeightedValidator', version: '0.0.1', chainId: c.chainId, verifyingContract: getAddress(validator) },
+    types: { Approve: [{ name: 'callDataAndNonceHash', type: 'bytes32' }] }, primaryType: 'Approve', message: { callDataAndNonceHash } });
+  const cosigners = others.map((i, k) => ({ signature: stubSignature(k + 1), signer: guardians[i].key.toLowerCase(), digest: approve }));
+  const entry = (i: number, signature: Hex) => concatHex([numberToHex(i, { size: 1 }), signature]);
+  // (A signer who is no guardian's key signs last all the same, at a key's index: the validator refuses it.)
+  const last = own >= 0 ? own : others[0];
+  return [{ signature: encodeAbiParameters([{ type: 'bytes[]' }], [[...others.map((i, k) => entry(i, cosigners[k].signature)), entry(last, STUB_SIGNATURE)]]), ...(cosigners.length && { cosigners }),
+    ...(own < 0 && { why: `ZeroDev's weighted validator (${shortAddr(validator)}) takes the signatures of the account's guardians (${guardians.map(g => (g.type === 1 && g.key.length === 42 ? shortAddr(g.key.toLowerCase()) : 'a passkey')).join(', ')}), and the signer asked isn't one of their keys` }) }];
 }
 // --- ZeroDev Kernel v3's enable mode ---
 // An operation whose nonce's first byte is 0x01 installs the validation its nonce names (a validator, or a permission:
