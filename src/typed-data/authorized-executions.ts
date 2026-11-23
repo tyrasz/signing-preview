@@ -60,8 +60,14 @@ export const authorizedExecutionsAdapter: TypedAdapter = async (data, env) => {
   const taker = known ? 'the account code' : 'UniversalGaslessDelegate, whose format this is,';
   // Its digest is under the chain and the account code alone (EIP712Domain(uint256 chainId,address verifyingContract)):
   // a domain with a name or a version has another, which it takes no signature over.
-  const others = (data.types.EIP712Domain?.map(f => f.name) ?? Object.keys(data.domain)).filter(k => k !== 'chainId' && k !== 'verifyingContract');
+  // (Exactly: those two fields, of those types, in that order. A domain type with one of them, or with them the other
+  // way round, has another digest as surely as one with a name in it.)
+  const domainType = shape('EIP712Domain');
+  const fields = data.types.EIP712Domain?.map(f => f.name) ?? Object.keys(data.domain);
+  const others = fields.filter(k => k !== 'chainId' && k !== 'verifyingContract');
+  const misshapen = !others.length && (domainType !== undefined ? domainType !== 'uint256 chainId,address verifyingContract' : fields.length !== 2);
   if (others.length) b.warn('caution', 'gasless_exec_domain', `It is signed under a domain that also has ${others.map(o => `"${o}"`).join(', ')}: UniversalGaslessDelegate checks signatures under the chain and the account code alone, so it doesn't take this one. What else would take it isn't known.`);
+  else if (misshapen) b.warn('caution', 'gasless_exec_domain', `It is signed under a domain that isn't the delegate's (${domainType ?? (fields.join(', ') || 'no fields')}): UniversalGaslessDelegate checks signatures under the chain and the account code, in that order, so it doesn't take this one. What else would take it isn't known.`);
   // The mode decides how the calls are read back: one call, or a batch. Any other the delegate refuses.
   const kind = mode.startsWith(SINGLE) ? 'single' : mode.startsWith(BATCH) ? 'batch' : null;
   if (!kind) b.warn('info', 'gasless_exec_mode', `Its mode (${mode.slice(0, 22)}…) isn't one ${taker} runs on a signature (a single call, 0x00…78210001, or a batch, 0x01…78210001): it refuses the execution.`);
@@ -144,7 +150,7 @@ export const authorizedExecutionsAdapter: TypedAdapter = async (data, env) => {
     if (p.trace && !b.trace) b.trace = p.trace;
     assetChanges = p.assetChanges;
     approvals = failing ? undefined : p.approvals;
-    status = kind && known && !others.length && !toSelf.length ? p.decoding.status : 'partial';
+    status = kind && known && !others.length && !misshapen && !toSelf.length ? p.decoding.status : 'partial';
     title = `Gasless ${what} as you: ${p.title.replace(/^(Send|Sign|Submit) (a )?transaction: /i, '').replace(/^\d+ actions: /, '')}`;
   } catch {
     // (Said, and the calls shown as signed, calldata and all: no less than typed data in no known format gets.)

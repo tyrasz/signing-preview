@@ -132,7 +132,12 @@ test('A batch of more than twenty calls: every call decoded to the two hundredth
   const approving = await batch([...benign, [0, USDC, 0n, approve]]);
   assert.match(approving.warnings.find(w => w.code === 'unlimited_approval')?.message ?? '', /^Call 21: /);
   assert.match(detail(approving, 'Call 21') ?? '', /^Allow 0x9622…7242 to spend unlimited USDC/);
-  assert.match(approving.decoding.notes.join(' '), /The calls after the first 20 are decoded from their calldata alone/);
+  // Each call past the twentieth gets the reads of the chain the first twenty get: decoded from its calldata alone,
+  // a call whose danger depends on a read (an authorization given to an address with no code) was a caution there.
+  const chain: Dependencies = { ...deps, rpc: { has: () => true, call: async () => '0x' } };
+  const authorize = encodeFunctionData({ abi: parseAbi(['function setAuthorization(address authorized, bool newIsAuthorized)']), functionName: 'setAuthorization', args: [EVIL, true] });
+  const late = await batch([...benign, [0, '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb', 0n, authorize]], chain);
+  assert.deepEqual([late.warnings.find(w => w.code === 'morpho_authorize')?.severity, /^Call 21: /.test(late.warnings.find(w => w.code === 'morpho_authorize')?.message ?? '')], ['danger', true]);
   // And a change to the Safe itself.
   const owner = await batch([...benign, [0, SAFE, 0n, encodeFunctionData({ abi: ABI, functionName: 'addOwnerWithThreshold', args: [BOB, 1n] })]]);
   assert.ok(codes(owner).some(c => /^safe_owners/.test(c)), codes(owner).join());
@@ -179,6 +184,80 @@ test('A batch nested in a batch is laid out: its calls run as the Safe too, and 
   const signing = await outer([1, SIGN_LIB, 0n, encodeFunctionData({ abi: parseAbi(['function signMessage(bytes)']), functionName: 'signMessage', args: ['0x1234'] })]);
   assert.match(signing.warnings.find(w => w.code === 'safe_sign_message')?.message ?? '', /^Call 2: signs a message in the Safe's name/);
   assert.equal(detail(signing, 'Call 2')?.startsWith('(delegatecall) Sign a message as the Safe'), true);
+});
+
+test('A batch of one call, coin sent with a call, and who a call pays: none of it left unsaid', async () => {
+  const MULTISEND = '0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761', EVIL = '0x96221423681a6d52e184d440a8efcebb105c7242';
+  // A batch whose only call delegatecalls unknown code is the Bybit pattern as much as a batch of two: it was
+  // shown as what its calldata reads as, a transfer, with no danger. So was one whose other call is an empty batch.
+  for (const calls of [[[1, EVIL, 0n, transfer]], [[1, MULTISEND, 0n, multiSend([])], [1, EVIL, 0n, transfer]], [[1, MULTISEND, 0n, multiSend([[1, EVIL, 0n, transfer]])]]] as [number, string, bigint, Hex][][]) {
+    const p = await sign({ to: MULTISEND, operation: 1, data: multiSend(calls) });
+    assert.equal(p.attention, 'danger');
+    assert.match(p.warnings.find(w => w.code === 'safe_delegatecall')?.message ?? '', /^a delegatecall to 0x96221423681a6d52e184d440a8efcebb105c7242 inside the batch/);
+    assert.equal(p.title, 'Safe transaction: Let 0x9622…7242 run its code as the Safe (delegatecall)');
+    assert.match(detail(p, 'Call') ?? '', /^\(delegatecall\) /);
+  }
+  // Who a call pays, and the coin sent with it: a Safe transaction titled "Send 1,000 USDC" named no recipient,
+  // and one with 100 ETH attached to it said nothing of the coin.
+  const plain = await sign({});
+  assert.equal(detail(plain, 'Recipient')?.toLowerCase(), BOB.toLowerCase());
+  const withCoin = await sign({ value: (100n * 10n ** 18n).toString() });
+  assert.equal(detail(withCoin, 'Value sent with the call'), '100 ETH');
+  const unknown = await sign({ to: BOB, data: '0xdeadbeef', value: (100n * 10n ** 18n).toString() });
+  assert.equal(detail(unknown, 'Value sent with the call'), '100 ETH');
+  // An operation written as JSON `true` signs as 1, a delegatecall (the digest shown is computed so): it was read
+  // as 0, a plain call, with no danger. One that can't be read at all isn't taken for a plain call either.
+  const disguised = await sign({ to: BOB, data: '0xdeadbeef', operation: true });
+  assert.deepEqual([disguised.attention, codes(disguised).includes('safe_delegatecall')], ['danger', true]);
+  assert.equal((await sign({ to: BOB, data: '0xdeadbeef', operation: [1] })).attention, 'danger');
+  assert.equal((await sign({ to: BOB, data: '0xdeadbeef', operation: { v: 1 } })).decoding.decoder, 'eip712_generic');
+  // In a batch too, whatever the call's title: and a call's own details under its number.
+  const both = await sign({ to: MULTISEND, operation: 1, data: multiSend([[0, USDC, 10n ** 18n, transfer], [0, BOB, 2n * 10n ** 18n, '0x']]) });
+  assert.match(detail(both, 'Call 1') ?? '', /^Send 1,000 USDC, with 1 ETH \(0xa0b8…eb48\)$/);
+  assert.match(detail(both, 'Call 2') ?? '', /^Send 2 ETH \(/);
+  assert.equal(detail(both, 'Call 1: Recipient')?.toLowerCase(), BOB.toLowerCase());
+});
+
+test('Safe’s own libraries are read for what the call does with them, not taken on their name', async () => {
+  const MULTISEND = '0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761', EVIL = '0x96221423681a6d52e184d440a8efcebb105c7242';
+  const L2_MIGRATION = '0xfF83F6335d8930cBad1c0D439A841f01888D9f69', MIGRATION = '0x526643F69b81B008F46d95CD5ced5eC0edFFDaC6', CREATE_CALL = '0x7cbB62EaA69F79e6873cD1ecB2392971036cFAa4', SIGN_LIB = '0xA65387F16B013cf2Af4605Ad8aA5ec25a2cbA3a2';
+  const LIB = parseAbi(['function migrateToL2(address l2Singleton)', 'function migrateSingleton()', 'function performCreate(uint256 value, bytes deploymentData)', 'function signMessage(bytes _data)', 'function changeMasterCopy(address _masterCopy)']);
+  // SafeToL2Migration sets the Safe's code to whatever address it is given that says it is the right version: an
+  // "official upgrade" of a Safe to code that isn't Safe's was a caution. To an official singleton it is one.
+  const hostile = await sign({ to: L2_MIGRATION, operation: 1, data: encodeFunctionData({ abi: LIB, functionName: 'migrateToL2', args: [EVIL] }) });
+  assert.deepEqual([hostile.attention, hostile.title], ['danger', 'Safe transaction: Replace the Safe\'s code with 0x9622…7242 (SafeToL2Migration 1.4.1)']);
+  assert.match(hostile.warnings.find(w => w.code === 'safe_code_replaced')?.message ?? '', /sets the Safe's code to the code at 0x96221423681a6d52e184d440a8efcebb105c7242, which isn't one of Safe's own/);
+  const official = await sign({ to: L2_MIGRATION, operation: 1, data: encodeFunctionData({ abi: LIB, functionName: 'migrateToL2', args: ['0x29fcB43b46531BcA003ddC8FCB67FFE91900C762'] }) });
+  assert.deepEqual([official.attention, official.title, codes(official).includes('safe_migration')], ['caution', 'Safe transaction: Upgrade the Safe to Safe 1.4.1 (L2)', true]);
+  const noArgs = await sign({ to: MIGRATION, operation: 1, data: encodeFunctionData({ abi: LIB, functionName: 'migrateSingleton' }) });
+  assert.deepEqual([noArgs.attention, noArgs.title, noArgs.decoding.status], ['caution', 'Safe transaction: Upgrade the Safe (SafeMigration 1.4.1)', 'full']);
+  // Calldata that is none of the library's functions isn't an upgrade.
+  const garbage = await sign({ to: MIGRATION, operation: 1, data: '0xdeadbeef' });
+  assert.deepEqual([codes(garbage).includes('safe_library_unread'), codes(garbage).includes('safe_migration'), garbage.decoding.status], [true, false, 'opaque']);
+  // A contract deployed with the Safe's coin, and a message signed as the Safe: what is deployed, with how much,
+  // and what is signed, at the top and inside a batch (where they read "fully decoded" on the library's name).
+  const create = encodeFunctionData({ abi: LIB, functionName: 'performCreate', args: [500n * 10n ** 18n, '0x6080604052'] });
+  const deploying = await sign({ to: CREATE_CALL, operation: 1, data: create });
+  assert.match(deploying.warnings.find(w => w.code === 'safe_create_call')?.message ?? '', /of 5 bytes of code that isn't read here, and sends it 500 ETH of the Safe's/);
+  assert.deepEqual([deploying.attention, deploying.title, deploying.decoding.status], ['caution', 'Safe transaction: Deploy a contract from the Safe, with 500 ETH', 'partial']);
+  const inBatch = await sign({ to: MULTISEND, operation: 1, data: multiSend([[0, USDC, 0n, transfer], [1, CREATE_CALL, 0n, create], [1, SIGN_LIB, 0n, encodeFunctionData({ abi: LIB, functionName: 'signMessage', args: [`0x${'ab'.repeat(32)}`] })]]) });
+  assert.match(inBatch.warnings.find(w => w.code === 'safe_create_call')?.message ?? '', /^Call 2: deploys a contract from the Safe .* and sends it 500 ETH/);
+  assert.match(inBatch.warnings.find(w => w.code === 'safe_sign_message')?.message ?? '', /^Call 3: signs a message in the Safe's name .* Only the message's hash is given: what it commits the Safe to isn't read here/);
+  assert.deepEqual([inBatch.attention, inBatch.decoding.status], ['caution', 'partial']);
+  assert.match(detail(inBatch, 'Call 3: message signed as the Safe') ?? '', /^a hash, 0xabab/);
+  // Safe 1.1.1's and 1.2.0's own changeMasterCopy: the Safe replacing its code was "a call that couldn't be decoded".
+  const replaced = await sign({ to: SAFE, data: encodeFunctionData({ abi: LIB, functionName: 'changeMasterCopy', args: [EVIL] }) });
+  assert.deepEqual([replaced.attention, codes(replaced).includes('safe_code_replaced')], ['danger', true]);
+  assert.equal((await sign({ to: SAFE, data: encodeFunctionData({ abi: LIB, functionName: 'changeMasterCopy', args: ['0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552'] }) })).warnings.find(w => w.code === 'safe_upgrade')?.severity, 'caution');
+  // MultiSendCallOnly makes no delegatecall: a batch through it with one in it reverts, and isn't run from the
+  // Safe call by call as if it went through (nor is a batch nested under it laid out: it never runs).
+  const sims: number[] = [];
+  const simulated: Dependencies = { ...deps, simulator: { simulate: async () => ({ status: 'success', source: 'mock', gasUsed: 1n, transfers: [] }), simulateBatch: async rs => { sims.push(rs.length); return rs.map(() => ({ status: 'success' as const, source: 'mock', gasUsed: 1n, transfers: [] })); } } };
+  const refused = await sign({ to: MULTISEND_CALL_ONLY, operation: 1, data: multiSend([[0, USDC, 0n, transfer], [1, MULTISEND, 0n, multiSend([[0, USDC, 0n, transfer]])]]) }, simulated);
+  assert.match(refused.warnings.find(w => w.code === 'safe_tx_reverts')?.message ?? '', /^Call 2: the batch reverts on this call as it is built: it is a delegatecall, which MultiSendCallOnly makes none of/);
+  assert.deepEqual([sims, refused.decoding.notes.some(n => /Simulated as the Safe making the calls/.test(n))], [[], false]);
+  const odd = await sign({ to: MULTISEND, operation: 1, data: multiSend([[0, USDC, 0n, transfer], [2, USDC, 0n, transfer]]) });
+  assert.match(odd.warnings.find(w => w.code === 'safe_tx_reverts')?.message ?? '', /operation 2 isn't one MultiSend runs/);
 });
 
 test('SafeOp checks: delegatecalls, an unknown module or EntryPoint, a plain call to MultiSend, and a used nonce', async () => {
@@ -916,7 +995,8 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   const [exec] = batches[0];
   assert.deepEqual([exec.at?.block, exec.at?.before?.length, exec.gasPrice, exec.gas, exec.from], ['0x10', 1, 9n, 200_000n, alice]);
   assert.deepEqual(exec.accessList, ACCESS, 'with the access list it was sent with: its gas is the receipt\'s only with it');
-  assert.equal(batches.length, 1);
+  // (One run of the transaction; and, a transaction having run before it in the block, the Safe read where it ran.)
+  assert.deepEqual([batches.filter(rs => rs[0].data === data).length, batches.length], [1, 2]);
   assert.ok(tags.length > 0 && tags.every(t => t === '0x10'), 'the Safe is read on the parent block');
   assert.match(p.decoding.notes.join(' '), /What it did for the Safe: execTransaction run again as it was sent, where it ran/);
   assert.doesNotMatch(p.decoding.notes.join(' '), /Simulated at the latest block/);
@@ -948,7 +1028,7 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   const refunds: Dependencies = { ...d('as the receipt'), simulator: { simulate: async r => ok(r, 0), simulateBatch: async rs => { refunding.push(rs);
     return rs.map((r, i) => (i === 0 ? { ...ok(r, 0), transfers: r.gasPrice ? [{ asset: 'native', from: SAFE, to: r.from, raw: 140_000n * r.gasPrice }] : [] } : ok(r, i))); } } };
   const paidFor = await send(refunds, outer);
-  assert.deepEqual(refunding.map(rs => [rs[0].gasPrice, rs[0].baseFee, rs[0].at?.block]), [[undefined, undefined, '0x10'], [9n, 7n, '0x10']]);
+  assert.deepEqual(refunding.filter(rs => rs[0].data === data).map(rs => [rs[0].gasPrice, rs[0].baseFee, rs[0].at?.block]), [[undefined, undefined, '0x10'], [9n, 7n, '0x10']]);
   assert.match(paidFor.decoding.notes.join(' '), /it was simulated at the price the replayed transaction paid, 0\.000000009 gwei\./);
   assert.doesNotMatch(paidFor.decoding.notes.join(' '), /the price a transaction would pay now/);
   // What the transaction changed in the Safe is told against the Safe as the block's earlier transactions left it.
@@ -969,15 +1049,19 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   assert.deepEqual([placedReads.length, placedReads[0].every(r => r.at?.block === '0x10' && r.at.before?.length === 1)], [1, true]);
   const undone = await send(sameBlock([alice], []), { ...replay, before: [toSafe] });
   assert.ok(codes(undone).includes('safe_owners_removed'), 'and one that undoes it removes an owner');
-  // Where no earlier transaction is sent to the Safe and the run leaves it as the block before had it, there is
-  // nothing to read again.
-  const quiet: SimulationRequest[][] = [];
-  await send({ ...sameBlock([alice], quiet), rpc: d('as the receipt').rpc });
-  assert.equal(quiet.length, 0);
-  // (One that changes the Safe is read again even so: an earlier transaction can reach a Safe through another contract.)
+  // An earlier transaction can reach the Safe through another contract (none of them is sent to it): the Safe is
+  // read where the transaction ran whenever any ran before it. One that gave the Safe an owner so, which this one
+  // then removes, leaves the Safe as the block before had it: unread, that was no change at all.
   const through: SimulationRequest[][] = [];
   const indirect = await send(sameBlock([alice, bob], through));
   assert.deepEqual([through.length, codes(indirect).filter(c => /^safe_owners/.test(c))], [1, []]);
+  const undoneIndirectly: SimulationRequest[][] = [];
+  const reverted = await send(sameBlock([alice], undoneIndirectly));
+  assert.deepEqual([undoneIndirectly.length, codes(reverted).includes('safe_owners_removed')], [1, true]);
+  // (The first transaction of its block has the block before to compare with: nothing to read again.)
+  const first: SimulationRequest[][] = [];
+  await send(sameBlock([alice], first), { ...replay, before: [], earlier: 0 });
+  assert.equal(first.length, 0);
   // Where the Safe can't be read on the replayed block (a node that no longer has it), its calls aren't run on
   // today's state instead: they were shown, "simulated at the latest block", beside a replay.
   const singles: SimulationRequest[] = [];

@@ -129,8 +129,11 @@ async function replay(hash: string): Promise<void> {
   const [to, value, data, operation, safeTxGas, baseGas, gasPrice, gasToken, refundReceiver, signatures] = args as [Hex, bigint, Hex, number, bigint, bigint, bigint, Hex, Hex, Hex];
   // Reads on the parent block (the state the Safe was in), and the block itself for its header.
   const atParent = { has: (c: number) => c === CHAIN, call: (c: number, m: string, ps: unknown[]) => m === 'eth_getBlockByNumber' && ps[0] === 'latest' ? rpc.call(c, m, [hex(number), ps[1]]) : rpc.call(c, m, ps.map(x => x === 'latest' ? parent : x)) };
+  // (A node that no longer has the block's state is told apart from a contract that isn't a Safe: one is a read
+  // that failed, which a run of mostly such reads fails on; the other is the transaction's own.)
+  try { await call('eth_getCode', [safe, parent]); } catch { return skip('its state is no longer served by the node'); }
   const before = await readConfig({ ...base, rpc: atParent }, CHAIN, safe).catch(() => undefined);
-  if (!before) return skip("not a Safe whose configuration reads (another contract's execTransaction, or its state is gone)");
+  if (!before) return skip("not a Safe whose configuration reads (another contract's execTransaction)");
   // The Safe earlier in its own block (another transaction of its own first): its nonce and state then aren't the
   // parent block's, which the preview's reads are of.
   const receipts = await blockReceipts(hex(number)).catch(() => undefined);

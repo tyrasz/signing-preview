@@ -166,6 +166,15 @@ test('A gasless execution that isn’t all read says so: more calls than are rea
   const q = await sign(named);
   assert.match(q.warnings.find(w => w.code === 'gasless_exec_domain')?.message ?? '', /also has "name", "version": UniversalGaslessDelegate checks signatures under the chain and the account code alone/);
   assert.equal(q.decoding.status, 'partial');
+  // And one whose domain type has the two fields the other way round, or one of them: another digest just as surely.
+  const swapped = typed();
+  swapped.types.EIP712Domain = [...swapped.types.EIP712Domain].reverse();
+  const r = await sign(swapped);
+  assert.match(r.warnings.find(w => w.code === 'gasless_exec_domain')?.message ?? '', /a domain that isn't the delegate's \(address verifyingContract,uint256 chainId\)/);
+  assert.equal(r.decoding.status, 'partial');
+  const lone = typed();
+  lone.types.EIP712Domain = lone.types.EIP712Domain.slice(1);
+  assert.ok(codes(await sign(lone, offline, { chainId: 1 })).includes('gasless_exec_domain'));
   // Of code this wasn't read from, nothing is said to be refused by it.
   const elsewhere = await sign(typed({ mode: `0x${'00'.repeat(32)}` }, { verifyingContract: '0x00000000000000000000000000000000000000aa' }));
   assert.match(elsewhere.warnings.find(w => w.code === 'gasless_exec_mode')?.message ?? '', /isn't one UniversalGaslessDelegate, whose format this is, runs on a signature/);

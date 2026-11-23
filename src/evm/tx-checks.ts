@@ -185,14 +185,21 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     const have = BigInt(balance);
     // A gas limit named with no fee cap: the cap a wallet fills in is the base fee at least, so the whole limit at
     // the base fee is the least the network asks for. (Checked against the gas the run used alone, a limit of ten
-    // million from an account that could pay for fifty thousand passed with nothing said.)
-    const floor = baseFee ?? price;
-    const least = maximum === undefined && tx.gas !== undefined && floor !== undefined ? tx.gas * floor + (l1Fee ?? 0n) : undefined;
+    // million from an account that could pay for fifty thousand passed with nothing said.) Where the chain has no
+    // base fee (BNB Chain's is zero), at the price the transaction would pay.
+    const floor = baseFee !== undefined && baseFee > 0n ? baseFee : price;
+    const least = maximum === undefined && tx.gas !== undefined && floor !== undefined && floor > 0n ? tx.gas * floor + (l1Fee ?? 0n) : undefined;
     const worst = maximum ?? least ?? (fee ? fee.estimate : undefined);
     if (worst !== undefined && have >= tx.value && have < tx.value + worst) {
-      b.warn(maximum !== undefined || least !== undefined ? 'danger' : 'caution', 'insufficient_funds_for_gas', maximum !== undefined
+      // That the network rejects it holds for an account that sends its own transactions: a plain one. One with code
+      // (a contract account, whose transactions something else submits and pays for; an account with delegated
+      // code, whose wallet may have a relayer pay) was told the same, of a transaction it never pays for.
+      const pays = least === undefined || await call<string>('eth_getCode', [tx.from, 'latest']) === '0x';
+      const basis = `${baseFee !== undefined && baseFee > 0n ? 'the current base fee' : 'its price'}${l1Fee ? ', with the fee for its data' : ''}`;
+      b.warn(maximum !== undefined || (least !== undefined && pays) ? 'danger' : 'caution', 'insufficient_funds_for_gas', maximum !== undefined
         ? `Your balance (${native(have)}) doesn't cover the value plus the most the gas can cost (${native(tx.value + maximum)}): the network will reject this transaction.`
-        : least !== undefined ? `Your balance (${native(have)}) doesn't cover the value plus its gas limit (${tx.gas!.toLocaleString('en-US')}) at ${baseFee !== undefined ? 'the current base fee' : 'its price'} (${native(tx.value + least)}): the network asks for the whole limit's cost before it runs, whatever it then uses, and will reject this transaction as it is.`
+        : least !== undefined && pays ? `Your balance (${native(have)}) doesn't cover the value plus its gas limit (${tx.gas!.toLocaleString('en-US')}) at ${basis} (${native(tx.value + least)}): the network asks for the whole limit's cost before it runs, whatever it then uses, and will reject this transaction as it is.`
+        : least !== undefined ? `This account's balance (${native(have)}) doesn't cover the value plus its gas limit (${tx.gas!.toLocaleString('en-US')}) at ${basis} (${native(tx.value + least)}). An account with code doesn't always pay for its own transactions (a contract account's are submitted for it; a wallet can have a relayer pay): if this one is to pay, the network will reject the transaction as it is.`
         : `Your balance (${native(have)}) may not cover the value plus the network fee (about ${native(tx.value + worst)}).`);
     } else if (least !== undefined && fee && have >= tx.value + least && have < tx.value + fee.estimate) {
       // (Above the base fee's floor and under the estimate with its tip: as an estimate is told.)

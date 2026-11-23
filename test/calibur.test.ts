@@ -72,6 +72,9 @@ test('A signed Calibur batch is previewed as its calls, made as the signer’s a
   assert.match((await sign(t({}, { version: '2.0.0' }))).warnings.find(w => w.code === 'calibur_domain')?.message ?? '', /the name "Calibur" \(version "2\.0\.0"\): Calibur checks signatures under "Calibur", version "1\.0\.0"/);
   assert.match((await sign(t({}, { salt: salt('0x00000000000000000000000000000000000000aa') }))).warnings.find(w => w.code === 'calibur_unknown_code')?.message ?? '', /isn't a Calibur this format was read from/);
   assert.equal((await sign(t({}, { salt: salt('0x00000000000000000000000000000000000000aa') }))).decoding.status, 'partial');
+  const reordered = t();
+  reordered.types.EIP712Domain = [...reordered.types.EIP712Domain].reverse();
+  assert.match((await sign(reordered)).warnings.find(w => w.code === 'calibur_domain')?.message ?? '', /a domain whose fields aren't Calibur's/);
   assert.match((await sign(t({ deadline: 0n }))).warnings.find(w => w.code === 'calibur_no_deadline')?.message ?? '', /^It has no deadline: whoever holds it can submit it at any time/);
   assert.ok(codes(await sign(t(), offline, { now: (Number(signedMined.deadline) + 1) * 1000 })).includes('calibur_expired'));
   const other = await sign(t(), offline, {}, FRIEND);
@@ -159,6 +162,13 @@ test('Calibur’s own batch, sent by the account to itself, and a UserOperation�
   const registering = await send(own([{ to: USDC, data: transfer(1n) }, { to: ZERO, data: encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 2, publicKey: key }] }) }]));
   assert.deepEqual([registering.attention, codes(registering).includes('calibur_register_key'), codes(registering).includes('smart_account_self_call')], ['danger', true, false]);
   assert.match(detail(registering, 'Call 2') ?? '', /^Register an Ethereum key \(0xc51e…cb08\) on your account/);
+  // One of Calibur's own functions sent straight to the account, where the account is known to run Calibur: by the
+  // delegation its code is now, or not at all (an account running other code has other functions under a selector).
+  const chain = (code: string): Dependencies => ({ ...offline, rpc: { has: () => true, call: async (_c: number, m: string) => (m === 'eth_getCode' ? code : '0x') } });
+  const direct = await send(encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 1, publicKey: `0x${'11'.repeat(64)}` }] }), chain(`0xef0100${CODE.slice(2)}`));
+  assert.deepEqual([direct.title, direct.attention, direct.decoding.decoder, codes(direct).includes('calibur_register_key')], ['Register a passkey (WebAuthn, P-256) on your account', 'danger', 'smart_account', true]);
+  const elsewhere = await send(encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 1, publicKey: `0x${'11'.repeat(64)}` }] }), chain(`0xef0100${'22'.repeat(20)}`));
+  assert.ok(!codes(elsewhere).includes('calibur_register_key'));
   // A UserOperation's callData for Calibur: executeUserOp's selector, then the batch. Other bytes after that
   // selector are another account's layout, and aren't read as this one.
   const [encoded] = [encodeAbiParameters([{ type: 'tuple', components: [{ name: 'calls', type: 'tuple[]', components: [{ name: 'to', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }, { name: 'revertOnFailure', type: 'bool' }] }],

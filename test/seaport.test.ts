@@ -83,6 +83,16 @@ test('A bulk listing: every order in the tree, padding left out', async () => {
   assert.deepEqual([wide.attention, wide.decoding.status, detail(wide, 'More orders')], ['danger', 'partial', '1']);
   assert.match(wide.warnings.find(w => w.code === 'seaport_orders_unread')?.message ?? '', /^One signature for 21 orders, and the 1 after the first 20 aren't read here/);
   assert.ok(!codes(p).includes('seaport_orders_unread'));
+  // A number written as JSON `true` signs as 1 (the digest is computed so): the give-away order with such an
+  // amount was dropped as unreadable, and the signature shown as one fair listing. It reads as the 1 it signs.
+  const sly = components([{ ...nft(2), startAmount: true, endAmount: true }], [eth(1n, BOB)]);
+  const disguised = await sign({ tree: [[components([nft(1)], [eth(E, ALICE)]), sly], [empty, empty]] }, 'BulkOrder', types);
+  assert.deepEqual([disguised.attention, detail(disguised, 'Orders in this signature'), codes(disguised).includes('seaport_nothing_in_return')], ['danger', '2', true]);
+  // And a leaf that really can't be read is counted and warned of, not dropped.
+  const broken = components([{ ...nft(2), startAmount: { n: 1 } }], [eth(1n, BOB)]);
+  const partly = await sign({ tree: [[components([nft(1)], [eth(E, ALICE)]), broken], [empty, empty]] }, 'BulkOrder', types);
+  assert.deepEqual([partly.attention, partly.decoding.status, detail(partly, 'Orders in this signature')], ['danger', 'partial', '2']);
+  assert.match(partly.warnings.find(w => w.code === 'seaport_orders_unread')?.message ?? '', /^One of the orders in this signature can't be read here/);
 });
 
 // Transactions to Seaport, from the side of whoever sends them.

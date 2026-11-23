@@ -127,8 +127,11 @@ export async function heldToBalance(tokens: (Compared & { balance?: string; unju
       // only a balance that says something else than its token's logs is the one to hold the preview to. (Within
       // the tolerance alone, a preview half a token off both the logs and the balance of a large holder passed.)
       if (abs(b1 - b0 - BigInt(t.actual)) <= 2n) continue;
+      // And only where it is nearer the preview than its logs are: a preview half a token off both, for a holder of
+      // a million whose balance drifted three base units from its logs, passed within the interest on a million.
       const held = b0 > b1 ? b0 : b1, interest = held / 1_000_000n > 2n ? held / 1_000_000n : 2n;
-      if (abs(b1 - b0 - BigInt(t.simulated)) <= interest) t.balance = (b1 - b0).toString();
+      const off = abs(b1 - b0 - BigInt(t.simulated));
+      if (off <= interest && off < abs(b1 - b0 - BigInt(t.actual))) t.balance = (b1 - b0).toString();
     } catch (e) {
       // (Only state the node says it no longer has: a token that doesn't answer balanceOf, or answers nothing, is
       // no reason to let the difference go.)
@@ -144,15 +147,15 @@ export const stateGone = (e: unknown): boolean => /missing trie node|header not 
 export const differsIn = (t: Compared & { balance?: string; unjudged?: string }): boolean => offBy(t) && t.balance === undefined && !t.unjudged;
 
 /**
- * Why a run could not look, which is not a pass: the node answered for none of the blocks asked of it, or what failed
- * (a read or a preview that erred, a block's receipts, state the node no longer serves, a preview that wasn't
- * simulated) is ten or more of the transactions found and more than those compared, or three or more with none
- * compared. Reasons that are a transaction's own (not a batch, not a Safe,
+ * Why a run could not look, which is not a pass: the node answered for fewer of the blocks asked of it than it
+ * failed (ten or more of them), or what failed (a read or a preview that erred, a block's receipts, state the node
+ * no longer serves, a replay the node couldn't serve, a preview that wasn't simulated) is three or more of the
+ * transactions found and more than those compared. Reasons that are a transaction's own (not a batch, not a Safe,
  * used earlier in its block) are not failures. Null where it looked.
  */
 export function couldNotLook(skipped: Readonly<Record<string, number>>, compared: number, blocks?: { read: number; unread: number }): string | null {
   if (blocks?.unread && !blocks.read) return `none of the ${blocks.unread} block${blocks.unread === 1 ? '' : 's'} asked for could be read`;
-  const failed = Object.entries(skipped).filter(([why]) => /^error: |could not be read|no longer served|^a read of |^not simulated/.test(why)).reduce((n, [, count]) => n + count, 0);
-  // (Most of what was found, or all of it: three or more with none compared isn't a quiet chain.)
-  return (failed >= 10 && failed > compared) || (failed >= 3 && compared === 0) ? `${failed} transactions could not be looked at (a read, a preview or a simulation that failed), against ${compared} compared` : null;
+  if (blocks && blocks.unread >= 10 && blocks.unread > blocks.read) return `${blocks.unread} of the ${blocks.unread + blocks.read} blocks asked for could not be read`;
+  const failed = Object.entries(skipped).filter(([why]) => /^error: |could not be read|no longer served|^a read of |^not simulated|^not replayable \(UNAVAILABLE\)/.test(why)).reduce((n, [, count]) => n + count, 0);
+  return failed >= 3 && failed > compared ? `${failed} transactions could not be looked at (a read, a replay, a preview or a simulation that failed), against ${compared} compared` : null;
 }

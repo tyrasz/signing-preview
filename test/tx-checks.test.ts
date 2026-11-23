@@ -228,6 +228,22 @@ test('A gas limit named with no fee cap is checked against the balance: the whol
   assert.ok(!codes(await send({ gas: toHex(10_000_000n) })).includes('insufficient_funds_for_gas'));
   // (With no limit named, as before: the estimate.)
   assert.equal((await send({}, deps(10n ** 13n))).warnings.find(w => w.code === 'insufficient_funds_for_gas')?.severity, 'caution');
+  // An account with code doesn't always pay for its own transactions (a contract account's are submitted for it, a
+  // wallet with delegated code can have a relayer pay): it isn't told that the network rejects this one.
+  const withCode = (code: string, balance = 10n ** 15n): Dependencies => { const d = deps(balance), inner = d.rpc!.call; return { ...d, rpc: { has: () => true, call: async (c: number, m: string, ps: unknown[]) => (m === 'eth_getCode' ? code : inner(c, m, ps)) } }; };
+  for (const code of ['0x6080604052', `0xef0100${'11'.repeat(20)}`]) {
+    const contract = (await send({ gas: toHex(10_000_000n) }, withCode(code))).warnings.find(w => w.code === 'insufficient_funds_for_gas');
+    assert.equal(contract?.severity, 'caution', code);
+    assert.match(contract?.message ?? '', /An account with code doesn't always pay for its own transactions/);
+  }
+  // OP Stack: the figure is the limit at the base fee with the fee for its data, and says so (0.001 ETH of gas
+  // and 0.00001 ETH of data fee, with the value of 1 wei).
+  const op = (await send({ gas: toHex(1_000_000n), chainId: '0xa' }, deps(10n ** 14n))).warnings.find(w => w.code === 'insufficient_funds_for_gas');
+  assert.match(op?.message ?? '', /at the current base fee, with the fee for its data \(0\.001010000000000001 ETH\)/);
+  // A chain whose base fee is zero (BNB Chain): the limit at the price the transaction would pay, its tip.
+  const noBase = (balance: bigint): Dependencies => { const d = deps(balance), inner = d.rpc!.call; return { ...d, rpc: { has: () => true, call: async (c: number, m: string, ps: unknown[]) => (m === 'eth_getBlockByNumber' ? { baseFeePerGas: '0x0' } : inner(c, m, ps)) } }; };
+  const bnb = (await send({ gas: toHex(10_000_000n), chainId: '0x38' }, noBase(10n ** 11n))).warnings.find(w => w.code === 'insufficient_funds_for_gas');
+  assert.deepEqual([bnb?.severity, /at its price \(/.test(bnb?.message ?? '')], ['danger', true]);
 });
 
 test('A batch runs again at the price it would pay, and that run is shown when it changes what a call does', async () => {

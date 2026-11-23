@@ -65,7 +65,9 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
   // like it: what takes the signature, and what it does with it, isn't known.
   const named = str(data.domain.name) === 'Calibur' && str(data.domain.version) === '1.0.0';
   const others = (data.types.EIP712Domain?.map(f => f.name) ?? Object.keys(data.domain)).filter(k => !['name', 'version', 'chainId', 'verifyingContract', 'salt'].includes(k));
-  if (!named || !code || others.length) b.warn('caution', 'calibur_domain', `It is signed under ${!code ? 'a domain with no salt' : others.length ? `a domain that also has ${others.map(o => `"${o}"`).join(', ')}` : `the name "${str(data.domain.name)}" (version "${str(data.domain.version)}")`}: Calibur checks signatures under "Calibur", version "1.0.0", the chain, the account and a salt that names its code, so an account that runs it doesn't take this one. What else would take it isn't known.`);
+  // (Its domain type exactly, where one is given: the five fields, of these types, in this order.)
+  const domainType = shape('EIP712Domain'), misshapen = domainType !== undefined && domainType !== 'string name,string version,uint256 chainId,address verifyingContract,bytes32 salt';
+  if (!named || !code || others.length || misshapen) b.warn('caution', 'calibur_domain', `It is signed under ${!code ? 'a domain with no salt' : others.length ? `a domain that also has ${others.map(o => `"${o}"`).join(', ')}` : misshapen ? `a domain whose fields aren't Calibur's (${domainType})` : `the name "${str(data.domain.name)}" (version "${str(data.domain.version)}")`}: Calibur checks signatures under "Calibur", version "1.0.0", the chain, the account and a salt that names its code, so an account that runs it doesn't take this one. What else would take it isn't known.`);
   else if (!known) b.warn('caution', 'calibur_unknown_code', `Its salt names ${shortAddress(code)} as the account's code, which isn't a Calibur this format was read from: the request is shaped like Calibur's signed batches, but what code takes this signature, and what it does with it, isn't known.`);
   if (never) b.warn('caution', 'calibur_no_deadline', `It has no deadline: ${anyone ? 'whoever holds it' : shortAddress(executor)} can submit it at any time, until its nonce is used or you invalidate it.`);
   else if (deadline < now) b.warn('info', 'calibur_expired', 'Its deadline has passed: Calibur refuses it.');
@@ -147,7 +149,7 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
     if (p.trace && !b.trace) b.trace = p.trace;
     assetChanges = p.assetChanges;
     approvals = failing ? undefined : p.approvals;
-    status = known && named && !others.length && !admin.some(a => !a.title) ? (admin.length && p.decoding.status !== 'full' && admin.length === n ? 'full' : p.decoding.status) : 'partial';
+    status = known && named && !others.length && !misshapen && !admin.some(a => !a.title) ? (admin.length && p.decoding.status !== 'full' && admin.length === n ? 'full' : p.decoding.status) : 'partial';
     const head = n === 1 && admin[0]?.title ? admin[0].title : p.title.replace(/^(Send|Sign|Submit) (a )?transaction: /i, '').replace(/^\d+ actions: /, '');
     title = `Signed ${what} as ${mine || !signer ? 'you' : shortAddress(account)}: ${head}`;
     also = p.summary;

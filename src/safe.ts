@@ -11,7 +11,7 @@ import { callerOverrides, decodeTransaction, simulationNote, warnOverridden } fr
 import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
 import type { AssetChange, SimulationRequest, SimulationResult, Warning } from './types.ts';
-import { configChanges, simulateSafeExecution, type SafeConfig } from './safe-sim.ts';
+import { configChanges, SAFE_SINGLETONS, simulateSafeExecution, type SafeConfig } from './safe-sim.ts';
 import { namedBlock, pinLatest } from './block.ts';
 import { tracePreviews, noTrace, type TraceEnv } from './evm/trace.ts';
 
@@ -33,36 +33,45 @@ export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 
   '0xa83c336b20401af773b6219ba5027174338d1836': { name: 'MultiSendCallOnly 1.5.0', kind: 'multisend_call_only' },
   '0x4ffef8222648872b3de295ba1e49110e61f5b5aa': { name: 'SignMessageLib 1.5.0', kind: 'sign_message' },
   '0x2ef5ecfbea521449e4de05edb1ce63b75eda90b4': { name: 'CreateCall 1.5.0', kind: 'create_call' },
-  // Official upgrades: these change the Safe's code, to an official Safe singleton.
+  // Safe's own upgrade contracts: these change the Safe's code. SafeMigration's functions take no argument and move
+  // the Safe to the singleton it was deployed for; SafeToL2Migration's take the new singleton as an argument, and
+  // check only the version it says it is, on a Safe that has run no transaction yet (libraryCall).
   '0x526643f69b81b008f46d95cd5ced5ec0edffdac6': { name: 'SafeMigration 1.4.1', kind: 'migration' },
   '0xff83f6335d8930cbad1c0d439a841f01888d9f69': { name: 'SafeToL2Migration 1.4.1', kind: 'migration' },
   '0x6439e7abd8bb915a5263094784c5cf561c4172ac': { name: 'SafeMigration 1.5.0', kind: 'migration' },
 };
 const ZERO = '0x0000000000000000000000000000000000000000';
-/**
- * How many of a batch's calls are decoded with reads of the chain (a token's name, an account's code), and how many
- * are decoded at all: those after the first twenty from their calldata alone, so that a batch of two hundred
- * transfers (an airdrop's, a payroll's) is read whole without two hundred calls' worth of lookups.
- */
-const MAX_CALLS = 20, MAX_LISTED = 200;
+/** How many of a batch's calls are decoded: a batch of two hundred transfers (an airdrop's, a payroll's) is read whole. */
+const MAX_LISTED = 200;
 
 export interface SafeTx { safe: string; to: string; value: bigint; data: Hex; operation: number; safeTxGas: bigint; baseGas: bigint; gasPrice: bigint; gasToken: string; refundReceiver: string; nonce?: bigint }
-interface Call { operation: number; to: string; value: bigint; data: Hex; /** A delegatecall to MultiSend whose own batch couldn't be read (or is nested too deep). */ unread?: boolean }
+interface Call {
+  operation: number; to: string; value: bigint; data: Hex;
+  /** A delegatecall to MultiSend whose own batch couldn't be read (or is nested too deep). */
+  unread?: boolean;
+  /** Why the batch this call is in reverts on it: MultiSendCallOnly makes no delegatecall, and neither library runs an operation other than 0 and 1. */
+  refused?: string;
+}
+type MultiSendKind = 'multisend' | 'multisend_call_only';
 
 /**
  * A batch with the batches nested in it laid out: a call that delegatecalls MultiSend (or MultiSendCallOnly) runs a
  * batch of its own as the Safe, so its calls take its place, to four levels. Left as one call "to MultiSend", which
  * is one of Safe's libraries and so no danger, a delegatecall to unknown code one level down showed as a call that
  * couldn't be decoded: a caution, where the same call in the outer batch is the Bybit pattern's danger.
+ * `kind` is the library whose code runs the batch: MultiSendCallOnly reverts on a delegatecall (so a batch nested
+ * under it isn't laid out: it never runs), and both revert on an operation that is neither a call nor a delegatecall.
  */
-function laidOut(calls: Call[], depth = 1): { calls: Call[]; nested: number } {
+function laidOut(calls: Call[], kind: MultiSendKind, depth = 1): { calls: Call[]; nested: number } {
   let nested = 0;
   const out = calls.flatMap(c => {
-    const kind = c.operation === 1 ? SAFE_LIBRARIES[c.to.toLowerCase()]?.kind : undefined;
-    if (kind !== 'multisend' && kind !== 'multisend_call_only') return [c];
-    const inner = depth < 4 ? multiSendCalls(c.data) : null;
-    if (!inner) return [{ ...c, unread: true }];
-    const below = laidOut(inner, depth + 1);
+    if (c.operation > 1) return [{ ...c, refused: `operation ${c.operation} isn't one MultiSend runs (a call, 0, or a delegatecall, 1)` }];
+    if (c.operation === 1 && kind === 'multisend_call_only') return [{ ...c, refused: 'it is a delegatecall, which MultiSendCallOnly makes none of' }];
+    const inner = c.operation === 1 ? SAFE_LIBRARIES[c.to.toLowerCase()]?.kind : undefined;
+    if (inner !== 'multisend' && inner !== 'multisend_call_only') return [c];
+    const batch = depth < 4 ? multiSendCalls(c.data) : null;
+    if (!batch) return [{ ...c, unread: true }];
+    const below = laidOut(batch, inner, depth + 1);
     nested += below.calls.length;
     return below.calls;
   });
@@ -86,6 +95,7 @@ export function multiSendCalls(data: Hex): Call[] | null {
 }
 
 const ADMIN = parseAbi([
+  'function changeMasterCopy(address _masterCopy)',
   'function addOwnerWithThreshold(address owner, uint256 threshold)', 'function removeOwner(address prevOwner, address owner, uint256 threshold)',
   'function swapOwner(address prevOwner, address oldOwner, address newOwner)', 'function changeThreshold(uint256 threshold)',
   'function enableModule(address module)', 'function disableModule(address prevModule, address module)',
@@ -98,6 +108,13 @@ function safeAdmin(data: Hex, b: PreviewBuilder, p: string): string | null {
   try { c = decodeFunctionData({ abi: ADMIN, data }); } catch { return null; }
   const a = c.args as readonly unknown[];
   switch (c.functionName) {
+    // (Safe 1.1.1 and 1.2.0: the Safe replaces its own code. Later versions have no such function.)
+    case 'changeMasterCopy': {
+      const to = String(a[0]).toLowerCase(), official = SAFE_SINGLETONS[to];
+      if (official) b.warn('caution', 'safe_upgrade', `${p}Changes the Safe's code to ${official} (${to}). Only sign it if you meant to upgrade the Safe.`);
+      else b.warn('danger', 'safe_code_replaced', `${p}Replaces the Safe's code with the code at ${to}, which isn't one of Safe's own: whoever controls that code controls the Safe and everything in it.`);
+      return official ? `Upgrade the Safe to ${official}` : `Replace the Safe's code with ${shortAddress(to)}`;
+    }
     case 'addOwnerWithThreshold': b.warn('caution', 'safe_owners_change', `${p}Adds ${a[0]} as an owner of the Safe, with a threshold of ${a[1]}.`); return `Add owner ${shortAddress(a[0] as string)} (threshold ${a[1]})`;
     case 'removeOwner': b.warn('caution', 'safe_owners_change', `${p}Removes ${a[1]} as an owner of the Safe, leaving a threshold of ${a[2]}.`); return `Remove owner ${shortAddress(a[1] as string)} (threshold ${a[2]})`;
     case 'swapOwner': b.warn('caution', 'safe_owners_change', `${p}Replaces owner ${a[1]} with ${a[2]}.`); return `Replace owner ${shortAddress(a[1] as string)} with ${shortAddress(a[2] as string)}`;
@@ -108,6 +125,50 @@ function safeAdmin(data: Hex, b: PreviewBuilder, p: string): string | null {
     case 'setFallbackHandler': b.warn('caution', 'safe_fallback_handler', `${p}Sets ${a[0]} as the Safe's fallback handler: it answers calls the Safe doesn't know, including ERC-1271 signature checks made in the Safe's name.`); return `Set the Safe's fallback handler to ${shortAddress(a[0] as string)}`;
   }
   return null;
+}
+
+const LIBRARY = parseAbi([
+  'function signMessage(bytes _data)', 'function performCreate(uint256 value, bytes deploymentData)', 'function performCreate2(uint256 value, bytes deploymentData, bytes32 salt)',
+  'function migrateSingleton()', 'function migrateWithFallbackHandler()', 'function migrateL2Singleton()', 'function migrateL2WithFallbackHandler()',
+  'function migrateToL2(address l2Singleton)', 'function migrateFromV111(address l2Singleton, address fallbackHandler)',
+]);
+/**
+ * A delegatecall to one of Safe's own libraries other than MultiSend: what it does to the Safe, read from its
+ * calldata, warned of into `b`. The library being Safe's own says who wrote the code, not what the call does with
+ * it: SignMessageLib signs whatever message it is given as the Safe, CreateCall deploys whatever code it is given
+ * with the Safe's coin, and SafeToL2Migration sets the Safe's code to whatever address it is given that answers the
+ * right version string, on a Safe that has run no transaction yet.
+ */
+function libraryCall(lib: { name: string; kind: string }, c: Call, b: PreviewBuilder, p: string, coin: (v: bigint) => string): { title: string; summary: string; status: Decoded['status'] } {
+  let call;
+  try { call = decodeFunctionData({ abi: LIBRARY, data: c.data }); } catch { call = undefined; }
+  const fits = (kind: string, names: string[]) => lib.kind === kind && !!call && names.includes(call.functionName);
+  if (fits('sign_message', ['signMessage'])) {
+    const data = call!.args![0] as Hex, bytes = (data.length - 2) / 2;
+    const chars = (data.slice(2).match(/../g) ?? []).map(h => String.fromCharCode(parseInt(h, 16))).join('');
+    const text = bytes > 0 && bytes !== 32 && /^[\x20-\x7e\n\r\t]+$/.test(chars) ? chars : null;
+    b.detail(`${p}Message signed as the Safe`.replace(/^Call (\d+): M/, 'Call $1: m'), text ? (text.length > 300 ? `${text.slice(0, 300)}…` : text) : bytes === 32 ? `a hash, ${data}` : data.length > 202 ? `${data.slice(0, 202)}… (${bytes} bytes)` : data, data);
+    b.warn('caution', 'safe_sign_message', `${p}signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's. ${text ? 'The message is shown as text' : bytes === 32 ? "Only the message's hash is given" : 'The message is shown as its bytes'}: what it commits the Safe to isn't read here, and it can be an order or a permit that moves the Safe's tokens.`);
+    return { title: 'Sign a message as the Safe', summary: 'Marks a message as signed by the Safe.', status: 'partial' };
+  }
+  if (fits('create_call', ['performCreate', 'performCreate2'])) {
+    const [value, code] = call!.args as unknown as [bigint, Hex];
+    b.warn(value > 0n ? 'caution' : 'info', 'safe_create_call', `${p}deploys a contract from the Safe (${lib.name}), of ${((code.length - 2) / 2).toLocaleString('en-US')} bytes of code that isn't read here${value > 0n ? `, and sends it ${coin(value)} of the Safe's: what its code does with the coin isn't known` : ''}.`);
+    return { title: `Deploy a contract from the Safe${value > 0n ? `, with ${coin(value)}` : ''}`, summary: 'Deploys a contract with the Safe as its creator.', status: 'partial' };
+  }
+  if (fits('migration', ['migrateSingleton', 'migrateWithFallbackHandler', 'migrateL2Singleton', 'migrateL2WithFallbackHandler']) && /^SafeMigration/.test(lib.name)) {
+    b.warn('caution', 'safe_migration', `${p}upgrades the Safe's code through Safe's official ${lib.name} contract (${call!.functionName}: to the singleton that contract was deployed for${/FallbackHandler/.test(call!.functionName) ? ', with its fallback handler' : ''}). Only sign it if you meant to upgrade the Safe.`);
+    return { title: `Upgrade the Safe (${lib.name})`, summary: 'Moves the Safe to another official Safe version.', status: 'full' };
+  }
+  if (fits('migration', ['migrateToL2', 'migrateFromV111']) && /^SafeToL2Migration/.test(lib.name)) {
+    const to = String(call!.args![0]).toLowerCase(), official = SAFE_SINGLETONS[to], handler = call!.functionName === 'migrateFromV111' ? String(call!.args![1]).toLowerCase() : null;
+    if (official) b.warn('caution', 'safe_migration', `${p}changes the Safe's code to ${official} (${to}) through Safe's ${lib.name} contract${handler ? `, and sets ${handler} as its fallback handler` : ''}. Only sign it if you meant to upgrade the Safe.`);
+    else b.warn('danger', 'safe_code_replaced', `${p}sets the Safe's code to the code at ${to}, which isn't one of Safe's own, through Safe's ${lib.name} contract: that contract takes whatever address it is given that says it is version 1.3.0 or 1.4.1, on a Safe that has run no transaction yet. Whoever controls that code controls the Safe and everything in it.`);
+    return { title: official ? `Upgrade the Safe to ${official}` : `Replace the Safe's code with ${shortAddress(to)} (${lib.name})`, summary: official ? 'Moves the Safe to another official Safe version.' : "Replaces the Safe's code with code that isn't Safe's own.", status: official ? 'full' : 'partial' };
+  }
+  // Calldata that is none of the library's functions: its code runs as the Safe all the same, on bytes that aren't read.
+  b.warn('caution', 'safe_library_unread', `${p}delegatecalls Safe's ${lib.name} with calldata (${c.data.length >= 10 ? c.data.slice(0, 10) : 'none'}) that isn't one of the functions this reads from it: what it does to the Safe isn't shown.`);
+  return { title: `Call ${lib.name} as the Safe (${c.data.length >= 10 ? c.data.slice(0, 10) : 'no calldata'})`, summary: 'A delegatecall to one of Safe\'s libraries, with calldata that isn\'t read.', status: 'opaque' };
 }
 
 /** A call running a Safe transaction: execTransaction(to, value, data, operation, safeTxGas, …, signatures). */
@@ -121,7 +182,7 @@ const EXECUTION_SUCCESS = '0x442e715f626346e8c54381002da614f62bee8d27386535b2521
 type Log = NonNullable<SimulationResult['logs']>[number];
 
 /** One call the Safe makes, decoded as its own transaction from the Safe (its settings when it calls itself). */
-async function describeCall(c: Call, safe: string, chainId: number, env: AdapterEnv, b: PreviewBuilder, p: string): Promise<Decoded | { title: string; status: 'full'; watch?: undefined }> {
+async function describeCall(c: Call, safe: string, chainId: number, env: AdapterEnv, b: PreviewBuilder, p: string): Promise<Decoded | { title: string; status: 'full'; watch?: undefined; b?: undefined }> {
   if (sameAddress(c.to, safe)) {
     const t = safeAdmin(c.data, b, p);
     if (t) return { title: t, status: 'full' };
@@ -165,29 +226,29 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     } catch { /* not simulated */ }
     return r;
   };
+  const coin = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}`;
+  // The transaction is a batch: MultiSend's, delegatecalled. Its calls then run as the Safe, a delegatecall among
+  // them too, whether it has twenty calls or one.
+  let batched = false;
   if (t.operation === 1 && (lib?.kind === 'multisend' || lib?.kind === 'multisend_call_only')) {
     const parsed = multiSendCalls(t.data);
     if (!parsed) { b.warn('danger', 'safe_delegatecall', `This delegatecalls ${lib.name} with a batch that can't be read.`); return { title: 'Run an unreadable Safe batch', summary: 'A MultiSend batch that could not be decoded.', status: 'opaque', assetChanges: [] }; }
-    const flat = laidOut(parsed);
+    const flat = laidOut(parsed, lib.kind);
     calls = flat.calls;
     label = lib.name;
+    batched = true;
     b.detail('Batch', `${calls.length} call${calls.length === 1 ? '' : 's'} through ${lib.name}${flat.nested ? ` (${flat.nested} of them from ${flat.nested === 1 ? 'a batch' : 'batches'} nested in it, which run as the Safe too)` : ''}`);
-  } else if (t.operation === 1 && lib?.kind === 'sign_message') {
-    b.warn('info', 'safe_sign_message', `This signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's.`);
-    return early({ title: 'Sign a message as the Safe', summary: `Marks a message as signed by the Safe, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
-  } else if (t.operation === 1 && lib?.kind === 'migration') {
-    b.warn('caution', 'safe_migration', `This upgrades the Safe's code through Safe's official ${lib.name} contract. Only sign it if you meant to upgrade the Safe.`);
-    return early({ title: `Upgrade the Safe (${lib.name})`, summary: `Moves the Safe to another official Safe version, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
-  } else if (t.operation === 1 && lib?.kind === 'create_call') {
-    b.warn('info', 'safe_create_call', `This deploys a contract from the Safe (${lib.name}).`);
-    return early({ title: 'Deploy a contract from the Safe', summary: `Deploys a contract with the Safe as its creator, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
+  } else if (t.operation === 1 && lib) {
+    // Another of Safe's libraries: what it does to the Safe, read from its calldata.
+    const r = libraryCall(lib, { operation: 1, to: t.to, value: t.value, data: t.data }, b, '', coin);
+    return early({ title: r.title, summary: `${r.summary} Through ${lib.name}.`, status: r.status, assetChanges: [] });
   } else if (t.operation === 1) {
     b.warn('danger', 'safe_delegatecall', `This is a delegatecall: ${t.to}'s code would run as the Safe itself, able to change its owners, move everything in it or replace its code. It is not one of Safe's own libraries. A delegatecall like this is how the Bybit Safe was drained in 2025: don't sign it unless you know exactly what that contract does.`);
     calls = [{ operation: 1, to: t.to, value: t.value, data: t.data }];
   } else {
     // MultiSend must be delegatecalled to run its batch as the Safe. MultiSendCallOnly, called plainly, still runs
     // it, but as itself: the calls can't move the Safe's funds or act in its name. (MultiSend itself reverts.)
-    if (lib?.kind === 'multisend' || lib?.kind === 'multisend_call_only') b.warn('caution', 'safe_multisend_call', `This calls ${lib.name} directly instead of delegatecalling it, so its batch ${lib.kind === 'multisend' ? 'is rejected' : 'runs from the MultiSend contract, not from the Safe: the calls can\'t move the Safe\'s funds or act in its name'}. Wallets send batches as a delegatecall; this one is probably built wrongly.`);
+    if (lib?.kind === 'multisend' || lib?.kind === 'multisend_call_only') b.warn('caution', 'safe_multisend_call', `This calls ${lib.name} directly instead of delegatecalling it, so its batch ${lib.kind === 'multisend' ? 'is rejected' : 'runs from the MultiSend contract, not from the Safe: the calls can\'t move the Safe\'s funds or act in its name'}. Wallets send batches as a delegatecall; this one is probably built wrong.`);
     calls = [{ operation: 0, to: t.to, value: t.value, data: t.data }];
   }
 
@@ -200,40 +261,53 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   // 1.3.0 always, from it with a safeTxGas or a gas price). On Base, a SafeOp sent a token to a Safe it then deployed
   // and ran a transaction on: shown failing (ERC20InsufficientBalance), it ran.
   const alone: { call: number; warning: Warning }[] = [];
-  // (Past the twentieth call, with no RPC and no simulator: from the calldata alone.)
-  const fromCalldata: AdapterEnv = { ...env, deps: { ...env.deps, rpc: undefined, simulator: undefined } };
-  for (const [i, c] of calls.slice(0, MAX_LISTED).entries()) {
-    const p = calls.length > 1 ? `Call ${i + 1}: ` : '';
-    if (calls.length > 1 && c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()]) b.warn('danger', 'safe_delegatecall', `${p}a delegatecall to ${c.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
-    const from = b.warnings.length;
+  const many = calls.length > 1, listed = calls.slice(0, MAX_LISTED);
+  // Every call is decoded, to the two hundredth, each with the reads of the chain its decoding makes (a call past
+  // the twentieth wasn't decoded at all: behind twenty transfers, a delegatecall to unknown code or an unlimited
+  // approval went with nothing warned of, the batch "fully decoded"). Eight at a time, each into a builder of its
+  // own, so that what they warn of is told in the batch's order.
+  type Described = { d: { title: string; status: Decoded['status']; watch?: string[]; b?: PreviewBuilder }; sub: PreviewBuilder };
+  const describe = async (c: Call, i: number): Promise<Described> => {
+    const sub = new PreviewBuilder(), p = many ? `Call ${i + 1}: ` : '';
     // Safe's own libraries, delegatecalled from inside the batch: what each does to the Safe, as when one is the
     // whole transaction. (A nested batch that could be read is already laid out above.)
     const inLib = c.operation === 1 ? SAFE_LIBRARIES[c.to.toLowerCase()] : undefined;
-    let d: { title: string; status: Decoded['status']; watch?: string[] };
     if (c.unread) {
-      b.warn('danger', 'safe_delegatecall', `${p}delegatecalls ${inLib?.name ?? 'MultiSend'} with a batch of its own that can't be read here (malformed, or nested more than four deep): its calls run as the Safe, and any of them can move what it holds or change it.`);
-      d = { title: 'Run an unreadable nested batch', status: 'opaque' };
-    } else if (inLib?.kind === 'sign_message') {
-      b.warn('info', 'safe_sign_message', `${p}signs a message in the Safe's name (${inLib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's.`);
-      d = { title: 'Sign a message as the Safe', status: 'full' };
-    } else if (inLib?.kind === 'migration') {
-      b.warn('caution', 'safe_migration', `${p}upgrades the Safe's code through Safe's official ${inLib.name} contract. Only sign it if you meant to upgrade the Safe.`);
-      d = { title: `Upgrade the Safe (${inLib.name})`, status: 'full' };
-    } else if (inLib?.kind === 'create_call') {
-      b.warn('info', 'safe_create_call', `${p}deploys a contract from the Safe (${inLib.name}).`);
-      d = { title: 'Deploy a contract from the Safe', status: 'full' };
-    } else d = await describeCall(c, safe, chainId, i < MAX_CALLS ? env : fromCalldata, b, p);
-    if (i > 0 && isExecTransaction(c)) for (const w of b.warnings.slice(from)) if (w.code === 'safe_tx_reverts') alone.push({ call: i, warning: w });
+      sub.warn('danger', 'safe_delegatecall', `${p}delegatecalls ${inLib?.name ?? 'MultiSend'} with a batch of its own that can't be read here (malformed, or nested more than four deep): its calls run as the Safe, and any of them can move what it holds or change it.`);
+      return { d: { title: 'Run an unreadable nested batch', status: 'opaque' }, sub };
+    }
+    if (inLib && inLib.kind !== 'multisend' && inLib.kind !== 'multisend_call_only' && !c.refused) return { d: libraryCall(inLib, c, sub, p, coin), sub };
+    return { d: await describeCall(c, safe, chainId, env, sub, p), sub };
+  };
+  const described: Described[] = [];
+  for (let i = 0; i < listed.length; i += 8) described.push(...await Promise.all(listed.slice(i, i + 8).map((c, j) => describe(c, i + j))));
+  for (const [i, c] of listed.entries()) {
+    const { d, sub } = described[i], p = many ? `Call ${i + 1}: ` : '';
+    // A delegatecall inside a batch runs as the Safe, wherever in the batch it is and however many calls the batch
+    // has (in a batch of one it went unsaid: the call was shown as what its calldata reads as, a transfer).
+    const rogue = batched && c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()];
+    if (rogue) b.warn('danger', 'safe_delegatecall', `${p}a delegatecall to ${c.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
+    // The batch reverts on this call, whatever the others do: said, as the simulation would say it.
+    if (c.refused) b.warn('caution', 'safe_tx_reverts', `${p}the batch reverts on this call as it is built: ${c.refused}.`);
+    for (const w of sub.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push(w);
+    if (i > 0 && isExecTransaction(c)) for (const w of sub.warnings) if (w.code === 'safe_tx_reverts') alone.push({ call: i, warning: w });
     decoded.push(d);
-    const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}` : '';
+    // The coin a call sends, wherever its title doesn't already say it (a token transfer with 100 ETH attached was
+    // titled as the transfer, the coin nowhere).
+    const value = c.value > 0n && !d.title.includes(coin(c.value)) ? `, with ${coin(c.value)}` : '';
     titles.push(d.title);
-    if (calls.length > 1) b.detail(`Call ${i + 1}`, `${c.operation === 1 ? '(delegatecall) ' : ''}${d.title}${value} (${shortAddress(c.to.toLowerCase())})`, c.to.toLowerCase());
+    const how = c.operation === 1 ? '(delegatecall) ' : '';
+    if (many) b.detail(`Call ${i + 1}`, `${how}${d.title}${value} (${shortAddress(c.to.toLowerCase())})`, c.to.toLowerCase());
+    else if (batched && how) b.detail('Call', `${how}${d.title}${value} (${shortAddress(c.to.toLowerCase())})`, c.to.toLowerCase());
+    if (!many && value) b.detail('Value sent with the call', coin(c.value), c.value.toString());
+    // What the call's own decoding tells of it (who a transfer goes to, who an approval is for): a Safe transaction
+    // titled "Send 1,000 USDC" named no recipient anywhere.
+    for (const x of d.b?.details ?? []) b.detail(many ? `Call ${i + 1}: ${x.label}` : x.label, x.value, x.raw);
+    // (And what a library call's reading adds: the message it signs as the Safe.)
+    for (const x of sub.details) b.detail(x.label, x.value, x.raw);
   }
-  // Every call is decoded, to the two hundredth (calls past the twentieth weren't: behind twenty transfers, a
-  // delegatecall to unknown code or an unlimited approval went with nothing warned of, the batch "fully decoded").
-  // Past that they aren't, and that is said, with what is cheap to tell of them and matters most: a delegatecall
-  // inside the batch runs as the Safe wherever in it it is.
-  if (calls.length > MAX_CALLS) b.note(`The calls after the first ${MAX_CALLS} are decoded from their calldata alone, without the reads of the chain the first ${MAX_CALLS} get (a token this doesn't know is shown by its address).`);
+  // Past the two hundredth they aren't decoded, and that is said, with what is cheap to tell of them and matters
+  // most: a delegatecall inside the batch runs as the Safe wherever in it it is.
   if (calls.length > MAX_LISTED) {
     const rest = calls.slice(MAX_LISTED);
     const rogue = rest.flatMap((c, j) => (c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()] ? [{ n: MAX_LISTED + j + 1, to: c.to }] : []));
@@ -301,9 +375,11 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   const status = calls.length > MAX_LISTED || statuses.includes('opaque') ? 'partial' : statuses.includes('partial') ? 'partial' : 'full';
   // A delegatecall to an unknown contract is titled for what it is: whatever its calldata looks like (in the Bybit
   // theft it looked like a plain transfer), the contract's own code runs as the Safe.
-  const rogue = t.operation === 1 && !lib;
+  // (The same for a batch of one call that is such a delegatecall.)
+  const only = calls.length === 1 && calls[0].operation === 1 && !SAFE_LIBRARIES[calls[0].to.toLowerCase()] ? calls[0].to.toLowerCase() : null;
+  const rogue = (t.operation === 1 && !lib) || !!only;
   if (rogue) b.detail('Its calldata reads as', titles[0]);
-  const title = rogue ? `Let ${shortAddress(t.to.toLowerCase())} run its code as the Safe (delegatecall)` : calls.length === 1 ? titles[0] : `Run ${calls.length} calls from the Safe`;
+  const title = rogue ? `Let ${shortAddress(only ?? t.to.toLowerCase())} run its code as the Safe (delegatecall)` : calls.length === 1 ? titles[0] : `Run ${calls.length} calls from the Safe`;
   return { title, summary: `The Safe ${shortAddress(safe)} ${calls.length === 1 ? (t.operation === 1 ? 'delegatecalls' : 'makes this call') : `runs ${calls.length} calls${label ? ` through ${label}` : ''}`}: ${titles.slice(0, 3).join('; ')}${calls.length > 3 ? '; …' : ''}.`, status, assetChanges };
 }
 

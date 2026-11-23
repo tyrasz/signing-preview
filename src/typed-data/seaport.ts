@@ -77,7 +77,11 @@ export const seaportAdapter: TypedAdapter = async (data, env) => {
   if (chainId === null) return null;
   const network = { kind: 'evm' as const, chainId, name: chainName(chainId) };
   const raw = data.primaryType === 'BulkOrder' ? leaves((data.message as Record<string, unknown>).tree) : [data.message];
-  const orders = raw.map(order).filter((o): o is SeaportOrder => !!o && !(/^0x0{40}$/.test(o.offerer) && !o.offer.length && !o.consideration.length));
+  const read = raw.map(order);
+  const orders = read.filter((o): o is SeaportOrder => !!o && !(/^0x0{40}$/.test(o.offerer) && !o.offer.length && !o.consideration.length));
+  // A leaf that doesn't read is signed with the rest all the same: it isn't dropped from the count (an order with
+  // an amount written in a form this couldn't read vanished, and the signature showed one listing, "fully decoded").
+  const unread = read.filter(o => !o).length;
   if (!orders.length) return null;
   const b = new PreviewBuilder();
   const contract = str(data.domain.verifyingContract).toLowerCase();
@@ -86,7 +90,8 @@ export const seaportAdapter: TypedAdapter = async (data, env) => {
   b.detail('Offerer', orders[0].offerer);
   const env2 = { deps: env.deps, chainId };
   const bulk = data.primaryType === 'BulkOrder';
-  if (bulk) b.detail('Orders in this signature', String(orders.length));
+  if (bulk) b.detail('Orders in this signature', String(orders.length + unread));
+  if (unread) b.warn('danger', 'seaport_orders_unread', `${unread === 1 ? 'One of the orders' : `${unread} of the orders`} in this signature can't be read here: ${unread === 1 ? 'it' : 'each'} is signed with the rest and can be filled on its own, and could give your tokens away for nothing.`);
   const summaries = [];
   const assetChanges: AssetChange[] = [];
   for (const [i, o] of orders.slice(0, MAX_ORDERS).entries()) {
@@ -110,6 +115,6 @@ export const seaportAdapter: TypedAdapter = async (data, env) => {
   return {
     title, summary: summaries.length === 1 ? `Signs a Seaport order: you give ${summaries[0].gives.join(', ') || 'nothing'} and receive ${summaries[0].gets.join(', ') || 'nothing'}.`
       : `Signs ${orders.length} Seaport orders at once: ${summaries.slice(0, 3).map(s => s.title).join('; ')}${orders.length > 3 ? '; …' : ''}.`,
-    decoder: bulk ? 'seaport_bulk_order' : 'seaport_order', status: orders.length > MAX_ORDERS ? 'partial' : 'full', b, network, assetChanges,
+    decoder: bulk ? 'seaport_bulk_order' : 'seaport_order', status: orders.length > MAX_ORDERS || unread ? 'partial' : 'full', b, network, assetChanges,
   };
 };

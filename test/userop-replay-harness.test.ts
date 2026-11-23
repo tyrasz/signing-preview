@@ -135,7 +135,7 @@ test("A token whose logs carry its interest is held to the account's balance acr
   assert.deepEqual(same.map(differsIn), [false, true]);
 });
 
-test('a run that could not look is not a pass: no block read, or more failed reads than transactions compared', () => {
+test('a run that could not look is not a pass: blocks unread, or more failed reads than transactions compared', () => {
   // The node answered for no block it was asked for.
   assert.match(couldNotLook({}, 0, { read: 0, unread: 40 })!, /none of the 40 blocks/);
   assert.equal(couldNotLook({}, 0, { read: 40, unread: 3 }), null);
@@ -146,8 +146,17 @@ test('a run that could not look is not a pass: no block read, or more failed rea
   const failed = { "its block's receipts could not be read": 6, 'error: fetch failed': 5, 'its state is no longer served by the node': 2 };
   assert.equal(couldNotLook(failed, 80, { read: 300, unread: 0 }), null);
   assert.match(couldNotLook(failed, 4, { read: 300, unread: 0 })!, /13 transactions could not be looked at .* against 4 compared/);
+  // The reasons the harnesses record when the node fails them, as they word them: a replay it can't serve
+  // (src/replay.ts wraps every failed read so), state it no longer has. Forty of either with none compared passed.
+  assert.match(couldNotLook({ 'not replayable (UNAVAILABLE)': 40 }, 0)!, /40 transactions could not be looked at/);
+  assert.match(couldNotLook({ 'its state is no longer served by the node': 40 }, 0)!, /40 transactions/);
+  assert.equal(couldNotLook({ 'not replayable (UNSUPPORTED)': 40, "not a Safe whose configuration reads (another contract's execTransaction)": 40 }, 0), null);
+  // Most blocks unread, and nine reads failed against one compared.
+  assert.match(couldNotLook({}, 5, { read: 1, unread: 99 })!, /99 of the 100 blocks asked for could not be read/);
+  assert.equal(couldNotLook({}, 5, { read: 60, unread: 9 }), null);
+  assert.match(couldNotLook({ 'error: fetch failed': 9 }, 1)!, /9 transactions .* against 1 compared/);
   assert.equal(couldNotLook({ 'error: fetch failed': 2 }, 0), null);
-  // (Three or more with none compared isn't a quiet chain, nor are previews that weren't simulated a pass.)
+  // (Three or more, and more than were compared, isn't a quiet chain; nor are previews that weren't simulated a pass.)
   assert.match(couldNotLook({ 'error: fetch failed': 9 }, 0)!, /9 transactions/);
   assert.match(couldNotLook({ 'not simulated': 4 }, 0)!, /4 transactions could not be looked at/);
   assert.equal(couldNotLook({ 'not simulated': 4 }, 30), null);
@@ -161,6 +170,11 @@ test('a balance that moved as the logs say leaves the difference standing, and o
   const off = [row(-5_000n * M, -4_999n * M - M / 2n)];
   await heldToBalance(off, ACCOUNT, [], async (_t, when) => (when === 'before' ? held : held - 5_000n * M));
   assert.deepEqual([off[0].balance, off[0].unjudged, differsIn(off[0])], [undefined, undefined, true]);
+  // A balance three base units off its logs is no reason to take a preview half a token off both: the balance
+  // is the one to hold the preview to only where it is nearer the preview than the logs are.
+  const drift = [row(-5_000n * M, -4_999n * M - M / 2n)];
+  await heldToBalance(drift, ACCOUNT, [], async (_t, when) => (when === 'before' ? held : held - 5_000n * M + 3n));
+  assert.deepEqual([drift[0].balance, differsIn(drift[0])], [undefined, true]);
   // A token that doesn't answer balanceOf (a revert, or nothing to read) isn't one whose state is gone.
   for (const failure of ['execution reverted', 'Cannot convert 0x to a BigInt']) {
     const unanswered = [row(-5_000n * M, -4_000n * M)];

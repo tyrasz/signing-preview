@@ -65,6 +65,35 @@ test('A batch nested in a batch is laid out, and a call back into the account th
   assert.ok(!codes(await send(batch([{ target: USDC, value: 0n, data: transfer }, { target: ALICE as Hex, value: 1n, data: '0x' }]))).includes('smart_account_self_call'));
 });
 
+test('Coin sent with a call, who a call pays, batches nested too deep, and nested batches’ own failure modes', async () => {
+  const batch = (calls: { target: Hex; value: bigint; data: Hex }[]) => encodeFunctionData({ abi: ACCOUNT, functionName: 'executeBatch', args: [calls] });
+  // A token transfer with coin attached was titled as the transfer, the coin nowhere; and no call said who it pays.
+  const coin = await send(batch([{ target: USDC, value: 10n ** 18n, data: transfer }, { target: BOB as Hex, value: 2n * 10n ** 18n, data: '0x' }]));
+  assert.match(detail(coin, 'Call 1') ?? '', /^Send 1 USDC, with 1 ETH \(/);
+  assert.match(detail(coin, 'Call 2') ?? '', /^Send 2 ETH \(/);
+  assert.equal(detail(coin, 'Call 1: Recipient')?.toLowerCase(), BOB.toLowerCase());
+  const single = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [USDC, 5n * 10n ** 18n, transfer] }));
+  assert.deepEqual([detail(single, 'Value sent with the call'), detail(single, 'Recipient')?.toLowerCase()], ['5 ETH', BOB.toLowerCase()]);
+  // A batch nested deeper than is laid out isn't read: a danger, as calls past the two hundredth are (it was a
+  // caution that "a call back into your account" isn't read).
+  let deep = batch([{ target: WETH, value: 0n, data: approve }]);
+  for (let i = 0; i < 4; i++) deep = batch([{ target: ALICE as Hex, value: 0n, data: deep }]);
+  const tooDeep = await send(deep);
+  assert.equal(tooDeep.attention, 'danger');
+  assert.match(tooDeep.warnings.find(w => w.code === 'smart_account_calls_unread')?.message ?? '', /a batch of 1 call nested more than four deep in calls back into your account, which isn't read here/);
+  // A nested batch fails as its own mode has it: laid out among the outer batch's calls, that was lost.
+  const tryInside = encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [mode('01', '01'), encodeAbiParameters(CALLS, [[{ target: USDC, value: 0n, data: transfer }, { target: WETH, value: 0n, data: transfer }]])] });
+  const mixed = await send(batch([{ target: USDC, value: 0n, data: transfer }, { target: ALICE as Hex, value: 0n, data: tryInside }]));
+  assert.match(mixed.decoding.notes.join(' '), /A batch nested in it is in "try" mode: a call of that batch that fails is skipped/);
+  // An execution with a signature after it, in an encoding that isn't its canonical one (a gap before its tails):
+  // read as the packed call it isn't, it was a call to the zero address with 1.4e32 ETH. Unread, and said to be.
+  const [head, ...rest] = [encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [concatHex([USDC, numberToHex(0n, { size: 32 }), approve]), '0x1234'])];
+  const gapped = `0x${(0x60).toString(16).padStart(64, '0')}${(BigInt(`0x${head.slice(66, 130)}`) + 0x20n).toString(16).padStart(64, '0')}${'00'.repeat(32)}${head.slice(130)}` as Hex;
+  assert.equal(rest.length, 0);
+  const odd = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [`0x000000000000aabbccdd${'00'.repeat(22)}`, gapped] }));
+  assert.deepEqual([codes(odd).includes('smart_account_unread'), /0x0000…0000/.test(odd.title)], [true, false]);
+});
+
 test('Single calls (packed ERC-7579, execute(address,uint256,bytes)), executeBatch, and delegatecall', async () => {
   const single = concatHex([USDC, numberToHex(0n, { size: 32 }), transfer]);
   assert.equal((await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [mode('00'), single] }))).title, 'Send 1 USDC');

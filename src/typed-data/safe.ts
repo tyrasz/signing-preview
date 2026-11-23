@@ -23,6 +23,9 @@ export const safeTxAdapter: TypedAdapter = async (data, env) => {
   const chainId = domainChainId(data) ?? env.context.chainId ?? null;
   const value = big(m.value), safeTxGas = big(m.safeTxGas) ?? 0n, baseGas = big(m.baseGas ?? m.dataGas) ?? 0n, gasPrice = big(m.gasPrice) ?? 0n, operation = Number(big(m.operation) ?? 0n), nonce = big(m.nonce) ?? undefined;
   if (!/^0x[0-9a-f]{40}$/.test(safe) || chainId === null || value === null) return null;
+  // A number that is there and doesn't read (the operation above all: whether the call is a delegatecall) isn't
+  // taken for zero: the request is shown field by field, as any typed data is.
+  if (['operation', 'safeTxGas', 'baseGas', 'dataGas', 'gasPrice', 'nonce'].some(k => m[k] !== undefined && m[k] !== null && big(m[k]) === null)) return null;
   const b = new PreviewBuilder();
   const t = { safe, to: str(m.to), value, data: (str(m.data) || '0x') as `0x${string}`, operation, safeTxGas, baseGas, gasPrice, gasToken: str(m.gasToken) || '0x0000000000000000000000000000000000000000', refundReceiver: str(m.refundReceiver) || '0x0000000000000000000000000000000000000000', nonce };
   const r = await describeSafeTx(t, chainId, { deps: env.deps, context: env.context }, b, viaExecTransaction(t, chainId, { deps: env.deps, context: env.context }, b, { executor: env.signer }));

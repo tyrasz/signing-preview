@@ -48,11 +48,8 @@ const CALIBUR_OWN = '0x99e1d016', CALIBUR_SIGNED = '0xc3c16ee4', EXECUTE_USER_OP
 export const CALIBUR_CODES: Record<string, string> = { '0x000000009b1d0af20d8c6d0a44e162d11f9b8f00': 'Calibur', '0x000000005c84f8fd50b21cac312528a64437030e': 'Calibur' };
 type CaliburBatch = { calls: readonly { to: string; value: bigint; data: Hex }[]; revertOnFailure: boolean };
 const CALLS = [{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }] as const;
-/**
- * How many of a batch's calls are decoded with reads of the chain, and how many are decoded at all: those after the
- * first twenty from their calldata alone (as a Safe's batch is: src/safe.ts).
- */
-const MAX_CALLS = 20, MAX_LISTED = 200;
+/** How many of a batch's calls are decoded (as a Safe's batch: src/safe.ts). */
+const MAX_LISTED = 200;
 
 type Call = { target: string; value: bigint; data: Hex };
 
@@ -76,9 +73,12 @@ function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: bool
   // the execution a signature follows; under any other, or as a delegatecall, the layout isn't known and the call
   // isn't read: said so, and still said to be a delegatecall where it is one (returning nothing here dropped that
   // warning, and the call was shown as a plain call to the account).
+  // (As the account's abi.decode reads them, whether or not they are that layout's one canonical encoding: with a
+  // gap before its tails, such an execution was read as packed again, a call to the zero address with 1.4e32 ETH.)
+  const wrapped = (): Hex | null => { try { return decodeAbiParameters(SIGNED, data)[0]; } catch { return null; } };
   let inner: Hex | null = null;
   if ((callType === '00' || callType === 'ff') && selector !== '00000000') {
-    inner = signed();
+    inner = wrapped();
     if (inner && !(callType === '00' && selector === '78210001')) return { calls: [], delegatecall: callType === 'ff', tryMode, unread: true };
   }
   const body = (inner ?? data).slice(2);
@@ -210,19 +210,42 @@ export function caliburAdmin(data: Hex, b: PreviewBuilder, p: string, chainId: n
  * one level down went with nothing said of it. (A nested delegatecall, or one that can't be read, stays a call back
  * into the account, and is warned of as one.)
  */
-function laidOut(calls: Call[], account: string, depth = 1): Call[] {
+function laidOut(calls: Call[], account: string, modes: Set<boolean>, depth = 1): Call[] {
   return calls.flatMap(c => {
     if (!toSelf(c, account) || depth >= 4) return [c];
     const inner = batchCalls(c.data);
-    return !inner || inner.delegatecall || inner.unread || !inner.calls.length ? [c] : laidOut(inner.calls, account, depth + 1);
+    if (!inner || inner.delegatecall || inner.unread || !inner.calls.length) return [c];
+    // (Whether the nested batch's calls fail together or one by one: laid out, that is the nested batch's own.)
+    modes.add(inner.tryMode);
+    return laidOut(inner.calls, account, modes, depth + 1);
   });
+}
+
+/**
+ * A call an account that runs Calibur sends straight to itself, to one of Calibur's own functions (a key registered,
+ * a key's rights, a native allowance, its EntryPoint): what it changes in the account. Null for anything else, and
+ * where the account isn't known to run Calibur (a delegation set in this transaction, or its code now).
+ */
+async function caliburOwn(tx: Parameters<Adapter>[0], env: Parameters<Adapter>[1]): Promise<Decoded | null> {
+  let runs = await ownDelegateAfter(tx);
+  if (runs === null) return null;
+  if (runs === undefined && env.deps.rpc?.has(tx.chainId)) {
+    const code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, 'latest']).catch(() => undefined);
+    if (typeof code === 'string' && code.toLowerCase().startsWith('0xef0100')) runs = `0x${code.slice(8, 48)}`.toLowerCase();
+  }
+  if (!runs || !CALIBUR_CODES[runs]) return null;
+  const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Account code', `${CALIBUR_CODES[runs]} (${runs})`, runs);
+  const title = caliburAdmin(tx.data, b, 'This ', tx.chainId);
+  return title ? decoded({ title, summary: `Your account calls one of its own functions (${CALIBUR_CODES[runs]}'s), which changes the account itself.`, decoder: 'smart_account', status: 'full', b }) : null;
 }
 
 export const smartAccountAdapter: Adapter = async (tx, env) => {
   if (!tx.to || !sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
   const read = batchCalls(tx.data);
-  if (!read || (!read.calls.length && !read.unread)) return null;
-  const parsed = read.delegatecall ? read : { ...read, calls: laidOut(read.calls, tx.from) };
+  if (!read) return caliburOwn(tx, env);
+  if (!read.calls.length && !read.unread) return null;
+  const nestedModes = new Set<boolean>();
+  const parsed = read.delegatecall ? read : { ...read, calls: laidOut(read.calls, tx.from, nestedModes) };
 
   const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', parsed.standard);
   // Only code at the account runs the calls: a delegation set in this transaction, or one (or a contract) already there.
@@ -249,46 +272,64 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     return decoded({ title: parsed.delegatecall ? "Run code inside your account (a delegatecall that isn't read)" : "Run a call from your account that isn't read",
       summary: `Your account runs ${parsed.delegatecall ? "another contract's code as its own" : 'a call'} through its own code, in a layout that isn't read.`, decoder: 'smart_account', status: 'opaque', b });
   }
-  const native = CHAINS[tx.chainId]?.nativeSymbol ?? 'native';
-  const inner: Decoded[] = [];
-  // (Past the twentieth call, with no RPC and no simulator: from the calldata alone.)
-  const fromCalldata = { ...env.deps, rpc: undefined, simulator: undefined };
-  for (const [i, c] of parsed.calls.slice(0, MAX_LISTED).entries()) {
+  const coin = (v: bigint) => `${formatUnits(v, CHAINS[tx.chainId]?.nativeDecimals ?? 18)} ${CHAINS[tx.chainId]?.nativeSymbol ?? 'native'}`;
+  const listed = parsed.calls.slice(0, MAX_LISTED), many = parsed.calls.length > 1;
+  // Every call is decoded, to the two hundredth, each with the reads of the chain its decoding makes (calls past the
+  // twentieth weren't decoded at all: a batch read "fully decoded" on its first twenty, with nothing of what the
+  // rest approve or send). Eight at a time, each into a builder of its own, told in the batch's order.
+  const describe = async (c: Call, i: number): Promise<{ d: Decoded; sub: PreviewBuilder }> => {
+    const sub = new PreviewBuilder();
     // A call back into the account itself that isn't a batch laid out above: the account's own code runs it, with
     // the account's own authority (an upgrade, a new owner or module, a batch in a layout that isn't read). What it
-    // is isn't read, which is said; a delegatecall is said to be one.
+    // is isn't read, which is said; a delegatecall is said to be one, and a batch nested too deep to lay out.
     const self = toSelf(c, tx.from), back = self ? batchCalls(c.data) : null;
     // (Calibur's own functions, where the account is known to run it, or the batch is in a form only Calibur has.)
-    const calibur = self && !back && (CALIBUR_CODES[runs ?? ''] || parsed.standard.startsWith('Calibur')) ? caliburAdmin(c.data, b, `Call ${i + 1}: `, tx.chainId) : null;
+    const calibur = self && !back && (CALIBUR_CODES[runs ?? ''] || parsed.standard.startsWith('Calibur')) ? caliburAdmin(c.data, sub, `Call ${i + 1}: `, tx.chainId) : null;
     if (self && !calibur) {
       const where = sameAddress(c.target, tx.from) ? 'a call back into your account' : 'a call to the zero address with calldata, which an ERC-7821 account (Calibur, Porto) takes to mean itself: a call back into your account';
-      if (back?.delegatecall) b.warn('danger', 'smart_account_delegatecall', `Call ${i + 1}: has your account run ${back.calls[0] ? `${shortAddress(back.calls[0].target)}'s` : "another contract's"} code inside itself (a delegatecall, through a call back into the account): it can do anything with the account and everything in it.`);
-      else if (c.data.length >= 10) b.warn('caution', 'smart_account_self_call', `Call ${i + 1}: ${where} (${c.data.slice(0, 10)}) that isn't read: the account's own code runs it with the account's own authority, which is how an account's code, owners or modules are changed.`);
+      if (back?.delegatecall) sub.warn('danger', 'smart_account_delegatecall', `Call ${i + 1}: has your account run ${back.calls[0] ? `${shortAddress(back.calls[0].target)}'s` : "another contract's"} code inside itself (a delegatecall, through a call back into the account): it can do anything with the account and everything in it.`);
+      else if (back?.calls.length) sub.warn('danger', 'smart_account_calls_unread', `Call ${i + 1}: a batch of ${back.calls.length} call${back.calls.length === 1 ? '' : 's'} nested more than four deep in calls back into your account, which isn't read here: any of them can move what your account holds or approve a spender.`);
+      else if (c.data.length >= 10) sub.warn('caution', 'smart_account_self_call', `Call ${i + 1}: ${where} (${c.data.slice(0, 10)}) that isn't read: the account's own code runs it with the account's own authority, which is how an account's code, owners or modules are changed.`);
     }
-    const d = calibur ? decoded({ title: calibur, summary: '', decoder: 'smart_account', status: 'full' })
-      : self ? decoded({ title: `Call your own account (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: 'partial' })
-      : await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, i < MAX_CALLS ? env.deps : fromCalldata, env.context);
+    if (calibur) return { d: decoded({ title: calibur, summary: '', decoder: 'smart_account', status: 'full' }), sub };
+    if (self) return { d: decoded({ title: `Call your own account (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: back?.calls.length ? 'opaque' : 'partial' }), sub };
+    return { d: await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, env.deps, env.context), sub };
+  };
+  const described: { d: Decoded; sub: PreviewBuilder }[] = [];
+  for (let i = 0; i < listed.length; i += 8) described.push(...await Promise.all(listed.slice(i, i + 8).map((c, j) => describe(c, i + j))));
+  const inner: Decoded[] = [];
+  for (const [i, c] of listed.entries()) {
+    const { d, sub } = described[i];
     inner.push(d);
-    const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[tx.chainId]?.nativeDecimals ?? 18)} ${native}` : '';
+    // The coin a call sends, wherever its title doesn't already say it (a token transfer with 100 ETH attached was
+    // titled as the transfer, the coin nowhere).
+    const value = c.value > 0n && !d.title.includes(coin(c.value)) ? `, with ${coin(c.value)}` : '';
     b.detail(`Call ${i + 1}`, `${d.title}${value} (${shortAddress(c.target.toLowerCase())})`, c.target.toLowerCase());
+    // What the call's own decoding tells of it (who a transfer goes to, who an approval is for).
+    for (const x of d.b.details) b.detail(many ? `Call ${i + 1}: ${x.label}` : x.label, x.value, x.raw);
+    for (const w of sub.warnings) b.warnings.push(w);
     // Every call's own warnings, numbered (two calls can raise the same kind), except the caution that a run used the
     // caller's state (from a Safe a call runs execTransaction on), which is said once.
     for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `Call ${i + 1}: ${w.message}` });
   }
-  // Every call is decoded, to the two hundredth (calls past the twentieth weren't: a batch read "fully decoded" on
-  // its first twenty, with nothing of what the rest approve or send). Past that they aren't, and that is said.
-  if (parsed.calls.length > MAX_CALLS) b.note(`The calls after the first ${MAX_CALLS} are decoded from their calldata alone, without the reads of the chain the first ${MAX_CALLS} get (a token this doesn't know is shown by its address).`);
+  // Past the two hundredth they aren't decoded, and that is said.
   if (parsed.calls.length > MAX_LISTED) {
     b.detail('More calls', String(parsed.calls.length - MAX_LISTED));
     b.warn('danger', 'smart_account_calls_unread', `The batch has ${parsed.calls.length} calls, and the ${parsed.calls.length - MAX_LISTED} after the first ${MAX_LISTED} aren't decoded here: any of them can move what your account holds or approve a spender. What they do is told only by the simulated changes, if any are shown.`);
   }
   if (parsed.delegatecall) b.warn('danger', 'smart_account_delegatecall', `This runs ${shortAddress(parsed.calls[0].target)}'s code inside your account (delegatecall): it can do anything with the account and everything in it.`);
   if (parsed.tryMode && parsed.calls.length > 1) b.note('The batch is in "try" mode: a call that fails is skipped and the others still take effect.');
+  // Batches nested in it are laid out above as its own calls, but each fails as its own mode has it.
+  if (nestedModes.has(!parsed.tryMode)) b.note(parsed.tryMode
+    ? 'A batch nested in it is not in "try" mode: its calls fail together, and are skipped together.'
+    : 'A batch nested in it is in "try" mode: a call of that batch that fails is skipped, and the rest of the calls still take effect.');
 
   const n = parsed.calls.length;
   const statuses = inner.map(d => d.status);
   const some = statuses.includes('opaque') ? (statuses.every(s => s === 'opaque') ? 'opaque' : 'partial') : statuses.includes('partial') ? 'partial' : 'full';
   const status = parsed.calls.length > MAX_LISTED && some === 'full' ? 'partial' : some;
+  const only = !many && parsed.calls[0]?.value > 0n && !inner[0].title.includes(coin(parsed.calls[0].value));
+  if (only) b.detail('Value sent with the call', coin(parsed.calls[0].value), parsed.calls[0].value.toString());
   return decoded({
     title: n === 1 ? inner[0].title : `Run ${n} calls from your account`,
     summary: n === 1 ? `${inner[0].summary.replace(/\.$/, '')}${inner[0].summary ? '. ' : ''}Your account runs it through its own code.`

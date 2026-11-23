@@ -459,11 +459,12 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   // A run placed inside a block (a replay's: after the block's earlier transactions, or on the state they left) is
   // compared with the Safe as they left it, not as the block before had it: a Safe given an owner by one transaction
   // was said to be given it by each later one of the same block too. Read there, with one more run of the earlier
-  // transactions, where they can have changed the Safe: one of them is sent to it, the state they left has the
-  // Safe in it, or the Safe isn't after the run what it was a block before.
+  // transactions, whenever any ran before it (one can reach the Safe through another contract, and what it changed
+  // be changed back by this one: with nothing sent to the Safe and nothing different after, that went unread), or
+  // where the state they left has the Safe in it.
   let was = before;
   const placed = opts.at && (opts.at.before?.length || opts.at.state) ? opts.at : undefined;
-  if (placed && after && (placed.before?.some(r => r.to?.toLowerCase() === safe) || Object.keys(placed.state ?? {}).some(a => a.toLowerCase() === safe) || configChanges(before, after).length)) {
+  if (placed && after && (placed.before?.length || Object.keys(placed.state ?? {}).some(a => a.toLowerCase() === safe) || configChanges(before, after).length)) {
     const there = await sim.simulateBatch(reads(safe).map(r => ({ chainId, from: exec.from, to: r.to, data: r.data, value: 0n, at: placed }))).catch(() => null);
     const read = there && config(there.map(r => (r.status === 'success' ? r.returnData as Hex : undefined)));
     if (read && !read.partial) was = read;

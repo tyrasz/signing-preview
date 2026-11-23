@@ -91,13 +91,17 @@ export function str(value: unknown): string {
 
 /**
  * An unsigned integer, read as the digest is computed (typedDataDigest, viem): BigInt() of a string, which takes
- * surrounding whitespace and 0x, 0o or 0b, and an empty string as 0; a whole JSON number, however large. Read
- * otherwise, the same signed message could show other amounts than it signs.
+ * surrounding whitespace and 0x, 0o or 0b, and an empty string as 0; a whole JSON number, however large; and, as
+ * BigInt() takes them, a JSON boolean (true is 1) and an array (its elements joined: [1] is 1). Read otherwise, the
+ * same signed message could show other amounts than it signs: a Safe transaction whose operation was written `true`
+ * was previewed as a plain call under the digest of a delegatecall.
  */
 export function big(value: unknown): bigint | null {
   try {
     if (typeof value === 'bigint') return value >= 0n ? value : null;
     if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return BigInt(value);
+    if (typeof value === 'boolean') return value ? 1n : 0n;
+    if (Array.isArray(value)) return big(String(value));
     if (typeof value === 'string' && value.length <= 200) { const v = BigInt(value); return v >= 0n ? v : null; }
   } catch { /* fallthrough */ }
   return null;
