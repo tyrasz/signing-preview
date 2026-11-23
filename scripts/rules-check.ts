@@ -2460,8 +2460,13 @@ class Chain {
       // aren't compared (as overrides the local EVM takes them otherwise: an authority's code and nonce aren't the
       // state an authorization is checked against, and 9 of 73 then differed).
       // (So too a priced program, whose price is the pinned block's base fee and a tip.)
+      // The same where the node runs calls, not blocks (HyperEVM's): its latest block's header is what the local EVM
+      // runs them in, and with none read (its public RPC rate-limits: one read of some eighty in a full run) the
+      // accounts the programs give reached the local EVM not at all. In the scheduled runs of 2026-11-21 and 22 the
+      // sixteen programs of one batch each time (delegations one day, gas probes the next) ran locally on accounts
+      // with no code, 23,674 gas each, and the strict check failed on them.
       const needsPin = (p: Program) => !!p.state || !!p.fees;
-      const unpinned = this.simulateV1 && !pinned && placed.some(needsPin);
+      const unpinned = !pinned && placed.some(needsPin);
       if (unpinned && attempt < 6) { await new Promise(r => setTimeout(r, 2000 * (attempt + 1))); continue; }
       const local = (await this.locally(placed, overrides, given && at ? { ...at, state } : at, price))
         .map((o, i) => (unpinned && needsPin(placed[i]) ? { kind: 'refused' as const, returns: '', logs: '', why: "no block pinned (the node didn't answer for its latest: a rate limit), so the accounts the program gives couldn't be its state, nor its price the block's" } : o));
