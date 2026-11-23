@@ -861,3 +861,31 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   assert.ok(!codes(q).includes('safe_tx_reverts'));
   assert.equal(traced.some(rs => rs[0].data === data && rs.length === batches[0].length), true);
 });
+
+test('A Safe transaction that spends more coin than the Safe holds runs again with the coin sent along, and says so', async () => {
+  // execTransaction takes coin with the call, and apps that fund a Safe's call in the same transaction send it: one
+  // on Ethereum (2026-11-23) sent 0.537 ETH with a call that wraps and lends them, the amount its SafeTx names. On
+  // the Safe's own balance the call fails (GS013), which was all the preview said.
+  const alice = ALICE.toLowerCase(), E = 10n ** 18n, word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const env = (held: bigint, withCoin: 'runs' | 'fails') => {
+    const batches: SimulationRequest[][] = [];
+    const d: Dependencies = { ...deps,
+      rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? viewsOf([alice])((p[0] as { data: string }).data) : m === 'eth_getBalance' ? `0x${held.toString(16)}` : '0x' },
+      simulator: { simulate: async () => null, simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => (i > 0 ? { status: 'success' as const, source: 'mock', transfers: [], returnData: viewsOf([alice])(r.data) }
+        : r.value > 0n && withCoin === 'runs' ? { status: 'success' as const, source: 'mock', transfers: [], returnData: word(1n) } : { status: 'reverted' as const, source: 'mock', revertReason: 'GS013', transfers: [] })); } } };
+    return { d, batches };
+  };
+  const spend = { to: '0x6e7dede13e011eee74e0c731a06c158377fc1cae', operation: 1, data: '0x0c2c8750', value: (E / 2n).toString() };
+  const short = env(E / 100n, 'runs');
+  const p = await sign(spend, short.d);
+  assert.ok(!codes(p).includes('safe_tx_reverts'), codes(p).join());
+  assert.match(p.warnings.find(w => w.code === 'safe_needs_coin')?.message ?? '', /^The Safe holds 0\.01 ETH and this spends 0\.5 ETH: on the Safe's own balance it fails\. It was simulated with 0\.5 ETH sent along by whoever submits it/);
+  // The second run: the same call with the SafeTx's value, from a submitter who can afford it.
+  assert.deepEqual(short.batches.map(b => b[0].value), [0n, E / 2n]);
+  assert.ok(BigInt(short.batches[1][0].stateOverrides![alice].balance!) > E / 2n);
+  // A Safe that holds what it spends fails by itself, and so does one whose call fails with the coin too.
+  for (const other of [env(E, 'runs'), env(0n, 'fails')]) {
+    const q = await sign(spend, other.d);
+    assert.ok(codes(q).includes('safe_tx_reverts') && !codes(q).includes('safe_needs_coin'), codes(q).join());
+  }
+});

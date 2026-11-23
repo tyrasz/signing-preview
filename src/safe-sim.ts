@@ -53,6 +53,11 @@ export interface SafeRun {
   result: SimulationResult; executed: boolean; before: SafeConfig; after?: SafeConfig;
   /** The price the run shown was simulated at, when the price changes what the transaction does for the Safe. */
   priced?: { gasPrice: bigint; tip: bigint };
+  /**
+   * The run shown is one with the Safe transaction's own value sent along with execTransaction by whoever submits
+   * it: on the Safe's balance alone (`held`) the transaction fails.
+   */
+  funded?: { value: bigint; held: bigint };
   /** What was simulated for `result` (execTransaction, then the configuration reads): for tracing it. */
   requests?: SimulationRequest[];
   /**
@@ -398,6 +403,24 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     const local = await sim.trace(exact, { budgetMs: 60_000 }).catch(() => null);
     if (local && local.length === requests.length && compareWithReceipt(local[0], opts.replayed.receipt).matches) { results = local; requests = exact; }
   }
+  // A Safe transaction that spends more coin than the Safe holds fails on the Safe's own balance, and can be sent
+  // the coin with the call: execTransaction takes it, and apps that fund a Safe's call in the same transaction do
+  // (one on Ethereum sent 0.537 ETH with a call that wraps and lends them, the amount its SafeTx names:
+  // 2026-11-23). A signature that fails so runs again with the value it names sent along by whoever submits it;
+  // if it then runs, that run is the one shown, and the preview says what it took.
+  const ran = (r: SimulationResult) => r.status === 'success' && (!r.returnData || r.returnData === '0x' || BigInt(r.returnData.slice(0, 66)) === 1n);
+  let funded: SafeRun['funded'];
+  if (!opts.request && !ran(results[0]) && t.value > 0n) {
+    try {
+      const set = Object.entries(given ?? {}).find(([address]) => address.toLowerCase() === safe)?.[1].balance;
+      const held = set !== undefined ? BigInt(set) : BigInt(String(await rpc.call(chainId, 'eth_getBalance', [safe, opts.at?.block ?? 'latest'])));
+      if (held < t.value) {
+        const sent = batch({ ...exec, value: t.value, stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: `0x${(t.value + 10n ** 24n).toString(16)}` } } });
+        const again = await sim.simulateBatch(sent);
+        if (again && ran(again[0])) { results = again; requests = sent; exec = sent[0]; funded = { value: t.value, held }; }
+      }
+    } catch { /* the balance wasn't read, or the node refused the run: the first stands */ }
+  }
   // Once more at the price the transaction would pay now, as a single transaction is (src/evm/transaction.ts). A
   // Safe's refund in the native token is gas × min(its gasPrice, tx.gasprice): nothing at no price. If the price
   // changes what the Safe ends up with, the priced run is the one shown. Whoever submits a signed SafeTx can pay
@@ -409,7 +432,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     try {
       const price = await expectedGasPrice({ chainId, from: exec.from, to: exec.to, data: exec.data as Hex, value: exec.value }, deps);
       const pricedRequests = batch({ ...exec, gas: exec.gas ?? roomFor(results[0].gasUsed), gasPrice: price?.gasPrice, baseFee: price?.baseFee,
-        ...(!opts.request && { stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: SUBMITTER_BALANCE } } }) });
+        ...(!opts.request && !funded && { stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: SUBMITTER_BALANCE } } }) });
       const again = price && await sim.simulateBatch(pricedRequests);
       // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only that.)
       if (price && again && again[0].status === 'success' && !(again[0].stateReadError && !results[0].stateReadError) && effectOf(again[0], safe) !== effectOf(results[0], safe)) { results = again; priced = price; requests = pricedRequests; }
@@ -417,8 +440,8 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   }
   const result = results[0];
   // execTransaction returns false (and emits ExecutionFailure) when the call fails with safeTxGas or gasPrice set.
-  const executed = result.status === 'success' && (!result.returnData || result.returnData === '0x' || BigInt(result.returnData.slice(0, 66)) === 1n);
-  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), requests, ...(signedByPasskey && { passkey: signedByPasskey }) };
+  const executed = ran(result);
+  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), ...(funded && { funded }), requests, ...(signedByPasskey && { passkey: signedByPasskey }) };
 }
 
 const SAFE_FACTORY = parseAbi([

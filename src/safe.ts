@@ -311,6 +311,11 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
       : opts.request
       ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'
       : `Simulated as the Safe runs it: execTransaction itself, signed by enough owners (stand-ins for their signatures, each taken as its owner's${run.passkey === 'inline' ? ", and for the signing owner's passkey a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : run.passkey ? ", and for the signing owner's passkey a stand-in WebAuthn assertion, which the P-256 verifier it is checked with accepts after running its real check" : ''}), so guards, the gas refund and delegatecalls run as they will.`, !!(replay || named));
+    // The run shown had the coin the Safe transaction spends sent along with it (SafeRun.funded).
+    if (outcome && 'assetChanges' in outcome && run.funded) {
+      const native = CHAINS[chainId]?.nativeSymbol ?? 'native', unit = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${native}`;
+      b.warn('caution', 'safe_needs_coin', `The Safe holds ${unit(run.funded.held)} and this spends ${unit(run.funded.value)}: on the Safe's own balance it fails. It was simulated with ${unit(run.funded.value)} sent along by whoever submits it (execTransaction takes coin with the call, as apps that fund a Safe's call in the same transaction send it): without that, it fails.`);
+    }
     // A signature's run is sent from the signer. What it takes out of the signer's own account (not the Safe's) is
     // told too: a contract the Safe calls that can spend the signer's tokens (an allowance to the Safe, or to what
     // it runs), or that charges whoever submits the transaction. A Safe transaction on Arbitrum One had the Safe

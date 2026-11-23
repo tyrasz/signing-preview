@@ -5,7 +5,8 @@
 // the transaction goes on to do. Recent execTransaction calls sent to a Safe are rebuilt as the SafeTx an owner
 // signed (the owner that sent it, else one its signatures recover to, else the Safe's first), and previewed on the
 // state the transaction met: its parent block, its block's header and the block's earlier transactions (as a mined
-// transaction is replayed: src/replay.ts), at the price it paid, with the coin it carried and on its gas limit (with
+// transaction is replayed: src/replay.ts), at the price it paid, with the coin it carried (where the SafeTx doesn't
+// name it: what it names the preview sends along by itself, when the Safe holds less) and on its gas limit (with
 // room for the stand-ins). No signature of the transaction's is used: the preview stands in for them, as it does
 // before any exists.
 // Compared with the receipt:
@@ -159,7 +160,9 @@ async function replay(hash: string): Promise<void> {
   // other call that names none: six previews there failed the Safe's own check of its gas, GS010).
   const at = { ...where.at, before: where.before };
   const isExec = (q: SimulationRequest) => q.to?.toLowerCase() === safe && !!q.data?.startsWith(EXEC);
-  const sent = BigInt(tx.value);
+  // (Coin the SafeTx itself names is the preview's to find: a call that fails on the Safe's own balance runs again
+  // with it sent along, src/safe-sim.ts. Only coin the signature doesn't name is put in here.)
+  const sent = BigInt(tx.value) === value ? 0n : BigInt(tx.value);
   const placed = (q: SimulationRequest): SimulationRequest => ({ ...q, at: q.at ?? at, ...(q.gasPrice !== undefined && { gasPrice: where.gasPrice }),
     ...(isExec(q) && { gas: q.gas ?? BigInt(tx.gas) + STAND_IN_ROOM, ...(sent > 0n && { value: sent, stateOverrides: { ...q.stateOverrides, [q.from.toLowerCase()]: { ...q.stateOverrides?.[q.from.toLowerCase()], balance: hex(sent * 2n + 10n ** 18n) } } }) }) });
   const runs: SimulationResult[] = [];
