@@ -236,6 +236,12 @@ test('A gas limit named with no fee cap is checked against the balance: the whol
     assert.equal(contract?.severity, 'caution', code);
     assert.match(contract?.message ?? '', /An account with code doesn't always pay for its own transactions/);
   }
+  // Named with a fee cap, an account with code is told the same: it got "the network will reject this transaction".
+  const capped = (await send({ gas: toHex(10_000_000n), maxFeePerGas: toHex(20n * GWEI) }, withCode('0x6080604052'))).warnings.find(w => w.code === 'insufficient_funds_for_gas');
+  assert.deepEqual([capped?.severity, /^This account's balance .* doesn't cover the value plus the most the gas can cost .*An account with code doesn't always pay/.test(capped?.message ?? '')], ['caution', true]);
+  // A code read that fails is a plain account's, the common one: it was told it had code.
+  const unread = (await send({ gas: toHex(10_000_000n) }, (() => { const d = deps(10n ** 15n), inner = d.rpc!.call; return { ...d, rpc: { has: () => true, call: async (c: number, m: string, ps: unknown[]) => { if (m === 'eth_getCode') throw new Error('timeout'); return inner(c, m, ps); } } }; })())).warnings.find(w => w.code === 'insufficient_funds_for_gas');
+  assert.deepEqual([unread?.severity, /^Your balance /.test(unread?.message ?? '')], ['danger', true]);
   // OP Stack: the figure is the limit at the base fee with the fee for its data, and says so (0.001 ETH of gas
   // and 0.00001 ETH of data fee, with the value of 1 wei).
   const op = (await send({ gas: toHex(1_000_000n), chainId: '0xa' }, deps(10n ** 14n))).warnings.find(w => w.code === 'insufficient_funds_for_gas');

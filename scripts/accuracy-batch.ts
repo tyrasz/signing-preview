@@ -122,8 +122,11 @@ async function replay(hash: string): Promise<void> {
     ...(funded && { stateOverrides: { ...q.stateOverrides, [account]: { ...q.stateOverrides?.[account], balance: funded } } }) });
   const simulator = { simulate: (q: SimulationRequest) => base.simulator!.simulate(placed(q)), simulateBatch: (qs: SimulationRequest[]) => base.simulator!.simulateBatch!(qs.map(placed)) };
   const request = { method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: hex(CHAIN), from: account, atomicRequired: !batch.tryMode,
-    // (A call to the zero address is one to the account itself, at an ERC-7821 account: Calibur makes it so.)
-    calls: batch.calls.map(c => ({ to: /^0x0{40}$/.test(c.target) && c.data.length >= 10 ? account : c.target, data: c.data, value: hex(c.value) })) }] };
+    // (A call to the zero address is one to the account itself, at an ERC-7821 account. In a batch of Calibur's own
+    // form it is asked as mined: the preview reads it as the account's where the account runs Calibur, and that is
+    // what is checked. In another form it is asked as the call to the account it was: whether that account's code
+    // takes the zero address so isn't known to the preview, which says so.)
+    calls: batch.calls.map(c => ({ to: /^0x0{40}$/.test(c.target) && c.data.length >= 10 && !batch.standard.startsWith('Calibur') ? account : c.target, data: c.data, value: hex(c.value) })) }] };
   let p: Preview;
   try { p = await previewRequest(request as never, { chainId: CHAIN, account, now: where.when.time * 1000 }, { ...base, rpc: atParent, simulator }); } catch (e) { return skip(`error: ${(e as Error).message.slice(0, 80)}`); }
   if (DUMP) writeFileSync(DUMP, JSON.stringify(p, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 1));

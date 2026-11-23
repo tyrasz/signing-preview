@@ -35,6 +35,7 @@ import { metaTransactionAdapter } from './typed-data/meta-transaction.ts';
 import { authorizedExecutionsAdapter } from './typed-data/authorized-executions.ts';
 import { walletCoreSessionAdapter } from './typed-data/wallet-core-session.ts';
 import { caliburSignedBatchAdapter } from './typed-data/calibur.ts';
+import { CALIBUR_CODES } from './evm/smart-account.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, veloraDeltaAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, relayMulticallAdapter, metaTransactionAdapter, authorizedExecutionsAdapter, caliburSignedBatchAdapter, walletCoreSessionAdapter, genericTypedDataAdapter];
 
@@ -147,6 +148,17 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   const suffix = batch.capabilities?.dataSuffix?.value;
   if (suffix !== undefined && (typeof suffix !== 'string' || !/^0x([0-9a-fA-F]{2})*$/.test(suffix) || suffix.length > 2 + 2 * 1024)) throw new RequestError('capabilities.dataSuffix.value must be hex bytes (at most 1,024)');
   const given = batch.calls.map(call => normalizeTransaction(call, context, batch.from, chainId));
+  // A call to the zero address with calldata. An account whose code follows ERC-7821 runs it as a call to itself
+  // ("to: replaced with address(this) if address(0)"), which Calibur does: sent so, a key registered on the account
+  // read "Call contract 0x0000…". Where the sender runs Calibur it is read, and simulated, as the call to the account
+  // it is; where its code isn't known to take it so, it is said that it may be one.
+  const toZero = given.flatMap((t, i) => (t.to && /^0x0{40}$/.test(t.to) && t.data.length >= 10 ? [i] : []));
+  let zeroIsSelf = false;
+  if (toZero.length && deps.rpc?.has(given[0].chainId)) {
+    const code = await deps.rpc.call(given[0].chainId, 'eth_getCode', [given[0].from, 'latest']).catch(() => undefined);
+    zeroIsSelf = typeof code === 'string' && code.toLowerCase().startsWith('0xef0100') && !!CALIBUR_CODES[`0x${code.slice(8, 48)}`.toLowerCase()];
+  }
+  if (zeroIsSelf) for (const i of toZero) given[i] = { ...given[i], to: given[i].from };
   // Appended only to a call with data, as viem does: a plain transfer stays one. Decoded as the wallet sends it (an
   // ERC-8021 attribution is read past, src/evm/transaction.ts; other bytes can be the call's own arguments).
   const txs = given.map(tx => suffix && suffix !== '0x' && tx.to && tx.data !== '0x' ? { ...tx, data: `${tx.data}${suffix.slice(2).toLowerCase()}` as `0x${string}` } : tx);
@@ -213,6 +225,11 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   }
 
   const b = new PreviewBuilder();
+  if (toZero.length) {
+    const which = `Call${toZero.length === 1 ? '' : 's'} ${toZero.map(i => i + 1).join(', ')}`, is = toZero.length === 1 ? 'is' : 'are';
+    if (zeroIsSelf) b.note(`${which} ${is} to the zero address, which your account's code (Calibur) takes to mean the account itself: ${toZero.length === 1 ? 'it is' : 'they are'} read, and simulated, as ${toZero.length === 1 ? 'a call' : 'calls'} to your own account.`);
+    else b.warn('caution', 'zero_address_call', `${which} ${is} to the zero address with calldata: a wallet whose account code follows ERC-7821 (Calibur, Porto) runs that as a call into your own account, with the account's own authority (how its keys and settings are changed); other accounts call the zero address, where nothing runs. Which this account does isn't known here.`);
+  }
   if (suffix && suffix !== '0x') {
     const attribution = readAttribution(suffix);
     b.detail(attribution ? 'Attribution (ERC-8021)' : 'Data suffix', attribution ? attribution.parts.join('; ') : suffix.length > 2 + 64 ? `${suffix.slice(0, 66)}… (${(suffix.length - 2) / 2} bytes)` : suffix, suffix);

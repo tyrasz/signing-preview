@@ -178,3 +178,128 @@ test('Calibur’s own batch, sent by the account to itself, and a UserOperation�
   assert.equal(batchCalls(`0x8dd7712f${encoded.slice(2)}00`), null);
   assert.equal(batchCalls('0x8dd7712f1234'), null);
 });
+
+test('Every call of a signed Calibur batch is told: a second key, EntryPoint or allowance isn’t hidden behind the first', async () => {
+  const EVIL = '0x96221423681a6d52e184d440a8efcebb105c7242', V08 = '0x4337084d9e255ff0702461cf8895ce9e3b5ff108';
+  const t = (calls: { to: string; value?: bigint; data: Hex }[], o: Partial<Signed> & { revertOnFailure?: boolean } = {}) => typed(batch(calls, o), {}, 1);
+  const entry = (to: string) => encodeFunctionData({ abi: ABI, functionName: 'updateEntryPoint', args: [to as Hex] });
+  const lend = (to: string, amount: bigint) => encodeFunctionData({ abi: ABI, functionName: 'approveNative', args: [to as Hex, amount] });
+  const reg = (who: string) => encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 2, publicKey: encodeAbiParameters([{ type: 'address' }], [who as Hex]) }] });
+  // A warning code was kept once, its first: ERC-4337's EntryPoint set, then another's, was "info", the second unsaid.
+  const two = await sign(t([{ to: ACCOUNT, data: entry(V08) }, { to: ACCOUNT, data: entry(EVIL) }]));
+  assert.equal(two.attention, 'danger');
+  assert.match(two.warnings.find(w => w.code === 'calibur_entry_point')!.message, new RegExp(`^Call 1: sets your account's EntryPoint to ${V08} \\(ERC-4337's v0\\.8\\)\\. Call 2: makes ${EVIL} your account's EntryPoint, which isn't one of ERC-4337's`));
+  const lent = await sign(t([{ to: ACCOUNT, data: lend(FRIEND, 1n) }, { to: ZERO, data: lend(EVIL, (1n << 256n) - 1n) }]));
+  assert.match(lent.warnings.find(w => w.code === 'calibur_native_approval')!.message, new RegExp(`Call 1: lets ${FRIEND} take up to 0\\.000000000000000001 ETH .* Call 2: lets ${EVIL} take any amount of ETH`));
+  const keys = await sign(t([{ to: ACCOUNT, data: reg(FRIEND) }, { to: ACCOUNT, data: reg(EVIL) }]));
+  assert.match(keys.warnings.find(w => w.code === 'calibur_register_key')!.message, new RegExp(`Call 1: registers an Ethereum key, ${FRIEND}, .* Call 2: registers an Ethereum key, ${EVIL},`));
+  // And what the calls' own previews warn of: two unlimited approvals are two.
+  const approve = (spender: string) => encodeFunctionData({ abi: ABI, functionName: 'approve', args: [spender as Hex, (1n << 256n) - 1n] });
+  const both = await sign(t([{ to: USDC, data: approve(FRIEND) }, { to: USDC, data: approve(EVIL) }]));
+  const unlimited = both.warnings.filter(w => /unlimited/.test(w.code));
+  assert.equal(unlimited.length, 1);
+  assert.match(unlimited[0].message, /^Call 1: .* Call 2: /);
+  // A call back into the account silences "a function that isn't known" for itself alone: a call to unknown code
+  // beside it, with 5 ETH, was left with nothing said.
+  const beside = await sign(t([{ to: ACCOUNT, data: lend(FRIEND, 0n) }, { to: EVIL, value: 5n * 10n ** 18n, data: '0xdeadbeef' }]));
+  assert.match(beside.warnings.find(w => w.code === 'unknown_function')?.message ?? '', /^Call 2: /);
+  assert.notEqual(beside.attention, 'none');
+  assert.ok(!(await sign(t([{ to: ACCOUNT, data: lend(FRIEND, 0n) }]))).warnings.some(w => w.code === 'unknown_function'));
+  // EntryPoint v0.9 is ERC-4337's (it was a danger); v0.6's operations Calibur doesn't read.
+  assert.equal((await sign(t([{ to: ACCOUNT, data: entry('0x433709009B8330FDa32311DF1C2AFA402eD8D009') }]))).warnings.find(w => w.code === 'calibur_entry_point')?.severity, 'info');
+  const v06 = (await sign(t([{ to: ACCOUNT, data: entry('0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789') }]))).warnings.find(w => w.code === 'calibur_entry_point')!;
+  assert.deepEqual([v06.severity, /v0\.6, whose operations are in an older form than Calibur reads/.test(v06.message)], ['caution', true]);
+  // Signing as a key registered on another account: the account isn't "yours".
+  const KEY = `0x${'cd'.repeat(32)}` as Hex;
+  const forOther = await sign(t([{ to: ACCOUNT, data: reg(EVIL) }], { keyHash: KEY }), offline, {}, FRIEND);
+  assert.match(forOther.warnings.find(w => w.code === 'calibur_register_key')!.message, /^This registers an Ethereum key, 0x9622[0-9a-f]+, on 0xd640…b2f1: whoever holds it can make calls as the account, moving anything it holds, until it is revoked/);
+  assert.equal(forOther.title, 'Signed call as 0xd640…b2f1: Register an Ethereum key (0x9622…7242) on 0xd640…b2f1');
+  // The account's own key asked to sign as a registered key: Calibur checks it against that key.
+  assert.equal((await sign(t([{ to: USDC, data: transfer(1n) }], { keyHash: KEY }))).warnings.find(w => w.code === 'calibur_key_mismatch')?.severity, 'info');
+});
+
+test('A Calibur key’s settings are read as each deployment reads them: the admin byte, and what a hook is called for', async () => {
+  const t = (calls: { to: string; value?: bigint; data: Hex }[]) => typed(batch(calls), {}, 1);
+  const KEY = `0x${'ab'.repeat(32)}` as Hex, exp = BigInt(Math.floor(NOW / 1000) + 86400) << 160n;
+  const update = (settings: bigint) => encodeFunctionData({ abi: ABI, functionName: 'update', args: [KEY, settings] });
+  const said = async (settings: bigint) => { const p = await sign(t([{ to: ACCOUNT, data: update(settings) }])); return p.warnings.find(w => w.code === 'calibur_admin_key' || w.code === 'calibur_key_settings')!; };
+  // The older Calibur takes any bit of the byte at 200 as the admin flag (bit 201 was "not an admin"); the newer
+  // refuses bits above 200.
+  for (const bit of [201n, 207n]) {
+    const w = await said(1n << bit | exp);
+    assert.deepEqual([w.code, w.severity], ['calibur_admin_key', 'danger'], String(bit));
+    assert.match(w.message, /It is made one by a bit above the admin flag's own: the older Calibur \(0x…9b8f00\) reads any bit of that byte as the flag, and the newer refuses such settings\.$/);
+  }
+  assert.match((await said(1n << 210n)).message, /not an admin, .* Its settings set bits the newer Calibur reserves: it refuses them\.$/);
+  assert.ok(!/reserves|above the admin/.test((await said(1n << 200n)).message));
+  // A hook is called for what the low bits of its address enable: with neither execution bit it checks no call.
+  const hook = (low: number) => BigInt(`0x${'c0de'.repeat(9)}00${low.toString(16).padStart(2, '0')}`);
+  assert.match((await said(hook(0x18))).message, /its calls checked by the hook 0xc0de[0-9a-f]+18 \(called for each call, before it, each call, after it\)/);
+  assert.match((await said(hook(0x04))).message, /with a hook \(0xc0de[0-9a-f]+04\) that isn't called on the calls it makes, only for a signature checked for the account \(ERC-1271\): nothing checks its calls/);
+  assert.match((await said(hook(0x20))).message, /with a hook \(0xc0de[0-9a-f]+20\) whose address enables none of its checks: it is never called/);
+  assert.match((await said(0n)).message, /with no hook checking its calls/);
+  // The older Calibur's multicall runs each of its calls on the account: read as they are, each told.
+  const MULTI = parseAbi(['function multicall(bytes[] data)', 'function updateSalt(uint96 prefix)', 'function approveNativeTransient(address spender, uint256 amount)']);
+  const reg = encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 2, publicKey: encodeAbiParameters([{ type: 'address' }], [FRIEND as Hex]) }] });
+  const multi = await sign(t([{ to: ACCOUNT, data: encodeFunctionData({ abi: MULTI, functionName: 'multicall', args: [[reg, update(1n << 200n)]] }) }]));
+  assert.deepEqual([multi.attention, multi.decoding.status], ['danger', 'full']);
+  assert.match(multi.warnings.find(w => w.code === 'calibur_register_key')!.message, /^This \(1 of 2 in a multicall\) registers an Ethereum key/);
+  assert.match(multi.warnings.find(w => w.code === 'calibur_admin_key')!.message, /^This \(2 of 2 in a multicall\) makes the key/);
+  assert.match(multi.title, /^Signed call as you: 2 changes to your account: Register an Ethereum key \(0xc51e…cb08\) on your account; Set a key's rights on your account \(admin\)$/);
+  // One with a call that isn't the account's own function isn't read as a whole, but what was read is still said.
+  const part = await sign(t([{ to: ACCOUNT, data: encodeFunctionData({ abi: MULTI, functionName: 'multicall', args: [[reg, '0x12345678']] }) }]));
+  assert.deepEqual([codes(part).includes('calibur_register_key'), codes(part).includes('calibur_self_call'), part.decoding.status], [true, true, 'partial']);
+  // Its other own functions: the salt with a prefix, and an allowance for one transaction.
+  assert.ok(codes(await sign(t([{ to: ACCOUNT, data: encodeFunctionData({ abi: MULTI, functionName: 'updateSalt', args: [7n] }) }]))).includes('calibur_update_salt'));
+  assert.match((await sign(t([{ to: ACCOUNT, data: encodeFunctionData({ abi: MULTI, functionName: 'approveNativeTransient', args: [FRIEND as Hex, 10n ** 18n] }) }]))).warnings.find(w => w.code === 'calibur_native_approval')!.message, /take up to 1 ETH from your account \(its native allowance, ERC-7914\), for the rest of this transaction\.$/);
+});
+
+test('A signed Calibur batch is for the chain its digest is for, and a deadline that never comes is none', async () => {
+  const reg = encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 2, publicKey: encodeAbiParameters([{ type: 'address' }], [FRIEND as Hex]) }] });
+  // Forms of a chain id the digest takes as 1 (BigInt's): read as no chain, the preview was for the wallet's chain.
+  for (const chainId of [' 1', '1 ', '0b1', true, [1]] as unknown[]) {
+    const t = typed(batch([{ to: USDC, data: transfer(1n) }]), { chainId });
+    assert.equal(hashTypedData({ ...t, domain: { ...t.domain, chainId: 1 } } as never), hashTypedData(typed(batch([{ to: USDC, data: transfer(1n) }]), {}, 1) as never));
+    const p = await sign(t, offline, { chainId: 8453 });
+    assert.deepEqual([(p.network as { chainId?: number } | null)?.chainId, codes(p).includes('chain_mismatch')], [1, true], JSON.stringify(chainId));
+  }
+  // With no chain to read the calls for, what a call back into the account does is still said.
+  const t = typed(batch([{ to: ACCOUNT, data: reg }]));
+  delete (t.domain as Record<string, unknown>).chainId;
+  t.types.EIP712Domain = t.types.EIP712Domain.filter(f => f.name !== 'chainId');
+  const chainless = await sign(t);
+  assert.deepEqual([chainless.attention, codes(chainless).includes('calibur_register_key'), codes(chainless).includes('calibur_unread')], ['danger', true, true]);
+  // A domain with no type given and no chain isn't one Calibur computes a digest over.
+  const untyped = typed(batch([{ to: USDC, data: transfer(1n) }]));
+  delete (untyped.domain as Record<string, unknown>).chainId;
+  delete (untyped.types as Record<string, unknown>).EIP712Domain;
+  assert.match((await sign(untyped, offline, { chainId: 1 })).warnings.find(w => w.code === 'calibur_domain')?.message ?? '', /^It is signed under a domain that names no chain/);
+  // A deadline of the largest number, or years off, is no deadline: it was "a time that will not come", nothing said.
+  const forever = await sign(typed(batch([{ to: USDC, data: transfer(1n) }], { deadline: (1n << 256n) - 1n }), {}, 1));
+  assert.deepEqual([forever.attention, detail(forever, 'Valid until')], ['caution', 'a time that will not come']);
+  assert.match(forever.warnings.find(w => w.code === 'calibur_no_deadline')!.message, /^Its deadline is a time that will not come: whoever holds it can submit it at any time, until its nonce is used/);
+  const years = await sign(typed(batch([{ to: USDC, data: transfer(1n) }], { deadline: BigInt(Math.floor(NOW / 1000)) + 3n * 365n * 86400n + 86400n }), {}, 1));
+  assert.match(years.warnings.find(w => w.code === 'calibur_no_deadline')!.message, /^Its deadline is 3 years away \(20\d\d-/);
+  assert.ok(!codes(await sign(typed(batch([{ to: USDC, data: transfer(1n) }]), {}, 1))).includes('calibur_no_deadline'));
+});
+
+test('wallet_sendCalls to the zero address: the account itself where it runs Calibur, said to be either where that isn’t known', async () => {
+  const reg = encodeFunctionData({ abi: ABI, functionName: 'register', args: [{ keyType: 2, publicKey: encodeAbiParameters([{ type: 'address' }], [FRIEND as Hex]) }] });
+  const chain = (code: string): Dependencies => ({ ...offline, rpc: { has: () => true, call: async (_c: number, m: string) => (m === 'eth_getCode' ? code : '0x') } });
+  const calls = (d: Dependencies) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ACCOUNT, calls: [{ to: USDC, data: transfer(1_000_000n) }, { to: ZERO, data: reg }] }] }, { now: NOW }, d);
+  // It read "Call contract 0x0000…", a function that isn't known: a key registered on the account.
+  const calibur = await calls(chain(`0xef0100${CODE.slice(2)}`));
+  assert.equal(calibur.attention, 'danger');
+  assert.match(calibur.warnings.find(w => w.code === 'calibur_register_key')?.message ?? '', /^Call 2: This registers an Ethereum key/);
+  assert.match(calibur.decoding.notes.join(' '), /Call 2 is to the zero address, which your account's code \(Calibur\) takes to mean the account itself: it is read, and simulated, as a call to your own account\./);
+  assert.equal(calibur.calls?.[1].title, 'Register an Ethereum key (0xc51e…cb08) on your account');
+  // Other code, or none read: it may be a call into the account, and that is said.
+  for (const d of [chain(`0xef0100${'22'.repeat(20)}`), offline]) {
+    const other = await calls(d);
+    assert.ok(!codes(other).includes('calibur_register_key'));
+    assert.match(other.warnings.find(w => w.code === 'zero_address_call')?.message ?? '', /^Call 2 is to the zero address with calldata: a wallet whose account code follows ERC-7821 \(Calibur, Porto\) runs that as a call into your own account/);
+  }
+  // A plain transfer of coin to the zero address is only that.
+  const burn = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ACCOUNT, calls: [{ to: ZERO, value: '0x1' }] }] }, { now: NOW }, offline);
+  assert.ok(!codes(burn).includes('zero_address_call'));
+});

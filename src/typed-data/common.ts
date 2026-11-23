@@ -76,11 +76,13 @@ export function typedDataDigest(data: TypedData): Hex | null {
   }
 }
 
+/**
+ * The chain a domain names, read as the digest takes it (`big`): " 1", "0b1", true and [1] are chain 1 to the digest,
+ * and read as no chain at all they left a signature for Ethereum previewed on whatever chain the wallet was on.
+ */
 export function domainChainId(data: TypedData): number | null {
-  const id = data.domain.chainId;
-  if (typeof id === 'number') return id;
-  if (typeof id === 'string' && /^(0x[0-9a-fA-F]+|\d+)$/.test(id)) return Number(BigInt(id));
-  return null;
+  const id = big(data.domain.chainId);
+  return id === null ? null : Number(id);
 }
 
 export function str(value: unknown): string {
@@ -102,7 +104,14 @@ export function big(value: unknown): bigint | null {
     if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return BigInt(value);
     if (typeof value === 'boolean') return value ? 1n : 0n;
     if (Array.isArray(value)) return big(String(value));
-    if (typeof value === 'string' && value.length <= 200) { const v = BigInt(value); return v >= 0n ? v : null; }
+    if (typeof value === 'string') {
+      // (However long with zeros before it: a number padded with them is the same number to the digest. What is left
+      // is bounded: a uint256 in binary, the longest form, is 258 characters.)
+      const text = value.length <= 300 ? value : value.trim().replace(/^(0[xXoObB])?0+(?=[0-9a-fA-F])/, '$1');
+      if (text.length > 300) return null;
+      const v = BigInt(text);
+      return v >= 0n ? v : null;
+    }
   } catch { /* fallthrough */ }
   return null;
 }

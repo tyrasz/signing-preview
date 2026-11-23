@@ -128,6 +128,20 @@ export class PreviewBuilder {
     if (!this.warnings.some(w => w.code === code)) this.warnings.push({ severity, code, message });
     return this;
   }
+  /**
+   * A warning that can be one of several of its code (one for each call of a batch, each part of a plan): told with
+   * the others of its code, at the gravest severity among them. `warn` keeps the first alone, and a second key
+   * registered, or a second approval, in a later call went unsaid.
+   */
+  also(severity: Severity, code: string, message: string): this {
+    const w = this.warnings.find(x => x.code === code);
+    if (!w) this.warnings.push({ severity, code, message });
+    else {
+      if (!w.message.includes(message)) w.message = `${w.message} ${message}`;
+      if (ORDER[severity] > ORDER[w.severity]) w.severity = severity;
+    }
+    return this;
+  }
   note(text: string): this {
     this.notes.push(text);
     return this;

@@ -55,9 +55,12 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
   if (code) b.detail('Account code', known ? `${known} (${code})` : code, code);
   b.detail('Submitted by', anyone ? 'anyone who holds the signature' : executor, executor);
   b.detail('Signed as', root ? "the account's own key" : `a key registered on the account (${keyHash.slice(0, 10)}…${keyHash.slice(-4)})`, keyHash);
-  const never = deadline === 0n, now = BigInt(Math.floor(env.now / 1000));
-  const until = never ? 'with no expiry' : `until ${formatTimestamp(Number(deadline) * 1000)}`;
-  b.detail('Valid until', never ? 'no expiry' : deadline < 1n << 47n ? formatTimestamp(Number(deadline) * 1000) : 'a time that will not come', deadline.toString());
+  // (A deadline too far off to be a date, or years away, is none in effect: it read "a time that will not come" with
+  // nothing said, where a deadline of zero was a caution.)
+  const never = deadline === 0n, now = BigInt(Math.floor(env.now / 1000)), beyond = deadline >= 1n << 47n, distant = !never && deadline > now + 366n * 86400n;
+  const when = never ? 'no expiry' : beyond ? 'a time that will not come' : formatTimestamp(Number(deadline) * 1000);
+  const until = never || beyond ? 'with no expiry' : `until ${when}`;
+  b.detail('Valid until', when, deadline.toString());
   const sequenceOf = nonce >> 64n;
   b.detail('Nonce', `${nonce & ((1n << 64n) - 1n)} in sequence ${sequenceOf > 0xffffffffn ? `0x${sequenceOf.toString(16)}` : sequenceOf}`, nonce.toString());
 
@@ -65,14 +68,18 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
   // like it: what takes the signature, and what it does with it, isn't known.
   const named = str(data.domain.name) === 'Calibur' && str(data.domain.version) === '1.0.0';
   const others = (data.types.EIP712Domain?.map(f => f.name) ?? Object.keys(data.domain)).filter(k => !['name', 'version', 'chainId', 'verifyingContract', 'salt'].includes(k));
-  // (Its domain type exactly, where one is given: the five fields, of these types, in this order.)
+  // (Its domain type exactly, where one is given: the five fields, of these types, in this order. Where none is, the
+  // digest is over the fields the domain has: without its chain, it isn't one Calibur computes.)
   const domainType = shape('EIP712Domain'), misshapen = domainType !== undefined && domainType !== 'string name,string version,uint256 chainId,address verifyingContract,bytes32 salt';
-  if (!named || !code || others.length || misshapen) b.warn('caution', 'calibur_domain', `It is signed under ${!code ? 'a domain with no salt' : others.length ? `a domain that also has ${others.map(o => `"${o}"`).join(', ')}` : misshapen ? `a domain whose fields aren't Calibur's (${domainType})` : `the name "${str(data.domain.name)}" (version "${str(data.domain.version)}")`}: Calibur checks signatures under "Calibur", version "1.0.0", the chain, the account and a salt that names its code, so an account that runs it doesn't take this one. What else would take it isn't known.`);
+  const chainless = domainType === undefined && (data.domain.chainId === undefined || data.domain.chainId === null);
+  if (!named || !code || others.length || misshapen || chainless) b.warn('caution', 'calibur_domain', `It is signed under ${!code ? 'a domain with no salt' : others.length ? `a domain that also has ${others.map(o => `"${o}"`).join(', ')}` : misshapen ? `a domain whose fields aren't Calibur's (${domainType})` : chainless ? 'a domain that names no chain' : `the name "${str(data.domain.name)}" (version "${str(data.domain.version)}")`}: Calibur checks signatures under "Calibur", version "1.0.0", the chain, the account and a salt that names its code, so an account that runs it doesn't take this one. What else would take it isn't known.`);
   else if (!known) b.warn('caution', 'calibur_unknown_code', `Its salt names ${shortAddress(code)} as the account's code, which isn't a Calibur this format was read from: the request is shaped like Calibur's signed batches, but what code takes this signature, and what it does with it, isn't known.`);
-  if (never) b.warn('caution', 'calibur_no_deadline', `It has no deadline: ${anyone ? 'whoever holds it' : shortAddress(executor)} can submit it at any time, until its nonce is used or you invalidate it.`);
+  if (never || distant) b.warn('caution', 'calibur_no_deadline', `${never ? 'It has no deadline' : beyond ? 'Its deadline is a time that will not come' : `Its deadline is ${(deadline - now) / (365n * 86400n)} year${(deadline - now) / (365n * 86400n) === 1n ? '' : 's'} away (${when})`}: ${anyone ? 'whoever holds it' : shortAddress(executor)} can submit it at any time${never || beyond ? '' : ' until then'}, until its nonce is used or you invalidate it.`);
   else if (deadline < now) b.warn('info', 'calibur_expired', 'Its deadline has passed: Calibur refuses it.');
   if (signer && !mine && root) b.warn('caution', 'calibur_other_account', `It is a batch for ${shortAddress(account)}, signed as that account's own key, but ${shortAddress(signer)} is asked to sign it: the account takes only its own key's signature for it.`);
   else if (signer && !mine) b.warn('caution', 'calibur_other_account', `It is a batch for ${shortAddress(account)}, not for ${shortAddress(signer)}, who is asked to sign it as a key registered on that account: its calls run as ${shortAddress(account)}.`);
+  // (The account's own key asked to sign as a registered key: Calibur checks the signature against that key.)
+  else if (signer && mine && !root) b.warn('info', 'calibur_key_mismatch', `It is to be signed as a key registered on the account (${keyHash.slice(0, 10)}…${keyHash.slice(-4)}), but the account's own key is asked to sign it: Calibur checks the signature against that key, and refuses this one unless that key is the account's own.`);
   if (chainId !== null && env.context.chainId && chainId !== env.context.chainId) b.warn('caution', 'chain_mismatch', `The signature is for ${chainName(chainId)}, but the wallet is on ${chainName(env.context.chainId)}.`);
   const network = chainId !== null ? { kind: 'evm' as const, chainId, name: chainName(chainId) } : null;
   const n = calls.length, what = n === 1 ? 'call' : 'calls';
@@ -84,6 +91,12 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
     if (whole && c.data.length > 10) b.detail(`Call ${i + 1} calldata`, c.data.length > 4098 ? `${c.data.slice(0, 4098)}… (${(c.data.length - 2) / 2} bytes in all)` : c.data);
   };
   const said = `A signed batch (${known ?? "an account code this previewer doesn't know"}): ${anyone ? 'whoever holds the signature' : `the executor ${shortAddress(executor)}`} may have ${who} make ${n === 1 ? 'this call' : `these ${n} calls`}, once${strict ? ', all or nothing' : ', each on its own (one that fails is skipped)'}.`;
+  // Calls back into the account (to itself, or to the zero address, which Calibur takes to mean itself): what each
+  // changes in the account, its keys above all, whatever chain it is for and however many calls there are. (A key
+  // that isn't an admin can't make them: Calibur refuses.) Each is told, with the others of its kind: of two keys
+  // registered, or two EntryPoints set, the second went unsaid.
+  const admin = calls.map((c, i) => ((sameAddress(c.to, account) || ZERO.test(c.to)) && c.data.length >= 10 ? { i, title: caliburAdmin(c.data, b, n === 1 ? 'This ' : `Call ${i + 1}: `, chainId ?? 0, who) } : null)).filter((x): x is { i: number; title: string | null } => !!x);
+  for (const a of admin) if (!a.title) b.also('caution', 'calibur_self_call', `${n === 1 ? 'The call is' : `Call ${a.i + 1} is`} one back into the account itself (${calls[a.i].data.slice(0, 10)}) that isn't read: the account's own code runs it with the account's own authority.`);
   if (chainId === null) {
     b.warn('caution', 'calibur_unread', `Which chain it is for isn't part of what is signed, nor known to the wallet: its ${what} can't be read for a chain.`);
     for (let i = 0; i < Math.min(n, MAX_READ); i++) asSigned(i, true);
@@ -108,11 +121,6 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
       }
     } catch { b.note("Whether the account runs this code and the nonce is its next wasn't read."); }
   } else b.note("Whether the account runs this code and the nonce is its next wasn't checked (no RPC for this chain).");
-
-  // Calls back into the account (to itself, or to the zero address, which Calibur takes to mean itself): what each
-  // changes in the account, its keys above all. A key that isn't an admin can't make them: Calibur refuses.
-  const admin = calls.map((c, i) => ((sameAddress(c.to, account) || ZERO.test(c.to)) && c.data.length >= 10 ? { i, title: caliburAdmin(c.data, b, n === 1 ? 'This ' : `Call ${i + 1}: `, chainId) } : null)).filter((x): x is { i: number; title: string | null } => !!x);
-  for (const a of admin) if (!a.title) b.warn('caution', 'calibur_self_call', `${n === 1 ? 'The call is' : `Call ${a.i + 1} is`} one back into the account itself (${calls[a.i].data.slice(0, 10)}) that isn't read: the account's own code runs it with the account's own authority.`);
 
   // The calls, as the account's own: decoded so, and simulated as the account makes them, in order. A past block
   // named for the preview isn't used: a signature is previewed on the latest state.
@@ -142,8 +150,17 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
     const reason = failing?.simulation?.revertReason;
     if (failing && !spent) b.warn('caution', 'calibur_batch_fails', strict
       ? `The ${what} would fail if ${n === 1 ? 'it was' : 'they were'} submitted now${reason ? ` (${reason})` : ''}: nothing would move now. But the signature stays valid ${until}, until it is used: it can be submitted once the ${what} would succeed. What ${n === 1 ? 'it moves' : 'they move'} then is what the ${what} say${n === 1 ? 's' : ''}, not what is simulated here.`
-      : `${n === 1 ? 'The call' : 'One of the calls'} would fail if submitted now${reason ? ` (${reason})` : ''}: a call that fails is skipped, and the rest still run. What is shown is of the calls that go through now.`);
-    for (const w of p.warnings) if (!TX_ONLY.has(w.code) && !FAILS.has(w.code) && !(admin.length && w.code === 'unknown_function')) b.warn(w.severity, w.code, w.message);
+      : `${n === 1 ? 'The call' : 'One of the calls'} would fail if submitted now${reason ? ` (${reason})` : ''}: a call that fails is skipped, and the rest still run. The changes shown are each call's own, a failing call's as it asks for them: a call that fails moves nothing.`);
+    // Each call's warnings, told with the others of their code (the second unlimited approval of a batch went
+    // unsaid). A call back into the account is told above: what the plain reading of it says (a function that isn't
+    // known) is left out for that call alone, not for every call of a batch that has one.
+    const own = new Map(admin.map(a => [a.i, a.title]));
+    for (const w of p.warnings) {
+      if (TX_ONLY.has(w.code) || FAILS.has(w.code)) continue;
+      const at = n === 1 ? 0 : Number(/^Call (\d+): /.exec(w.message)?.[1] ?? 0) - 1;
+      if (own.has(at) && (own.get(at) !== null || w.code === 'unknown_function' || w.code === 'smart_account_self_call')) continue;
+      b.also(w.severity, w.code, w.message);
+    }
     if (p.simulation?.status === 'success') b.note(`Simulated as the account making the ${what}${n === 1 ? '' : ' in order'}, on the current state: its code makes ${n === 1 ? 'it' : 'each'} as the account, whoever submits the batch.`);
     for (const note of p.decoding.notes) b.note(note);
     if (p.trace && !b.trace) b.trace = p.trace;
@@ -158,6 +175,6 @@ export const caliburSignedBatchAdapter: TypedAdapter = async (data, env) => {
     for (let i = 0; i < n; i++) asSigned(i, true);
   }
   if (!strict && n > 1) b.note('The batch doesn\'t revert on failure: a call that fails is skipped, and the others still take effect.');
-  b.note(`An off-chain signature: it costs nothing now. ${anyone ? 'Anyone who holds it' : `The executor ${shortAddress(executor)}, and no one else,`} can submit it${never ? '' : ` until ${formatTimestamp(Number(deadline) * 1000)}`}, once: the ${what} then run${n === 1 ? 's' : ''} as the account, as if it had sent ${n === 1 ? 'it' : 'them'}. Until then the account can void it by invalidating its nonce.`);
+  b.note(`An off-chain signature: it costs nothing now. ${anyone ? 'Anyone who holds it' : `The executor ${shortAddress(executor)}, and no one else,`} can submit it${never || beyond ? '' : ` until ${when}`}, once: the ${what} then run${n === 1 ? 's' : ''} as the account, as if it had sent ${n === 1 ? 'it' : 'them'}. Until then the account can void it by invalidating its nonce.`);
   return { title, summary: `${said}${also ? ` ${also}` : ''}`, decoder: 'calibur_signed_batch', status, b, network, ...(assetChanges && { assetChanges }), ...(approvals?.length && { approvals }) };
 };

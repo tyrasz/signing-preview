@@ -1128,3 +1128,41 @@ test('A Safe transaction that spends more coin than the Safe holds runs again wi
   const never = await sign(spend, env(0n, 'fails').d);
   assert.ok(codes(never).includes('safe_tx_reverts') && !codes(never).includes('safe_needs_coin'), codes(never).join());
 });
+
+test('Every delegatecall to unknown code in a Safe batch is named, a call’s rows aren’t taken for the Safe’s, and a delegatecall’s calldata isn’t read as facts', async () => {
+  const ROGUE = '0x96221423681a6d52e184d440a8efcebb105c7242', OTHER = '0x1111111111111111111111111111111111111111', MULTI = '0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526';
+  const batchOf = (calls: [number, string, bigint, Hex][]) => sign({ to: MULTI, operation: 1, data: multiSend(calls) });
+  // Of two, the second went unsaid: a warning code is kept once, and each was its own warning.
+  const two = await batchOf([[0, USDC, 0n, transfer], [1, ROGUE, 0n, transfer], [1, OTHER, 0n, transfer]]);
+  const said = two.warnings.filter(w => w.code === 'safe_delegatecall');
+  assert.equal(said.length, 1);
+  assert.equal(said[0].message, `Calls 2, 3 are delegatecalls inside the batch, to ${ROGUE}, ${OTHER}, which aren't any of Safe's libraries: the code of each would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
+  // One among the calls decoded and one past them: both, where the second's "more" never showed.
+  const far = await batchOf([[1, ROGUE, 0n, transfer], ...Array.from({ length: 200 }, (): [number, string, bigint, Hex] => [0, USDC, 0n, transfer]), [1, ROGUE, 0n, transfer]]);
+  assert.match(far.warnings.find(w => w.code === 'safe_delegatecall')!.message, new RegExp(`^Calls 1, 202 are delegatecalls inside the batch, to ${ROGUE}, which isn't one of Safe's libraries`));
+  // What a delegatecall's calldata reads as isn't listed as what it does: in the Bybit theft it read as a transfer.
+  for (const p of [await sign({ to: ROGUE, operation: 1, data: transfer }), await batchOf([[1, ROGUE, 0n, transfer]])]) {
+    assert.ok(!p.details.some(d => /Recipient|Amount|Token contract/.test(d.label)), p.details.map(d => d.label).join());
+    assert.equal(p.attention, 'danger');
+  }
+  // (In a batch, the plain call's rows are its own; the delegatecalls have none.)
+  assert.deepEqual(two.details.filter(d => /Recipient$/.test(d.label)).map(d => d.label), ['Call 1: Recipient']);
+  assert.equal(detail(await sign({ to: ROGUE, operation: 1, data: transfer }), 'Its calldata reads as'), `Send 1000000000 base units of token ${ROGUE}`);
+  // A plain call's own rows are still shown.
+  assert.ok((await sign({})).details.some(d => d.label === 'Recipient'));
+  // A Safe transaction run on another Safe: its rows are marked as the call's, and each Safe's gas refund is said
+  // of that Safe (the inner one's read "The Safe pays…", and this Safe's own went unsaid under the same code).
+  const SAFE_B = '0x5afe00000000000000000000000000000000beef', PAYEE_A = '0xaaaa00000000000000000000000000000000aaaa', PAYEE_B = '0xbbbb00000000000000000000000000000000bbbb';
+  const inner = encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [USDC, 0n, transfer, 0, 50_000n, 0n, 10n ** 9n, ZERO, PAYEE_B, `0x${'11'.repeat(130)}`] });
+  const nested = await sign({ to: SAFE_B, data: inner, safeTxGas: '50000', gasPrice: '1000000000', refundReceiver: PAYEE_A });
+  assert.deepEqual(nested.details.filter(d => /(^|: )Safe$/.test(d.label)).map(d => [d.label, d.value]), [['Safe', SAFE], ['Call: Safe', SAFE_B]]);
+  assert.deepEqual(nested.details.filter(d => /Gas refund$/.test(d.label)).map(d => d.label).sort(), ['Call: Gas refund', 'Gas refund']);
+  const refunds = nested.warnings.filter(w => w.code === 'safe_gas_refund').map(w => w.message);
+  assert.equal(refunds.length, 2);
+  assert.match(refunds[0], /^On 0x5afe…beef, the Safe it runs a transaction on: The Safe pays a gas refund to 0xbbbb…bbbb: /i);
+  assert.match(refunds[1], /^The Safe pays a gas refund to 0xaaaa…aaaa: /i);
+  // A library's warning at the top of a transaction is a sentence.
+  const SIGN = '0xd53cd0aB83D845Ac265BE939c57F53AD838012c9';
+  const message = await sign({ to: SIGN, operation: 1, data: encodeFunctionData({ abi: parseAbi(['function signMessage(bytes _data)']), functionName: 'signMessage', args: ['0x1234'] }) });
+  assert.match(message.warnings.find(w => w.code === 'safe_sign_message')?.message ?? '', /^This signs a message in the Safe's name/);
+});

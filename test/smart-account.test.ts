@@ -178,3 +178,33 @@ test("WalletCore's batches: the account's own, and the calls of one a relayer or
   const session = { id: 7n, executor: BOB as Hex, validator: '0x0000000000000000000000000000000000000001' as Hex, validUntil: 1_800_000_000n, validAfter: 0n, preHook: '0x' as Hex, postHook: '0x' as Hex, signature: `0x${'22'.repeat(65)}` as Hex };
   assert.equal(batchCalls(encodeFunctionData({ abi: WALLET_CORE, functionName: 'executeFromExecutor', args: [calls, session] }))!.calls.length, 2);
 });
+
+test('A call to the zero address is one back into the account only where the account’s code is known to take it so', async () => {
+  // ERC-7821 has the zero address stand for the account, and Calibur follows it; other account code (Coinbase Smart
+  // Wallet, Simple7702Account) calls the zero address as given, where nothing runs. Taken as the account for every
+  // format, a revoke nested under the zero address was shown undoing an approval that, on such an account, stands.
+  const revoke = encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [BOB, 0n] });
+  const nested = encodeFunctionData({ abi: ACCOUNT, functionName: 'executeBatch', args: [[{ target: USDC, value: 0n, data: revoke }]] });
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  const data = encodeFunctionData({ abi: ACCOUNT, functionName: 'executeBatch', args: [[{ target: USDC, value: 0n, data: approve }, { target: ZERO, value: 0n, data: nested }]] });
+  const chain = (code: string) => ({ tokens: new StaticTokenRegistry(), rpc: { has: () => true, call: async (_c: number, m: string) => (m === 'eth_getCode' ? code : '0x') } });
+  const at = (d: object, input = data) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: ALICE, data: input, chainId: '0x1' }] }, { now: NOW }, d as never);
+  for (const d of [{ tokens: new StaticTokenRegistry() }, chain(`0xef0100${'22'.repeat(20)}`)]) {
+    const p = await at(d);
+    assert.equal(detail(p, 'Call 2'), 'Call the zero address (0x34fcd5be) (0x0000…0000)');
+    assert.notEqual(p.decoding.status, 'full');
+    assert.ok(!p.details.some(x => /Revoke/.test(x.value)));
+    const w = p.warnings.find(x => x.code === 'smart_account_calls_unread')!;
+    assert.equal(w.severity, 'danger');
+    assert.match(w.message, /^Call 2: a call to the zero address carrying a batch of 1 call, which isn't laid out here: an account whose code follows ERC-7821 \(Calibur, Porto\) takes the zero address to mean itself, .* other account code calls the zero address, where nothing runs\. Which your account's code does isn't known here\. If it runs them, any of them can move what your account holds or approve a spender; if it doesn't, nothing they say happens\.$/);
+  }
+  // Coin sent there with calldata is lost on such an account: it read "Call your own account, with 10 ETH".
+  const lost = await at({ tokens: new StaticTokenRegistry() }, encodeFunctionData({ abi: ACCOUNT, functionName: 'executeBatch', args: [[{ target: ZERO, value: 10n ** 19n, data: '0x12345678' }]] }));
+  assert.match(lost.warnings.find(x => x.code === 'smart_account_zero_target')?.message ?? '', /other account code calls the zero address, where nothing runs, and the 10 ETH sent with it is lost\./);
+  assert.equal(lost.title, 'Call the zero address (0x12345678)');
+  // Where the account runs Calibur, it is the account: the nested batch is laid out as its own calls.
+  const CALIBUR = '0x000000009b1d0af20d8c6d0a44e162d11f9b8f00';
+  const laid = await at(chain(`0xef0100${CALIBUR.slice(2)}`));
+  assert.equal(detail(laid, 'Call 2'), 'Revoke USDC approval for 0xb0b0…0002 (0xa0b8…eb48)');
+  assert.ok(!codes(laid).includes('smart_account_calls_unread'));
+});

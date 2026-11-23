@@ -193,3 +193,22 @@ test('Whether a listing can be filled now: the NFT owned, the conduit approved, 
   assert.equal(detail(await at(listing(43), chain(true, 3n)), 'can transfer now'), "no: you don't own BAYC #43");
   assert.ok(codes(await at(listing(42), chain(true, 4n))).includes('seaport_counter_stale'));
 });
+
+test('A number is read as the digest takes it however it is padded, and a domain’s chain in any form the digest takes', async () => {
+  const { big, domainChainId, typedDataDigest } = await import('../src/typed-data/common.ts');
+  // Zeros before a number add nothing to it: an end time padded past 200 characters has the digest of the plain
+  // one, and read as no number the order was "already expired".
+  const end = String(start + 86400), padded = end.padStart(210, '0');
+  const plain = components([nft(42)], [eth(10n * E, ALICE)], { endTime: end }), long = components([nft(42)], [eth(10n * E, ALICE)], { endTime: padded });
+  const typed = (message: unknown) => ({ domain: { name: 'Seaport', version: '1.6', chainId: 1, verifyingContract: SEAPORT }, types: TYPES, primaryType: 'OrderComponents', message });
+  assert.ok(typedDataDigest(typed(plain) as never));
+  assert.equal(typedDataDigest(typed(long) as never), typedDataDigest(typed(plain) as never));
+  const [a, b] = [await sign(plain), await sign(long)];
+  assert.deepEqual([b.title, codes(b), b.attention], [a.title, codes(a), a.attention]);
+  assert.ok(!b.warnings.some(w => /expired/.test(w.message)));
+  assert.deepEqual([big(padded), big(`0x${'0'.repeat(400)}ff`), big(`  ${'0'.repeat(300)}7  `), big(`0b${'1'.repeat(256)}`), big('9'.repeat(400)), big('0'.repeat(500))], [BigInt(end), 255n, 7n, (1n << 256n) - 1n, null, 0n]);
+  // The chain a domain names, as BigInt() reads it: these are all chain 1 to the digest.
+  const domain = (chainId: unknown) => ({ types: {}, primaryType: 'X', domain: { chainId }, message: {} }) as never;
+  assert.deepEqual([' 1', '1 ', '0b1', '0x1', '01', true, [1], 1, 1n].map(c => domainChainId(domain(c))), Array(9).fill(1));
+  assert.deepEqual([undefined, null, 'one', 1.5, -1, {}].map(c => domainChainId(domain(c))), Array(6).fill(null));
+});

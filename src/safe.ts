@@ -140,6 +140,8 @@ const LIBRARY = parseAbi([
  * right version string, on a Safe that has run no transaction yet.
  */
 function libraryCall(lib: { name: string; kind: string }, c: Call, b: PreviewBuilder, p: string, coin: (v: bigint) => string): { title: string; summary: string; status: Decoded['status'] } {
+  // (At the top of a transaction its warnings are sentences of their own; in a batch they follow "Call N: ".)
+  const say = p || 'This ';
   let call;
   try { call = decodeFunctionData({ abi: LIBRARY, data: c.data }); } catch { call = undefined; }
   const fits = (kind: string, names: string[]) => lib.kind === kind && !!call && names.includes(call.functionName);
@@ -147,27 +149,27 @@ function libraryCall(lib: { name: string; kind: string }, c: Call, b: PreviewBui
     const data = call!.args![0] as Hex, bytes = (data.length - 2) / 2;
     const chars = (data.slice(2).match(/../g) ?? []).map(h => String.fromCharCode(parseInt(h, 16))).join('');
     const text = bytes > 0 && bytes !== 32 && /^[\x20-\x7e\n\r\t]+$/.test(chars) ? chars : null;
-    b.detail(`${p}Message signed as the Safe`.replace(/^Call (\d+): M/, 'Call $1: m'), text ? (text.length > 300 ? `${text.slice(0, 300)}…` : text) : bytes === 32 ? `a hash, ${data}` : data.length > 202 ? `${data.slice(0, 202)}… (${bytes} bytes)` : data, data);
-    b.warn('caution', 'safe_sign_message', `${p}signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's. ${text ? 'The message is shown as text' : bytes === 32 ? "Only the message's hash is given" : 'The message is shown as its bytes'}: what it commits the Safe to isn't read here, and it can be an order or a permit that moves the Safe's tokens.`);
+    b.detail(`${say}Message signed as the Safe`.replace(/^Call (\d+): M/, 'Call $1: m'), text ? (text.length > 300 ? `${text.slice(0, 300)}…` : text) : bytes === 32 ? `a hash, ${data}` : data.length > 202 ? `${data.slice(0, 202)}… (${bytes} bytes)` : data, data);
+    b.warn('caution', 'safe_sign_message', `${say}signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's. ${text ? 'The message is shown as text' : bytes === 32 ? "Only the message's hash is given" : 'The message is shown as its bytes'}: what it commits the Safe to isn't read here, and it can be an order or a permit that moves the Safe's tokens.`);
     return { title: 'Sign a message as the Safe', summary: 'Marks a message as signed by the Safe.', status: 'partial' };
   }
   if (fits('create_call', ['performCreate', 'performCreate2'])) {
     const [value, code] = call!.args as unknown as [bigint, Hex];
-    b.warn(value > 0n ? 'caution' : 'info', 'safe_create_call', `${p}deploys a contract from the Safe (${lib.name}), of ${((code.length - 2) / 2).toLocaleString('en-US')} bytes of code that isn't read here${value > 0n ? `, and sends it ${coin(value)} of the Safe's: what its code does with the coin isn't known` : ''}.`);
+    b.warn(value > 0n ? 'caution' : 'info', 'safe_create_call', `${say}deploys a contract from the Safe (${lib.name}), of ${((code.length - 2) / 2).toLocaleString('en-US')} bytes of code that isn't read here${value > 0n ? `, and sends it ${coin(value)} of the Safe's: what its code does with the coin isn't known` : ''}.`);
     return { title: `Deploy a contract from the Safe${value > 0n ? `, with ${coin(value)}` : ''}`, summary: 'Deploys a contract with the Safe as its creator.', status: 'partial' };
   }
   if (fits('migration', ['migrateSingleton', 'migrateWithFallbackHandler', 'migrateL2Singleton', 'migrateL2WithFallbackHandler']) && /^SafeMigration/.test(lib.name)) {
-    b.warn('caution', 'safe_migration', `${p}upgrades the Safe's code through Safe's official ${lib.name} contract (${call!.functionName}: to the singleton that contract was deployed for${/FallbackHandler/.test(call!.functionName) ? ', with its fallback handler' : ''}). Only sign it if you meant to upgrade the Safe.`);
+    b.warn('caution', 'safe_migration', `${say}upgrades the Safe's code through Safe's official ${lib.name} contract (${call!.functionName}: to the singleton that contract was deployed for${/FallbackHandler/.test(call!.functionName) ? ', with its fallback handler' : ''}). Only sign it if you meant to upgrade the Safe.`);
     return { title: `Upgrade the Safe (${lib.name})`, summary: 'Moves the Safe to another official Safe version.', status: 'full' };
   }
   if (fits('migration', ['migrateToL2', 'migrateFromV111']) && /^SafeToL2Migration/.test(lib.name)) {
     const to = String(call!.args![0]).toLowerCase(), official = SAFE_SINGLETONS[to], handler = call!.functionName === 'migrateFromV111' ? String(call!.args![1]).toLowerCase() : null;
-    if (official) b.warn('caution', 'safe_migration', `${p}changes the Safe's code to ${official} (${to}) through Safe's ${lib.name} contract${handler ? `, and sets ${handler} as its fallback handler` : ''}. Only sign it if you meant to upgrade the Safe.`);
-    else b.warn('danger', 'safe_code_replaced', `${p}sets the Safe's code to the code at ${to}, which isn't one of Safe's own, through Safe's ${lib.name} contract: that contract takes whatever address it is given that says it is version 1.3.0 or 1.4.1, on a Safe that has run no transaction yet. Whoever controls that code controls the Safe and everything in it.`);
+    if (official) b.warn('caution', 'safe_migration', `${say}changes the Safe's code to ${official} (${to}) through Safe's ${lib.name} contract${handler ? `, and sets ${handler} as its fallback handler` : ''}. Only sign it if you meant to upgrade the Safe.`);
+    else b.warn('danger', 'safe_code_replaced', `${say}sets the Safe's code to the code at ${to}, which isn't one of Safe's own, through Safe's ${lib.name} contract: that contract takes whatever address it is given that says it is version 1.3.0 or 1.4.1, on a Safe that has run no transaction yet. Whoever controls that code controls the Safe and everything in it.`);
     return { title: official ? `Upgrade the Safe to ${official}` : `Replace the Safe's code with ${shortAddress(to)} (${lib.name})`, summary: official ? 'Moves the Safe to another official Safe version.' : "Replaces the Safe's code with code that isn't Safe's own.", status: official ? 'full' : 'partial' };
   }
   // Calldata that is none of the library's functions: its code runs as the Safe all the same, on bytes that aren't read.
-  b.warn('caution', 'safe_library_unread', `${p}delegatecalls Safe's ${lib.name} with calldata (${c.data.length >= 10 ? c.data.slice(0, 10) : 'none'}) that isn't one of the functions this reads from it: what it does to the Safe isn't shown.`);
+  b.warn('caution', 'safe_library_unread', `${say}delegatecalls Safe's ${lib.name} with calldata (${c.data.length >= 10 ? c.data.slice(0, 10) : 'none'}) that isn't one of the functions this reads from it: what it does to the Safe isn't shown.`);
   return { title: `Call ${lib.name} as the Safe (${c.data.length >= 10 ? c.data.slice(0, 10) : 'no calldata'})`, summary: 'A delegatecall to one of Safe\'s libraries, with calldata that isn\'t read.', status: 'opaque' };
 }
 
@@ -189,7 +191,10 @@ async function describeCall(c: Call, safe: string, chainId: number, env: Adapter
   }
   const d = await decodeTransaction({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, env.deps, env.context);
   // (The caution that a run used the caller's state, from a Safe this one calls execTransaction on, is said once.)
-  for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `${p}${w.message}` });
+  // What is warned of a transaction run on another Safe is said to be of that Safe: unmarked, its gas refund read as
+  // this Safe's own.
+  const q = isExecTransaction(c) && d.decoder !== 'unknown' ? `${p}On ${shortAddress(c.to.toLowerCase())}, the Safe it runs a transaction on: ` : p;
+  for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `${q}${w.message}` });
   return d;
 }
 
@@ -202,6 +207,8 @@ async function describeCall(c: Call, safe: string, chainId: number, env: Adapter
  * (through the EntryPoint and the 4337 module, or execTransaction itself). It resolves the Safe's balance changes, or
  * null when it couldn't be simulated (the calls are then simulated one by one, as before).
  */
+/** The rows a Safe transaction's own preview has: a call's rows of the same names are marked as the call's. */
+const OWN_LABELS = new Set(['Safe', 'Safe nonce', 'Batch', 'Gas refund', 'Call', 'More calls', 'Value sent with the call']);
 export type SafeExecution = (watch: string[]) => Promise<SafeRan | { reverted: string } | null>;
 /**
  * A run of the Safe's transaction: its balance changes, a note, whether its calls succeeded (an operation can run with
@@ -281,12 +288,21 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   };
   const described: Described[] = [];
   for (let i = 0; i < listed.length; i += 8) described.push(...await Promise.all(listed.slice(i, i + 8).map((c, j) => describe(c, i + j))));
+  // A delegatecall inside a batch runs as the Safe, wherever in the batch it is and however many calls the batch has
+  // (in a batch of one it went unsaid: the call was shown as what its calldata reads as, a transfer). Every one is
+  // named, in one warning, those past the calls decoded too: of two, only the first was.
+  const rogues = batched ? calls.flatMap((c, j) => (c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()] ? [{ n: j + 1, to: c.to.toLowerCase() }] : [])) : [];
+  const runsAs = 'would run as the Safe itself, able to change its owners, move everything in it or replace its code';
+  const rogueWarning = () => {
+    if (rogues.length === 1) return b.warn('danger', 'safe_delegatecall', `${many ? `Call ${rogues[0].n}: ` : ''}a delegatecall to ${rogues[0].to} inside the batch: its code ${runsAs}.`);
+    const to = [...new Set(rogues.map(r => r.to))];
+    b.warn('danger', 'safe_delegatecall', `Calls ${rogues.slice(0, 12).map(r => r.n).join(', ')}${rogues.length > 12 ? `, and ${rogues.length - 12} more` : ''} are delegatecalls inside the batch, to ${to.length === 1 ? to[0] : `${to.slice(0, 3).join(', ')}${to.length > 3 ? ` and ${to.length - 3} more contract${to.length === 4 ? '' : 's'}` : ''}`}, which ${to.length === 1 ? "isn't one" : "aren't any"} of Safe's libraries: the code of each ${runsAs}.`);
+  };
   for (const [i, c] of listed.entries()) {
-    const { d, sub } = described[i], p = many ? `Call ${i + 1}: ` : '';
-    // A delegatecall inside a batch runs as the Safe, wherever in the batch it is and however many calls the batch
-    // has (in a batch of one it went unsaid: the call was shown as what its calldata reads as, a transfer).
+    const { d, sub } = described[i];
     const rogue = batched && c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()];
-    if (rogue) b.warn('danger', 'safe_delegatecall', `${p}a delegatecall to ${c.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
+    if (rogue && rogues[0].n === i + 1) rogueWarning();
+    const p = many ? `Call ${i + 1}: ` : '';
     // The batch reverts on this call, whatever the others do: said, as the simulation would say it.
     if (c.refused) b.warn('caution', 'safe_tx_reverts', `${p}the batch reverts on this call as it is built: ${c.refused}.`);
     for (const w of sub.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push(w);
@@ -301,8 +317,13 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     else if (batched && how) b.detail('Call', `${how}${d.title}${value} (${shortAddress(c.to.toLowerCase())})`, c.to.toLowerCase());
     if (!many && value) b.detail('Value sent with the call', coin(c.value), c.value.toString());
     // What the call's own decoding tells of it (who a transfer goes to, who an approval is for): a Safe transaction
-    // titled "Send 1,000 USDC" named no recipient anywhere.
-    for (const x of d.b?.details ?? []) b.detail(many ? `Call ${i + 1}: ${x.label}` : x.label, x.value, x.raw);
+    // titled "Send 1,000 USDC" named no recipient anywhere. Not of a delegatecall to a contract that isn't Safe's:
+    // its calldata is that contract's to read as it likes (in the Bybit theft it read as a transfer), and a
+    // recipient and an amount listed from it as plain facts say otherwise. And what a single call's decoding names
+    // as this Safe's rows are (a Safe transaction it runs on another Safe has its own "Safe" and "Gas refund") is
+    // marked as the call's.
+    const unknownCode = c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()];
+    if (!unknownCode) for (const x of d.b?.details ?? []) b.detail(many ? `Call ${i + 1}: ${x.label}` : OWN_LABELS.has(x.label) ? `Call: ${x.label}` : x.label, x.value, x.raw);
     // (And what a library call's reading adds: the message it signs as the Safe.)
     for (const x of sub.details) b.detail(x.label, x.value, x.raw);
   }
@@ -310,9 +331,8 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   // most: a delegatecall inside the batch runs as the Safe wherever in it it is.
   if (calls.length > MAX_LISTED) {
     const rest = calls.slice(MAX_LISTED);
-    const rogue = rest.flatMap((c, j) => (c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()] ? [{ n: MAX_LISTED + j + 1, to: c.to }] : []));
-    for (const r of rogue.slice(0, 3)) b.warn('danger', 'safe_delegatecall', `Call ${r.n}: a delegatecall to ${r.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
-    if (rogue.length > 3) b.warn('danger', 'safe_delegatecall', `${rogue.length - 3} more of the batch's calls are delegatecalls to contracts that aren't Safe's libraries (calls ${rogue.slice(3, 9).map(r => r.n).join(', ')}${rogue.length > 9 ? ', …' : ''}).`);
+    // (Delegatecalls among them only: none among the calls decoded, which would have said it there.)
+    if (rogues.length && rogues[0].n > MAX_LISTED) rogueWarning();
     b.detail('More calls', String(rest.length));
     b.warn('danger', 'safe_calls_unread', `The batch has ${calls.length} calls, and the ${rest.length} after the first ${MAX_LISTED} aren't decoded here: any of them can move what the Safe holds, approve a spender or change the Safe. Don't sign it on the calls listed alone${env.deps.simulator ? ': what a simulation of the whole batch shows, if one is shown below, is all that is told of them' : ''}.`);
   }
@@ -322,7 +342,10 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     const native = /^0x0{40}$/.test(t.gasToken);
     const who = /^0x0{40}$/.test(t.refundReceiver) ? 'whoever submits it' : t.refundReceiver;
     b.detail('Gas refund', `up to ${(t.safeTxGas + t.baseGas).toString()} gas × ${t.gasPrice} in ${native ? CHAINS[chainId]?.nativeSymbol ?? 'native' : shortAddress(t.gasToken)}, paid by the Safe to ${who}`);
-    if (!/^0x0{40}$/.test(t.refundReceiver)) b.warn('caution', 'safe_gas_refund', `The Safe pays a gas refund to ${shortAddress(t.refundReceiver)}: check that the price and the receiver are what you expect.`);
+    // (Said of this Safe whatever a call it makes warned of its own: a Safe transaction run on another Safe has a
+    // refund too, and under the one code this Safe's went unsaid.)
+    const refund = `The Safe pays a gas refund to ${shortAddress(t.refundReceiver)}: check that the price and the receiver are what you expect.`;
+    if (!/^0x0{40}$/.test(t.refundReceiver) && !b.warnings.some(w => w.code === 'safe_gas_refund' && w.message === refund)) b.warnings.push({ severity: 'caution', code: 'safe_gas_refund', message: refund });
   }
 
   let assetChanges: AssetChange[] = [];

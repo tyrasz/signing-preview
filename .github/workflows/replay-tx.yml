@@ -13,8 +13,9 @@ name: Transaction replays
 # L1 fee a few).
 # Then, for five minutes, the chain's Safe transactions are previewed as the signatures their owners gave (npm run
 # accuracy:safe): each execTransaction rebuilt as its SafeTx and run where it ran with stand-ins for its signatures,
-# against the receipt. That step fails when one differs, or when the run could not look (more blocks unread than
-# read, or three or more reads failed and more than the transactions compared).
+# against the receipt. That step fails when one differs, or when the run could not look (none of its blocks read; ten
+# or more blocks unread and more than were read; or three or more reads failed and more than the transactions
+# compared).
 # And for five more, its batches (npm run accuracy:batch): each call an account with delegated code (EIP-7702) ran
 # for its wallet, read back into its calls and previewed as the wallet_sendCalls request, against the receipt,
 # failing as the Safe step does.

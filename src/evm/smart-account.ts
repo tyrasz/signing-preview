@@ -144,63 +144,102 @@ export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; t
 }
 
 /**
- * Whether a call is one back into the account: to its own address, or to the zero address with calldata, which an
- * ERC-7821 account (Calibur, Porto) takes to mean itself ("to: replaced with address(this) if address(0)").
+ * Whether a call is one back into the account: to its own address, or, where the account's code is known to take it
+ * so (`zeroIsSelf`), to the zero address with calldata. ERC-7821 has "to: replaced with address(this) if address(0)",
+ * and Calibur and Porto follow it; other account code (Coinbase Smart Wallet, Simple7702Account, DeleGator) calls
+ * the zero address as given, where nothing runs. Taken as the account for every format, a revoke nested under the
+ * zero address was shown undoing an approval that, on such an account, stands.
  */
-const toSelf = (c: Call, account: string): boolean => sameAddress(c.target, account) || (/^0x0{40}$/.test(c.target) && c.data.length >= 10);
+const toSelf = (c: Call, account: string, zeroIsSelf: boolean): boolean => sameAddress(c.target, account) || (zeroIsSelf && toZero(c));
+/** A call to the zero address with calldata: one back into the account for some account code, to nothing for other. */
+const toZero = (c: Call): boolean => /^0x0{40}$/.test(c.target) && c.data.length >= 10;
 
-/** Calibur's functions that only the account itself may call: its keys, its native allowances, its EntryPoint, its nonces. */
+/**
+ * Calibur's functions that only the account itself may call: its keys, its native allowances, its EntryPoint, its
+ * nonces. The older deployment (0x…9b8f00) also has updateSalt(uint96), a native allowance for one transaction
+ * (approveNativeTransient) and multicall(bytes[]), which runs each of its calls on the account as the caller: from
+ * the account itself, as its own.
+ */
 const CALIBUR_ADMIN = parseAbi(['function register((uint8 keyType, bytes publicKey) key)', 'function update(bytes32 keyHash, uint256 settings)', 'function revoke(bytes32 keyHash)',
-  'function approveNative(address spender, uint256 amount)', 'function updateEntryPoint(address entryPoint)', 'function invalidateNonce(uint256 newNonce)', 'function updateSalt()']);
-/** The EntryPoints Calibur works with (v0.7, v0.8), and none. */
-const ENTRY_POINTS = new Set(['0x0000000071727de22e5e9d8baf0edac6f37da032', '0x4337084d9e255ff0702461cf8895ce9e3b5ff108', '0x0000000000000000000000000000000000000000']);
+  'function approveNative(address spender, uint256 amount)', 'function approveNativeTransient(address spender, uint256 amount)', 'function updateEntryPoint(address entryPoint)',
+  'function invalidateNonce(uint256 newNonce)', 'function updateSalt()', 'function updateSalt(uint96 prefix)', 'function multicall(bytes[] data)']);
+/** The EntryPoints whose operations Calibur reads (the packed form: v0.7, v0.8, v0.9), and v0.6, whose it doesn't. */
+const ENTRY_POINTS: Record<string, string> = { '0x0000000071727de22e5e9d8baf0edac6f37da032': 'v0.7', '0x4337084d9e255ff0702461cf8895ce9e3b5ff108': 'v0.8', '0x433709009b8330fda32311df1c2afa402ed8d009': 'v0.9' };
+const ENTRY_POINT_V06 = '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789';
+/** What a hook's address says it is called for (HooksLib: its lowest five bits). */
+const HOOK_FLAGS = ['a signature it verifies', 'a UserOperation it validates', 'a signature checked for the account (ERC-1271)', 'each call, before it', 'each call, after it'];
 /**
  * A call an account that runs Calibur makes to itself: what it changes in the account, warned of into `b`, and a
- * title for it. Null when it isn't one of Calibur's own functions. A key registered on the account can make calls
- * as the account (as the transaction's sender, or on its signature) until it is revoked; its settings (one word:
- * an admin flag at bit 200, an expiry in the 40 bits from 160, a hook's address below) say how far it goes.
+ * title for it. Null when it isn't one of Calibur's own functions (or is a multicall with a call that isn't). A key
+ * registered on the account can make calls as the account (as the transaction's sender, or on its signature) until
+ * it is revoked; its settings (one word: an admin flag at bit 200, an expiry in the 40 bits from 160, a hook's
+ * address below) say how far it goes. Each warning is told with the others of its code (`also`): a batch can
+ * register two keys.
  */
-export function caliburAdmin(data: Hex, b: PreviewBuilder, p: string, chainId: number): string | null {
+export function caliburAdmin(data: Hex, b: PreviewBuilder, p: string, chainId: number, whose = 'your account', depth = 0): string | null {
   let call;
   try { call = decodeFunctionData({ abi: CALIBUR_ADMIN, data }); } catch { return null; }
   const native = CHAINS[chainId]?.nativeSymbol ?? 'native', short = (h: string) => `${h.slice(0, 10)}…${h.slice(-4)}`;
+  const its = whose === 'your account' ? "your account's" : `${whose}'s`;
   switch (call.functionName) {
     case 'register': {
       const [key] = call.args;
       const kind = ['a P-256 key', 'a passkey (WebAuthn, P-256)', 'an Ethereum key'][key.keyType] ?? `a key of a type that isn't known (${key.keyType})`;
       const who = key.keyType === 2 && /^0x0{24}[0-9a-f]{40}$/i.test(key.publicKey) ? `0x${key.publicKey.slice(26)}`.toLowerCase() : null;
-      b.warn('danger', 'calibur_register_key', `${p}registers ${kind}${who ? `, ${who},` : ''} on your account: whoever holds it can make calls as the account, moving anything it holds, until you revoke it. Do this only for a key that is yours.`);
-      return `Register ${kind}${who ? ` (${shortAddress(who)})` : ''} on your account`;
+      b.also('danger', 'calibur_register_key', `${p}registers ${kind}${who ? `, ${who},` : ''} on ${whose}: whoever holds it can make calls as the account, moving anything it holds, until ${whose === 'your account' ? 'you revoke it' : 'it is revoked'}. Do this only for a key that is yours.`);
+      return `Register ${kind}${who ? ` (${shortAddress(who)})` : ''} on ${whose}`;
     }
     case 'update': {
       const [keyHash, settings] = call.args;
-      const admin = (settings >> 200n & 1n) === 1n, expiry = Number(settings >> 160n & 0xffffffffffn), hook = `0x${(settings & ((1n << 160n) - 1n)).toString(16).padStart(40, '0')}`;
-      const terms = `${admin ? 'an admin' : 'not an admin'}, ${expiry ? `until ${formatTimestamp(expiry * 1000)}` : 'with no expiry'}, ${/^0x0{40}$/.test(hook) ? 'with no hook checking its calls' : `its calls checked by the hook ${hook}`}`;
-      if (admin) b.warn('danger', 'calibur_admin_key', `${p}makes the key ${short(keyHash)} an admin of your account (${terms}): it can register other keys, change any key's settings and call the account itself, as you can.`);
-      else b.warn('caution', 'calibur_key_settings', `${p}sets what the key ${short(keyHash)} may do on your account: ${terms}.`);
-      return `Set a key's rights on your account (${admin ? 'admin' : 'not admin'})`;
+      // The admin flag is bit 200. The older Calibur (0x…9b8f00) takes any bit of that byte as the flag; the newer
+      // refuses settings with a bit above 200 set. Read as bit 200 alone, a key made an admin by bit 201 was "not an
+      // admin".
+      const flag = settings >> 200n & 0xffn, reserved = settings >> 201n !== 0n, admin = flag !== 0n;
+      const expiry = Number(settings >> 160n & 0xffffffffffn), hook = `0x${(settings & ((1n << 160n) - 1n)).toString(16).padStart(40, '0')}`;
+      // A hook is called only for what its address's lowest bits enable: one with neither execution bit is never
+      // asked about a call the key makes ("its calls checked by the hook" was said of any).
+      const none = /^0x0{40}$/.test(hook), flags = Number(BigInt(hook) & 0x1fn), asked = HOOK_FLAGS.filter((_, i) => flags >> i & 1);
+      const hooked = none ? 'with no hook checking its calls'
+        : flags & 0x18 ? `its calls checked by the hook ${hook} (called for ${asked.join(', ')})`
+        : flags ? `with a hook (${hook}) that isn't called on the calls it makes, only for ${asked.join(', ')}: nothing checks its calls`
+        : `with a hook (${hook}) whose address enables none of its checks: it is never called, and nothing checks the key's calls (the newer Calibur refuses such a hook)`;
+      const terms = `${admin ? 'an admin' : 'not an admin'}, ${expiry ? `until ${formatTimestamp(expiry * 1000)}` : 'with no expiry'}, ${hooked}`;
+      const odd = !reserved ? '' : flag > 1n ? ' It is made one by a bit above the admin flag\'s own: the older Calibur (0x…9b8f00) reads any bit of that byte as the flag, and the newer refuses such settings.' : ' Its settings set bits the newer Calibur reserves: it refuses them.';
+      if (admin) b.also('danger', 'calibur_admin_key', `${p}makes the key ${short(keyHash)} an admin of ${whose} (${terms}): it can register other keys, change any key's settings and call the account itself, as ${whose === 'your account' ? 'you' : 'its owner'} can.${odd}`);
+      else b.also('caution', 'calibur_key_settings', `${p}sets what the key ${short(keyHash)} may do on ${whose}: ${terms}.${odd}`);
+      return `Set a key's rights on ${whose} (${admin ? 'admin' : 'not admin'})`;
     }
     case 'revoke':
-      b.warn('info', 'calibur_revoke_key', `${p}revokes the key ${short(call.args[0])}: it can no longer act for your account.`);
-      return 'Revoke a key of your account';
-    case 'approveNative': {
-      const [spender, amount] = call.args, all = amount >= (1n << 255n);
+      b.also('info', 'calibur_revoke_key', `${p}revokes the key ${short(call.args[0])}: it can no longer act for ${whose}.`);
+      return `Revoke a key of ${whose}`;
+    case 'approveNative': case 'approveNativeTransient': {
+      const [spender, amount] = call.args, all = amount >= (1n << 255n), once = call.functionName === 'approveNativeTransient';
       const text = all ? `any amount of ${native}` : `up to ${formatUnits(amount, CHAINS[chainId]?.nativeDecimals ?? 18)} ${native}`;
-      if (amount > 0n) b.warn('caution', 'calibur_native_approval', `${p}lets ${spender.toLowerCase()} take ${text} from your account (its native allowance, ERC-7914), now and later, until you set it to zero.`);
-      return amount > 0n ? `Allow ${shortAddress(spender.toLowerCase())} to take ${text} from your account` : `Remove ${shortAddress(spender.toLowerCase())}'s allowance of ${native}`;
+      if (amount > 0n) b.also('caution', 'calibur_native_approval', `${p}lets ${spender.toLowerCase()} take ${text} from ${whose} (its native allowance, ERC-7914), ${once ? 'for the rest of this transaction' : `now and later, until ${whose === 'your account' ? 'you set it' : 'it is set'} to zero`}.`);
+      return amount > 0n ? `Allow ${shortAddress(spender.toLowerCase())} to take ${text} from ${whose}${once ? ' in this transaction' : ''}` : `Remove ${shortAddress(spender.toLowerCase())}'s allowance of ${native}`;
     }
     case 'updateEntryPoint': {
-      const entryPoint = call.args[0].toLowerCase();
-      if (!ENTRY_POINTS.has(entryPoint)) b.warn('danger', 'calibur_entry_point', `${p}makes ${entryPoint} your account's EntryPoint, which isn't one of ERC-4337's (v0.7, v0.8): the account runs whatever calls its EntryPoint hands it, so whoever controls that contract controls the account.`);
-      else b.warn('info', 'calibur_entry_point', `${p}${/^0x0{40}$/.test(entryPoint) ? "removes your account's EntryPoint: it takes no UserOperations after this" : `sets your account's EntryPoint to ${entryPoint} (ERC-4337's)`}.`);
-      return /^0x0{40}$/.test(entryPoint) ? "Remove your account's EntryPoint" : `Set your account's EntryPoint to ${shortAddress(entryPoint)}`;
+      const entryPoint = call.args[0].toLowerCase(), version = ENTRY_POINTS[entryPoint], zero = /^0x0{40}$/.test(entryPoint);
+      if (zero) b.also('info', 'calibur_entry_point', `${p}removes ${its} EntryPoint: it takes no UserOperations after this.`);
+      else if (version) b.also('info', 'calibur_entry_point', `${p}sets ${its} EntryPoint to ${entryPoint} (ERC-4337's ${version}).`);
+      else if (entryPoint === ENTRY_POINT_V06) b.also('caution', 'calibur_entry_point', `${p}sets ${its} EntryPoint to ${entryPoint}, ERC-4337's v0.6, whose operations are in an older form than Calibur reads: UserOperations for the account through it fail.`);
+      else b.also('danger', 'calibur_entry_point', `${p}makes ${entryPoint} ${its} EntryPoint, which isn't one of ERC-4337's (v0.7, v0.8, v0.9): the account runs whatever calls its EntryPoint hands it, so whoever controls that contract controls the account.`);
+      return zero ? `Remove ${its} EntryPoint` : `Set ${its} EntryPoint to ${shortAddress(entryPoint)}`;
     }
     case 'invalidateNonce':
-      b.warn('info', 'calibur_invalidate_nonce', `${p}invalidates your account's nonces below ${call.args[0] & ((1n << 64n) - 1n)} in the sequence ${call.args[0] >> 64n}: signatures you gave on them can't be used.`);
-      return "Invalidate your account's unused nonces";
+      b.also('info', 'calibur_invalidate_nonce', `${p}invalidates ${its} nonces below ${call.args[0] & ((1n << 64n) - 1n)} in the sequence ${call.args[0] >> 64n}: signatures given on them can't be used.`);
+      return `Invalidate ${its} unused nonces`;
+    case 'multicall': {
+      // Each of its calls runs on the account as this one does: the account's own functions, one after another.
+      const [inner] = call.args;
+      if (!inner.length || depth >= 2) return null;
+      const titles = inner.map((d, i) => caliburAdmin(d, b, `${p}(${i + 1} of ${inner.length} in a multicall) `, chainId, whose, depth + 1));
+      if (titles.some(t => t === null)) return null;
+      return inner.length === 1 ? titles[0] : `${inner.length} changes to ${whose}: ${titles.slice(0, 2).join('; ')}${inner.length > 2 ? '; …' : ''}`;
+    }
     default:
-      b.warn('info', 'calibur_update_salt', `${p}changes the domain your account's signatures are under: signatures you gave before stop working.`);
-      return "Change your account's signing domain";
+      b.also('info', 'calibur_update_salt', `${p}changes the domain ${its} signatures are under: signatures given before stop working.`);
+      return `Change ${its} signing domain`;
   }
 }
 
@@ -210,14 +249,14 @@ export function caliburAdmin(data: Hex, b: PreviewBuilder, p: string, chainId: n
  * one level down went with nothing said of it. (A nested delegatecall, or one that can't be read, stays a call back
  * into the account, and is warned of as one.)
  */
-function laidOut(calls: Call[], account: string, modes: Set<boolean>, depth = 1): Call[] {
+function laidOut(calls: Call[], account: string, modes: Set<boolean>, zeroIsSelf: boolean, depth = 1): Call[] {
   return calls.flatMap(c => {
-    if (!toSelf(c, account) || depth >= 4) return [c];
+    if (!toSelf(c, account, zeroIsSelf) || depth >= 4) return [c];
     const inner = batchCalls(c.data);
     if (!inner || inner.delegatecall || inner.unread || !inner.calls.length) return [c];
     // (Whether the nested batch's calls fail together or one by one: laid out, that is the nested batch's own.)
     modes.add(inner.tryMode);
-    return laidOut(inner.calls, account, modes, depth + 1);
+    return laidOut(inner.calls, account, modes, zeroIsSelf, depth + 1);
   });
 }
 
@@ -244,10 +283,7 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   const read = batchCalls(tx.data);
   if (!read) return caliburOwn(tx, env);
   if (!read.calls.length && !read.unread) return null;
-  const nestedModes = new Set<boolean>();
-  const parsed = read.delegatecall ? read : { ...read, calls: laidOut(read.calls, tx.from, nestedModes) };
-
-  const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', parsed.standard);
+  const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', read.standard);
   // Only code at the account runs the calls: a delegation set in this transaction, or one (or a contract) already there.
   const delegate = await ownDelegateAfter(tx);
   if (delegate === null) return null; // cleared in this transaction: a plain account again
@@ -262,6 +298,11 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
       return decoded({ title: `Call your own account (${tx.data.slice(0, 10)})`, summary: 'A call to your own account, which has no code to run it.', decoder: 'smart_account', status: 'partial', b });
     }
   }
+  // Whether the account's code takes the zero address to mean itself: known of Calibur (the account runs it, or the
+  // batch is in a form only Calibur has). Of other code it isn't known, and a call there is told as either.
+  const zeroIsSelf = !!CALIBUR_CODES[runs ?? ''] || read.standard.startsWith('Calibur');
+  const nestedModes = new Set<boolean>();
+  const parsed = read.delegatecall ? read : { ...read, calls: laidOut(read.calls, tx.from, nestedModes, zeroIsSelf) };
   // An execution laid out for a mode this doesn't know: what it runs isn't shown, and that is said, with what the
   // mode's call type alone tells (a delegatecall is one whatever its layout).
   if (parsed.unread) {
@@ -282,11 +323,20 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     // A call back into the account itself that isn't a batch laid out above: the account's own code runs it, with
     // the account's own authority (an upgrade, a new owner or module, a batch in a layout that isn't read). What it
     // is isn't read, which is said; a delegatecall is said to be one, and a batch nested too deep to lay out.
-    const self = toSelf(c, tx.from), back = self ? batchCalls(c.data) : null;
+    const self = toSelf(c, tx.from, zeroIsSelf), back = self ? batchCalls(c.data) : null;
+    if (!self && toZero(c)) {
+      // The zero address with calldata, on an account whose code isn't known to take it as itself: either a call
+      // back into the account (ERC-7821) or one to nothing, and it is said to be either, with what it would run.
+      const nested = batchCalls(c.data), sent = c.value > 0n ? `, and the ${coin(c.value)} sent with it is lost` : '';
+      const either = `an account whose code follows ERC-7821 (Calibur, Porto) takes the zero address to mean itself, and runs this as a call back into the account with the account's own authority; other account code calls the zero address, where nothing runs${sent}. Which your account's code does isn't known here.`;
+      if (nested && (nested.delegatecall || nested.unread || nested.calls.length)) sub.warn('danger', 'smart_account_calls_unread', `Call ${i + 1}: a call to the zero address carrying ${nested.delegatecall ? 'a delegatecall' : nested.calls.length ? `a batch of ${nested.calls.length} call${nested.calls.length === 1 ? '' : 's'}` : "an execution that isn't read"}, which isn't laid out here: ${either} If it runs them, any of them can move what your account holds or approve a spender; if it doesn't, nothing they say happens.`);
+      else sub.warn('caution', 'smart_account_zero_target', `Call ${i + 1}: a call to the zero address with calldata (${c.data.slice(0, 10)}): ${either}`);
+      return { d: decoded({ title: `Call the zero address (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: nested ? 'opaque' : 'partial' }), sub };
+    }
     // (Calibur's own functions, where the account is known to run it, or the batch is in a form only Calibur has.)
     const calibur = self && !back && (CALIBUR_CODES[runs ?? ''] || parsed.standard.startsWith('Calibur')) ? caliburAdmin(c.data, sub, `Call ${i + 1}: `, tx.chainId) : null;
     if (self && !calibur) {
-      const where = sameAddress(c.target, tx.from) ? 'a call back into your account' : 'a call to the zero address with calldata, which an ERC-7821 account (Calibur, Porto) takes to mean itself: a call back into your account';
+      const where = sameAddress(c.target, tx.from) ? 'a call back into your account' : "a call to the zero address with calldata, which your account's code (Calibur) takes to mean the account itself: a call back into your account";
       if (back?.delegatecall) sub.warn('danger', 'smart_account_delegatecall', `Call ${i + 1}: has your account run ${back.calls[0] ? `${shortAddress(back.calls[0].target)}'s` : "another contract's"} code inside itself (a delegatecall, through a call back into the account): it can do anything with the account and everything in it.`);
       else if (back?.calls.length) sub.warn('danger', 'smart_account_calls_unread', `Call ${i + 1}: a batch of ${back.calls.length} call${back.calls.length === 1 ? '' : 's'} nested more than four deep in calls back into your account, which isn't read here: any of them can move what your account holds or approve a spender.`);
       else if (c.data.length >= 10) sub.warn('caution', 'smart_account_self_call', `Call ${i + 1}: ${where} (${c.data.slice(0, 10)}) that isn't read: the account's own code runs it with the account's own authority, which is how an account's code, owners or modules are changed.`);

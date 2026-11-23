@@ -194,12 +194,18 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
       // That the network rejects it holds for an account that sends its own transactions: a plain one. One with code
       // (a contract account, whose transactions something else submits and pays for; an account with delegated
       // code, whose wallet may have a relayer pay) was told the same, of a transaction it never pays for.
-      const pays = least === undefined || await call<string>('eth_getCode', [tx.from, 'latest']) === '0x';
+      // (Read only for a shortfall the network would refuse for. A read that fails is taken as a plain account, the
+      // common one: it was told it had code. And an account with code is told the same whether or not it names a
+      // fee cap: named, it got "the network will reject this transaction" flatly.)
+      const code = maximum === undefined && least === undefined ? '0x' : await call<string>('eth_getCode', [tx.from, 'latest']);
+      const pays = code === undefined || code === '0x';
       const basis = `${baseFee !== undefined && baseFee > 0n ? 'the current base fee' : 'its price'}${l1Fee ? ', with the fee for its data' : ''}`;
-      b.warn(maximum !== undefined || (least !== undefined && pays) ? 'danger' : 'caution', 'insufficient_funds_for_gas', maximum !== undefined
-        ? `Your balance (${native(have)}) doesn't cover the value plus the most the gas can cost (${native(tx.value + maximum)}): the network will reject this transaction.`
+      const relayed = "An account with code doesn't always pay for its own transactions (a contract account's are submitted for it; a wallet can have a relayer pay): if this one is to pay, the network will reject the transaction as it is.";
+      b.warn((maximum !== undefined || least !== undefined) && pays ? 'danger' : 'caution', 'insufficient_funds_for_gas', maximum !== undefined
+        ? pays ? `Your balance (${native(have)}) doesn't cover the value plus the most the gas can cost (${native(tx.value + maximum)}): the network will reject this transaction.`
+          : `This account's balance (${native(have)}) doesn't cover the value plus the most the gas can cost (${native(tx.value + maximum)}). ${relayed}`
         : least !== undefined && pays ? `Your balance (${native(have)}) doesn't cover the value plus its gas limit (${tx.gas!.toLocaleString('en-US')}) at ${basis} (${native(tx.value + least)}): the network asks for the whole limit's cost before it runs, whatever it then uses, and will reject this transaction as it is.`
-        : least !== undefined ? `This account's balance (${native(have)}) doesn't cover the value plus its gas limit (${tx.gas!.toLocaleString('en-US')}) at ${basis} (${native(tx.value + least)}). An account with code doesn't always pay for its own transactions (a contract account's are submitted for it; a wallet can have a relayer pay): if this one is to pay, the network will reject the transaction as it is.`
+        : least !== undefined ? `This account's balance (${native(have)}) doesn't cover the value plus its gas limit (${tx.gas!.toLocaleString('en-US')}) at ${basis} (${native(tx.value + least)}). ${relayed}`
         : `Your balance (${native(have)}) may not cover the value plus the network fee (about ${native(tx.value + worst)}).`);
     } else if (least !== undefined && fee && have >= tx.value + least && have < tx.value + fee.estimate) {
       // (Above the base fee's floor and under the estimate with its tip: as an estimate is told.)
