@@ -26,7 +26,7 @@ import { replayContext, ReplayError } from '../src/replay.ts';
 import { batchCalls } from '../src/evm/smart-account.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
-import { compareTokens, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
+import { compareTokens, couldNotLook, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), BLOCKS = Number(arg('blocks', '100')), FOLLOW = Number(arg('follow', '0')), MAX = Number(arg('max', '40'));
@@ -143,9 +143,10 @@ async function replay(hash: string): Promise<void> {
   process.stdout.write(differs.length ? 'X' : preview === 'not simulated' ? '?' : '.');
 }
 
-const seen = new Set<string>();
+const seen = new Set<string>(), blocks = { read: 0, unread: 0 };
 async function blockAt(n: number): Promise<void> {
   const b = await call<{ transactions: { hash: string; to: string | null; input: string }[] } | null>('eth_getBlockByNumber', [hex(n), true]).catch(() => null);
+  blocks[b ? 'read' : 'unread']++;
   for (const t of b?.transactions ?? []) {
     if (rows.length >= MAX) return;
     if (!t.to || !SELECTORS.has(t.input.slice(0, 10)) || seen.has(t.hash)) continue;
@@ -172,6 +173,8 @@ else {
 const judged = rows.filter(r => !r.unjudged && r.preview !== 'not simulated');
 const nativeOf = rows.filter(r => r.native);
 const delegates = [...new Set(rows.map(r => r.delegate))];
+// A run that could not look (the node failing its reads) is not one that found nothing.
+const blind = couldNotLook(skipped, rows.length, blocks);
 const lines = [
   `${rows.length} batches on ${chainName(CHAIN)} previewed as the calls their wallets were asked to send, where each ran${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
   `  outcome: ${judged.filter(r => !r.differs.includes('outcome')).length} of ${judged.length} that went through previewed with no call failing`,
@@ -182,9 +185,10 @@ const lines = [
   ...(rows.some(r => r.preview === 'not simulated') ? [`  not simulated: ${rows.filter(r => r.preview === 'not simulated').length}`] : []),
   `  ${rows.filter(r => r.calls > 1).length} of several calls, ${rows.filter(r => r.calls === 1).length} of one; ${rows.filter(r => r.sentBy === 'the account').length} sent by the account, ${rows.filter(r => r.sentBy === 'a relayer').length} by a relayer; ${delegates.length} kind${delegates.length === 1 ? '' : 's'} of account code`,
   ...Object.entries(skipped).map(([why, n]) => `  skipped: ${n} ${why}`),
+  ...(blind ? [`  NOT LOOKED AT: ${blind}`] : []),
   ...rows.filter(r => r.differs.length).map(r => `  DIFFERS ${r.hash} (${r.calls} call${r.calls === 1 ? '' : 's'}, ${r.format}, code ${r.delegate}): ${r.differs.join(', ')}${r.differs.includes('outcome') ? ` (the preview: ${r.how})` : ''}`),
 ];
 console.log(`\n${lines.join('\n')}`);
 if (OUT) writeFileSync(OUT, JSON.stringify({ chainId: CHAIN, generatedAt: new Date().toISOString(), rows, skipped }, null, 1));
 if (SUMMARY) appendFileSync(SUMMARY, `### Batches, ${chainName(CHAIN)}\n\n\`\`\`\n${lines.join('\n')}\n\`\`\`\n\n`);
-if (STRICT && rows.some(r => r.differs.length)) process.exit(1);
+if (STRICT && (blind || rows.some(r => r.differs.length))) process.exit(1);

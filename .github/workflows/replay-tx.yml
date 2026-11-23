@@ -13,9 +13,11 @@ name: Transaction replays
 # L1 fee a few).
 # Then, for five minutes, the chain's Safe transactions are previewed as the signatures their owners gave (npm run
 # accuracy:safe): each execTransaction rebuilt as its SafeTx and run where it ran with stand-ins for its signatures,
-# against the receipt. That step fails when one differs.
+# against the receipt. That step fails when one differs, or when the run could not look (no block read, or more
+# reads failed than transactions compared).
 # And for five more, its batches (npm run accuracy:batch): each call an account with delegated code (EIP-7702) ran
-# for its wallet, read back into its calls and previewed as the wallet_sendCalls request, against the receipt.
+# for its wallet, read back into its calls and previewed as the wallet_sendCalls request, against the receipt,
+# failing as the Safe step does.
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
 # differences are listed in the summary. Where the node didn't answer the balance reads after a run (a rate limit),
@@ -111,7 +113,8 @@ jobs:
       - name: Safe transactions, as the signatures their owners gave
         # Recent execTransaction calls rebuilt as the SafeTx an owner signed and previewed where each ran, with none
         # of its signatures (npm run accuracy:safe): the outcome the Safe logged, its token and native movements,
-        # and each change to the Safe itself against the preview's warnings. Fails when one differs.
+        # and each change to the Safe itself against the preview's warnings. Fails when one differs, or when the
+        # node failed more reads than the run compared transactions.
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -130,7 +133,8 @@ jobs:
       - name: Batches, as the calls their wallets were asked to send
         # Recent batches run by accounts with delegated code (EIP-7702), read back into their calls and previewed as
         # the wallet_sendCalls request, where each ran (npm run accuracy:batch): the outcome and the account's token
-        # movements against the receipt. Fails when one differs.
+        # movements against the receipt. Fails when one differs, or when the node failed more reads than the run
+        # compared batches.
         if: ${{ !cancelled() }}
         shell: bash
         env:

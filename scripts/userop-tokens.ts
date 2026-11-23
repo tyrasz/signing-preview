@@ -131,3 +131,15 @@ export async function heldToBalance(tokens: (Compared & { balance?: string; unju
 
 /** Whether a compared token is a difference: its amounts apart, and neither its balance nor a reason not to judge it says otherwise. */
 export const differsIn = (t: Compared & { balance?: string; unjudged?: string }): boolean => offBy(t) && t.balance === undefined && !t.unjudged;
+
+/**
+ * Why a run could not look, which is not a pass: the node answered for none of the blocks asked of it, or what failed
+ * (a read or a preview that erred, a block's receipts, state the node no longer serves) is ten or more of the
+ * transactions found and more than those compared. Reasons that are a transaction's own (not a batch, not a Safe,
+ * used earlier in its block) are not failures. Null where it looked.
+ */
+export function couldNotLook(skipped: Readonly<Record<string, number>>, compared: number, blocks?: { read: number; unread: number }): string | null {
+  if (blocks?.unread && !blocks.read) return `none of the ${blocks.unread} block${blocks.unread === 1 ? '' : 's'} asked for could be read`;
+  const failed = Object.entries(skipped).filter(([why]) => /^error: |could not be read|no longer served|^a read of /.test(why)).reduce((n, [, count]) => n + count, 0);
+  return failed >= 10 && failed > compared ? `${failed} transactions could not be looked at (a read or a preview that failed), against ${compared} compared` : null;
+}

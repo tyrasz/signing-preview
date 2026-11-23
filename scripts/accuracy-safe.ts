@@ -27,7 +27,7 @@ import { replayContext, ReplayError } from '../src/replay.ts';
 import { readConfig, SAFE_SINGLETONS } from '../src/safe-sim.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import type { Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
-import { compareTokens, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
+import { compareTokens, couldNotLook, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), BLOCKS = Number(arg('blocks', '100')), FOLLOW = Number(arg('follow', '0')), MAX = Number(arg('max', '40'));
@@ -235,9 +235,10 @@ async function replay(hash: string): Promise<void> {
   process.stdout.write(differs.length ? 'X' : preview === 'not simulated' ? '?' : '.');
 }
 
-const seen = new Set<string>();
+const seen = new Set<string>(), blocks = { read: 0, unread: 0 };
 async function blockAt(n: number): Promise<void> {
   const b = await call<{ transactions: { hash: string; to: string | null; input: string }[] } | null>('eth_getBlockByNumber', [hex(n), true]).catch(() => null);
+  blocks[b ? 'read' : 'unread']++;
   for (const t of b?.transactions ?? []) {
     if (rows.length >= MAX) return;
     if (!t.to || !t.input.startsWith(EXEC) || seen.has(t.hash)) continue;
@@ -264,6 +265,8 @@ else {
 const pct = (a: string, b: string) => (100 * (Number(b) - Number(a)) / Number(a));
 const judged = rows.filter(r => r.actual !== 'reverted' && r.preview !== 'not simulated');
 const gasOff = rows.filter(r => r.gas).map(r => pct(r.gas!.actual, r.gas!.simulated)).sort((a, b) => a - b);
+// A run that could not look (the node failing its reads) is not one that found nothing.
+const blind = couldNotLook(skipped, rows.length, blocks);
 const lines = [
   `${rows.length} Safe transactions on ${chainName(CHAIN)} previewed as the SafeTx an owner signed, where each ran${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
   `  outcome: ${judged.filter(r => !r.differs.includes('outcome')).length} of ${judged.length} as the Safe logged it (${judged.filter(r => r.actual === 'failure').length} of them a call that failed)`,
@@ -276,9 +279,10 @@ const lines = [
   ...(rows.some(r => r.preview === 'not simulated') ? [`  not simulated through execTransaction: ${rows.filter(r => r.preview === 'not simulated').length}`] : []),
   `  signed as: ${(['the sender', 'a signer of it', "the Safe's first owner"] as const).map(s => `${rows.filter(r => r.signer === s).length} ${s}`).join(', ')}`,
   ...Object.entries(skipped).map(([why, n]) => `  skipped: ${n} ${why}`),
+  ...(blind ? [`  NOT LOOKED AT: ${blind}`] : []),
   ...rows.filter(r => r.differs.length).map(r => `  DIFFERS ${r.hash} (${r.version}, ${r.threshold} of ${r.owners}): ${r.differs.join(', ')}${r.differs.includes('outcome') ? ` (receipt ${r.actual}, preview ${r.preview}${r.how ? `: ${r.how}` : ''})` : ''}`),
 ];
 console.log(`\n${lines.join('\n')}`);
 if (OUT) writeFileSync(OUT, JSON.stringify({ chainId: CHAIN, generatedAt: new Date().toISOString(), rows, skipped }, null, 1));
 if (SUMMARY) appendFileSync(SUMMARY, `### Safe transactions, ${chainName(CHAIN)}\n\n\`\`\`\n${lines.join('\n')}\n\`\`\`\n\n`);
-if (STRICT && rows.some(r => r.differs.length)) process.exit(1);
+if (STRICT && (blind || rows.some(r => r.differs.length))) process.exit(1);

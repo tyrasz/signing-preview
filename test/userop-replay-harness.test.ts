@@ -2,7 +2,7 @@
 // (scripts/userop-tokens.ts), and what a replay has warm (src/simulation.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareTokens, DEPOSIT, differsIn, heldToBalance, keptEarlier, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
+import { compareTokens, couldNotLook, DEPOSIT, differsIn, heldToBalance, keptEarlier, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 
 const word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
@@ -133,4 +133,19 @@ test("A token whose logs carry its interest is held to the account's balance acr
   await heldToBalance(same, ACCOUNT, [], async () => { throw new Error('not asked'); });
   assert.deepEqual(same.map(t => [t.balance, t.unjudged]), [[undefined, undefined], [undefined, undefined]]);
   assert.deepEqual(same.map(differsIn), [false, true]);
+});
+
+test('a run that could not look is not a pass: no block read, or more failed reads than transactions compared', () => {
+  // The node answered for no block it was asked for.
+  assert.match(couldNotLook({}, 0, { read: 0, unread: 40 })!, /none of the 40 blocks/);
+  assert.equal(couldNotLook({}, 0, { read: 40, unread: 3 }), null);
+  // A quiet chain: nothing found, or only transactions that aren't the harness's to judge.
+  assert.equal(couldNotLook({}, 0, { read: 300, unread: 0 }), null);
+  assert.equal(couldNotLook({ "calldata that isn't a batch's": 30, 'the account was used earlier in the same block': 12, 'not an account running delegated code': 50 }, 0, { read: 300, unread: 0 }), null);
+  // Reads that failed: a few beside many compared pass, most of what was found does not.
+  const failed = { "its block's receipts could not be read": 6, 'error: fetch failed': 5, 'its state is no longer served by the node': 2 };
+  assert.equal(couldNotLook(failed, 80, { read: 300, unread: 0 }), null);
+  assert.match(couldNotLook(failed, 4, { read: 300, unread: 0 })!, /13 transactions could not be looked at .* against 4 compared/);
+  assert.equal(couldNotLook({ 'error: fetch failed': 9 }, 0), null);
+  assert.match(couldNotLook({ 'a read of the Safe failed': 10 }, 0)!, /10 transactions/);
 });
