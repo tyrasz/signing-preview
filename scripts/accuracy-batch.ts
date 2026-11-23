@@ -36,8 +36,12 @@ if (!URL_ || !EVM_RPCS[CHAIN]) { console.error(`no RPC for chain ${CHAIN}`); pro
 const rpc = new JsonRpcClient({ [CHAIN]: URL_ }, { retries: 6, retryDelayMs: 400 });
 const call = <T>(method: string, params: unknown[]) => rpc.call(CHAIN, method, params) as Promise<T>;
 const hex = (v: bigint | number) => `0x${v.toString(16)}`;
-/** The selectors batchCalls reads: execute(bytes32,bytes), executeBatch((address,uint256,bytes)[]), execute(address,uint256,bytes), executeBatch(address[],bytes[]), executeBatch(address[],uint256[],bytes[]). */
-const SELECTORS = new Set(['0xe9ae5c53', '0x34fcd5be', '0xb61d27f6', '0x18dfb3c7', '0x47e1da2a']);
+/**
+ * The selectors batchCalls reads: execute(bytes32,bytes), executeBatch((address,uint256,bytes)[]),
+ * execute(address,uint256,bytes), executeBatch(address[],bytes[]), executeBatch(address[],uint256[],bytes[]); and
+ * WalletCore's executeFromSelf, executeWithValidator, initializeExecuteWithValidator and executeFromExecutor.
+ */
+const SELECTORS = new Set(['0xe9ae5c53', '0x34fcd5be', '0xb61d27f6', '0x18dfb3c7', '0x47e1da2a', '0x893aa9f6', '0xfcfbd33a', '0x32fba9bb', '0x4da6d8e5']);
 
 interface Row {
   hash: string; block: number; account: string;

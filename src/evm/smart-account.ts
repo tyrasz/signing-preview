@@ -6,7 +6,8 @@
 // adapter, Ithaca/Porto, OpenZeppelin's accounts), and executeBatch((address,uint256,bytes)[]) /
 // execute(address,uint256,bytes) (Coinbase Smart Wallet, eth-infinitism's Simple7702Account and most ERC-4337
 // accounts), and the older executeBatch(address[],bytes[]) (SimpleAccount for EntryPoint v0.6, Alchemy's
-// LightAccount) and executeBatch(address[],uint256[],bytes[]) (LightAccount).
+// LightAccount) and executeBatch(address[],uint256[],bytes[]) (LightAccount); and WalletCore's executeFromSelf and
+// its relayed and session forms.
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, parseAbi, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
@@ -20,7 +21,15 @@ const ABI = parseAbi([
   'function execute(address target, uint256 value, bytes data)',
   'function executeBatch(address[] dest, bytes[] func)',
   'function executeBatch(address[] dest, uint256[] value, bytes[] func)',
+  // WalletCore (an EIP-7702 account code, verified on Sourcify): the account's own batch, one a relayer submits with
+  // the account's signature for it (to a validator: the account's own key, or a contract it added), and one a
+  // session's executor makes (src/typed-data/wallet-core-session.ts).
+  'function executeFromSelf((address target, uint256 value, bytes data)[] calls)',
+  'function executeWithValidator((address target, uint256 value, bytes data)[] calls, address validator, bytes validationData)',
+  'function initializeExecuteWithValidator((address target, uint256 value, bytes data)[] calls, address validator, bytes validationData)',
+  'function executeFromExecutor((address target, uint256 value, bytes data)[] calls, (uint256 id, address executor, address validator, uint256 validUntil, uint256 validAfter, bytes preHook, bytes postHook, bytes signature) session)',
 ]);
+const WALLET_CORE = new Set(['executeFromSelf', 'executeWithValidator', 'initializeExecuteWithValidator', 'executeFromExecutor']);
 const CALLS = [{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }] as const;
 const MAX_CALLS = 20;
 
@@ -72,6 +81,7 @@ function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: bool
 export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean; standard: string } | null {
   try {
     const call = decodeFunctionData({ abi: ABI, data });
+    if (WALLET_CORE.has(call.functionName)) return { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: `WalletCore ${call.functionName}` };
     if (call.functionName === 'executeBatch' && call.args.length === 1) return { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: 'executeBatch' };
     if (call.functionName === 'executeBatch') {
       // Parallel arrays: targets, (values,) calldata. The account requires equal lengths (an empty value list means none).
@@ -80,6 +90,7 @@ export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; t
       if (dest.length !== datas.length || (values.length && values.length !== dest.length)) return null;
       return { calls: dest.map((target, i) => ({ target, value: values[i] ?? 0n, data: datas[i] })), delegatecall: false, tryMode: false, standard: b ? 'executeBatch(address[],uint256[],bytes[])' : 'executeBatch(address[],bytes[])' };
     }
+    if (call.functionName !== 'execute') return null;
     if (call.args.length === 3) return { calls: [{ target: call.args[0], value: call.args[1], data: call.args[2] }], delegatecall: false, tryMode: false, standard: 'execute(address,uint256,bytes)' };
     const p = erc7579Calls(call.args[0] as Hex, call.args[1] as Hex);
     return p && { ...p, standard: 'ERC-7579 / ERC-7821 execute' };

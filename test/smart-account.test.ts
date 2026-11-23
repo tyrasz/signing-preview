@@ -88,3 +88,21 @@ test('The older parallel-array batches: executeBatch(address[],bytes[]) and exec
   const bad = await run(encodeFunctionData({ abi, functionName: 'executeBatch', args: [[usdc, usdc], [usdcTransfer]] }));
   assert.notEqual(bad.decoding.decoder, 'smart_account');
 });
+
+test("WalletCore's batches: the account's own, and the calls of one a relayer or a session's executor submits", async () => {
+  const { batchCalls } = await import('../src/evm/smart-account.ts');
+  const WALLET_CORE = parseAbi([
+    'function executeFromSelf((address target, uint256 value, bytes data)[] calls)',
+    'function executeWithValidator((address target, uint256 value, bytes data)[] calls, address validator, bytes validationData)',
+    'function executeFromExecutor((address target, uint256 value, bytes data)[] calls, (uint256 id, address executor, address validator, uint256 validUntil, uint256 validAfter, bytes preHook, bytes postHook, bytes signature) session)',
+  ]);
+  const calls = [{ target: USDC as Hex, value: 0n, data: transfer }, { target: WETH as Hex, value: 0n, data: approve }];
+  // Sent by the account itself: decoded as its calls, like any smart account's batch.
+  const p = await send(encodeFunctionData({ abi: WALLET_CORE, functionName: 'executeFromSelf', args: [calls] }));
+  assert.deepEqual([p.title, detail(p, 'Format'), detail(p, 'Call 1')], ['Run 2 calls from your account', 'WalletCore executeFromSelf', 'Send 1 USDC (0xa0b8…eb48)']);
+  // Submitted for the account by a relayer, or by a session's executor: the same calls read back.
+  const relayed = batchCalls(encodeFunctionData({ abi: WALLET_CORE, functionName: 'executeWithValidator', args: [calls, '0x0000000000000000000000000000000000000001', `0x${'11'.repeat(65)}`] }))!;
+  assert.deepEqual([relayed.standard, relayed.calls.map(c => c.target.toLowerCase())], ['WalletCore executeWithValidator', [USDC, WETH]]);
+  const session = { id: 7n, executor: BOB as Hex, validator: '0x0000000000000000000000000000000000000001' as Hex, validUntil: 1_800_000_000n, validAfter: 0n, preHook: '0x' as Hex, postHook: '0x' as Hex, signature: `0x${'22'.repeat(65)}` as Hex };
+  assert.equal(batchCalls(encodeFunctionData({ abi: WALLET_CORE, functionName: 'executeFromExecutor', args: [calls, session] }))!.calls.length, 2);
+});
