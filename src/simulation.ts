@@ -155,7 +155,10 @@ const STAND_IN_ROOM = 100_000n;
 const FAILED_OP = '0x220266b6', AA95 = Array.from('AA95 out of gas', ch => ch.charCodeAt(0).toString(16)).join('');
 /**
  * Whether a call that failed in a simulated block failed for want of gas. One that ran out used all it was given (a
- * revert gives the rest back). A bundle of UserOperations fails sooner, most of its gas unused: before it runs an
+ * revert gives the rest back); one whose inner call ran out, and that reverted on what it had kept back (a
+ * sixty-fourth at each call), nearly all: within a sixteenth of its limit counts. On BNB Chain (block 135,185,849,
+ * 2026-11-23) a transaction sent with 110,414 gas that used 108,387 reverted so, 109,188 used, once ecrecover was
+ * moved. A bundle of UserOperations fails sooner, most of its gas unused: before it runs an
  * operation's calls its EntryPoint checks that the gas left covers what the operation asked for, and reverts with
  * FailedOp(index, "AA95 out of gas") where it doesn't. Bundlers send on just that much. On Base (block 60,397,164,
  * 2026-11-21) a bundle of 620,866 gas that used 240,585 failed so, 121,683 gas in, once ecrecover was moved; the
@@ -165,7 +168,7 @@ const FAILED_OP = '0x220266b6', AA95 = Array.from('AA95 out of gas', ch => ch.ch
 export function ranShort(c: { status: string; gasUsed?: string; returnData?: string; error?: { data?: string } }, limit: bigint | undefined): boolean {
   if (c.status === '0x1' || limit === undefined) return false;
   const data = (c.error?.data ?? c.returnData ?? '').toLowerCase();
-  return BigInt(c.gasUsed ?? 0) >= limit || (data.startsWith(FAILED_OP) && data.includes(AA95));
+  return BigInt(c.gasUsed ?? 0) * 16n >= limit * 15n || (data.startsWith(FAILED_OP) && data.includes(AA95));
 }
 /**
  * A replayed block's earlier calls with room for what the reported calls' stand-ins cost them, or undefined where none
@@ -178,7 +181,7 @@ export function ranShort(c: { status: string; gasUsed?: string; returnData?: str
  * on 171,954 where nothing limits it), the transfer its sender made next had nothing to send, and the node refused
  * the block ("insufficient funds for gas * price + value").
  *
- * `failed`: the earlier calls that failed in a run for want of gas (their indexes: ranShort), or 'unpaid' where the node refused the block for
+ * `failed`: the earlier calls that failed in a run for want of gas, as far as it shows (their indexes: ranShort), or 'unpaid' where the node refused the block for
  * one that couldn't pay (which isn't said). Those that succeeded on the chain (SimulationRequest.mined) on a gas limit
  * are given STAND_IN_ROOM more: what the stand-ins cost, not gas their code had on the chain to spend otherwise, so
  * one that still fails, or that failed on the chain, is left as it is.

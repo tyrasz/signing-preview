@@ -908,6 +908,9 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   assert.ok(firstGas().every(g => g === 191_339n), String(firstGas()));
   assert.deepEqual([ranShort({ status: '0x0', gasUsed: '0x1db53', returnData: failedOp('AA95 out of gas') }, 620_866n), ranShort({ status: '0x1', gasUsed: '0x97942' }, 620_866n), ranShort({ status: '0x0', gasUsed: '0x97942' }, 620_866n),
     ranShort({ status: '0x0', gasUsed: '0x1db53', error: { data: '0x08c379a0' } }, 620_866n), ranShort({ status: '0x0', gasUsed: '0x97942' }, undefined)], [true, false, true, false, false]);
+  // One whose inner call ran out, reverting on the sixty-fourth it kept (BNB Chain: 109,188 of 110,414 used): short too;
+  // one that reverted with most of its gas left isn't.
+  assert.deepEqual([ranShort({ status: '0x0', gasUsed: '0x1aa84' }, 110_414n), ranShort({ status: '0x0', gasUsed: '0x97f4' }, 321_145n)], [true, false]);
   failure = undefined;
   // The room is for what the stand-ins cost: given to those that failed, once.
   assert.deepEqual(roomForStandIns([payout(true), transfer], [operation([])], [0])!.map(r => [r.gas, r.roomy]), [[291_339n, true], [25_000n, undefined]]);
