@@ -42,7 +42,7 @@ const call = async <T>(method: string, params: unknown[]): Promise<T | null> => 
 };
 
 type Tx = { hash: string; to: string | null; input: string; transactionIndex: string; type: string };
-type Row = { hash: string; block: number; index: number; title?: string; ms: number; kind: 'same' | 'receipt' | 'trace' | 'gas' | 'state' | 'untraced' | 'unavailable' | 'own' | 'error'; what?: string; gasCompared?: boolean; stateChecked?: boolean; standIn?: boolean; /** A run shown in place of the node's first, which wasn't the receipt's: the merged same-second run, or the local EVM's. */ shownBy?: 'merged' | 'local' | 'l1' };
+type Row = { hash: string; block: number; index: number; title?: string; ms: number; kind: 'same' | 'receipt' | 'trace' | 'gas' | 'state' | 'untraced' | 'unavailable' | 'own' | 'error'; what?: string; gasCompared?: boolean; stateChecked?: boolean; standIn?: boolean; /** Run after this many of the block's earlier transactions, where the node couldn't run them all. */ earlierRan?: string; /** A run shown in place of the node's first, which wasn't the receipt's: the merged same-second run, or the local EVM's. */ shownBy?: 'merged' | 'local' | 'l1' };
 const rows: Row[] = [];
 const seen = new Map<string, number>();
 
@@ -56,7 +56,10 @@ async function replay(hash: string, block: number): Promise<void> {
     const shownBy = /It was run instead with the \d+ transactions before it in that second/.test(notes) ? 'merged' as const : /Run again with the gas limit moved by what the node charged over the receipt's L1 gas/.test(notes) ? 'l1' as const : /local EVM/.test(p.simulation?.source ?? '') ? 'local' as const : undefined;
     // A trace that ran a contract the node runs itself from its Solidity reference (Base's B20 tokens) says so.
     const standIn = /ran in the trace from (its|their) Solidity reference/.test(p.trace?.note ?? '');
-    const base = { index: p.replay!.index, title: p.title, gasCompared: p.trace?.gasAgrees !== undefined, stateChecked: p.trace?.stateAgrees !== undefined, ...(shownBy && { shownBy }), ...(standIn && { standIn }) };
+    // A replay run after only part of its block's earlier transactions (the node couldn't run them all within the
+    // gas it allows one simulation: src/replay.ts, relatedEarlier): how many of how many.
+    const part = /after (\d+) of the (\d+) transactions before it in the block/.exec(notes);
+    const base = { index: p.replay!.index, title: p.title, gasCompared: p.trace?.gasAgrees !== undefined, stateChecked: p.trace?.stateAgrees !== undefined, ...(shownBy && { shownBy }), ...(standIn && { standIn }), ...(part && { earlierRan: `${part[1]} of ${part[2]}` }) };
     // A node that didn't hold the replay (state it no longer keeps, its allowance for one simulation) leaves nothing to compare.
     if (p.simulation?.status === 'unavailable') return row('unavailable', { ...base, what: p.simulation.error?.slice(0, 200) });
     if (!p.replay!.matches) return row('receipt', { ...base, what: p.replay!.differences?.join('; ').slice(0, 300) });
@@ -122,6 +125,7 @@ const lines = [
     ...(rows.some(r => r.stateChecked) ? [`  state changes against the block's access list: the same in ${rows.filter(r => r.stateChecked && r.kind !== 'state').length} of ${rows.filter(r => r.stateChecked).length}`] : []),
   ] : []),
   ...(rows.some(r => r.standIn) ? [`  ${rows.filter(r => r.standIn).length} traces ran a contract the node runs itself from its Solidity reference: ${rows.filter(r => r.standIn && ['same', 'gas', 'state'].includes(r.kind)).length} agree with the node's run, ${rows.filter(r => r.standIn && r.kind === 'same' && r.gasCompared).length} with its gas too`] : []),
+  ...(rows.some(r => r.earlierRan) ? [`  after part of their block's earlier transactions (the node can't run them all within the gas it allows one simulation): ${rows.filter(r => r.earlierRan).length}, of which ${rows.filter(r => r.earlierRan && r.kind === 'same').length} came out as their receipts${TRACE ? ' and traces' : ''}`] : []),
   ...(count('untraced') ? [`  no trace for ${count('untraced')}: ${[...new Set(rows.filter(r => r.kind === 'untraced').map(r => r.what))].slice(0, 3).join(' | ')}`] : []),
   ...(count('unavailable') + count('error') ? [`  not replayed: ${count('unavailable')} the node didn't hold, ${count('error')} failed${count('error') ? ` (${rows.find(r => r.kind === 'error')!.what})` : ''}`] : []),
   ...(rows.some(r => r.shownBy) ? [`  shown by another run than the node's first, which wasn't the receipt's: ${rows.filter(r => r.shownBy === 'merged').length} by the node with the second's blocks merged, ${rows.filter(r => r.shownBy === 'l1').length} by the node with the gas limit moved by its L1 charge, ${rows.filter(r => r.shownBy === 'local').length} by the local EVM`] : []),
