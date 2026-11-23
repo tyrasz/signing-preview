@@ -3282,7 +3282,10 @@ async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Pr
   // same signature with the ECDSA stand-in in place of the one it carries: the account then reads the form its
   // owner's signature will take (a type byte, a wrapper) and runs that path, as the plain stand-in may not (an
   // account on Sepolia took a bare 65-byte signature by a path 29,000 gas cheaper than its wallet's own form).
-  const stubs: Stub[] = supplied ? [...enable, supplied, ...walletForm(supplied.signature).map(signature => ({ signature, walletForm: true }))] : await stubFor(context, op.delegate, op.initCode);
+  // (Not a passkey's assertion in ZeroDev's form: its r and s, with the flag's word after them, read as an ECDSA
+  // signature's, and each such stub cost a run the account could only refuse.)
+  const forms = supplied && zeroDevFlag(supplied.signature) === undefined ? walletForm(supplied.signature) : [];
+  const stubs: Stub[] = supplied ? [...enable, supplied, ...forms.map(signature => ({ signature, walletForm: true }))] : await stubFor(context, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.
   let timer: ReturnType<typeof setTimeout> | undefined;

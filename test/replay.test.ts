@@ -912,6 +912,14 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   // one that reverted with most of its gas left isn't.
   assert.deepEqual([ranShort({ status: '0x0', gasUsed: '0x1aa84' }, 110_414n), ranShort({ status: '0x0', gasUsed: '0x97f4' }, 321_145n)], [true, false]);
   failure = undefined;
+  // The same block run again with the same stand-ins (a replayed operation is simulated several times over): its
+  // earlier calls start with the room found. Without the stand-ins, they run on their own limits as ever.
+  const earlier = [payout(true)], simulator = new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl: node(1) });
+  sent.length = 0;
+  for (const standIn of [true, true, false]) assert.equal((await simulator.simulateBatch([operation(earlier, standIn)]))![0].status, 'success');
+  // (Each run asks twice, the calls and then its reads: the first run's first ask alone is on the payout's own limit.)
+  assert.deepEqual(firstGas(), [191_339n, 291_339n, 291_339n, 291_339n, 291_339n, 191_339n, 191_339n]);
+  assert.equal(simulator.roomGiven, 1);
   // The room is for what the stand-ins cost: given to those that failed, once.
   assert.deepEqual(roomForStandIns([payout(true), transfer], [operation([])], [0])!.map(r => [r.gas, r.roomy]), [[291_339n, true], [25_000n, undefined]]);
   assert.equal(roomForStandIns(roomForStandIns([payout(true)], [operation([])], [0])!, [operation([])], [0]), undefined);

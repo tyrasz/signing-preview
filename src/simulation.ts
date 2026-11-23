@@ -280,6 +280,14 @@ export class RpcSimulator implements Simulator {
   private replay?: RpcSimulatorOptions['replay'];
   /** How many of a replayed block's earlier calls a run of this simulator's was given room for the calls' stand-ins (roomForStandIns). */
   roomGiven = 0;
+  /**
+   * A replayed block's earlier calls with the room a run found them to need (roomForStandIns), by the list they came
+   * from and the precompiles that run's calls moved: the block's next run with the same ones moved starts with it. A
+   * replayed operation is simulated several times over (each signer tried, each form of stand-in), and on Polygon,
+   * where every block carries USDC transfers by signature sent on about 2,000 gas more than they use, each of those
+   * runs otherwise failed them first and was asked again.
+   */
+  private roomyFor = new WeakMap<SimulationRequest[], Map<string, SimulationRequest[]>>();
   /** Chains whose RPC answered "method not found" for eth_simulateV1 (e.g. HyperEVM's public RPC). */
   private noSimulate = new Set<number>();
   /** ...and that also ignore eth_call state overrides: only success or failure can be checked. */
@@ -387,6 +395,14 @@ export class RpcSimulator implements Simulator {
     const url = this.urls[chainId];
     if (!url) return null;
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
+    // (Earlier calls a run of this block found to need room for these stand-ins start with it: roomyFor.)
+    const earlier = this.replay?.(chainId)?.before ?? reqs[0]?.at?.before;
+    const moved = reqs.flatMap(r => Object.entries(r.stateOverrides ?? {}).filter(([, o]) => o.movePrecompileToAddress).map(([address]) => address.toLowerCase())).sort().join(',');
+    const known = !fitted && earlier && moved ? this.roomyFor.get(earlier)?.get(moved) : undefined;
+    if (known) {
+      const ran = await this.simulateAt(reqs, known, retried).catch(() => null);
+      if (ran) { this.roomGiven = Math.max(this.roomGiven, known.filter(r => r.roomy).length); return ran; }
+    }
     const calls = await Promise.all(this.warmed(reqs).map(async req => ({ from: req.from, ...(req.to && { to: req.to }), data: req.data, value: '0x' + req.value.toString(16), ...await simulationFields(this.buildable(chainId, req)) })));
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
@@ -409,14 +425,19 @@ export class RpcSimulator implements Simulator {
     }
     // The stand-ins the calls install can make an earlier transaction fail that succeeded on the chain, and the node
     // refuse the block for one after it that then can't pay: asked again with room for them (roomForStandIns).
-    const earlierNow = fitted ?? this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [];
+    const earlierNow = fitted ?? earlier ?? [];
     const roomy = before.length ? roomForStandIns(earlierNow, reqs, body.error
       ? (/insufficient funds for gas \* price \+ value/i.test(body.error.message ?? '') ? 'unpaid' : [])
       // (Failed for want of gas, ranShort: any other revert is the transaction's own, and more gas wouldn't change it.)
       : (body.result?.[0]?.calls ?? []).slice(0, before.length).flatMap((c, i) => (ranShort(c, earlierNow[i]?.gas) ? [i] : []))) : undefined;
     // (Where the node won't run them so, a node that adds up the calls' gas limits for one, this run stands.)
     const again = roomy && await this.simulateAt(reqs, roomy, retried).catch(() => null);
-    if (again) { this.roomGiven = Math.max(this.roomGiven, roomy!.filter(r => r.roomy).length); return again; }
+    if (again) {
+      this.roomGiven = Math.max(this.roomGiven, roomy!.filter(r => r.roomy).length);
+      // (Remembered for the block's own list, or for one remembered before that needed more; not for one cut to fit a node's gas: fitGas.)
+      if (earlier && moved && (!fitted || this.roomyFor.get(earlier)?.get(moved) === fitted)) this.roomyFor.set(earlier, (this.roomyFor.get(earlier) ?? new Map<string, SimulationRequest[]>()).set(moved, roomy!));
+      return again;
+    }
     // A node that adds up the gas limits of the block's calls and won't have them pass the block's (fitGas): the
     // earlier transactions are asked again on less gas each, and none may have run short on it (hadRoom).
     if (/block gas limit exceeded/i.test(body.error?.message ?? '') && before.length) {

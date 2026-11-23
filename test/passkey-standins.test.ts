@@ -472,13 +472,12 @@ test('A ZeroDev passkey account with no earlier operation to tell: a wallet’s 
   // Ethereum, where most sign without the precompile: no stub, so; a stub naming it (run first as it is, with no
   // verifier stood in for), with it.
   assert.deepEqual(await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2601'), [{ own: false, precompiled: false, verifier: 'daimo' }]);
-  // (Between the two, the stub with an ECDSA stand-in where its r and s read as a signature's: walletForm.)
-  const ends = <T>(all: T[]) => [all[0], all[all.length - 1]];
-  assert.deepEqual(ends(await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2602', stub(true))), [{ own: true, precompiled: true, verifier: 'none' }, { own: false, precompiled: true, verifier: 'precompile' }]);
+  // (Nothing between the two: the stub's r and s aren't taken for an ECDSA signature's, to stand in for in its form.)
+  assert.deepEqual((await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2602', stub(true))), [{ own: true, precompiled: true, verifier: 'none' }, { own: false, precompiled: true, verifier: 'precompile' }]);
   // Base, where most sign with it: a stub that doesn't name it is what every wallet's was, and changes nothing.
-  assert.deepEqual(ends(await standIns(8453, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2603', stub(false))), [{ own: true, precompiled: false, verifier: 'none' }, { own: false, precompiled: true, verifier: 'precompile' }]);
+  assert.deepEqual((await standIns(8453, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2603', stub(false))), [{ own: true, precompiled: false, verifier: 'none' }, { own: false, precompiled: true, verifier: 'precompile' }]);
   // And on Ethereum such a stub leaves the chain's usual way, the verifier contract.
-  assert.deepEqual(ends(await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2604', stub(false))), [{ own: true, precompiled: false, verifier: 'none' }, { own: false, precompiled: false, verifier: 'daimo' }]);
+  assert.deepEqual((await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2604', stub(false))), [{ own: true, precompiled: false, verifier: 'none' }, { own: false, precompiled: false, verifier: 'daimo' }]);
   // What the preview says where it only took the chain's usual way.
   assert.match(zeroDevAssumed(8453, true), /isn't known: no earlier operation of the account's was found to show it, and nothing supplied with this one says\. It is taken to use the chain's P-256 precompile, as most ZeroDev passkey wallets on Base do\. If it uses a verifier contract \(P-256 in Solidity\) instead, the operation takes about 335,000 gas more than shown\./);
   assert.match(zeroDevAssumed(1, false), /taken to use a verifier contract \(P-256 in Solidity\), as most ZeroDev passkey wallets on Ethereum do\. If it uses the chain's P-256 precompile instead, the operation takes about 335,000 gas less than shown\./);
