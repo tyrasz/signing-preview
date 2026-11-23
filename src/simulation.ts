@@ -462,6 +462,15 @@ export class RpcSimulator implements Simulator {
     const rejected = body.error?.message && reqs.length === 1 && !before.length ? rejection(body.error.message) : null;
     if (rejected) return [{ status: 'reverted', source, revertReason: rejected, transfers: [], limited: true }];
     if (body.error && before.length && /intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(body.error.message ?? '')) {
+      // The node allows one simulation so much gas, and the block's earlier transactions used more: run again after
+      // those of them that bear on the calls, and the latest of the rest (BlockAt.related), which the result says.
+      const all = !fitted && !this.replay?.(chainId) ? reqs[0]?.at?.before : undefined;
+      const kept = all && await reqs[0].at!.related?.().catch(() => undefined);
+      if (all && kept && kept.length < all.length) {
+        const part = kept.map(i => all[i]);
+        const ran = await this.simulateAt(reqs.map(r => (r.at ? { ...r, at: { ...r.at, before: part, related: undefined, beforeUsed: undefined } } : r)), undefined, retried).catch(() => null);
+        if (ran) return ran.map(r => ({ ...r, earlierLeftOut: all.length - kept.length }));
+      }
       throw new Error(`the chain's node couldn't run the ${before.length} transactions before this one in its block within its gas allowance for one simulation (${body.error.message}); a node with a higher allowance can`);
     }
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);

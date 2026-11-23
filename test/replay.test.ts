@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net';
 import { readFileSync } from 'node:fs';
 import { encodeAbiParameters, encodeErrorResult, encodeFunctionData, parseAbi, type Hex } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
-import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
+import { compareWithReceipt, relatedEarlier, ReplayError, replayTransaction } from '../src/replay.ts';
 import { compareWithAccessList } from '../src/evm/trace.ts';
 import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, keepsToBlock, nodeOverrides, parseBlock, pinBlock, priceFields, stateBefore } from '../src/block.ts';
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
@@ -132,6 +132,58 @@ test('A replay that doesn’t come out as the receipt says so', async () => {
   assert.equal(compareWithReceipt(ran({ gasUsed: 99_000n }), receipt).matches, false);
   assert.deepEqual(compareWithReceipt(ran({ logs: undefined }), { ...receipt, gasUsed: 51_234n }).differences, ["the run's events couldn't be read back to compare"]);
   assert.deepEqual(compareWithReceipt(ran({ status: 'reverted', logs: undefined }), { status: 'reverted', gasUsed: 51_234n, logs: [] }), { matches: true });
+});
+
+test('A block whose earlier transactions used more gas than the node allows one simulation: those that bear on the transaction run first, and the replay says so', async () => {
+  // Ethereum's public node allows a simulation 50 million gas (in two simulated blocks as in one) and its blocks hold
+  // 60: a transaction after the first 50 million of its block couldn't be replayed at all (2026-11-23: 16 of 16
+  // such, in four blocks, now run after 212 to 435 of the 258 to 528 before them, each as its receipt).
+  const SWAP = H(0x51), POOL = '0x00000000000000000000000000000000000000aa', OTHER = '0x00000000000000000000000000000000000000bb', CAROL = '0x00000000000000000000000000000000000000cc';
+  const earlier = [
+    { from: DEPOSITOR, to: '0x4200000000000000000000000000000000000015', gasUsed: 50_000n, logs: [], always: true }, // the chain's own, kept
+    { from: BOB, to: OTHER, gasUsed: 10_000_000n, logs: [{ address: POOL, topics: [SWAP] }] },                         // a trade in the same pool
+    { from: CAROL, to: USDC, gasUsed: 9_000_000n, logs: [{ address: USDC, topics: [TRANSFER] }] },                     // only a transfer of a token it moves
+    { from: ALICE, to: BOB, gasUsed: 21_000n, logs: [] },                                                             // the sender's own
+    { from: CAROL, to: OTHER, gasUsed: 8_000_000n, logs: [] },
+    { from: CAROL, to: POOL.toUpperCase().replace('0X', '0x'), gasUsed: 100_000n, logs: [] },                          // sent to the same contract
+    { from: CAROL, to: OTHER, gasUsed: 4_000_000n, logs: [] },                                                        // the latest of the rest
+  ];
+  const own = { from: ALICE, to: POOL, logs: [{ address: POOL, topics: [SWAP] }, { address: USDC, topics: [TRANSFER] }] };
+  // The sender's own and the chain's own always; then what bears on it, the latest first; then the latest others: within the budget.
+  assert.deepEqual(relatedEarlier(earlier, own, 15_000_000n), [0, 1, 3, 5, 6]);
+  assert.deepEqual(relatedEarlier(earlier, own, 5_000_000n), [0, 3, 5, 6]);
+  assert.deepEqual(relatedEarlier(earlier, own, 0n), [0, 3]);
+  assert.deepEqual(relatedEarlier(earlier, own, 100_000_000n), [0, 1, 2, 3, 4, 5, 6]);
+
+  // The simulator: a node that refuses a block with more than two of the earlier calls (told by their data) runs it
+  // after those `related` names, in their order, and the result says how many were left out.
+  const sent: string[][] = [];
+  const node = (async (_u: string, init: { body: string }) => {
+    const [{ blockStateCalls: [{ calls }] }] = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: { input?: string; data?: string }[] }[] }] }).params;
+    const marks = calls.map(c => c.input ?? c.data ?? '0x').filter(d => /^0xe\d$/.test(d));
+    sent.push(marks);
+    if (marks.length > 2) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38013, message: 'intrinsic gas too low' } }));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map(() => ({ status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] })) }] }));
+  }) as unknown as typeof fetch;
+  const at = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 60_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const before: SimulationRequest[] = [0, 1, 2, 3, 4].map(k => ({ chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: `0xe${k}` as Hex, value: 0n, gas: 21_000n }));
+  const request = (related?: () => Promise<number[] | undefined>): SimulationRequest => ({ chainId: 1, from: ALICE.toLowerCase(), to: BOB, data: '0x', value: 0n, at: { block: '0x10', header: at, required: true, before, ...(related && { related }) } });
+  const simulator = () => new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl: node });
+  const narrowed = (await simulator().simulateBatch([request(async () => [1, 4])]))![0];
+  assert.deepEqual([narrowed.status, narrowed.earlierLeftOut], ['success', 3]);
+  assert.deepEqual(sent.slice(0, 2), [['0xe0', '0xe1', '0xe2', '0xe3', '0xe4'], ['0xe1', '0xe4']]);
+  // Nothing to narrow to (not worked out, or every one of them named, or none given): the node's refusal is the answer.
+  for (const related of [undefined, async () => undefined, async () => [0, 1, 2, 3, 4]]) await assert.rejects(simulator().simulateBatch([request(related)]), /couldn't run the 5 transactions before this one in its block within its gas allowance for one simulation/);
+
+  // The replay: it hands the simulator the means, and says what the run was.
+  const { deps: d, batches } = deps(ran({ earlierLeftOut: 1 }));
+  const p = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, d);
+  assert.equal(typeof batches[0][0].at!.related, 'function');
+  assert.equal(p.replay?.matches, true);
+  assert.match(p.decoding.notes.join(' '), /Replayed where it ran: in block 100 \(2025-11-01 12:28:20 UTC\), after 1 of the 2 transactions before it in the block \(the chain's node couldn't run them all within the gas it allows one simulation: those from the same sender, to the same contract or with the same contracts' events ran, and the latest of the rest\), at the price it paid\. The run has the same outcome, events and gas as its receipt\./);
+  // One that then differs from its receipt says that what was left out may be why.
+  const q = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, deps(ran({ earlierLeftOut: 1, gasUsed: 60_000n })).deps);
+  assert.match(q.warnings.find(w => w.code === 'replay_differs')?.message ?? '', /may not be what happened\. 1 of the block's earlier transactions didn't run before it \(the node's limit\), and one of them may be why\./);
 });
 
 test('What can’t be replayed: no such transaction, one not mined, the chain’s own, a chain without an RPC', async () => {

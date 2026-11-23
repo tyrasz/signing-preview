@@ -566,6 +566,12 @@ export interface SimulationResult {
    */
   limited?: boolean;
   /**
+   * A replay's: how many of its block's earlier transactions didn't run before it. The node couldn't run them all
+   * within the gas it allows one simulation, so those that bear on the transaction ran, and the latest of the rest
+   * (BlockAt.related).
+   */
+  earlierLeftOut?: number;
+  /**
    * How transfers and approvals were found: from the simulated logs (default); from balances and permissions read
    * before and after the call ('state', see SimulationProbe), which only covers the tokens that were read; or from a
    * local EVM over the chain's state ('fork', see ForkSimulator): tokens from its logs, amounts from balances.

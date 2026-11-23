@@ -167,6 +167,16 @@ export async function replayTransaction(input: { chainId: number; hash: string }
     return all.every(u => u !== undefined) ? all as bigint[] : undefined;
   }, () => undefined);
   if (over) Object.assign(at, { beforeUsed });
+  // And where the node can't run them all within the gas it allows one simulation, those to run (relatedEarlier):
+  // worked out from the block's receipts, when asked for.
+  const related = once(async () => {
+    const all = await rpc.call(chainId, 'eth_getBlockReceipts', [tx.blockNumber]).catch(() => undefined);
+    const byHash = new Map((Array.isArray(all) ? all as (RpcReceipt & { transactionHash: string })[] : []).map(r => [r.transactionHash.toLowerCase(), r]));
+    const rows = earlier.map(t => { const r = byHash.get(t.hash.toLowerCase()); return r && { from: t.from, to: t.to ?? null, gasUsed: BigInt(r.gasUsed) - BigInt(r.gasUsedForL1 ?? 0), logs: r.logs, always: isSystem(chainId, t, block) }; });
+    const limit = BigInt(block.gasLimit) / 2n;
+    return rows.every(r => r !== undefined) ? relatedEarlier(rows as EarlierRow[], { from: tx.from, to: tx.to ?? null, logs: receipt.logs }, limit < RELATED_BUDGET ? limit : RELATED_BUDGET) : undefined;
+  });
+  if (!state && earlier.length) Object.assign(at, { related });
   const before = state ? [] : await Promise.all(earlier.map(async t => ({ ...await requestOf(chainId, t, parent, deps), at })));
 
   const gasUsed = BigInt(receipt.gasUsed), gasForL1 = receipt.gasUsedForL1 !== undefined ? BigInt(receipt.gasUsedForL1) : undefined;
@@ -195,6 +205,42 @@ export async function replayTransaction(input: { chainId: number; hash: string }
     }],
   };
   return previewRequest(request as never, { chainId, account: tx.from, ...(context.trace && { trace: true }), ...(context.now !== undefined && { now: context.now }), replay }, deps);
+}
+
+type Logged = { address: string; topics: string[] };
+type EarlierRow = { from: string; to: string | null; gasUsed: bigint; logs: Logged[]; /** One of the chain's own that a replay keeps (an OP Stack block's L1 info deposit). */ always?: boolean };
+/** The most gas (as the chain counted it) of earlier transactions a narrowed replay runs first: under what public nodes allow one simulation (50 million on Ethereum's). */
+const RELATED_BUDGET = 30_000_000n;
+/** Events any transaction moving a token logs (Transfer, Approval, ApprovalForAll; a wrapper's Deposit and Withdrawal): no sign that two transactions bear on each other. */
+const PLAIN_EVENTS = new Set(['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925', '0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31',
+  '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c', '0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65']);
+/**
+ * Which of a block's earlier transactions to run before one of its transactions where the node can't run them all:
+ * what a node allows one simulation can be under what they used (Ethereum's public node allows 50 million gas, its
+ * blocks hold 60; a transaction late in a full block then couldn't be replayed at all). Those that can bear on it,
+ * and the latest of the rest, within `budget` gas as the chain counted it:
+ * - the sender's own (its nonce and balance follow from them) and the chain's own that a replay keeps: always;
+ * - those sent to the contract this one is sent to, and those whose receipts log an event this one's receipt logs
+ *   from the same contract (a pool's Swap and Sync, a market's accrual; not PLAIN_EVENTS), the latest first;
+ * - then the latest of the others.
+ * Indexes into `earlier`, in order. What is left out can still be what the transaction met, so the replay says how
+ * many ran and is compared with its receipt as any other.
+ */
+export function relatedEarlier(earlier: EarlierRow[], own: { from: string; to: string | null; logs: Logged[] }, budget: bigint): number[] {
+  const key = (l: Logged) => `${l.address.toLowerCase()} ${l.topics[0]}`;
+  const mine = new Set(own.logs.filter(l => l.topics[0] && !PLAIN_EVENTS.has(l.topics[0])).map(key));
+  const from = own.from.toLowerCase(), to = own.to?.toLowerCase();
+  const rank = earlier.map(t => (t.always || t.from.toLowerCase() === from ? 0 : (to !== undefined && t.to?.toLowerCase() === to) || t.logs.some(l => mine.has(key(l))) ? 1 : 2));
+  const keep = new Set<number>();
+  let used = 0n;
+  for (const r of [0, 1, 2]) {
+    for (let i = earlier.length - 1; i >= 0; i--) {
+      if (rank[i] !== r || (r > 0 && used + earlier[i].gasUsed > budget)) continue;
+      keep.add(i);
+      used += earlier[i].gasUsed;
+    }
+  }
+  return [...keep].sort((a, b) => a - b);
 }
 
 /** A mined transaction as a simulation request: its call, its gas limit and price, its access list and authorizations. */

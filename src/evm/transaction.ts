@@ -362,12 +362,16 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     if (replay) {
       const compared = compareWithReceipt(sim, replay.receipt);
       replayed = { ...replay.info, ...compared };
-      const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.earlier ? `after the ${replay.earlier} transaction${replay.earlier === 1 ? '' : 's'} before it in the block${replay.at.state ? " (the state they left read from the block's access list)" : ''}` : 'first in the block'}, at the price it paid.`;
+      // (Not all of them, where the node couldn't run them all within the gas it allows one simulation: BlockAt.related.)
+      const leftOut = sim.earlierLeftOut ?? 0;
+      const after = leftOut ? `after ${replay.earlier - leftOut} of the ${replay.earlier} transactions before it in the block (the chain's node couldn't run them all within the gas it allows one simulation: those from the same sender, to the same contract or with the same contracts' events ran, and the latest of the rest)`
+        : `after the ${replay.earlier} transaction${replay.earlier === 1 ? '' : 's'} before it in the block${replay.at.state ? " (the state they left read from the block's access list)" : ''}`;
+      const where = `Replayed where it ran: in ${blockText(BigInt(replay.info.block), Date.parse(replay.info.time) / 1000)}, ${replay.earlier ? after : 'first in the block'}, at the price it paid.`;
       if (localRun) b.note(localRun); else if (replay.shifted) b.note(SHIFTED);
       if (compared.matches) b.note(`${where} The run has the same outcome, events and gas as its receipt.`);
       else {
         b.note(where);
-        b.warn('caution', 'replay_differs', `The replay doesn't match the transaction's receipt (${compared.differences!.join('; ')}), so what is shown here may not be what happened.`);
+        b.warn('caution', 'replay_differs', `The replay doesn't match the transaction's receipt (${compared.differences!.join('; ')}), so what is shown here may not be what happened.${leftOut ? ` ${leftOut} of the block's earlier transactions didn't run before it (the node's limit), and one of them may be why.` : ''}`);
       }
     }
   }

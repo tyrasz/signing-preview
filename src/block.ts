@@ -75,6 +75,13 @@ export interface BlockAt {
    */
   beforeUsed?: () => Promise<bigint[] | undefined>;
   /**
+   * Which of `before` to run where the node can't run them all: indexes into it, in order, read when asked for
+   * (replay.ts, relatedEarlier). A node allows one simulation so much gas, and a block's earlier transactions can
+   * have used more (Ethereum's public node allows 50 million, in two simulated blocks as in one; its blocks hold 60).
+   * Undefined where it can't be worked out.
+   */
+  related?: () => Promise<number[] | undefined>;
+  /**
    * What the simulated block has already changed when the calls run, as differences from `block`'s state: a replayed
    * transaction's block as its earlier transactions left it, read from the block's access list (stateBefore) in
    * place of running them (`before`). Simulators start from it; a request's own state overrides go on top.
