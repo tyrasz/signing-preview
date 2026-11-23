@@ -186,6 +186,65 @@ test('A block whose earlier transactions used more gas than the node allows one 
   assert.match(q.warnings.find(w => w.code === 'replay_differs')?.message ?? '', /may not be what happened\. 1 of the block's earlier transactions didn't run before it \(the node's limit\), and one of them may be why\./);
 });
 
+test('A call the node gave less gas than its limit, its allowance for one simulation used up by the block’s earlier transactions, runs again after those that bear on it', async () => {
+  // Ethereum's public node allows one simulation 50 million gas in all and says nothing where a call's share of it
+  // is under the call's own limit: a Safe transaction with a limit of 8,964,428 ran on the 8,153,736 left after its
+  // block's 41,846,264 and failed in the Safe (GS013) where on the chain it had succeeded (2026-11-23; five more
+  // such, in 40 blocks, then came out as their receipts after 2 to 42 of their blocks' earlier transactions were
+  // left out).
+  // The node here: 50 million in all (what a call that never ends uses, the measure), each earlier call (told by its
+  // data) using 9 million, and a call that needs 7.5 million failing on less.
+  const ALLOWANCE = 50_000_000n, EACH = 9_000_000n, NEEDS = 7_500_000n;
+  const sent: string[][] = [];
+  let probes = 0, measures = true;
+  const node = (async (_u: string, init: { body: string }) => {
+    const [{ blockStateCalls: [{ calls, stateOverrides }] }] = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: { input?: string; data?: string; gas?: string }[]; stateOverrides?: Record<string, { code?: string }> }[] }] }).params;
+    const answer = (result: unknown) => new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+    if (Object.values(stateOverrides ?? {}).some(o => o.code === '0x5b600056')) {
+      probes++;
+      return measures ? answer([{ calls: [{ status: '0x0', gasUsed: `0x${ALLOWANCE.toString(16)}`, returnData: '0x', error: { message: 'out of gas' } }] }]) : new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'no' } }));
+    }
+    const data = (c: { input?: string; data?: string }) => c.input ?? c.data ?? '0x';
+    const marks = calls.filter(c => /^0xe\d$/.test(data(c)));
+    sent.push(marks.map(data));
+    let left = ALLOWANCE - EACH * BigInt(marks.length);
+    return answer([{ calls: calls.map(c => {
+      if (/^0xe\d$/.test(data(c))) return { status: '0x1', gasUsed: `0x${EACH.toString(16)}`, returnData: '0x', logs: [] };
+      if (data(c) !== '0x7a') return { status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] };
+      const given = c.gas !== undefined && BigInt(c.gas) < left ? BigInt(c.gas) : left;
+      const used = given < NEEDS ? given : NEEDS;
+      left -= used;
+      return given < NEEDS ? { status: '0x0', gasUsed: `0x${used.toString(16)}`, returnData: '0x', error: { message: 'execution reverted' } } : { status: '0x1', gasUsed: `0x${used.toString(16)}`, returnData: '0x', logs: [] };
+    }) }]);
+  }) as unknown as typeof fetch;
+  const at = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 60_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const before = (n: number): SimulationRequest[] => Array.from({ length: n }, (_, k) => ({ chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: `0xe${k}` as Hex, value: 0n, gas: 10_000_000n }));
+  const request = (n: number, gas: bigint | undefined, related?: () => Promise<number[] | undefined>): SimulationRequest => ({ chainId: 1, from: ALICE.toLowerCase(), to: BOB, data: '0x7a', value: 0n, ...(gas !== undefined && { gas }), at: { block: '0x10', header: at, required: true, before: before(n), ...(related && { related }) } });
+  const simulator = () => new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl: node });
+  const run = async (r: SimulationRequest, sim = simulator()) => { sent.length = 0; probes = 0; const [out] = (await sim.simulateBatch([r]))!; return [out.status, out.gasUsed, out.earlierLeftOut]; };
+  // Five earlier transactions leave 5 million of the 50: a call with a limit of 8 million is cut short, and runs
+  // again after the two that bear on it, on its own limit.
+  assert.deepEqual(await run(request(5, 8_000_000n, async () => [1, 4])), ['success', NEEDS, 3]);
+  assert.deepEqual([sent[0], sent[1], probes], [['0xe0', '0xe1', '0xe2', '0xe3', '0xe4'], ['0xe1', '0xe4'], 1]);
+  // And one with no limit of its own, which ran out on what was left.
+  assert.deepEqual(await run(request(5, undefined, async () => [1, 4])), ['success', NEEDS, 3]);
+  // A call that failed on all it asked for failed by itself: nothing is left out for it. (Two earlier transactions
+  // leave 32 million; with a limit of 7 million it had its 7 million.)
+  assert.deepEqual(await run(request(2, 7_000_000n, async () => [1])), ['reverted', 7_000_000n, undefined]);
+  assert.deepEqual(sent.filter(m => m.length === 1), []);
+  // Nothing to narrow to, or a node that doesn't say what it allows: the run stands as it came out.
+  assert.deepEqual(await run(request(5, 8_000_000n)), ['reverted', 5_000_000n, undefined]);
+  assert.deepEqual(await run(request(5, 8_000_000n, async () => [0, 1, 2, 3, 4])), ['reverted', 5_000_000n, undefined]);
+  measures = false;
+  assert.deepEqual(await run(request(5, 8_000_000n, async () => [1, 4])), ['reverted', 5_000_000n, undefined]);
+  // The allowance is measured once for a chain (and asked for again where the node didn't say).
+  measures = true;
+  const one = simulator();
+  await run(request(5, 8_000_000n, async () => [1, 4]), one);
+  assert.deepEqual(await run(request(5, 8_000_000n, async () => [1, 4]), one), ['success', NEEDS, 3]);
+  assert.equal(probes, 0);
+});
+
 test('What can’t be replayed: no such transaction, one not mined, the chain’s own, a chain without an RPC', async () => {
   const { deps: d } = deps(ran());
   const refused = async (input: { chainId: number; hash: string }, code: string, said: RegExp, with_ = d) =>

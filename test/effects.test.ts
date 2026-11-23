@@ -358,3 +358,26 @@ test('A token the transaction itself creates: no name to read, and a note that i
   const q = await previewRequest(send(ROUTER), { now: NOW }, withRpc(fixed({ transfers: [{ asset: OLD, from: ROUTER, to: ALICE, raw: 5n }, { asset: NEW, from: ALICE, to: ROUTER, raw: 5n }], nftTransfers: [] })));
   assert.ok(!codes(q).includes('token_created_here'), codes(q).join(','));
 });
+
+test('Two accounts read around a call (a Safe and the owner sending its transaction): one account’s change isn’t named as going to the other', async () => {
+  // A Safe transaction on Arbitrum One (2026-11-23): the Safe pulled 1,140 USDC from its owner and repaid a loan
+  // with them. The Safe's USDC balance doesn't change, and its events were dropped for that; the owner's fell, and
+  // was written as a transfer to the call's target, the Safe, which then showed 1,140 USDC coming in.
+  const SAFE = '0x5afe00000000000000000000000000000000cafe', POOL = '0x00000000000000000000000000000000000000aa', alice = ALICE.toLowerCase();
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body));
+    const calls = body.params[0].blockStateCalls[0].calls as { from?: string; to?: string; data: string }[];
+    const logs = [{ address: USDC, topics: [T.transfer, w(ALICE), w(SAFE)], data: data(5_000_000n) }, { address: USDC, topics: [T.transfer, w(SAFE), w(POOL)], data: data(5_000_000n) }];
+    if (body.params[0].traceTransfers) return new Response(JSON.stringify({ result: [{ calls: calls.map((_, i) => ({ status: '0x1', gasUsed: i === 0 ? '0xd163' : '0x5208', returnData: '0x', logs: i === 0 ? logs : [] })) }] }));
+    const at = calls.findIndex(c => c.data === '0x6a761202');
+    // The owner's USDC: 5 before the call, none after; the Safe's: none throughout. Nothing else answers.
+    return new Response(JSON.stringify({ result: [{ calls: calls.map((c, i) => ({ status: '0x1', gasUsed: i === at ? '0xd163' : '0x5208', logs: [],
+      returnData: c.data.startsWith('0x70a08231') && c.to === USDC ? data(c.data.endsWith(alice.slice(2)) && i < at ? 5_000_000n : 0n) : '0x' })) }] }));
+  }) as typeof fetch;
+  const [r] = (await new RpcSimulator({ 8453: 'http://rpc.invalid' }, { fetchImpl }).simulateBatch([
+    { chainId: 8453, from: alice, account: SAFE, to: SAFE, data: '0x6a761202', value: 0n },
+    { chainId: 8453, from: alice, to: SAFE, data: '0xa0e67e2b', value: 0n }, // a read of the Safe, sent from the owner: the owner's balances are read too
+  ]))!;
+  assert.equal(r.balancesRead, true);
+  assert.deepEqual(r.transfers.filter(t => t.asset === USDC).map(t => [t.from, t.to, t.raw]), [[alice, ELSEWHERE, 5_000_000n]]);
+});

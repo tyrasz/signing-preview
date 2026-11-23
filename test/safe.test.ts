@@ -155,7 +155,7 @@ test('What a Safe transaction changes in the Safe: code, owners, threshold, guar
   assert.deepEqual(codes({ guard: BOB.toLowerCase(), fallbackHandler: ZERO, modules: [BOB.toLowerCase()] }), ['caution:safe_guard_changed', 'caution:safe_fallback_changed', 'danger:safe_module_enabled']);
 });
 
-test('A SafeTx is simulated through execTransaction itself, approved by enough owners, and a replaced singleton is danger', async () => {
+test('A SafeTx is simulated through execTransaction itself, signed by enough owners, and a replaced singleton is danger', async () => {
   const SAFE_ABI = parseAbi(['function getStorageAt(uint256 offset, uint256 length) view returns (bytes)', 'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool)']);
   const HASH = `0x${'ab'.repeat(32)}` as Hex;
   const word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
@@ -186,18 +186,28 @@ test('A SafeTx is simulated through execTransaction itself, approved by enough o
   assert.match(bybit.warnings.find(w => w.code === 'safe_code_replaced')?.message ?? '', /runs the code at 0xbdd077f651ebe7f7b3ce16fe5f2b025be2969516, which isn't one of Safe's own \(the Safe no longer even answers as a Safe\)/);
   assert.match(bybit.decoding.notes.join(' '), /execTransaction itself/);
   // The request: from an owner (the first, as the signer isn't one), who signs with the ECDSA stand-in that the
-  // replaced ecrecover attributes to them over the hash; the lowest other owner approves on-chain (v = 1).
+  // replaced ecrecover attributes to them over the hash; the lowest other owner signs with a stand-in of its own,
+  // attributed to it the same way (nothing in the Safe's storage stands in for a signature: a guard that reads the
+  // signatures itself finds signatures).
   const exec = batches.at(-1)![0];
   assert.equal(exec.to, SAFE);
   assert.equal(exec.account, SAFE);
   assert.equal(exec.from, OWNERS[0]);
-  const slot = (o: string) => k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [o as Hex, 8n]))]));
-  assert.deepEqual(Object.keys(exec.stateOverrides![SAFE].stateDiff!), [slot(OWNERS[1])]);
-  assert.ok(exec.stateOverrides!['0x0000000000000000000000000000000000000001']?.code?.includes(OWNERS[0].slice(2)), 'ecrecover stands in for the owner');
-  const { STUB_SIGNATURE } = await import('../src/erc4337-sim.ts');
+  assert.equal(exec.stateOverrides![SAFE], undefined);
+  const recover = exec.stateOverrides!['0x0000000000000000000000000000000000000001']?.code ?? '';
+  assert.ok(recover.includes(OWNERS[0].slice(2)) && recover.includes(OWNERS[1].slice(2)), 'ecrecover stands in for both owners');
+  const { STUB_SIGNATURE, stubSignature } = await import('../src/erc4337-sim.ts');
   const signatures = (decodeCall({ abi: SAFE_ABI, data: exec.data as Hex }).args as unknown as unknown[])[9] as string;
-  // Ascending by owner: 0x1000… (approval), then 0x2000… (the stand-in signature).
-  assert.equal(signatures, `0x${OWNERS[1].slice(2).padStart(64, '0')}${'00'.repeat(32)}01${STUB_SIGNATURE.slice(2)}`);
+  // Ascending by owner: 0x1000… (its own stand-in signature), then 0x2000… (the signer's).
+  assert.equal(signatures, `0x${stubSignature(1).slice(2)}${STUB_SIGNATURE.slice(2)}`);
+  // A Safe that needs more than sixteen owners keeps to approvals for the others (Safe's approvedHashes, its
+  // signature type 1), set with a storage override.
+  const { approvalsFor } = await import('../src/safe-sim.ts');
+  const many = Array.from({ length: 18 }, (_, i) => `0x${(i + 1).toString(16).padStart(40, '0')}`);
+  const wide = approvalsFor({ ...base, owners: many, threshold: 17n }, HASH, { owner: many[0], signature: STUB_SIGNATURE }, true)!;
+  assert.deepEqual([wide.cosigners, Object.keys(wide.stateDiff).length], [undefined, 16]);
+  const slot = (o: string) => k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [o as Hex, 8n]))]));
+  assert.equal(Object.keys(wide.stateDiff)[0], slot(many[1]));
   // Moving to an official singleton is an upgrade, a caution.
   const upgrade = await sign({ to: '0x96221423681a6d52e184d440a8efcebb105c7242', data: transfer, operation: 1 }, d('0xff51a5898e281db6dfc7855790607438df2ca44b'));
   assert.ok(codes(upgrade).includes('safe_upgrade') && !codes(upgrade).includes('safe_code_replaced'));
@@ -637,13 +647,13 @@ test('A SafeTx, its plain-call fallback and an execTransaction are simulated on 
   assert.deepEqual(native(p), ['out 2']);
   assert.equal(p.warnings.filter(w => w.code === 'state_overridden').length, 1);
   assert.ok(!p.decoding.notes.some(n => /context\.stateOverrides/.test(n)), p.decoding.notes.join(' | '));
-  // The run: the caller's balance and slot at the Safe, under the approval standing in for the second owner; the
-  // stand-in ecrecover over the caller's code there. The Safe's nonce, hash and configuration were read in that state.
+  // The run: the caller's balance and slot at the Safe, as given (the owners' signatures are stood in for at
+  // ecrecover, not in the Safe's storage); the stand-in ecrecover, for both owners, over the caller's code there. The
+  // Safe's nonce, hash and configuration were read in that state.
   const exec = set.batches[0][0];
-  const approval = k256(enc([{ type: 'bytes32' }, { type: 'bytes32' }], [HASH, k256(enc([{ type: 'address' }, { type: 'uint256' }], [OWNERS[1] as Hex, 8n]))]));
   assert.equal(exec.stateOverrides![SAFE].balance, `0x${(5n * E).toString(16)}`);
-  assert.deepEqual(exec.stateOverrides![SAFE].stateDiff, { [`0x${'0'.repeat(63)}4`]: `0x${'0'.repeat(63)}1`, [approval]: `0x${'0'.repeat(63)}1` });
-  assert.ok(exec.stateOverrides![ECRECOVER].code!.includes(OWNERS[0].slice(2)) && exec.stateOverrides![ECRECOVER].movePrecompileToAddress, 'ecrecover is the stand-in');
+  assert.deepEqual(exec.stateOverrides![SAFE].stateDiff, { [`0x${'0'.repeat(63)}4`]: `0x${'0'.repeat(63)}1` });
+  assert.ok([OWNERS[0], OWNERS[1]].every(o => exec.stateOverrides![ECRECOVER].code!.includes(o.slice(2))) && exec.stateOverrides![ECRECOVER].movePrecompileToAddress, 'ecrecover is the stand-in');
   // (The checks of whether the signer is an owner and the nonce is the Safe's next describe the chain as it is.)
   const readsOf = (sel: string) => set.reads.filter(p => (p[0] as { data: string }).data.startsWith(sel));
   assert.ok(['0xa0e67e2b', '0xe75235b8', '0xd8d11f78'].every(sel => readsOf(sel).length && readsOf(sel).every(p => (p[2] as Record<string, unknown>)?.[SAFE])), 'owners, threshold and hash read with the overrides');
@@ -775,4 +785,79 @@ test('A SafeOp run whole lists the native coin its calls send, without the gas p
   const failed = await run(env(false));
   assert.ok(codes(failed).includes('userop_execution_reverts'), codes(failed).join());
   assert.deepEqual(native(failed).filter(c => c[2] !== 'requested'), []);
+});
+
+// A Safe whose views answer for these owners (threshold 1), for the two tests below.
+const viewsOf = (owners: string[]) => (data: string) => {
+  const sel = data.slice(0, 10), word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  if (sel === '0xa619486e') return enc([{ type: 'address' }], [SINGLETON as Hex]);
+  if (sel === '0xa0e67e2b') return enc([{ type: 'address[]' }], [owners as Hex[]]);
+  if (sel === '0xe75235b8') return word(1n);
+  if (sel === '0xaffed0e0') return word(5n);
+  if (sel === '0xd8d11f78') return `0x${'ab'.repeat(32)}`;
+  if (sel === '0xcc2f8452') return enc([{ type: 'address[]' }, { type: 'address' }], [[], '0x0000000000000000000000000000000000000001']);
+  if (sel === '0x5624b25b') return enc([{ type: 'bytes' }], [`0x${'00'.repeat(32)}`]);
+  if (sel === '0x2f54bf6e') return word(1n);
+  return '0x';
+};
+
+test("A Safe transaction that takes tokens out of the signer's own account says so, beside what it does for the Safe", async () => {
+  // On Arbitrum One (2026-11-23) a Safe transaction had the Safe pull 1,140 USDC from its owner (an allowance the
+  // owner had given it) and repay the Safe's loan with them. The Safe's USDC balance doesn't change; the preview
+  // showed it receiving 1,140 USDC (the owner's own change, named as going to the Safe: see test/simulation.test.ts)
+  // and nothing of the owner's account.
+  const alice = ALICE.toLowerCase(), DEBT = '0x00000000000000000000000000000000000000de';
+  const d = (owners: string[]): Dependencies => ({ ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => m === 'eth_call' ? viewsOf(owners)((p[0] as { data: string }).data) : '0x' },
+    simulator: { simulate: async () => null, simulateBatch: async rs => rs.map((r, i) => (i === 0
+      ? { status: 'success' as const, source: 'mock', balancesRead: true, returnData: enc([{ type: 'uint256' }], [1n]), transfers: [{ asset: DEBT, from: SAFE, to: ZERO, raw: 5_000_000n }, { asset: USDC, from: rs[0].from, to: ZERO, raw: 5_000_000n }] }
+      : { status: 'success' as const, source: 'mock', transfers: [], returnData: viewsOf(owners)(r.data) })) } });
+  const p = await sign({ to: '0xd88d5356e08dad84e1576f89f4bf43c79a8bf0b2', operation: 1, data: '0x2895f3aa' }, d([alice, OWNERS[1]]));
+  assert.match(p.warnings.find(w => w.code === 'safe_signer_pays')?.message ?? '', /^Simulated as sent from your account, the transaction also takes 5 USDC out of your own account \(0x[0-9a-fA-F]{4}…[0-9a-fA-F]{4}\), which isn't the Safe's/);
+  assert.equal(p.warnings.find(w => w.code === 'safe_signer_pays')?.severity, 'caution');
+  assert.deepEqual(p.assetChanges.map(c => [c.account, c.direction, c.asset, c.raw]), [[SAFE, 'out', DEBT, '5000000'], [alice, 'out', USDC, '5000000']]);
+  // Signed by someone who isn't an owner, the run is sent from the Safe's first owner: what leaves that account
+  // isn't the signer's, and isn't said to be.
+  const other = await sign({ to: '0xd88d5356e08dad84e1576f89f4bf43c79a8bf0b2', operation: 1, data: '0x2895f3aa' }, d(OWNERS));
+  assert.ok(!codes(other).includes('safe_signer_pays'));
+  assert.deepEqual(other.assetChanges.map(c => [c.account, c.asset]), [[SAFE, DEBT]]);
+});
+
+test("A mined execTransaction replayed: the Safe's own run is where the transaction ran, and the local EVM's where the node's isn't what the receipt says", async () => {
+  // Run on the latest state, a replayed Safe transaction was said to be expected to fail (GS026: the Safe's nonce
+  // has moved on, so its signatures are of another hash) beside a replay that matched its receipt (Ethereum,
+  // 2026-11-23: every one of three).
+  const alice = ALICE.toLowerCase(), word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const data = encodeFunctionData({ abi: ABI, functionName: 'execTransaction', args: [USDC, 0n, transfer, 0, 0n, 0n, 0n, ZERO, ZERO, `0x${'11'.repeat(65)}`] });
+  const LOG = { address: SAFE, topics: [EXECUTION_SUCCESS], data: `0x${'cd'.repeat(32)}${'0'.repeat(64)}` };
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: ZERO, gasLimit: 60_000_000n, baseFeePerGas: 7n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest = { chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: '0x', value: 0n };
+  const replay = { at: { block: '0x10', header, required: true }, before: [earlier], earlier: 1, gasPrice: 9n, receipt: { status: 'success' as const, gasUsed: 90_000n, logs: [LOG] },
+    info: { hash: `0x${'77'.repeat(32)}`, block: '17', index: 1, time: '2026-11-23T00:00:00.000Z', receipt: { status: 'success' as const, gasUsed: '90000' } }, when: { block: '0x11', time: 0x65000001 } };
+  const tags: unknown[] = [], batches: SimulationRequest[][] = [], traced: SimulationRequest[][] = [];
+  const ok = (r: SimulationRequest, i: number) => (i === 0 ? { status: 'success' as const, source: 'mock', gasUsed: 90_000n, transfers: [], logs: [LOG], returnData: word(1n) } : { status: 'success' as const, source: 'mock', transfers: [], returnData: viewsOf([alice])(r.data) });
+  const d = (node: 'as the receipt' | 'short of gas'): Dependencies => ({ ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => { if (m !== 'eth_call') return '0x'; tags.push(p[1]); return viewsOf([alice])((p[0] as { data: string }).data); } },
+    simulator: {
+      simulate: async r => (node === 'as the receipt' ? ok(r, 0) : { status: 'reverted' as const, source: 'mock', gasUsed: 80_000n, revertReason: 'GS013', transfers: [] }),
+      simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => (node === 'short of gas' && i === 0 ? { status: 'reverted' as const, source: 'mock', gasUsed: 80_000n, revertReason: 'GS013', transfers: [] } : ok(r, i))); },
+      trace: async rs => { traced.push(rs); return rs.map(ok); },
+    } });
+  const send = (with_: Dependencies) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SAFE, data, gas: '0x30d40', chainId: '0x1' }] }, { now: NOW, replay } as never, with_);
+  const p = await send(d('as the receipt'));
+  assert.ok(!codes(p).includes('safe_tx_reverts'));
+  // The Safe's run: on the parent block after the block's earlier transactions, at the price paid, on the gas limit
+  // the transaction had; its reads of the Safe on the parent block too; and no second run at today's price.
+  const [exec] = batches[0];
+  assert.deepEqual([exec.at?.block, exec.at?.before?.length, exec.gasPrice, exec.gas, exec.from], ['0x10', 1, 9n, 200_000n, alice]);
+  assert.equal(batches.length, 1);
+  assert.ok(tags.length > 0 && tags.every(t => t === '0x10'), 'the Safe is read on the parent block');
+  assert.match(p.decoding.notes.join(' '), /What it did for the Safe: execTransaction run again as it was sent, where it ran/);
+  assert.doesNotMatch(p.decoding.notes.join(' '), /Simulated at the latest block/);
+  // A node whose run isn't the receipt's (the gas it allows one simulation left the call short: GS013): the local
+  // EVM's run, which is, is the one the Safe's part is told from.
+  batches.length = 0;
+  const q = await send(d('short of gas'));
+  assert.ok(!codes(q).includes('safe_tx_reverts'));
+  assert.equal(traced.some(rs => rs[0].data === data && rs.length === batches[0].length), true);
 });

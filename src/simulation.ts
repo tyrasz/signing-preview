@@ -152,6 +152,8 @@ export function hadRoom(earlier: SimulationRequest[], fitted: SimulationRequest[
 /** The gas an earlier call is given over its own limit where the calls' stand-ins made it fail (roomForStandIns). */
 const STAND_IN_ROOM = 100_000n;
 /** FailedOp(uint256,string), and "AA95 out of gas" as its reason's bytes: an EntryPoint's own check of the gas left for an operation (ranShort). */
+/** Where the allowance probe's code is put for its one call (RpcSimulator.allowance), and the code: JUMPDEST, PUSH1 0, JUMP. */
+const ALLOWANCE_PROBE = '0x00000000000000000000000000000000a110a11c', ENDLESS = '0x5b600056';
 const FAILED_OP = '0x220266b6', AA95 = Array.from('AA95 out of gas', ch => ch.charCodeAt(0).toString(16)).join('');
 /**
  * Whether a call that failed in a simulated block failed for want of gas. One that ran out used all it was given (a
@@ -389,6 +391,39 @@ export class RpcSimulator implements Simulator {
     }
     return this.simulateAt(reqs);
   }
+  /**
+   * The calls after those of their block's earlier transactions that bear on them and the latest of the rest
+   * (BlockAt.related), where the node's gas allowance for one simulation doesn't hold them all and the calls: each
+   * result says how many were left out. Undefined where there is nothing to narrow to, or that run fails too.
+   */
+  private async afterRelated(reqs: SimulationRequest[], retried: boolean): Promise<SimulationResult[] | undefined> {
+    const all = !this.replay?.(reqs[0].chainId) ? reqs[0]?.at?.before : undefined;
+    const kept = all && await reqs[0].at!.related?.().catch(() => undefined);
+    if (!all || !kept || kept.length >= all.length) return undefined;
+    const part = kept.map(i => all[i]);
+    const ran = await this.simulateAt(reqs.map(r => (r.at ? { ...r, at: { ...r.at, before: part, related: undefined, beforeUsed: undefined } } : r)), undefined, retried).catch(() => null);
+    return ran?.map(r => ({ ...r, earlierLeftOut: all.length - kept.length }));
+  }
+
+  /** What each chain's node allows one simulation in gas, once measured (allowance). */
+  private allowances = new Map<number, Promise<bigint | undefined>>();
+  /**
+   * The gas a chain's node allows one eth_simulateV1 request in all (geth's RPC gas cap, 50 million by default,
+   * where Ethereum's blocks hold 60): what a call that never ends uses when it is given no limit of its own (the
+   * block's limit, where that is the lower). Measured once for a chain, when a replay needs it; undefined where
+   * the node doesn't answer so (asked again the next time).
+   */
+  private allowance(url: string, chainId: number): Promise<bigint | undefined> {
+    let known = this.allowances.get(chainId);
+    if (!known) {
+      known = (this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [{ to: ALLOWANCE_PROBE }], stateOverrides: { [ALLOWANCE_PROBE]: { code: ENDLESS } } }], validation: false }, 'latest']) as Promise<{ result?: { calls?: RawCallResult[] }[] }>)
+        .then(body => { const c = body.result?.[0]?.calls?.[0]; return c && c.status !== '0x1' && BigInt(c.gasUsed) > 0n ? BigInt(c.gasUsed) : undefined; }, () => undefined);
+      this.allowances.set(chainId, known);
+      void known.then(v => { if (v === undefined) this.allowances.delete(chainId); });
+    }
+    return known;
+  }
+
   private async simulateAt(reqs: SimulationRequest[], fitted?: SimulationRequest[], retried = false): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
@@ -464,16 +499,28 @@ export class RpcSimulator implements Simulator {
     if (body.error && before.length && /intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(body.error.message ?? '')) {
       // The node allows one simulation so much gas, and the block's earlier transactions used more: run again after
       // those of them that bear on the calls, and the latest of the rest (BlockAt.related), which the result says.
-      const all = !fitted && !this.replay?.(chainId) ? reqs[0]?.at?.before : undefined;
-      const kept = all && await reqs[0].at!.related?.().catch(() => undefined);
-      if (all && kept && kept.length < all.length) {
-        const part = kept.map(i => all[i]);
-        const ran = await this.simulateAt(reqs.map(r => (r.at ? { ...r, at: { ...r.at, before: part, related: undefined, beforeUsed: undefined } } : r)), undefined, retried).catch(() => null);
-        if (ran) return ran.map(r => ({ ...r, earlierLeftOut: all.length - kept.length }));
-      }
+      const ran = !fitted ? await this.afterRelated(reqs, retried) : undefined;
+      if (ran) return ran;
       throw new Error(`the chain's node couldn't run the ${before.length} transactions before this one in its block within its gas allowance for one simulation (${body.error.message}); a node with a higher allowance can`);
     }
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
+    // The same allowance, met without a word: what the block's earlier transactions used comes out of it, and a
+    // call after them is given what is left where that is under its own limit. On Ethereum's public node a Safe
+    // transaction with a limit of 8,964,428 ran on the 8,153,736 left after its block's 41,846,264, and its call
+    // ran out (GS013) where on the chain it had succeeded (2026-11-23; run on the parent block alone it came out
+    // as its receipt, to the gas). A call that failed on less than it asked for is run again after the earlier
+    // transactions that bear on it, as where the node refuses.
+    if (before.length && reqs[0]?.at?.related && !this.replay?.(chainId) && results.some(r => r.status !== '0x1')) {
+      const allowance = await this.allowance(url, chainId);
+      let used = body.result![0].calls.slice(0, before.length).reduce((sum, c) => sum + BigInt(c.gasUsed), 0n);
+      const cut = allowance !== undefined && results.some((r, i) => {
+        const left = allowance - used;
+        used += BigInt(r.gasUsed);
+        return r.status !== '0x1' && (reqs[i].gas !== undefined ? reqs[i].gas! > left : ranShort(r, left > 0n ? left : 1n));
+      });
+      const ran = cut ? await this.afterRelated(reqs, retried) : undefined;
+      if (ran) return ran;
+    }
     const parsed: SimulationResult[] = results.map(result => {
       const gasUsed = BigInt(result.gasUsed), peak = result.maxUsedGas ? BigInt(result.maxUsedGas) : undefined;
       const gasPeak = peak !== undefined && peak > gasUsed ? { gasPeak: peak } : {};
@@ -711,7 +758,7 @@ export class RpcSimulator implements Simulator {
       // (Elsewhere, too, for an account that isn't the call's sender, a UserOperation's: its call's target is the
       // EntryPoint, and what the account pays the EntryPoint is for the operation's preview to tell apart, its
       // prefund from its deposits: withoutGas, in src/erc4337-sim.ts.)
-      const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner || owner !== reqs[i].from.toLowerCase() ? ELSEWHERE : to;
+      const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner || owner !== reqs[i].from.toLowerCase() || owners.includes(to) ? ELSEWHERE : to;
       if (unlogged < 0n) p.transfers.push({ asset: 'native', from: owner, to: target, raw: -unlogged });
       else if (unlogged > 0n) p.transfers.push({ asset: 'native', from: target, to: owner, raw: unlogged });
       return true;
@@ -770,7 +817,7 @@ export class RpcSimulator implements Simulator {
           if (x === undefined || y === undefined) continue;
           if (token === 'native') { if (unloggedNative(p, i, owner, x, y) && owner === own) readAssets.push(token); continue; }
           if (owner === own) readAssets.push(token);
-          const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner ? ELSEWHERE : to;
+          const to = (reqs[i].to ?? READER).toLowerCase(), target = to === owner || owners.includes(to) ? ELSEWHERE : to;
           p.transfers = p.transfers.filter(t => t.asset !== token || (t.from !== owner && t.to !== owner));
           if (y < x) p.transfers.push({ asset: token, from: owner, to: target, raw: x - y });
           else if (y > x) p.transfers.push({ asset: token, from: target, to: owner, raw: y - x });
@@ -805,8 +852,12 @@ export class RpcSimulator implements Simulator {
         if (x === undefined || y === undefined) continue; // balanceOf unreadable: keep the logs
         if (b.owner === own) readAssets.push(b.token);
         // The balance difference replaces whatever the logs said about this token and owner.
-        // A call to the account itself (an EIP-7702 account running its own batch) moved the tokens elsewhere.
-        const to = (reqs[i].to ?? READER).toLowerCase(), target = to === b.owner ? ELSEWHERE : to;
+        // A call to the account itself (an EIP-7702 account running its own batch) moved the tokens elsewhere. And
+        // so did a call to another account whose balances are read here (a Safe its owner sends a transaction to,
+        // both read): that account's own change is what its own reads say, and it isn't named as where this one's
+        // went. (A Safe transaction that had the Safe pull 1,140 USDC from its owner and repay a loan with them
+        // showed the Safe receiving 1,140 USDC, its balance unchanged: Arbitrum One, 2026-11-23.)
+        const to = (reqs[i].to ?? READER).toLowerCase(), target = to === b.owner || owners.includes(to) ? ELSEWHERE : to;
         p.transfers = p.transfers.filter(t => t.asset !== b.token || (t.from !== b.owner && t.to !== b.owner));
         if (y < x) p.transfers.push({ asset: b.token, from: b.owner, to: target, raw: x - y });
         else if (y > x) p.transfers.push({ asset: b.token, from: target, to: b.owner, raw: y - x });

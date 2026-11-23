@@ -3118,11 +3118,12 @@ export function ecrecoverAsMany(pairs: Cosigner[], price = 3000): Hex {
 }
 /**
  * What a simulation request needs for ecrecover to recover STUB_SIGNATURE as `signer` (over `digest`, if given): the
- * precompile's stand-in (see ecrecoverAs), with both addresses warm as the precompile is. For Safe transactions too.
+ * precompile's stand-in (see ecrecoverAs), with both addresses warm as the precompile is. For Safe transactions too,
+ * with `cosigners` for the other owners' stand-in signatures (over the same digest).
  */
-export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number): Pick<SimulationRequest, 'stateOverrides' | 'accessList'> {
+export function ecdsaStandIn(signer: string, digest?: Hex, chainId?: number, cosigners: Cosigner[] = []): Pick<SimulationRequest, 'stateOverrides' | 'accessList'> {
   return {
-    stateOverrides: { '0x0000000000000000000000000000000000000001': { code: ecrecoverAs(signer, digest, [], chainId === undefined ? 3000 : ecrecoverPrice(chainId)), movePrecompileToAddress: ECRECOVER_MOVED } },
+    stateOverrides: { '0x0000000000000000000000000000000000000001': { code: ecrecoverAs(signer, digest, cosigners, chainId === undefined ? 3000 : ecrecoverPrice(chainId)), movePrecompileToAddress: ECRECOVER_MOVED } },
     accessList: [{ address: '0x0000000000000000000000000000000000000001', storageKeys: [] }, { address: ECRECOVER_MOVED, storageKeys: [] }],
   };
 }

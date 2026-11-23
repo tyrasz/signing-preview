@@ -1,19 +1,21 @@
 // Simulating a Safe transaction the way the Safe runs it: execTransaction itself, so the Safe's own logic decides
 // (guards, the gas refund, delegatecalls of any contract). An owner's signature doesn't exist yet when previewing,
 // so the signing owner signs with the ECDSA stand-in (ecrecover attributes it to them over the transaction's hash),
-// and the other owners the threshold needs approve the hash on-chain (Safe's approvedHashes, the approval signature
-// type 1 accepts): the threshold and owners stay as they are.
+// and so do the other owners the threshold needs, each with a stand-in of its own (past sixteen owners, the rest
+// approve the hash on-chain: Safe's approvedHashes, the approval signature type 1 accepts): the threshold and
+// owners stay as they are.
 // In the same simulated block, the Safe's configuration is read again (owners, threshold, singleton, guard,
 // fallback handler, modules) and compared with now: what a delegatecall did to the Safe shows even when its
 // calldata looks harmless, as in the 2025 Bybit theft (a delegatecall that replaced the Safe's singleton).
 import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, hexToBytes, hexToString, keccak256, parseAbi, sha256, stringToHex, toFunctionSelector, type Hex } from 'viem';
 import { p256 } from '@noble/curves/nist';
-import type { Dependencies, SimulationRequest, SimulationResult } from './types.ts';
+import type { Dependencies, ReplayContext, SimulationRequest, SimulationResult } from './types.ts';
 import type { SafeTx } from './safe.ts';
 import type { BlockAt } from './block.ts';
-import { base64url, ecdsaStandIn, lastSignature, mergeOverrides, P256_STUB, passkeyVerifiersStandIn, STAND_IN_PASSKEY, standInPasskey, STUB_SIGNATURE } from './erc4337-sim.ts';
+import { base64url, ecdsaStandIn, lastSignature, mergeOverrides, P256_STUB, passkeyVerifiersStandIn, STAND_IN_PASSKEY, standInPasskey, STUB_SIGNATURE, stubSignature } from './erc4337-sim.ts';
 import { effectOf, roomFor } from './evm/effects.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
+import { compareWithReceipt } from './evm/trace.ts';
 
 const ABI = parseAbi([
   'function getOwners() view returns (address[])',
@@ -103,13 +105,22 @@ export async function readConfig(deps: Dependencies, chainId: number, safe: stri
  * signature instead (a stand-in that a replaced ecrecover attributes to them, so validation costs what it will), and
  * the lowest other owners approve. Null if the Safe has fewer owners than its threshold.
  */
-export function approvalsFor(before: SafeConfig, hash: Hex, ecdsa?: { owner: string; signature: Hex; contract?: Hex }): { stateDiff: Record<string, string>; signatures: Hex } | null {
+export function approvalsFor(before: SafeConfig, hash: Hex, ecdsa?: { owner: string; signature: Hex; contract?: Hex }, cosign = false): { stateDiff: Record<string, string>; signatures: Hex; cosigners?: { signature: Hex; signer: string }[] } | null {
   const ascending = [...before.owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
   const own = ecdsa && ascending.includes(ecdsa.owner.toLowerCase()) ? ecdsa.owner.toLowerCase() : undefined;
   const signers = (own ? [own, ...ascending.filter(o => o !== own).slice(0, Number(before.threshold) - 1)] : ascending.slice(0, Number(before.threshold)))
     .sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
   if (signers.length < Number(before.threshold) || !/^0x[0-9a-f]{64}$/i.test(hash)) return null;
   const approving = signers.filter(o => o !== own);
+  // `cosign`: the other owners sign too, each with a stand-in signature of its own that the replaced ecrecover
+  // attributes to it (stubSignature(k): up to fifteen of them), as owners do who sign a Safe transaction off-chain.
+  // Nothing in the Safe's storage is touched, and whatever else reads the signatures (a guard that checks them
+  // itself) finds signatures: one on Sepolia answered InvalidSignatures() to an approved hash where an owner's
+  // signature belonged, and the transaction it then let through was previewed as failing (2026-11-23).
+  if (cosign && own && approving.length <= 15) {
+    const cosigners = approving.map((signer, k) => ({ signature: stubSignature(k + 1), signer }));
+    return { stateDiff: {}, cosigners, signatures: safeSignatures(signers.map(o => o === own ? { owner: o, signature: ecdsa!.signature, ...(ecdsa!.contract && { contract: ecdsa!.contract }) } : { owner: o, signature: cosigners.find(c => c.signer === o)!.signature })) };
+  }
   return {
     stateDiff: Object.fromEntries(approving.map(o => [keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [hash, keccak256(`0x${word(o)}${word(APPROVED_HASHES_SLOT)}` as Hex)])), `0x${word(1n)}`])),
     signatures: safeSignatures(signers.map(o => o === own ? { owner: o, signature: ecdsa!.signature, ...(ecdsa!.contract && { contract: ecdsa!.contract }) } : { owner: o, signature: `0x${word(o)}${word(0n)}01` as Hex })),
@@ -335,12 +346,14 @@ const SUBMITTER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
  * in that state too, so the approvals stand in for the owners it has there and the configuration is compared like
  * with like.
  */
-export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt; stateOverrides?: SimulationRequest['stateOverrides'] } = {}): Promise<SafeRun | null> {
+export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt; stateOverrides?: SimulationRequest['stateOverrides']; replayed?: { receipt: ReplayContext['receipt']; ownTimestamp?: bigint } } = {}): Promise<SafeRun | null> {
   const rpc = deps.rpc, sim = deps.simulator;
   if (!rpc?.has(chainId) || !sim?.simulateBatch) return null;
   const safe = t.safe.toLowerCase();
   const given = opts.stateOverrides && Object.keys(opts.stateOverrides).length ? opts.stateOverrides : undefined;
-  const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, 'latest', ...(given ? [given] : [])])) as Hex;
+  // (On the block the run is on, where one is named: a replayed transaction's parent, whose Safe had other owners
+  // and another nonce than now.)
+  const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, opts.at?.block ?? 'latest', ...(given ? [given] : [])])) as Hex;
   const before = config(await Promise.all(reads(safe).map(r => call(r.data).catch(() => undefined))));
   if (!before || before.partial) return null; // not a readable Safe
   let exec: SimulationRequest, signedByPasskey: SafeRun['passkey'] = false;
@@ -361,10 +374,10 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     // A Zeal passkey owner checks the passkey's P-256 signature itself, in Solidity, with no verifier to stand in at:
     // it signs a real assertion, by a passkey made up for the run (see zealStandIn).
     const zeal = verifiers ? null : await zealStandIn(deps, chainId, executor, { safe, hash, singleton: before.singleton, entryPoints: SAFE_OP_ENTRY_POINTS });
-    const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE, ...(passkey ? { contract: safeWebAuthnStub() } : zeal && { contract: zeal.contract }) });
+    const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE, ...(passkey ? { contract: safeWebAuthnStub() } : zeal && { contract: zeal.contract }) }, true);
     if (!approvals) return null;
     const { stateDiff, signatures } = approvals;
-    const standIn = ecdsaStandIn(executor, hash, chainId);
+    const standIn = ecdsaStandIn(executor, hash, chainId, approvals.cosigners);
     if (passkey) signedByPasskey = true;
     else if (zeal) signedByPasskey = 'inline';
     exec = { chainId, from: executor, account: safe, to: safe, value: 0n, accessList: [...standIn.accessList!, ...(passkey?.accessList ?? []), ...(zeal?.warm ?? []).map(address => ({ address, storageKeys: [] }))],
@@ -376,13 +389,23 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   let requests = batch(exec);
   let results = await sim.simulateBatch(requests);
   if (!results) return null;
+  // A mined transaction replayed has its receipt to go by: where the node's run isn't what the receipt says, the
+  // local EVM runs it too, and its run is the one taken if it is what happened (as the replay itself does:
+  // src/evm/transaction.ts).
+  if (opts.replayed && sim.trace && !compareWithReceipt(results[0], opts.replayed.receipt).matches) {
+    const own = opts.replayed.ownTimestamp;
+    const exact = own === undefined ? requests : requests.map(r => (r.at ? { ...r, at: { ...r.at, header: { ...r.at.header, ownTimestamp: own } } } : r));
+    const local = await sim.trace(exact, { budgetMs: 60_000 }).catch(() => null);
+    if (local && local.length === requests.length && compareWithReceipt(local[0], opts.replayed.receipt).matches) { results = local; requests = exact; }
+  }
   // Once more at the price the transaction would pay now, as a single transaction is (src/evm/transaction.ts). A
   // Safe's refund in the native token is gas × min(its gasPrice, tx.gasprice): nothing at no price. If the price
   // changes what the Safe ends up with, the priced run is the one shown. Whoever submits a signed SafeTx can pay
   // for its gas (the owner standing in for them may hold nothing); a transaction as sent runs on its sender's own
   // balance, and a node that refuses it there leaves the first run standing.
   let priced: SafeRun['priced'];
-  if (results[0].status === 'success' && !results[0].limited && results[0].gasUsed !== undefined) {
+  // (Not a replayed transaction, which ran at the price it paid.)
+  if (results[0].status === 'success' && !results[0].limited && results[0].gasUsed !== undefined && !opts.replayed) {
     try {
       const price = await expectedGasPrice({ chainId, from: exec.from, to: exec.to, data: exec.data as Hex, value: exec.value }, deps);
       const pricedRequests = batch({ ...exec, gas: exec.gas ?? roomFor(results[0].gasUsed), gasPrice: price?.gasPrice, baseFee: price?.baseFee,

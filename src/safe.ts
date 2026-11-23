@@ -12,7 +12,7 @@ import { netChanges } from './evm/effects.ts';
 import type { AdapterEnv, Decoded } from './evm/common.ts';
 import type { AssetChange, SimulationRequest, SimulationResult, Warning } from './types.ts';
 import { configChanges, simulateSafeExecution, type SafeConfig } from './safe-sim.ts';
-import { pinLatest } from './block.ts';
+import { namedBlock, pinLatest } from './block.ts';
 import { tracePreviews, noTrace, type TraceEnv } from './evm/trace.ts';
 
 /** Safe's libraries (safe-global/safe-deployments v1.3.0 canonical and EIP-155, v1.4.1, v1.5.0), deployed on every chain here. */
@@ -249,13 +249,16 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   return { title, summary: `The Safe ${shortAddress(safe)} ${calls.length === 1 ? (t.operation === 1 ? 'delegatecalls' : 'makes this call') : `runs ${calls.length} calls${label ? ` through ${label}` : ''}`}: ${titles.slice(0, 3).join('; ')}${calls.length > 3 ? '; …' : ''}.`, status, assetChanges };
 }
 
-/** A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes (and a note, unless it added its own), or why it fails. */
-export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: Pick<AdapterEnv, 'deps'>, b: PreviewBuilder, how: string): Promise<SafeRan | { reverted: string } | null> {
+/**
+ * A simulated Safe execution as describeSafeTx takes it: the Safe's balance changes (and a note, unless it added its own),
+ * or why it fails. `whole`: `how` is the whole note (a run that wasn't on the latest state: where it ran is said there).
+ */
+export async function safeOutcome(sim: SimulationResult, safe: string, chainId: number, env: Pick<AdapterEnv, 'deps'>, b: PreviewBuilder, how: string, whole = false): Promise<SafeRan | { reverted: string } | null> {
   if (sim.status === 'reverted') return { reverted: sim.revertReason ?? '' };
   // The probe measures the call's sender, which isn't the Safe here: its balance reads don't apply.
   if (sim.limited || sim.basis === 'state') return null;
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
-  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: `${how} ${simulationNote(sim)}`, succeeded: true, ...(sim.logs && { logs: sim.logs }) };
+  return { assetChanges: await netChanges(sim.transfers, { chainId, from: safe }, env.deps, b, basis), note: whole ? how : `${how} ${simulationNote(sim)}`, succeeded: true, ...(sim.logs && { logs: sim.logs }) };
 }
 
 /** Warns of what a simulated transaction changes in the Safe's configuration, unless a static warning already says it. */
@@ -272,11 +275,20 @@ const COVERED: Record<string, string> = { safe_owners_added: 'safe_owners_change
  */
 export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder, opts: { executor?: string | null; request?: SimulationRequest }): SafeExecution {
   return async () => {
+    // A transaction as sent runs where the transaction does: a mined one replayed, where it ran (its block's
+    // earlier transactions first, at the price it paid), and one on a block that was named, there. On the latest
+    // state, a replayed Safe transaction was said to be expected to fail (GS026: the Safe's nonce has moved on since,
+    // so its signatures are of another hash), beside a replay that matched its receipt. (A signature is previewed
+    // on the latest state, whatever block is named.)
+    const replay = opts.request ? env.context.replay : undefined;
+    const named = opts.request && !replay ? await namedBlock(env.context, env.deps.rpc, chainId) : undefined;
     // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
-    const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
+    const at = replay ? { ...replay.at, before: replay.before } : named?.at ?? (env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined);
+    const request = replay ? { ...opts.request!, gasPrice: replay.gasPrice, ...(replay.receipt.gasForL1 && { gasForL1: replay.receipt.gasForL1 }) } : opts.request;
     // With the state the caller set for the simulation (context.stateOverrides), beneath the stand-ins'.
-    const overrides = callerOverrides(env.context);
-    const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(at && { at }), ...(overrides && { stateOverrides: overrides }) });
+    const overrides = replay ? undefined : callerOverrides(env.context);
+    const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(request && { request }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }),
+      ...(replay && { replayed: { receipt: replay.receipt, ...(replay.ownTimestamp !== undefined && { ownTimestamp: replay.ownTimestamp }) } }) });
     if (!run) return null;
     warnOverridden(b, overrides);
     if (env.context.trace && run.requests) {
@@ -293,8 +305,25 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
       const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
       b.note(`What this does for the Safe depends on the gas price of the transaction that runs it${t.gasPrice > 0n && /^0x0{40}$/.test(t.gasToken) ? " (its gas refund is paid at the lower of its own gas price and the transaction's)" : ''}: it was simulated at the price a transaction would pay now, ${gwei(run.priced.gasPrice)}${run.priced.tip ? ` (the base fee plus a ${gwei(run.priced.tip)} tip)` : ''}. At another price the result can differ.`);
     }
-    return safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, opts.request
+    const outcome = await safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, replay
+      ? 'What it did for the Safe: execTransaction run again as it was sent, where it ran, so guards, the gas refund and delegatecalls run as they did.'
+      : named ? `Simulated as sent, on the state after block ${named.number.toLocaleString('en-US')}: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they would have.`
+      : opts.request
       ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'
-      : `Simulated as the Safe runs it: execTransaction itself, with the transaction approved by enough owners (the Safe's approvedHashes standing in for their signatures${run.passkey === 'inline' ? ", and for the signing owner's passkey a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : run.passkey ? ", and for the signing owner's passkey a stand-in WebAuthn assertion, which the P-256 verifier it is checked with accepts after running its real check" : ''}), so guards, the gas refund and delegatecalls run as they will.`);
+      : `Simulated as the Safe runs it: execTransaction itself, signed by enough owners (stand-ins for their signatures, each taken as its owner's${run.passkey === 'inline' ? ", and for the signing owner's passkey a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : run.passkey ? ", and for the signing owner's passkey a stand-in WebAuthn assertion, which the P-256 verifier it is checked with accepts after running its real check" : ''}), so guards, the gas refund and delegatecalls run as they will.`, !!(replay || named));
+    // A signature's run is sent from the signer. What it takes out of the signer's own account (not the Safe's) is
+    // told too: a contract the Safe calls that can spend the signer's tokens (an allowance to the Safe, or to what
+    // it runs), or that charges whoever submits the transaction. A Safe transaction on Arbitrum One had the Safe
+    // pull 1,140 USDC from its owner and repay the Safe's loan with them (2026-11-23): nothing in the Safe's own
+    // balances says so.
+    const signer = !opts.request && opts.executor && run.requests?.[0]?.from.toLowerCase() === opts.executor.toLowerCase() ? opts.executor.toLowerCase() : undefined;
+    if (outcome && 'assetChanges' in outcome && signer && signer !== t.safe.toLowerCase() && run.result.balancesRead) {
+      const own = (await netChanges(run.result.transfers.filter(x => x.asset !== 'native'), { chainId, from: signer }, env.deps, b, 'simulated_state')).filter(c => c.direction === 'out');
+      if (own.length) {
+        b.warn('caution', 'safe_signer_pays', `Simulated as sent from your account, the transaction also takes ${own.map(c => `${c.amount} ${c.symbol}`).join(', ')} out of your own account (${shortAddress(signer)}), which isn't the Safe's: something it calls can spend your tokens (an allowance you gave), or charges whoever submits it.`);
+        outcome.assetChanges.push(...own);
+      }
+    }
+    return outcome;
   };
 }

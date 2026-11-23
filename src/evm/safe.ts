@@ -14,7 +14,10 @@ export const safeExecAdapter: Adapter = async (tx, env) => {
   const b = new PreviewBuilder();
   const t = { safe: tx.to, to, value, data, operation, safeTxGas, baseGas, gasPrice, gasToken, refundReceiver };
   // The transaction as sent, signatures and all, with the Safe's configuration read again after it.
-  const r = await describeSafeTx(t, tx.chainId, env, b, viaExecTransaction(t, tx.chainId, env, b, { request: { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value } }));
+  const r = await describeSafeTx(t, tx.chainId, env, b, viaExecTransaction(t, tx.chainId, env, b, {
+    // (A mined transaction replayed, on the gas limit it had: the Safe's call gets what that leaves it.)
+    request: { chainId: tx.chainId, from: tx.from, to: tx.to, data: tx.data, value: tx.value, ...(env.context.replay && tx.gas !== undefined && { gas: tx.gas }) },
+  }));
   b.detail('Owner signatures', String(Math.floor((signatures.length - 2) / 130)));
   return decoded({ title: `Execute a Safe transaction: ${r.title}`, summary: r.summary, decoder: 'safe_exec', status: r.status, b, ...(r.assetChanges.length && { assetChanges: r.assetChanges }) });
 };
