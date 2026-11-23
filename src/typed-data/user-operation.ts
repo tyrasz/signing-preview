@@ -198,12 +198,12 @@ export function nodeFailed(b: PreviewBuilder, e: NodeFailure): void {
 }
 
 /**
- * Where the operation's calls failed with no revert data without a reservoir for new state and succeeded with one
- * (from Amsterdam on: OperationRun's `reservoir`, src/erc4337-sim.ts withStateReservoir), what the run shown is; or
- * (`reservoir` undefined) a run after an earlier operation that needed one (OperationRun's `afterReservoir`).
+ * What the run shown is where the bundle's gas limit is known and its calls, which fail without the gas it carries
+ * for new state, succeed with it (from Amsterdam on: OperationRun's `reservoir`, src/erc4337-sim.ts
+ * withStateReservoir); or (`reservoir` undefined) a run after an earlier operation that ran so (`afterReservoir`).
  */
 export const reservoirNote = (reservoir: bigint | undefined): string =>
-  `${reservoir !== undefined ? `Its calls fail, with no revert reason, unless the bundle's transaction carries gas beyond the ${ORDINARY_GAS_CAP.toLocaleString('en-US')} a transaction's code runs on, which from Amsterdam on pays for new state only, out of sight of the gas the EntryPoint counts: the chain's node gives all of a simulation's gas to the code, so there they failed. The run shown is the local EVM's, on a transaction carrying ${reservoir.toLocaleString('en-US')} gas more for new state` : "Run in the local EVM after the operations before it, one of which fails without gas for new state beyond what a transaction's code runs on (see it), as it runs with that gas"}, over this chain's latest state in the next block. Balance changes were read from the state before and after; the final result can differ if state changes before inclusion.`;
+  `${reservoir !== undefined ? `Its calls fail, with no revert reason, on the ${ORDINARY_GAS_CAP.toLocaleString('en-US')} gas a transaction's code runs on alone: from Amsterdam on, gas a transaction carries beyond that pays for new state only, out of sight of the gas the EntryPoint counts, and the chain's node gives all of a simulation's gas to the code. The run shown is the local EVM's, on the bundle's own gas limit, ${reservoir.toLocaleString('en-US')} of it for new state` : "Run in the local EVM after the operations before it, one of which fails without the gas its bundle carries for new state (see it), as it runs with that gas"}, over this chain's latest state in the next block. Balance changes were read from the state before and after; the final result can differ if state changes before inclusion.`;
 
 /**
  * Reports a whole-operation simulation (see simulateOperation) and returns its balance changes. Null when the
@@ -291,13 +291,15 @@ export async function reportRun(run: OperationRun | null, u: Pick<Operation, 'se
   const checked = how.deploys && validators.length === 1 && !run.account?.signatureFailed ? 1 : 0;
   if (validators.length > checked) b.warn('caution', 'userop_installs_validator', `The operation installs ${validators.length === 1 ? 'a validator module' : `${validators.length} validator modules`} on the account (${validators.map(m => shortAddress(m.module)).join(', ')}): a validator decides whose signatures the account takes, so whoever it names can sign the account's operations${how.deploys && validators.length > 1 ? ", not only the key the account's validation checked here" : ''}.`);
   if (run.postOpReverted) b.warn('caution', 'userop_postop_reverts', `The paymaster's charge after the calls (postOp) fails: ${run.postOpReverted}. The EntryPoint then undoes the calls, and the operation still pays ${native(run.paid)} for gas.`);
-  else if (run.reservoir !== undefined) b.warn('caution', 'userop_needs_state_gas', `The operation's calls succeed only in a bundle whose transaction carries gas beyond the ${ORDINARY_GAS_CAP.toLocaleString('en-US')} a transaction's code runs on, for the new state they write (from Amsterdam on, such gas pays for new state only). A bundler that sizes its transaction from the operation's own gas limits, under that, sees them run out of gas: the operation is still included, and ${pm ? 'the paymaster' : 'the account'} pays for the gas.`);
   else if (!run.executed) {
     // An account run through executeUserOp (IAccountExecute) is handed the whole operation, signature included: one
     // that reads data from its signature while running the calls fails on a stand-in where the signed one needn't
     // (seen on Ethereum: accounts with 700-byte signatures whose calls failed only in the simulation).
     const readsSignature = u.callData?.startsWith('0x8dd7712f') && run.standIn !== 'wallet';
     b.warn('caution', 'userop_execution_reverts', `The operation's calls fail when the EntryPoint runs them${run.revertReason ? `: ${run.revertReason}` : ''}. It can still be included, and ${pm ? 'the paymaster' : 'the account'} pays ${native(run.paid)} for the gas.${readsSignature ? " The account runs them through executeUserOp, which is handed the whole operation, its signature included: here a stand-in, so if the account reads data from its signature while running them, the signed operation can fare differently." : ''}`);
+    // From Amsterdam on: they fail for want of gas for the new state they write, which a bundle can carry
+    // (OperationRun's stateGasShort). Whether it does is its bundler's choice, so the failing run is the one shown.
+    if (run.stateGasShort) b.warn('caution', 'userop_needs_state_gas', `The operation's calls run out of gas for the new state they write. They go through only in a bundle whose transaction carries gas beyond the ${ORDINARY_GAS_CAP.toLocaleString('en-US')} a transaction's code runs on: from Amsterdam on such gas pays for new state only, and whether a bundle carries it is its bundler's choice (on Sepolia some do and some don't). What is shown is the operation in a bundle that carries none.`);
   }
   const basis = sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
   const changes = await netChanges(sim.transfers, { chainId, from: sender }, env.deps, b, basis);
@@ -412,7 +414,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
     try {
       // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
       const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
-      const run = await simulateOperation({ chainId, entryPoint, sender, nonce, initCode: onChainInit, callData: calls ?? '0x', callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
+      const run = await simulateOperation({ ...(env.context.bundleGas !== undefined && { bundleGas: env.context.bundleGas }), chainId, entryPoint, sender, nonce, initCode: onChainInit, callData: calls ?? '0x', callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
         maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(before && { before }), ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(u.supertransaction && { supertransaction: u.supertransaction }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
       if (run) warnOverridden(b, overrides);
       if (run?.origin?.by === 'factory') deployer = run.origin.bundler;

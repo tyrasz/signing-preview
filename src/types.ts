@@ -280,6 +280,14 @@ export interface PreviewContext {
     expiresAfter?: number | null;
   };
   /**
+   * For an ERC-4337 operation (a UserOperation or a SafeOp): the gas limit of the transaction it is bundled in, where
+   * that is known (a mined operation's, replayed). From Amsterdam on, gas a transaction holds beyond 16,777,216 pays
+   * for new state only, so whether an operation's calls have the gas for the state they write can depend on it: with
+   * none given, such an operation is shown as it runs in a bundle carrying none, and the preview says what one that
+   * does would change (userop_needs_state_gas).
+   */
+  bundleGas?: bigint;
+  /**
    * ERC-4337 operations for EntryPoint v0.6 and v0.7 are signed as their bare hash (personal_sign of
    * getUserOpHash). To decode one, the caller supplies the operation, as bundlers' RPC carries it. It is hashed as
    * the EntryPoint does and checked against the message being signed. A `signature` in it (the wallet's stub for
@@ -399,6 +407,13 @@ export interface SimulationRequest {
    * operation's own limits (AA95), whatever the operation goes on to use.
    */
   gasFloor?: bigint;
+  /**
+   * For a call that runs first in a replayed block (BlockAt.before): how its transaction came out on the chain. A
+   * simulator uses it to tell a call the simulation's own stand-ins made fail (RpcSimulator, roomForStandIns).
+   */
+  mined?: { succeeded: boolean };
+  /** Set by a simulator on an earlier call it gave more gas than its own limit (roomForStandIns), so that it does once. */
+  roomy?: boolean;
   /**
    * Arbitrum: the gas the chain took out of `gas` for the transaction's L1 data before running it (a replay's, from
    * its receipt's gasUsedForL1). The chain's node works it out itself; the local EVM runs on the rest.

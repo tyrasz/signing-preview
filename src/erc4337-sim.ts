@@ -1838,7 +1838,7 @@ async function okxDeployStub(c: StubContext, factoryData: Hex): Promise<Stub[]> 
 // q nodes (so a signature grows 32 bytes with each one the key makes). On success the leaf and the wallet's action
 // nonce are consumed. Neither half exists before signing, and the hash-based one can't be stood in for at a
 // precompile: the stand-in is a real SHRINCS signature by a key made up for the run, on the leaf the wallet's own
-// key signs next (its lowest unused one), with that key's commitment set in the wallet's storage for the run.
+// key signs next (the one after the highest it has used), with that key's commitment set in the wallet's storage for the run.
 // Validation then runs every check and hash the real signature's does (the verifier's chain walks, the tree path,
 // the leaf's bitmap word), for the gas it will use, and the ECDSA half is the usual stand-in for owner().
 export const SHRINCS_IMPLEMENTATION = '0xc4e4652898bb12c4f0ba9083829689b1963135e7';
@@ -1901,8 +1901,11 @@ async function shrincsStub(c: StubContext): Promise<Stub[]> {
     const maxSignatures = Number((budget >> 32n) & 0xffffffffn);
     const word = async (i: number) => BigInt(String(await c.deps.rpc!.call(c.chainId, 'eth_call', [{ to: c.sender, data: encodeFunctionData({ abi: SHRINCS, functionName: 'statefulLeafBitmapWord', args: [BigInt(i)] }) }, 'latest'])));
     const words = await Promise.all(Array.from({ length: Math.min(Math.floor(maxSignatures / 256) + 1, 16) }, (_, i) => word(i)));
+    // The leaf after the highest one used: the wallet counts up, and leaves whose operations never landed stay unused
+    // behind it. (A wallet on Base, 2026-11-21, had used 2 to 57 but for 42 and signed on 58: stood in for on its
+    // lowest unused leaf, 1, whose path up the tree is one node where 58's is 58, it came out 6.4% low in gas.)
     let leaf = 1;
-    while (leaf <= maxSignatures && leaf < words.length * 256 && (words[leaf >> 8] >> BigInt(leaf & 255)) & 1n) leaf++;
+    for (let i = 1; i < words.length * 256; i++) if ((words[i >> 8] >> BigInt(i & 255)) & 1n) leaf = i + 1;
     // A key with no leaf left can't sign (the wallet rotates first): nothing to stand in for.
     if (leaf > maxSignatures || leaf >= words.length * 256) return [{ signature: STUB_SIGNATURE }];
     const { signature, commitment } = shrincsStandIn(c.sender, c.chainId, hash, { keyVersion, nonce, maxSignatures }, leaf, STUB_SIGNATURE);
@@ -2928,6 +2931,11 @@ export const daimoAccepting = verifierAccepting;
 export interface OperationInput {
   /** The block to simulate on top of and the header to run in, instead of the latest and the simulator's own (src/block.ts). */
   at?: BlockAt;
+  /**
+   * The gas limit of the transaction the operation is bundled in, where it is known (a replay's: PreviewContext.bundleGas).
+   * From Amsterdam on, what it holds over ORDINARY_GAS_CAP pays for the new state the calls write (withStateReservoir).
+   */
+  bundleGas?: bigint;
   chainId: number; entryPoint: string; sender: string; nonce: bigint;
   /** As the EntryPoint receives it: factory + factoryData, or (v0.8) the EIP-7702 marker + initialization data. */
   initCode: Hex; callData: Hex;
@@ -3031,10 +3039,16 @@ export interface OperationRun {
   /** What to say where the account accepts the stand-in (Stub's `note`). */
   note?: string;
   /**
-   * From Amsterdam on: the gas the run's transaction carried for new state beyond the cap on what its code runs on
-   * (its reservoir), where the calls failed without it and succeeded with it, run in the local EVM (withStateReservoir).
+   * From Amsterdam on, with the bundle's gas limit known (OperationInput.bundleGas): the gas it carries for new state
+   * beyond the cap on what its code runs on (its reservoir), where the calls failed without it and succeed with it,
+   * run in the local EVM (withStateReservoir). This run is that one.
    */
   reservoir?: bigint;
+  /**
+   * From Amsterdam on, with no bundle gas limit known: the calls, which failed here, succeed in a bundle that carries
+   * gas for new state (withStateReservoir). This run is the one that failed.
+   */
+  stateGasShort?: boolean;
   /** Run in the local EVM after an earlier operation that needed that reservoir (see runOperation). */
   afterReservoir?: boolean;
   /** The `after` calls' results. */
@@ -3122,11 +3136,16 @@ async function suggestedTip(deps: Dependencies, chainId: number): Promise<bigint
  */
 export async function simulateOperation(op: OperationInput, deps: Dependencies): Promise<OperationRun | null> {
   const run = await simulateOperationOnce(op, deps);
-  // Calls that failed with no revert data (as running out of gas does), from Amsterdam on: run again with the
-  // reservoir for new state its bundler can give them (withStateReservoir), once, with the stand-in finally chosen.
+  // Calls that failed with no revert data (as running out of gas does), from Amsterdam on: whether they run with the
+  // gas for new state a bundle can carry (withStateReservoir), once, with the stand-in finally chosen.
   if (!run || run.rejected || run.executed || run.postOpReverted || run.revertReason) return run;
-  const again = await withStateReservoir(op, deps, run);
-  return again ? { ...run, ...again, revertReason: undefined, postOpReverted: undefined } : run;
+  // The bundle's gas limit known (a replay's), and no more than the code runs on: it carried none, and they failed.
+  if (op.bundleGas !== undefined && op.bundleGas <= ORDINARY_GAS_CAP) return run;
+  const again = await withStateReservoir(op, deps, run, op.bundleGas ?? 2n * ORDINARY_GAS_CAP);
+  if (!again) return run;
+  // On the bundle's own limit, that run is the operation's. On no known limit, whether a bundle carries the gas is
+  // its bundler's choice: the run that fails stands, and says that such a bundle gets its calls through.
+  return op.bundleGas !== undefined ? { ...run, ...again, revertReason: undefined, postOpReverted: undefined, reservoir: op.bundleGas - ORDINARY_GAS_CAP } : { ...run, stateGasShort: true };
 }
 
 async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Promise<OperationRun | null> {
@@ -3454,25 +3473,27 @@ export const ORDINARY_GAS_CAP = 16_777_216n;
  * From Amsterdam on (Ethereum and Sepolia, where a block's header says so), new state is metered apart (EIP-8037):
  * what a transaction's gas limit holds over ORDINARY_GAS_CAP is a reservoir that new state is paid from first, out of
  * sight of gasleft(), so not out of an operation's own call gas limit, and not counted in the gas the EntryPoint
- * charges it. Bundlers on Sepolia send operations so: of 22 operations of one Safe app (2026-11-19), the 15 signed
- * with a call gas limit of 700,000 came in bundles of 17.9-18.0 million gas, writing 1.2 million gas of new state from
- * the reservoir, and were charged 450,574 gas; the 7 signed with 2,000,000 came in bundles of 2.4 million, paid for the
- * same state out of their call gas, and were charged 1,677,857. The chain's node gives a simulation's whole gas as
- * ordinary gas (src/evm/transaction.ts), so the first kind ran out of gas in its calls there, where on the chain it
- * succeeded. Where an operation's calls failed with no revert data (as running out of gas does: a revert with a reason
- * isn't this), they are run again in the local EVM (which meters the reservoir), on the same stand-in, on a
- * transaction carrying ORDINARY_GAS_CAP more for new state: if they succeed so, that run is the operation's, as a
- * bundler sending it so runs it, and the preview warns that one sending it without the reservoir sees the calls fail
- * (userop_needs_state_gas). The reservoir's size changes nothing the account pays, so long as it holds the new state.
- * (The node's run was at its latest block, the local EVM's at the latest when it runs: a block apart at most.)
+ * charges it. Some bundlers on Sepolia send operations so and some don't. Of 22 operations of one Safe app
+ * (2026-11-19), the 15 signed with a call gas limit of 700,000 came in bundles of 17.9-18.0 million gas, wrote 1.2
+ * million gas of new state mostly from the reservoir, and succeeded, charged 450,574 to 524,737 gas (the less the
+ * reservoir held, the more: what it doesn't hold comes out of the call's own gas). Operations of other accounts
+ * signed with a call gas limit of 542,672 came from another bundler in bundles of 2 million gas (2026-11-21 and 22,
+ * a dozen): their calls ran out of gas on the chain, as they do in the node's simulation, which gives all of a
+ * simulation's gas to the code (src/evm/transaction.ts).
+ *
+ * So where an operation's calls failed with no revert data (as running out of gas does: a revert with a reason isn't
+ * this), they are run again in the local EVM (which meters the reservoir), on the same stand-in, on a transaction of
+ * `gas`: the bundle's own limit where it is known (OperationInput.bundleGas), else ORDINARY_GAS_CAP twice over, to
+ * learn whether a reservoir gets them through. The run, where they succeed so; null otherwise. (The node's run was at
+ * its latest block, the local EVM's at the latest when it runs: a block apart at most.)
  */
-async function withStateReservoir(op: OperationInput, deps: Dependencies, run: OperationRun): Promise<OperationRun | null> {
+async function withStateReservoir(op: OperationInput, deps: Dependencies, run: OperationRun, gas: bigint): Promise<OperationRun | null> {
   const sim = deps.simulator, [req] = run.requests ?? [], version = SIMULATIONS[op.entryPoint.toLowerCase()]?.version;
   if ((op.chainId !== 1 && op.chainId !== 11155111) || !sim?.trace || !req || !version) return null;
   const at = op.at ?? await pinLatest(deps.rpc, op.chainId);
   if (!at?.header.amsterdam) return null;
-  const again = await runOperation({ ...op, at }, localSimulator(sim), { ...req, gas: 2n * ORDINARY_GAS_CAP }, version).catch(() => null);
-  return again && !again.rejected && again.executed && !again.postOpReverted ? { ...again, reservoir: ORDINARY_GAS_CAP } : null;
+  const again = await runOperation({ ...op, at }, localSimulator(sim), { ...req, gas }, version).catch(() => null);
+  return again && !again.rejected && again.executed && !again.postOpReverted ? again : null;
 }
 
 /** The local EVM as a simulator (Simulator.trace's runs, without their traces' use). */

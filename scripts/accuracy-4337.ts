@@ -346,7 +346,7 @@ const CHROME_EXTRA_KEY = Buffer.from('"other_keys_can_be_added_here"').toString(
 /** How many operations of one bundle are replayed (each after the bundle's earlier ones). */
 const BUNDLE_MAX = 5;
 /** A block's receipts, read once for the operations replayed from it. */
-const BLOCK_RECEIPTS = new Map<string, Promise<{ transactionHash: string; gasUsed?: Hex; effectiveGasPrice?: Hex; logs: { address: string; topics: string[]; data: string }[] }[]>>();
+const BLOCK_RECEIPTS = new Map<string, Promise<{ transactionHash: string; status?: Hex; gasUsed?: Hex; effectiveGasPrice?: Hex; logs: { address: string; topics: string[]; data: string }[] }[]>>();
 const blockReceipts = (number: Hex) => {
   if (!BLOCK_RECEIPTS.has(number)) { BLOCK_RECEIPTS.set(number, call('eth_getBlockReceipts', [number])); if (BLOCK_RECEIPTS.size > 64) BLOCK_RECEIPTS.delete(BLOCK_RECEIPTS.keys().next().value!); }
   return BLOCK_RECEIPTS.get(number)!;
@@ -420,16 +420,19 @@ async function replay(item: string): Promise<void> {
     try {
       const receipts = new Map((await blockReceipts(r.blockNumber)).map(x => [x.transactionHash.toLowerCase(), x]));
       const bundle = (t: { to: string | null; input: string }) => Object.values(ENTRY_POINTS).includes(t.to?.toLowerCase() ?? '') || /^0x(1fad948c|765e827f)/.test(t.input);
+      // How each came out on the chain: the preview's stand-ins for the signature hold for the whole simulated block, and
+      // one of these they make fail on its own gas limit is given room for them (src/simulation.ts, roomForStandIns).
+      const mined = (rc: { status?: Hex }) => (rc.status !== undefined && { mined: { succeeded: BigInt(rc.status) === 1n } });
       pricedBefore = earlier.map((t, i) => {
         const rc = receipts.get(t.hash.toLowerCase());
         if (!rc?.gasUsed || !rc.effectiveGasPrice || SYSTEM.has(t.type)) return before[i];
         const roomy = BigInt(rc.gasUsed) * 13n / 10n + 30_000n;
-        return { ...before[i], gas: roomy < BigInt(t.gas) && !bundle(t) ? roomy : BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice) };
+        return { ...before[i], gas: roomy < BigInt(t.gas) && !bundle(t) ? roomy : BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice), ...mined(rc) };
       });
       ownBefore = earlier.map((t, i) => {
         const rc = receipts.get(t.hash.toLowerCase());
         if (!rc?.effectiveGasPrice || SYSTEM.has(t.type)) return before[i];
-        return { ...before[i], gas: BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice), ...(t.accessList?.length && { accessList: t.accessList }) };
+        return { ...before[i], gas: BigInt(t.gas), gasPrice: BigInt(rc.effectiveGasPrice), ...(t.accessList?.length && { accessList: t.accessList }), ...mined(rc) };
       });
     } catch { pricedBefore = ownBefore = undefined; }
   }
@@ -515,7 +518,9 @@ async function replay(item: string): Promise<void> {
   const simulator = { simulate: (q: SimulationRequest) => node.simulate(atBundlePrice(q)), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(qs.map(atBundlePrice)),
     ...(state && LOCAL && { trace: (qs: SimulationRequest[]) => LOCAL.trace(qs.map(q => warmed({ ...atBundlePrice(q), at: replayAt() }))) }) };
   const deps = { ...liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
-  const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000 };
+  // (The bundle's gas limit is part of what the operation met: from Amsterdam on, what it holds over the cap pays for
+  // new state, and an operation's calls can fail or not by it. A preview can't know it; a replay does.)
+  const context = { chainId: CHAIN, now: Number(block.timestamp) * 1000, bundleGas: BigInt(tx.gas) };
   // A node that no longer serves the parent block's state (Ethereum's public RPC keeps about 128 blocks) would leave
   // the preview reading nothing: the operation is skipped rather than replayed on missing state.
   let code: string;
@@ -974,7 +979,7 @@ async function replay(item: string): Promise<void> {
     }
   }
   rows.push({
-    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && !state && { leftOut }), ...(prefixUnpriced && !prefixDropped && { prefixUnpriced }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
+    hash, block: n, kind, sender, ...(relayed && { relayedBy: relayed }), ...(ops.length > 1 && { bundle: { size: ops.length, index } }), signersTried: tried, ...(prefixDropped && { prefix: `dropped: ${prefixDropped}` }), ...(leftOut && !prefixDropped && !state && { leftOut }), ...(prefixUnpriced && !prefixDropped && { prefixUnpriced }), ...(node.roomGiven && !prefixDropped && !prefixUnpriced && { earlierRoomy: node.roomGiven }), outcome: succeeded === !reverts, ...(minedOutcome && { minedOutcome }), succeeded, whole, standIn: whole ? (p.decoding.notes.some(x => STAND_IN_REJECTED.test(x)) ? 'rejected' : walletStub ? (p.decoding.notes.some(x => /in the form of the wallet's own|in the account's own form|in the form of the signer's last signature/.test(x)) ? 'validated' : 'as signed') : supplied && !enabling(p) ? 'as signed' : 'validated') : undefined,
     ...(supplied && !walletStub && { enableMode: ENABLE_DUMMIES ? 'dummies' : 'signed' }), ...(walletStub && { walletStub: true }), ...(session && { session, sessionValidator }), ...(ownSimple && { meeOwner: true }),
     // Where the account rejected the stand-in, who the preview says signs it instead (the stand-in's own reason).
     ...(whole && rejectedWhy(p) && { rejectedWhy: rejectedWhy(p) }),
@@ -1112,6 +1117,7 @@ say(`${rows.length} operations (${count(r => !bundled(r))} alone in their bundle
 if (PREFIX && count(r => !!r.prefix)) say(`  (for ${count(r => !!r.prefix)}, without the block's earlier transactions: ${[...new Set(rows.filter(r => r.prefix).map(r => String(r.prefix).replace(/^dropped: /, '')))].join('; or ')})`);
 if (PREFIX && count(r => !!r.leftOut)) say(`  (for ${count(r => !!r.leftOut)}, of more than 400 earlier transactions in the block only the last 400 and those that logged the bundle's contracts' events ran first: ${rows.reduce((sum, r) => sum + Number(r.leftOut ?? 0), 0)} left out)`);
 if (PREFIX && count(r => !!r.prefixUnpriced)) say(`  (for ${count(r => !!r.prefixUnpriced)}, the block's earlier transactions ran without their gas limits and prices: with the signature's stand-ins in place one of them couldn't pay on its own limit)`);
+if (PREFIX && count(r => !!r.earlierRoomy)) say(`  (for ${count(r => !!r.earlierRoomy)}, earlier transactions of the block that the signature's stand-ins made fail on their own gas limits were given gas for them: ${rows.reduce((sum, r) => sum + Number(r.earlierRoomy ?? 0), 0)})`);
 say(`  outcome ${count(r => r.outcome === true)}/${rows.length} | ran whole ${count(r => r.whole === true)} (the stand-in validated for ${count(r => r.standIn === 'validated')}) | not simulated at all (the node refused) ${count(r => !!r.notSimulated)} | not whole, the node failed it ${count(r => !!r.nodeFailed)} | SafeOps ${count(r => r.kind === 'SafeOp')}`);
 if (count(r => !!r.session)) say(`  session keys' operations (SmartSession): ${count(r => !!r.session)} (${['OwnableValidator', 'K1MeeValidator'].map(v => `through ${v} ${count(r => r.sessionValidator === v)}`).join(', ')}), the stand-in validated for ${count(r => !!r.session && r.standIn === 'validated')}`);
 if (count(r => !!r.meeOwner)) say(`  owners' operations through their own K1MeeValidator in simple mode (Biconomy Nexus): ${count(r => !!r.meeOwner)}, the stand-in validated for ${count(r => !!r.meeOwner && r.standIn === 'validated')}`);

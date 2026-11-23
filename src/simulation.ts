@@ -145,7 +145,32 @@ export function fitGas(earlier: SimulationRequest[], used: bigint[] | undefined,
  * same-second block a second late, calls differ from their receipts by a little on any gas limit.
  */
 export function hadRoom(earlier: SimulationRequest[], fitted: SimulationRequest[], results: { gasUsed?: string }[] | undefined): boolean {
-  return !!results && results.length >= fitted.length && fitted.every((r, i) => r.gas === earlier[i]?.gas || (results[i].gasUsed !== undefined && BigInt(results[i].gasUsed!) * 11n / 8n <= r.gas!));
+  // (A call on its own limit, or given more than it for the stand-ins' cost, roomForStandIns, has all it had.)
+  return !!results && results.length >= fitted.length && fitted.every((r, i) => r.gas === undefined || earlier[i]?.gas === undefined || r.gas >= earlier[i].gas! || (results[i].gasUsed !== undefined && BigInt(results[i].gasUsed!) * 11n / 8n <= r.gas));
+}
+
+/** The gas an earlier call is given over its own limit where the calls' stand-ins made it fail (roomForStandIns). */
+const STAND_IN_ROOM = 100_000n;
+/**
+ * A replayed block's earlier calls with room for what the reported calls' stand-ins cost them, or undefined where none
+ * needs it. State overrides hold for the whole simulated block, so a precompile moved to make room for a stand-in
+ * (ecrecover, for a signature that doesn't exist yet: src/erc4337-sim.ts) is moved for the earlier calls as well:
+ * each of their own calls to it goes on from the stand-in to the address it moved to, cold for them where the
+ * precompile is always warm, about 2,700 gas more. A transaction sent on just the gas it needs then fails. On
+ * Ethereum (block 26,454,693, 2026-11-20) a payout checked against one signature used 169,256 gas of a limit of
+ * 191,339 that its contract's own check of the gas left holds it to: with the stand-in it ran out of gas (it runs
+ * on 171,954 where nothing limits it), the transfer its sender made next had nothing to send, and the node refused
+ * the block ("insufficient funds for gas * price + value").
+ *
+ * `failed`: the earlier calls that failed in a run having used all their gas (their indexes), or 'unpaid' where the node refused the block for
+ * one that couldn't pay (which isn't said). Those that succeeded on the chain (SimulationRequest.mined) on a gas limit
+ * are given STAND_IN_ROOM more: what the stand-ins cost, not gas their code had on the chain to spend otherwise, so
+ * one that still fails, or that failed on the chain, is left as it is.
+ */
+export function roomForStandIns(earlier: SimulationRequest[], reqs: SimulationRequest[], failed: number[] | 'unpaid'): SimulationRequest[] | undefined {
+  if (!reqs.some(r => Object.values(r.stateOverrides ?? {}).some(o => o.movePrecompileToAddress))) return undefined;
+  const short = (r: SimulationRequest, i: number) => !!r.mined?.succeeded && r.gas !== undefined && !r.roomy && (failed === 'unpaid' || failed.includes(i));
+  return earlier.some(short) ? earlier.map((r, i) => (short(r, i) ? { ...r, gas: r.gas! + STAND_IN_ROOM, roomy: true } : r)) : undefined;
 }
 
 /**
@@ -234,6 +259,8 @@ export class RpcSimulator implements Simulator {
   private forkBudgetMs: number;
   private traceBudgetMs: number;
   private replay?: RpcSimulatorOptions['replay'];
+  /** How many of a replayed block's earlier calls a run of this simulator's was given room for the calls' stand-ins (roomForStandIns). */
+  roomGiven = 0;
   /** Chains whose RPC answered "method not found" for eth_simulateV1 (e.g. HyperEVM's public RPC). */
   private noSimulate = new Set<number>();
   /** ...and that also ignore eth_call state overrides: only success or failure can be checked. */
@@ -361,6 +388,16 @@ export class RpcSimulator implements Simulator {
       await new Promise(r => setTimeout(r, 500));
       return this.simulateAt(reqs, fitted, true);
     }
+    // The stand-ins the calls install can make an earlier transaction fail that succeeded on the chain, and the node
+    // refuse the block for one after it that then can't pay: asked again with room for them (roomForStandIns).
+    const earlierNow = fitted ?? this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [];
+    const roomy = before.length ? roomForStandIns(earlierNow, reqs, body.error
+      ? (/insufficient funds for gas \* price \+ value/i.test(body.error.message ?? '') ? 'unpaid' : [])
+      // (Failed having used all it was given: what running short of gas looks like, where a revert gives the rest back.)
+      : (body.result?.[0]?.calls ?? []).slice(0, before.length).flatMap((c, i) => (c.status !== '0x1' && earlierNow[i]?.gas !== undefined && BigInt(c.gasUsed ?? 0) >= earlierNow[i].gas! ? [i] : []))) : undefined;
+    // (Where the node won't run them so, a node that adds up the calls' gas limits for one, this run stands.)
+    const again = roomy && await this.simulateAt(reqs, roomy, retried).catch(() => null);
+    if (again) { this.roomGiven = Math.max(this.roomGiven, roomy!.filter(r => r.roomy).length); return again; }
     // A node that adds up the gas limits of the block's calls and won't have them pass the block's (fitGas): the
     // earlier transactions are asked again on less gas each, and none may have run short on it (hadRoom).
     if (/block gas limit exceeded/i.test(body.error?.message ?? '') && before.length) {

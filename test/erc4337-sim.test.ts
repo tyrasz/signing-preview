@@ -1343,7 +1343,7 @@ test('The caller’s state and a run’s own merge account by account and slot b
   assert.deepEqual(mergeOverrides(given, undefined), { '0x0000000000000000000000000000000000000001': { code: '0xbb', balance: '0x5' }, [account]: { balance: '0x9', stateDiff: { [`0x${'0'.repeat(63)}1`]: '0x07', [`0x${'0'.repeat(63)}2`]: '0x08' } }, [BOB]: { code: '0xcc' } });
 });
 
-test('From Amsterdam on, calls that fail only for want of gas for new state run again with the reservoir bundlers give them', async () => {
+test('From Amsterdam on, calls that fail only for want of gas for new state: shown failing, with what a bundle carrying that gas changes; succeeding on a bundle known to carry it', async () => {
   // Sepolia, 2026-11-19: a Safe app's operations signed with a call gas limit of 700,000 came in bundles of about 18
   // million gas, whose 1.2 million over the cap paid for the new state their calls wrote; the chain's node, which
   // gives a simulation's whole gas to the code, ran them out of gas (5 of 433 replayed, shown failing). Here an
@@ -1367,22 +1367,36 @@ test('From Amsterdam on, calls that fail only for want of gas for new state run 
       simulator: new RpcSimulator({ [SEPOLIA]: URL_ }, { fetchImpl, fork: new ForkSimulator({ [SEPOLIA]: URL_ }, { fetchImpl }) }) };
   };
   const op = operation({ callData: call('execute', [WRITER, 0n, '0x']), callGasLimit: numberToHex(200_000n) });
-  const ask = (deps_: Dependencies) => previewRequest({ method: 'personal_sign', params: [userOpHash(readOperation(op, '0.7')!, EP, SEPOLIA, '0.7'), OWNER] }, { now: NOW, chainId: SEPOLIA, userOperation: { entryPoint: EP, operation: op } }, deps_);
+  const ask = (deps_: Dependencies, bundleGas?: bigint) => previewRequest({ method: 'personal_sign', params: [userOpHash(readOperation(op, '0.7')!, EP, SEPOLIA, '0.7'), OWNER] }, { now: NOW, chainId: SEPOLIA, userOperation: { entryPoint: EP, operation: op }, ...(bundleGas !== undefined && { bundleGas }) }, deps_);
+  // Whether its bundle carries that gas is the bundler's choice (on Sepolia, 2026-11-21 and 22, a dozen operations
+  // came in bundles of 2 million gas and failed on the chain, where the preview had shown them succeeding): with no
+  // bundle known, the operation is shown as it runs in one that carries none, and the preview says what would change.
   const p = await ask(on(true));
   const notes = p.decoding.notes.join(' | ');
-  assert.ok(!codes(p).includes('userop_execution_reverts'), `${codes(p)} ${notes}`);
-  assert.match(notes, /Its calls fail, with no revert reason, unless the bundle's transaction carries gas beyond the 16,777,216 a transaction's code runs on, which from Amsterdam on pays for new state only/);
-  assert.match(notes, /The run shown is the local EVM's, on a transaction carrying 16,777,216 gas more for new state, over this chain's latest state in the next block/);
-  // Whether the bundle carries it is the bundler's choice: the preview says what happens if it doesn't.
-  assert.match(p.warnings.find(w => w.code === 'userop_needs_state_gas')?.message ?? '', /succeed only in a bundle whose transaction carries gas beyond the 16,777,216 .* sees them run out of gas: the operation is still included, and the account pays for the gas/);
+  assert.ok(codes(p).includes('userop_execution_reverts'), `${codes(p)} ${notes}`);
+  assert.match(p.warnings.find(w => w.code === 'userop_needs_state_gas')?.message ?? '', /run out of gas for the new state they write\. They go through only in a bundle whose transaction carries gas beyond the 16,777,216 .* whether a bundle carries it is its bundler's choice .* What is shown is the operation in a bundle that carries none\./);
+  assert.ok(!/The run shown is the local EVM's/.test(notes), notes);
+  // A bundle known to carry it (a replay's: its transaction's gas limit): the run on that limit is the operation's.
+  const known = await ask(on(true), 16_777_216n + 2_000_000n);
+  const knownNotes = known.decoding.notes.join(' | ');
+  assert.ok(!codes(known).includes('userop_execution_reverts') && !codes(known).includes('userop_needs_state_gas'), `${codes(known)} ${knownNotes}`);
+  assert.match(knownNotes, /Its calls fail, with no revert reason, on the 16,777,216 gas a transaction's code runs on alone: .* The run shown is the local EVM's, on the bundle's own gas limit, 2,000,000 of it for new state, over this chain's latest state in the next block/);
   // The new state, paid from the reservoir, isn't in the gas the EntryPoint counts (234,960 here, with validation and
   // the 50,000 of pre-verification): well under the 1.1 million it costs.
-  const used = BigInt(String(p.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+  const used = BigInt(String(known.details.find(d => d.label === 'Gas used (simulated)')?.raw));
   assert.ok(used < 400_000n, String(used));
+  // What the bundle carries for it doesn't hold it all: the rest comes out of the call's own gas, and is counted.
+  // (The ten slots cost 1,169,536; of 1,120,000 carried, 49,536 is left to the call: 284,496 against 234,960.)
+  const partly = await ask(on(true), 16_777_216n + 1_120_000n);
+  const partlyUsed = BigInt(String(partly.details.find(d => d.label === 'Gas used (simulated)')?.raw));
+  assert.ok(!codes(partly).includes('userop_execution_reverts') && partlyUsed > used + 30_000n, `${codes(partly)} ${partlyUsed} ${used}`);
+  // A bundle known to carry none (its limit under the cap): they fail, and nothing more is said.
+  const none = await ask(on(true), 2_000_000n);
+  assert.ok(codes(none).includes('userop_execution_reverts') && !codes(none).includes('userop_needs_state_gas'), codes(none).join());
   // Before Amsterdam (headers without the hash) there is no reservoir: the calls fail, as they would on-chain.
   const q = await ask(on(false));
   assert.ok(codes(q).includes('userop_execution_reverts'), codes(q).join());
-  assert.ok(!q.decoding.notes.some(n => /Its calls fail, with no revert reason, unless/.test(n)));
+  assert.ok(!codes(q).includes('userop_needs_state_gas') && !(await ask(on(false), 16_777_216n + 2_000_000n)).decoding.notes.some(n => /The run shown is the local EVM's/.test(n)));
   // Calls that revert with a reason failed for that reason, not for gas: not run again.
   const REVERTER = '0x00000000000000000000000000000000c0de8038';
   await chain.putCode(REVERTER, '0x600160005260206000fd');

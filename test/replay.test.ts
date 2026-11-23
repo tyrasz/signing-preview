@@ -13,7 +13,7 @@ import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, keepsToBlock, nod
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
-import { fitGas, hadRoom, NATIVE_LOG_ADDRESS, parseLogs, RpcSimulator } from '../src/simulation.ts';
+import { fitGas, hadRoom, NATIVE_LOG_ADDRESS, parseLogs, roomForStandIns, RpcSimulator } from '../src/simulation.ts';
 import { builtinTokens, StaticTokenRegistry } from '../src/chains.ts';
 import { CHAINLINK_FEEDS, ChainlinkPrices } from '../src/prices.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, TraceCall } from '../src/types.ts';
@@ -850,4 +850,51 @@ test('An Arbitrum replay whose call measures its gas: run again on the node with
   const q = await replayTransaction({ chainId: 8453, hash: TXS[3].hash }, {}, { tokens: new StaticTokenRegistry(), rpc: arb, simulator: far } as unknown as Dependencies);
   assert.equal(q.replay?.matches, false);
   assert.deepEqual(asked, [100_000n]);
+});
+
+test('An earlier transaction the calls’ stand-ins make fail, where it succeeded on the chain, is given room for them and the block run again', async () => {
+  // Ethereum, block 26,454,693: a payout checked against a signature (169,256 gas of its 191,339) ran out of gas once
+  // ecrecover was moved for a UserOperation's stand-in signature, and its sender's next transfer couldn't pay: the node
+  // refused the block. Here a node on which the first earlier call fails, using all its gas, when a precompile is
+  // moved and it has under 250,000; and which refuses the block when a second earlier call follows a failed first.
+  const MOVED = '0x0000000000000000000000000000000000ec0001', ECRECOVER = '0x0000000000000000000000000000000000000001';
+  const sent: { gas?: string }[][] = [];
+  let refuseRoomy = false;
+  const node = (earlier: number) => (async (_u: string, init: { body: string }) => {
+    const [{ blockStateCalls: [{ calls, stateOverrides }] }] = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: { gas?: string }[]; stateOverrides?: Record<string, { movePrecompileToAddress?: string }> }[] }] }).params;
+    sent.push(calls);
+    const moved = Object.values(stateOverrides ?? {}).some(o => o.movePrecompileToAddress);
+    if (refuseRoomy && BigInt(calls[0].gas ?? 0) > 191_339n) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38015, message: "Block gas limit exceeded by the block's transactions" } }));
+    const short = moved && BigInt(calls[0].gas ?? 0) < 250_000n;
+    if (short && earlier > 1) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38014, message: 'insufficient funds for gas * price + value: have 61660069215600 want 781197817361895' } }));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map((c, i) => (i === 0 && short ? { status: '0x0', gasUsed: c.gas, returnData: '0x', logs: [], error: { message: 'out of gas' } } : { status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] })) }] }));
+  }) as unknown as typeof fetch;
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 60_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const payout = (succeeded: boolean): SimulationRequest => ({ chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: '0x', value: 0n, gas: 191_339n, gasPrice: 5n, mined: { succeeded } });
+  const transfer: SimulationRequest = { chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: '0x', value: 7n, gas: 25_000n, gasPrice: 5n, mined: { succeeded: true } };
+  const operation = (before: SimulationRequest[], standIn = true): SimulationRequest => ({ chainId: 1, from: ALICE.toLowerCase(), to: BOB, data: '0x', value: 0n, at: { block: '0x10', header, before },
+    ...(standIn && { stateOverrides: { [ECRECOVER]: { code: '0x00', movePrecompileToAddress: MOVED } } }) });
+  const run = async (before: SimulationRequest[], standIn = true) => { sent.length = 0; return (await new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl: node(before.length) }).simulateBatch([operation(before, standIn)]))![0]; };
+  const firstGas = () => sent.map(calls => BigInt(calls[0].gas ?? 0));
+
+  // The node refuses the block for the transfer that can't pay: both earlier calls, which succeeded on the chain, get
+  // 100,000 more, and the operation runs.
+  assert.equal((await run([payout(true), transfer])).status, 'success');
+  assert.deepEqual([firstGas().slice(0, 2), BigInt(sent[1][1].gas!)], [[191_339n, 291_339n], 125_000n]);
+  // The payout alone fails without a word from the node: it alone is given room.
+  assert.equal((await run([payout(true)])).status, 'success');
+  assert.deepEqual(firstGas().slice(0, 2), [191_339n, 291_339n]);
+  // One that failed on the chain too is left on its own limit, as is any where no stand-in is installed.
+  await run([payout(false)]);
+  assert.ok(firstGas().every(g => g === 191_339n), String(firstGas()));
+  await run([payout(true)], false);
+  assert.ok(firstGas().every(g => g === 191_339n), String(firstGas()));
+  // A node that won't run the block with the room given: the first run stands.
+  refuseRoomy = true;
+  assert.equal((await run([payout(true)])).status, 'success');
+  assert.deepEqual(firstGas().slice(0, 2), [191_339n, 291_339n]);
+  assert.ok(firstGas().slice(2).every(g => g === 191_339n), String(firstGas()));
+  // The room is for what the stand-ins cost: given to those that failed, once.
+  assert.deepEqual(roomForStandIns([payout(true), transfer], [operation([])], [0])!.map(r => [r.gas, r.roomy]), [[291_339n, true], [25_000n, undefined]]);
+  assert.equal(roomForStandIns(roomForStandIns([payout(true)], [operation([])], [0])!, [operation([])], [0]), undefined);
 });
