@@ -936,3 +936,28 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   assert.deepEqual(roomForStandIns([payout(true), transfer], [operation([])], [0])!.map(r => [r.gas, r.roomy]), [[291_339n, true], [25_000n, undefined]]);
   assert.equal(roomForStandIns(roomForStandIns([payout(true)], [operation([])], [0])!, [operation([])], [0]), undefined);
 });
+
+test('Room found for a block’s earlier transactions in two steps is remembered whole', async () => {
+  // Two earlier calls that succeeded on the chain. Under a moved precompile the first runs out on under 250,000 gas;
+  // the second, once the first has run, on under 100,000. The first run finds the first short, then the second: three
+  // simulated blocks. What it remembers is both, so the block's next run starts with both and is one.
+  const MOVED = '0x0000000000000000000000000000000000ec0001', ECRECOVER = '0x0000000000000000000000000000000000000001';
+  const sent: bigint[][] = [];
+  const node = (async (_u: string, init: { body: string }) => {
+    const [{ blockStateCalls: [{ calls }] }] = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: { gas?: string }[] }[] }] }).params;
+    const gas = calls.map(c => BigInt(c.gas ?? 0));
+    sent.push(gas.slice(0, 2));
+    const firstShort = gas[0] < 250_000n, secondShort = !firstShort && gas[1] < 100_000n;
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map((c, i) => ((i === 0 && firstShort) || (i === 1 && secondShort) ? { status: '0x0', gasUsed: c.gas, returnData: '0x', logs: [], error: { message: 'out of gas' } } : { status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] })) }] }));
+  }) as unknown as typeof fetch;
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 60_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest[] = [191_339n, 50_000n].map(gas => ({ chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: '0x', value: 0n, gas, gasPrice: 5n, mined: { succeeded: true } }));
+  const operation = (): SimulationRequest => ({ chainId: 1, from: ALICE.toLowerCase(), to: BOB, data: '0x', value: 0n, at: { block: '0x10', header, before: earlier }, stateOverrides: { [ECRECOVER]: { code: '0x00', movePrecompileToAddress: MOVED } } });
+  const simulator = new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl: node });
+  assert.equal((await simulator.simulateBatch([operation()]))![0].status, 'success');
+  assert.deepEqual(sent.slice(0, 3), [[191_339n, 50_000n], [291_339n, 50_000n], [291_339n, 150_000n]]);
+  assert.equal(simulator.roomGiven, 2);
+  sent.length = 0;
+  assert.equal((await simulator.simulateBatch([operation()]))![0].status, 'success');
+  assert.ok(sent.length > 0 && sent.every(g => g[0] === 291_339n && g[1] === 150_000n), JSON.stringify(sent.map(g => g.map(String))));
+});
