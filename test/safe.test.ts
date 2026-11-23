@@ -843,13 +843,15 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
       simulateBatch: async rs => { batches.push(rs); return rs.map((r, i) => (node === 'short of gas' && i === 0 ? { status: 'reverted' as const, source: 'mock', gasUsed: 80_000n, revertReason: 'GS013', transfers: [] } : ok(r, i))); },
       trace: async rs => { traced.push(rs); return rs.map(ok); },
     } });
-  const send = (with_: Dependencies) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SAFE, data, gas: '0x30d40', chainId: '0x1' }] }, { now: NOW, replay } as never, with_);
+  const ACCESS = [{ address: USDC, storageKeys: [`0x${'00'.repeat(32)}`] }];
+  const send = (with_: Dependencies, where: Record<string, unknown> = replay) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: SAFE, data, gas: '0x30d40', accessList: ACCESS, chainId: '0x1' }] }, { now: NOW, replay: where } as never, with_);
   const p = await send(d('as the receipt'));
   assert.ok(!codes(p).includes('safe_tx_reverts'));
   // The Safe's run: on the parent block after the block's earlier transactions, at the price paid, on the gas limit
   // the transaction had; its reads of the Safe on the parent block too; and no second run at today's price.
   const [exec] = batches[0];
   assert.deepEqual([exec.at?.block, exec.at?.before?.length, exec.gasPrice, exec.gas, exec.from], ['0x10', 1, 9n, 200_000n, alice]);
+  assert.deepEqual(exec.accessList, ACCESS, 'with the access list it was sent with: its gas is the receipt\'s only with it');
   assert.equal(batches.length, 1);
   assert.ok(tags.length > 0 && tags.every(t => t === '0x10'), 'the Safe is read on the parent block');
   assert.match(p.decoding.notes.join(' '), /What it did for the Safe: execTransaction run again as it was sent, where it ran/);
@@ -860,6 +862,48 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   const q = await send(d('short of gas'));
   assert.ok(!codes(q).includes('safe_tx_reverts'));
   assert.equal(traced.some(rs => rs[0].data === data && rs.length === batches[0].length), true);
+  // An execTransaction nested in the replayed transaction (a Safe transaction that runs another Safe's, a batch with
+  // one in it) isn't the replayed transaction: it runs in the block, but the receipt, the price and the gas limit
+  // are the other's. Held to the outer receipt it could never match, and the local EVM ran each one for nothing.
+  batches.length = 0; traced.length = 0;
+  const outer = { ...replay, call: { from: alice, to: '0x00000000000000000000000000000000000000ee', data: '0x12345678' } };
+  const nested = await send(d('short of gas'), outer);
+  const [inner] = batches[0];
+  assert.deepEqual([inner.at?.block, inner.gasPrice, inner.gas, inner.accessList], ['0x10', undefined, undefined, undefined]);
+  assert.equal(traced.some(rs => rs.length === batches[0].length), false);
+  assert.ok(codes(nested).includes('safe_tx_reverts'));
+  // (The replayed transaction itself, named: as above.)
+  batches.length = 0;
+  await send(d('as the receipt'), { ...replay, call: { from: alice, to: SAFE, data } });
+  assert.deepEqual([batches[0][0].gasPrice, batches[0][0].gas], [9n, 200_000n]);
+  // Where the Safe can't be read on the replayed block (a node that no longer has it), its calls aren't run on
+  // today's state instead: they were shown, "simulated at the latest block", beside a replay.
+  const singles: SimulationRequest[] = [];
+  const gone: Dependencies = { ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string) => { if (m === 'eth_call') throw new Error('missing trie node'); return '0x'; } },
+    simulator: { simulate: async r => { singles.push(r); return { status: 'success' as const, source: 'mock', gasUsed: 90_000n, logs: [LOG], transfers: [{ asset: USDC, from: SAFE, to: BOB.toLowerCase(), raw: 1_000_000_000n }] }; }, simulateBatch: async () => null } };
+  const unread = await send(gone);
+  assert.equal(singles.some(r => r.from === SAFE), false);
+  assert.doesNotMatch(unread.decoding.notes.join(' '), /Simulated as the Safe making the call/);
+});
+
+test('A SafeTx previewed with a trace: where the block named for it doesn’t answer, the Safe is read on the latest state, as its run is', async () => {
+  // The block is named only so that the trace is of the same run. A node that didn't answer for it left the Safe
+  // unread, and with it everything execTransaction's run says: a replaced singleton among it.
+  const alice = ALICE.toLowerCase(), word = (v: bigint) => enc([{ type: 'uint256' }], [v]);
+  const asked: unknown[] = [];
+  const d: Dependencies = { ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => {
+      if (m === 'eth_getBlockByNumber') return { number: '0x10', timestamp: '0x65000000', miner: ZERO, gasLimit: '0x3938700', baseFeePerGas: '0x7', mixHash: `0x${'00'.repeat(32)}` };
+      if (m !== 'eth_call') return '0x';
+      asked.push(p[1]);
+      if (p[1] !== 'latest') throw new Error('header not found');
+      return viewsOf([alice])((p[0] as { data: string }).data);
+    } },
+    simulator: { simulate: async () => null, simulateBatch: async rs => rs.map((r, i) => ({ status: 'success' as const, source: 'mock', transfers: [], returnData: i === 0 ? word(1n) : viewsOf([alice])(r.data) })) } };
+  const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ALICE, JSON.stringify(safeTx({}))] }, { now: NOW, trace: true }, d);
+  assert.ok(asked.some(t => t !== 'latest') && asked.includes('latest'), 'asked on the block named, then on the latest');
+  assert.match(p.decoding.notes.join(' '), /Simulated as the Safe runs it: execTransaction itself/);
 });
 
 test('A Safe transaction that spends more coin than the Safe holds runs again with the coin sent along, and says so', async () => {
@@ -883,9 +927,18 @@ test('A Safe transaction that spends more coin than the Safe holds runs again wi
   // The second run: the same call with the SafeTx's value, from a submitter who can afford it.
   assert.deepEqual(short.batches.map(b => b[0].value), [0n, E / 2n]);
   assert.ok(BigInt(short.batches[1][0].stateOverrides![alice].balance!) > E / 2n);
-  // A Safe that holds what it spends fails by itself, and so does one whose call fails with the coin too.
-  for (const other of [env(E, 'runs'), env(0n, 'fails')]) {
-    const q = await sign(spend, other.d);
-    assert.ok(codes(q).includes('safe_tx_reverts') && !codes(q).includes('safe_needs_coin'), codes(q).join());
-  }
+  // The Safe sends a delegatecall no coin, whatever it holds: the code run reads what the transaction carries. So
+  // a delegatecall that fails is tried with the value it names though the Safe holds as much, and says why.
+  const rich = env(E, 'runs');
+  const viaCode = await sign(spend, rich.d);
+  assert.match(viaCode.warnings.find(w => w.code === 'safe_needs_coin')?.message ?? '', /^With no coin sent along it fails: the code it runs as the Safe \(a delegatecall\) reads the coin the transaction carries/);
+  assert.deepEqual(rich.batches.map(b => b[0].value), [0n, E / 2n]);
+  // A plain call from a Safe that holds what it spends fails by itself: nothing more is tried. And so does one
+  // whose call fails with the coin too.
+  const paid = env(E, 'runs');
+  const q = await sign({ ...spend, operation: 0 }, paid.d);
+  assert.ok(codes(q).includes('safe_tx_reverts') && !codes(q).includes('safe_needs_coin'), codes(q).join());
+  assert.equal(paid.batches.length, 1);
+  const never = await sign(spend, env(0n, 'fails').d);
+  assert.ok(codes(never).includes('safe_tx_reverts') && !codes(never).includes('safe_needs_coin'), codes(never).join());
 });

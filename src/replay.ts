@@ -206,7 +206,7 @@ export async function replayContext(input: { chainId: number; hash: string }, de
   const chain = CHAINS[chainId];
   const time = Number(BigInt(block.timestamp));
   const replay: ReplayContext = {
-    at, before, earlier: earlier.length, gasPrice, ...(tx.blobVersionedHashes?.length && { blobVersionedHashes: tx.blobVersionedHashes, maxFeePerBlobGas: BigInt(tx.maxFeePerBlobGas ?? '0x1') }),
+    at, before, earlier: earlier.length, call: { from: tx.from.toLowerCase(), to: tx.to?.toLowerCase() ?? null, data: tx.input.toLowerCase() }, gasPrice, ...(tx.blobVersionedHashes?.length && { blobVersionedHashes: tx.blobVersionedHashes, maxFeePerBlobGas: BigInt(tx.maxFeePerBlobGas ?? '0x1') }),
     receipt: { status: receipt.status === '0x1' ? 'success' : 'reverted', gasUsed: gasUsed - (gasForL1 ?? 0n), ...(gasForL1 !== undefined && { gasForL1 }), logs: receipt.logs.map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data })) },
     info: {
       hash: tx.hash, block: number.toString(), index, time: new Date(time * 1000).toISOString(),

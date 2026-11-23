@@ -55,9 +55,12 @@ export interface SafeRun {
   priced?: { gasPrice: bigint; tip: bigint };
   /**
    * The run shown is one with the Safe transaction's own value sent along with execTransaction by whoever submits
-   * it: on the Safe's balance alone (`held`) the transaction fails.
+   * it: without it the transaction fails, on the Safe's balance alone (`held`, where that is less) or because the
+   * code a delegatecall runs reads the coin the transaction carries.
    */
   funded?: { value: bigint; held: bigint };
+  /** How many of the other owners were stood in for by an approval of the hash in the Safe's storage, not a signature (a threshold past sixteen: approvalsFor). */
+  approved?: number;
   /** What was simulated for `result` (execTransaction, then the configuration reads): for tracing it. */
   requests?: SimulationRequest[];
   /**
@@ -358,10 +361,14 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   const given = opts.stateOverrides && Object.keys(opts.stateOverrides).length ? opts.stateOverrides : undefined;
   // (On the block the run is on, where one is named: a replayed transaction's parent, whose Safe had other owners
   // and another nonce than now.)
-  const call = async (data: Hex) => String(await rpc.call(chainId, 'eth_call', [{ to: safe, data }, opts.at?.block ?? 'latest', ...(given ? [given] : [])])) as Hex;
+  // A block named only so that a trace is of the same run (not `required`) falls back to the latest state where
+  // the node doesn't answer for it, as the simulation does (src/simulation.ts): without that the Safe went unread,
+  // and with it everything execTransaction's run says (a replaced singleton among it).
+  const read = (data: Hex, tag: string) => rpc.call(chainId, 'eth_call', [{ to: safe, data }, tag, ...(given ? [given] : [])]).then(r => String(r) as Hex);
+  const call = async (data: Hex) => (opts.at && !opts.at.required ? read(data, opts.at.block).catch(() => read(data, 'latest')) : read(data, opts.at?.block ?? 'latest'));
   const before = config(await Promise.all(reads(safe).map(r => call(r.data).catch(() => undefined))));
   if (!before || before.partial) return null; // not a readable Safe
-  let exec: SimulationRequest, signedByPasskey: SafeRun['passkey'] = false;
+  let exec: SimulationRequest, signedByPasskey: SafeRun['passkey'] = false, approved = 0;
   if (opts.request) exec = { ...opts.request, account: safe, ...(given && { stateOverrides: mergeOverrides(given, opts.request.stateOverrides) }) };
   else {
     // The transaction's hash at the Safe's current nonce, as execTransaction computes it.
@@ -382,6 +389,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     const approvals = approvalsFor(before, hash, { owner: executor, signature: STUB_SIGNATURE, ...(passkey ? { contract: safeWebAuthnStub() } : zeal && { contract: zeal.contract }) }, true);
     if (!approvals) return null;
     const { stateDiff, signatures } = approvals;
+    approved = Object.keys(stateDiff).length;
     const standIn = ecdsaStandIn(executor, hash, chainId, approvals.cosigners);
     if (passkey) signedByPasskey = true;
     else if (zeal) signedByPasskey = 'inline';
@@ -414,7 +422,9 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
     try {
       const set = Object.entries(given ?? {}).find(([address]) => address.toLowerCase() === safe)?.[1].balance;
       const held = set !== undefined ? BigInt(set) : BigInt(String(await rpc.call(chainId, 'eth_getBalance', [safe, opts.at?.block ?? 'latest'])));
-      if (held < t.value) {
+      // (A delegatecall is sent no coin by the Safe, whatever it holds: the code run reads what the transaction
+      // carries, msg.value, so it is tried with the value named whenever it fails without.)
+      if (held < t.value || t.operation === 1) {
         const sent = batch({ ...exec, value: t.value, stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: `0x${(t.value + 10n ** 24n).toString(16)}` } } });
         const again = await sim.simulateBatch(sent);
         if (again && ran(again[0])) { results = again; requests = sent; exec = sent[0]; funded = { value: t.value, held }; }
@@ -441,7 +451,7 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   const result = results[0];
   // execTransaction returns false (and emits ExecutionFailure) when the call fails with safeTxGas or gasPrice set.
   const executed = ran(result);
-  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), ...(funded && { funded }), requests, ...(signedByPasskey && { passkey: signedByPasskey }) };
+  return { result, executed, before, after: result.status === 'success' ? config(results.slice(1).map(r => r.status === 'success' ? r.returnData as Hex : undefined)) : undefined, ...(priced && { priced }), ...(funded && { funded }), ...(approved && { approved }), requests, ...(signedByPasskey && { passkey: signedByPasskey }) };
 }
 
 const SAFE_FACTORY = parseAbi([

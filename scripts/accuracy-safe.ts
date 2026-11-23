@@ -5,8 +5,8 @@
 // the transaction goes on to do. Recent execTransaction calls sent to a Safe are rebuilt as the SafeTx an owner
 // signed (the owner that sent it, else one its signatures recover to, else the Safe's first), and previewed on the
 // state the transaction met: its parent block, its block's header and the block's earlier transactions (as a mined
-// transaction is replayed: src/replay.ts), at the price it paid, with the coin it carried (where the SafeTx doesn't
-// name it: what it names the preview sends along by itself, when the Safe holds less) and on its gas limit (with
+// transaction is replayed: src/replay.ts), at the price it paid, with the coin it carried (but for what a plain
+// call's SafeTx names where the Safe holds less: that the preview sends along by itself) and on its gas limit (with
 // room for the stand-ins). No signature of the transaction's is used: the preview stands in for them, as it does
 // before any exists.
 // Compared with the receipt:
@@ -27,7 +27,7 @@ import { replayContext, ReplayError } from '../src/replay.ts';
 import { readConfig, SAFE_SINGLETONS } from '../src/safe-sim.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import type { Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
-import { compareTokens, TRANSFER, type Compared } from './userop-tokens.ts';
+import { compareTokens, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), BLOCKS = Number(arg('blocks', '100')), FOLLOW = Number(arg('follow', '0')), MAX = Number(arg('max', '40'));
@@ -70,7 +70,7 @@ interface Row {
   preview: 'success' | 'fails' | 'not simulated';
   how?: string;
   /** `balance`: the Safe's balance change across the block, where the token's logs say another amount than the preview and the balance says the preview's. */
-  tokens: (Compared & { balance?: string })[];
+  tokens: (Compared & { balance?: string; unjudged?: string })[];
   native?: { actual: string; simulated: string };
   gas?: { actual: string; simulated: string };
   config: { actual: string[]; warned: string[] };
@@ -162,7 +162,11 @@ async function replay(hash: string): Promise<void> {
   const isExec = (q: SimulationRequest) => q.to?.toLowerCase() === safe && !!q.data?.startsWith(EXEC);
   // (Coin the SafeTx itself names is the preview's to find: a call that fails on the Safe's own balance runs again
   // with it sent along, src/safe-sim.ts. Only coin the signature doesn't name is put in here.)
-  const sent = BigInt(tx.value) === value ? 0n : BigInt(tx.value);
+  // And only a plain call's, where the Safe holds less than it spends: a Safe that could pay by itself was still
+  // sent the coin, which its balance across the block has, and a delegatecall's code may leave it unspent.
+  const carried = BigInt(tx.value);
+  const held = carried === value && operation === 0 ? await call<string>('eth_getBalance', [safe, parent]).then(b => BigInt(b), () => undefined) : undefined;
+  const sent = held !== undefined && held < value ? 0n : carried;
   const placed = (q: SimulationRequest): SimulationRequest => ({ ...q, at: q.at ?? at, ...(q.gasPrice !== undefined && { gasPrice: where.gasPrice }),
     ...(isExec(q) && { gas: q.gas ?? BigInt(tx.gas) + STAND_IN_ROOM, ...(sent > 0n && { value: sent, stateOverrides: { ...q.stateOverrides, [q.from.toLowerCase()]: { ...q.stateOverrides?.[q.from.toLowerCase()], balance: hex(sent * 2n + 10n ** 18n) } } }) }) });
   const runs: SimulationResult[] = [];
@@ -184,20 +188,10 @@ async function replay(hash: string): Promise<void> {
   // The Safe's tokens, where both ran the call (the preview of a call that fails shows what it asks for).
   const tokens: Row['tokens'] = actual === 'success' && preview === 'success' ? await compareTokens(own.logs, safe, p.assetChanges ?? [], tokenLike) : [];
   const abs = (x: bigint) => (x < 0n ? -x : x);
-  // (A share-based token's balance can move a base unit or two from what its Transfer logs: the preview reads balances.)
-  const off = (t: Compared) => abs(BigInt(t.actual) - BigInt(t.simulated)) > 2n;
-  // A token whose balance grows by itself (Aave's aTokens) logs the interest since the holder's last movement with
-  // the next one: a deposit of 9 logged 9.00057, a withdrawal of 0.02 logged 0.0141. The preview shows what the
-  // balance does, so where the logs differ the Safe's balance across the block is what it is held to (where no
-  // other transaction of the block moved the token for it), within the interest of a block.
-  for (const t of tokens.filter(t => off(t) && !t.account)) {
-    if (others.some(r => r.logs.some(l => l.address.toLowerCase() === t.token && l.topics[0] === TRANSFER && l.topics.slice(1).some(x => `0x${x.slice(26)}` === safe)))) continue;
-    try {
-      const [b0, b1] = await Promise.all([parent, hex(number)].map(async b => BigInt(String(await call('eth_call', [{ to: t.token, data: `0x70a08231${safe.slice(2).padStart(64, '0')}` }, b])))));
-      if (abs(b1 - b0 - BigInt(t.simulated)) <= (abs(b1 - b0) / 1_000_000n > 2n ? abs(b1 - b0) / 1_000_000n : 2n)) t.balance = (b1 - b0).toString();
-    } catch { /* a balance the node no longer has */ }
-  }
-  if (tokens.some(t => off(t) && t.balance === undefined)) differs.push('tokens');
+  // A token whose logs say another amount than the preview is held to the Safe's balance across the block (an
+  // aToken's logs carry its interest: scripts/userop-tokens.ts, heldToBalance).
+  await heldToBalance(tokens, safe, others, async (token, when) => BigInt(String(await call('eth_call', [{ to: token, data: `0x70a08231${safe.slice(2).padStart(64, '0')}` }, when === 'before' ? parent : hex(number)]))));
+  if (tokens.some(differsIn)) differs.push('tokens');
   // Its native coin: its balance across the block, where nothing else in the block touched the Safe (a Safe logs
   // what it receives, and sends only by a transaction or a module's, which it logs too).
   let native: Row['native'];
@@ -242,7 +236,7 @@ else {
     let next = head;
     while (Date.now() < until && rows.length < MAX) {
       head = Number(await call<string>('eth_blockNumber', []).catch(() => hex(head)));
-      // Newest first where it fell behind: the node's state for the older ones goes first.
+      // Where it fell behind, from twenty blocks back: the node's state for older ones is the first to go.
       if (head - next > 20) next = head - 20;
       for (; next <= head && rows.length < MAX; next++) await blockAt(next);
       await new Promise(r => setTimeout(r, 500));
@@ -257,6 +251,7 @@ const lines = [
   `${rows.length} Safe transactions on ${chainName(CHAIN)} previewed as the SafeTx an owner signed, where each ran${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
   `  outcome: ${judged.filter(r => !r.differs.includes('outcome')).length} of ${judged.length} as the Safe logged it (${judged.filter(r => r.actual === 'failure').length} of them a call that failed)`,
   `  tokens: ${rows.filter(r => r.tokens.length && !r.differs.includes('tokens')).length} of ${rows.filter(r => r.tokens.length).length} that moved the Safe's tokens move the receipt's amounts${rows.some(r => r.tokens.some(t => t.balance !== undefined)) ? ` (${rows.filter(r => r.tokens.some(t => t.balance !== undefined)).length} of them by the Safe's balance, where a token's logs carry its interest)` : ''}`,
+  ...(rows.some(r => r.tokens.some(t => t.unjudged)) ? [`  tokens not judged: in ${rows.filter(r => r.tokens.some(t => t.unjudged)).length}, a token whose logs say another amount than the preview and whose balance can't say (${[...new Set(rows.flatMap(r => r.tokens.map(t => t.unjudged).filter(Boolean)))].join('; ')})`] : []),
   `  native coin: ${rows.filter(r => r.native && !r.differs.includes('native')).length} of ${rows.filter(r => r.native).length} with the Safe's balance change across the block`,
   `  configuration: ${rows.filter(r => r.config.actual.length && !r.differs.includes('configuration')).length} of ${rows.filter(r => r.config.actual.length).length} that changed the Safe warn of each change`,
   ...(gasOff.length ? [`  gas (not judged: the stand-ins aren't the signatures that ran): median ${gasOff[Math.floor(gasOff.length / 2)].toFixed(2)}%, from ${gasOff[0].toFixed(2)}% to ${gasOff.at(-1)!.toFixed(2)}%`] : []),

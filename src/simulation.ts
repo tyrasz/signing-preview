@@ -417,7 +417,8 @@ export class RpcSimulator implements Simulator {
     let known = this.allowances.get(chainId);
     if (!known) {
       known = (this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [{ to: ALLOWANCE_PROBE }], stateOverrides: { [ALLOWANCE_PROBE]: { code: ENDLESS } } }], validation: false }, 'latest']) as Promise<{ result?: { calls?: RawCallResult[] }[] }>)
-        .then(body => { const c = body.result?.[0]?.calls?.[0]; return c && c.status !== '0x1' && BigInt(c.gasUsed) > 0n ? BigInt(c.gasUsed) : undefined; }, () => undefined);
+        // (An answer that doesn't read is no answer: thrown from here, it would be remembered as one and thrown again.)
+        .then(body => { try { const c = body?.result?.[0]?.calls?.[0]; return c && c.status !== '0x1' && BigInt(c.gasUsed) > 0n ? BigInt(c.gasUsed) : undefined; } catch { return undefined; } }, () => undefined);
       this.allowances.set(chainId, known);
       void known.then(v => { if (v === undefined) this.allowances.delete(chainId); });
     }
@@ -470,6 +471,8 @@ export class RpcSimulator implements Simulator {
       : (body.result?.[0]?.calls ?? []).slice(0, before.length).flatMap((c, i) => (ranShort(c, earlierNow[i]?.gas) ? [i] : []))) : undefined;
     // (Where the node won't run them so, a node that adds up the calls' gas limits for one, this run stands.)
     const again = roomy && await this.simulateAt(reqs, roomy, retried).catch(() => null);
+    // (A run that came back after fewer of the block's transactions, the node's allowance: not this list's.)
+    if (again?.some(r => r.earlierLeftOut)) return again;
     if (again) {
       this.roomGiven = Math.max(this.roomGiven, roomy!.filter(r => r.roomy).length);
       // Remembered where it is the block's own list with room and nothing else (not one cut to fit a node's gas,
@@ -508,18 +511,21 @@ export class RpcSimulator implements Simulator {
     // call after them is given what is left where that is under its own limit. On Ethereum's public node a Safe
     // transaction with a limit of 8,964,428 ran on the 8,153,736 left after its block's 41,846,264, and its call
     // ran out (GS013) where on the chain it had succeeded (2026-11-23; run on the parent block alone it came out
-    // as its receipt, to the gas). A call that failed on less than it asked for is run again after the earlier
-    // transactions that bear on it, as where the node refuses.
+    // as its receipt, to the gas). A call that ran out on less than it asked for is run again after the earlier
+    // transactions that bear on it, as where the node refuses. Only one that ran out (ranShort, on what was left):
+    // a call that fails on a fraction of its gas failed by itself, whatever the allowance had left, and after fewer
+    // of the block's transactions it could come out as something that didn't happen. And the narrowed run is kept
+    // only where such a call then runs: one that fails there too is shown as it failed after the whole block.
     if (before.length && reqs[0]?.at?.related && !this.replay?.(chainId) && results.some(r => r.status !== '0x1')) {
       const allowance = await this.allowance(url, chainId);
       let used = body.result![0].calls.slice(0, before.length).reduce((sum, c) => sum + BigInt(c.gasUsed), 0n);
-      const cut = allowance !== undefined && results.some((r, i) => {
-        const left = allowance - used;
+      const short = allowance === undefined ? [] : results.flatMap((r, i) => {
+        const left = allowance > used ? allowance - used : 1n;
         used += BigInt(r.gasUsed);
-        return r.status !== '0x1' && (reqs[i].gas !== undefined ? reqs[i].gas! > left : ranShort(r, left > 0n ? left : 1n));
+        return r.status !== '0x1' && (reqs[i].gas === undefined || reqs[i].gas! > left) && ranShort(r, left) ? [i] : [];
       });
-      const ran = cut ? await this.afterRelated(reqs, retried) : undefined;
-      if (ran) return ran;
+      const ran = short.length ? await this.afterRelated(reqs, retried) : undefined;
+      if (ran && short.some(i => ran[i]?.status === 'success')) return ran;
     }
     const parsed: SimulationResult[] = results.map(result => {
       const gasUsed = BigInt(result.gasUsed), peak = result.maxUsedGas ? BigInt(result.maxUsedGas) : undefined;

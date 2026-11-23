@@ -210,7 +210,9 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   }
   // Otherwise simulated from the Safe, in order, when every call is a plain call (a delegatecall can't be run that way),
   // with the state the caller set for the simulation (context.stateOverrides).
-  if (!ran && sim && calls.every(c => c.operation === 0)) {
+  // (Not in a replay: where the Safe couldn't be read on the replayed block, or its run there failed to come back,
+  // the calls on today's state are another transaction's, and the replay itself says what this one did.)
+  if (!ran && sim && calls.every(c => c.operation === 0) && !env.context.replay) {
     const overrides = callerOverrides(env.context);
     const reqs = calls.map((c, i) => ({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data, value: c.value, ...((decoded[i] as Decoded).watch?.length && { watch: (decoded[i] as Decoded).watch }), ...(overrides && { stateOverrides: overrides }) }));
     try {
@@ -273,7 +275,7 @@ const COVERED: Record<string, string> = { safe_owners_added: 'safe_owners_change
  * The SafeExecution that runs execTransaction itself (for a SafeTx signature, with the hash approved by enough
  * owners; for an execTransaction transaction, as sent) and reports what it changes in the Safe.
  */
-export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder, opts: { executor?: string | null; request?: SimulationRequest }): SafeExecution {
+export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, b: PreviewBuilder, opts: { executor?: string | null; request?: SimulationRequest; asSent?: Pick<SimulationRequest, 'gas' | 'accessList'> }): SafeExecution {
   return async () => {
     // A transaction as sent runs where the transaction does: a mined one replayed, where it ran (its block's
     // earlier transactions first, at the price it paid), and one on a block that was named, there. On the latest
@@ -284,14 +286,20 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     const named = opts.request && !replay ? await namedBlock(env.context, env.deps.rpc, chainId) : undefined;
     // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
     const at = replay ? { ...replay.at, before: replay.before } : named?.at ?? (env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined);
-    const request = replay ? { ...opts.request!, gasPrice: replay.gasPrice, ...(replay.receipt.gasForL1 && { gasForL1: replay.receipt.gasForL1 }) } : opts.request;
+    // The replayed transaction itself, or a call nested in it (a Safe transaction that runs another Safe's, a batch
+    // with one in it: their decoders come here with the same context). Only the first has the receipt to be held
+    // to, the price it paid, its gas limit and its access list: a nested one runs in the block, alone, as a later
+    // call's Safe transaction is run anywhere.
+    const own = !!replay && (!replay.call || (sameAddress(opts.request!.from, replay.call.from) && sameAddress(opts.request!.to, replay.call.to) && opts.request!.data.toLowerCase() === replay.call.data));
+    const request = own ? { ...opts.request!, ...opts.asSent, gasPrice: replay!.gasPrice, ...(replay!.receipt.gasForL1 && { gasForL1: replay!.receipt.gasForL1 }) } : opts.request;
     // With the state the caller set for the simulation (context.stateOverrides), beneath the stand-ins'.
     const overrides = replay ? undefined : callerOverrides(env.context);
-    const run = await simulateSafeExecution(t, chainId, env.deps, { ...opts, ...(request && { request }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }),
-      ...(replay && { replayed: { receipt: replay.receipt, ...(replay.ownTimestamp !== undefined && { ownTimestamp: replay.ownTimestamp }) } }) });
+    const run = await simulateSafeExecution(t, chainId, env.deps, { executor: opts.executor, ...(request && { request }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }),
+      ...(own && { replayed: { receipt: replay!.receipt, ...(replay!.ownTimestamp !== undefined && { ownTimestamp: replay!.ownTimestamp }) } }) });
     if (!run) return null;
     warnOverridden(b, overrides);
-    if (env.context.trace && run.requests) {
+    // (Not in a replay: the replayed transaction's own trace is the one shown, and has the time a replay's takes.)
+    if (env.context.trace && run.requests && !replay) {
       const traceEnv: TraceEnv = { chainId, account: t.safe.toLowerCase(), accountLabel: 'the Safe', deps: env.deps };
       const traces = await tracePreviews(run.requests.slice(0, 1), [run.result], traceEnv);
       if (traces?.[0]) b.trace = traces[0];
@@ -310,11 +318,13 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
       : named ? `Simulated as sent, on the state after block ${named.number.toLocaleString('en-US')}: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they would have.`
       : opts.request
       ? 'Simulated as sent: execTransaction with its signatures, so guards, the gas refund and delegatecalls run as they will.'
-      : `Simulated as the Safe runs it: execTransaction itself, signed by enough owners (stand-ins for their signatures, each taken as its owner's${run.passkey === 'inline' ? ", and for the signing owner's passkey a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : run.passkey ? ", and for the signing owner's passkey a stand-in WebAuthn assertion, which the P-256 verifier it is checked with accepts after running its real check" : ''}), so guards, the gas refund and delegatecalls run as they will.`, !!(replay || named));
+      : `Simulated as the Safe runs it: execTransaction itself, signed by enough owners (${run.approved ? `a stand-in for the signing owner's signature, and for the other ${run.approved} an approval of the transaction the Safe is given to hold: more than the sixteen signatures that can be stood in for` : "stand-ins for their signatures, each taken as its owner's"}${run.passkey === 'inline' ? ", and for the signing owner's passkey a WebAuthn assertion by a passkey made up for the run, which the owner's own P-256 check is given in place of its key" : run.passkey ? ", and for the signing owner's passkey a stand-in WebAuthn assertion, which the P-256 verifier it is checked with accepts after running its real check" : ''}), so guards, the gas refund and delegatecalls run as they will.`, !!(replay || named));
     // The run shown had the coin the Safe transaction spends sent along with it (SafeRun.funded).
     if (outcome && 'assetChanges' in outcome && run.funded) {
       const native = CHAINS[chainId]?.nativeSymbol ?? 'native', unit = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${native}`;
-      b.warn('caution', 'safe_needs_coin', `The Safe holds ${unit(run.funded.held)} and this spends ${unit(run.funded.value)}: on the Safe's own balance it fails. It was simulated with ${unit(run.funded.value)} sent along by whoever submits it (execTransaction takes coin with the call, as apps that fund a Safe's call in the same transaction send it): without that, it fails.`);
+      b.warn('caution', 'safe_needs_coin', run.funded.held < run.funded.value
+        ? `The Safe holds ${unit(run.funded.held)} and this spends ${unit(run.funded.value)}: on the Safe's own balance it fails. It was simulated with ${unit(run.funded.value)} sent along by whoever submits it (execTransaction takes coin with the call, as apps that fund a Safe's call in the same transaction send it): without that, it fails.`
+        : `With no coin sent along it fails: the code it runs as the Safe (a delegatecall) reads the coin the transaction carries, which the Safe's own balance isn't. It was simulated with the ${unit(run.funded.value)} it names sent along by whoever submits it (execTransaction takes coin with the call): without that, it fails.`);
     }
     // A signature's run is sent from the signer. What it takes out of the signer's own account (not the Safe's) is
     // told too: a contract the Safe calls that can spend the signer's tokens (an allowance to the Safe, or to what

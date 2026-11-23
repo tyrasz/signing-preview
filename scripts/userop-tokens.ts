@@ -104,3 +104,30 @@ export function keptEarlier(earlier: readonly { hash: string }[], receipts: Read
   const from = earlier.length - last;
   return [...related.filter(i => i < from).slice(-max), ...Array.from({ length: last }, (_, j) => from + j)];
 }
+
+/** Whether a compared token's amounts differ by more than a share token's rounding (a base unit or two). */
+export const offBy = (t: Compared): boolean => { const d = BigInt(t.actual) - BigInt(t.simulated); return (d < 0n ? -d : d) > 2n; };
+
+/**
+ * Compared tokens whose logs say another amount than the preview, held to the account's balance instead (`balance`
+ * is then set: its change across the block). A token whose balance grows by itself (Aave's aTokens and debt tokens)
+ * logs the interest since its holder's last movement with the next one: a deposit of 9 logged 9.00057, a withdrawal
+ * of 0.02 logged 0.0141. A preview shows what the balance does. Within the interest a block adds to the whole
+ * balance (a millionth of it: a position of a million at 4% a year grows 0.015 in twelve seconds, whatever moved).
+ * Where the balance can't say (another transaction of the block moved the token for the account, `others` being
+ * their receipts; or the node no longer has it), the token is `unjudged`, with why: not a difference.
+ */
+export async function heldToBalance(tokens: (Compared & { balance?: string; unjudged?: string })[], account: string, others: readonly { logs: readonly Log[] }[], balanceOf: (token: string, when: 'before' | 'after') => Promise<bigint>): Promise<void> {
+  const abs = (x: bigint) => (x < 0n ? -x : x);
+  for (const t of tokens.filter(t => offBy(t) && !t.account)) {
+    if (others.some(r => r.logs.some(l => l.address.toLowerCase() === t.token && l.topics[0] === TRANSFER && l.topics.slice(1).some(x => `0x${x.slice(26)}`.toLowerCase() === account)))) { t.unjudged = 'another transaction of the block moved the token for the account'; continue; }
+    try {
+      const [b0, b1] = await Promise.all([balanceOf(t.token, 'before'), balanceOf(t.token, 'after')]);
+      const held = b0 > b1 ? b0 : b1, interest = held / 1_000_000n > 2n ? held / 1_000_000n : 2n;
+      if (abs(b1 - b0 - BigInt(t.simulated)) <= interest) t.balance = (b1 - b0).toString();
+    } catch { t.unjudged = "its balance across the block isn't served by the node any more"; }
+  }
+}
+
+/** Whether a compared token is a difference: its amounts apart, and neither its balance nor a reason not to judge it says otherwise. */
+export const differsIn = (t: Compared & { balance?: string; unjudged?: string }): boolean => offBy(t) && t.balance === undefined && !t.unjudged;

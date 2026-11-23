@@ -2,7 +2,7 @@
 // (scripts/userop-tokens.ts), and what a replay has warm (src/simulation.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareTokens, DEPOSIT, keptEarlier, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Log } from '../scripts/userop-tokens.ts';
+import { compareTokens, DEPOSIT, differsIn, heldToBalance, keptEarlier, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 
 const word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
@@ -102,4 +102,35 @@ test("Past 400 earlier transactions, a replay keeps those that logged the bundle
   assert.ok(most.slice(0, -1).every(i => i % 2 === 1 || i >= 689 - 400), String(most.slice(0, 5)));
   // No more than the cap: all of them, in order.
   assert.deepEqual(keptEarlier(earlier.slice(0, 3), receipts, own, 400), [0, 1, 2]);
+});
+
+test("A token whose logs carry its interest is held to the account's balance across the block, within what a block adds to the whole of it", async () => {
+  // Aave's aTokens log the interest since their holder's last movement with the next one: a withdrawal of 5,000
+  // from a position of a million logs less than 5,000, and the preview shows the 5,000 the balance loses. Across
+  // the block the balance also grows by the block's interest on all of it (0.0152 at 4% a year in twelve seconds).
+  type Row = Compared & { balance?: string; unjudged?: string };
+  const M = 1_000_000n, held = 1_000_000n * M, token = (actual: bigint, simulated: bigint): Row => ({ token: USDT, actual: actual.toString(), simulated: simulated.toString() });
+  const balances = (before: bigint, after: bigint) => async (_t: string, when: 'before' | 'after') => (when === 'before' ? before : after);
+  // The logs say 4,990, the preview 5,000, and the balance fell 5,000 less a block's interest: the preview's.
+  const aave = [token(-4_990n * M, -5_000n * M)];
+  await heldToBalance(aave, ACCOUNT, [], balances(held, held - 5_000n * M + 15_210n));
+  assert.deepEqual([aave[0].balance, differsIn(aave[0])], [(-(5_000n * M) + 15_210n).toString(), false]);
+  // (A millionth of the amount moved, the tolerance it had, is 5,000 base units: under the interest.)
+  // A balance that says something else than the preview is a difference.
+  const off = [token(-4_990n * M, -5_000n * M)];
+  await heldToBalance(off, ACCOUNT, [], balances(held, held - 4_000n * M));
+  assert.deepEqual([off[0].balance, off[0].unjudged, differsIn(off[0])], [undefined, undefined, true]);
+  // Where the balance can't say, the token isn't judged: another transaction of the block moved it for the
+  // account, or the node no longer has the balance.
+  const moved = [token(-4_990n * M, -5_000n * M)];
+  await heldToBalance(moved, ACCOUNT, [{ logs: [transfer(USDT, OTHER, ACCOUNT, 1n)] }], balances(held, held));
+  assert.deepEqual([moved[0].unjudged, differsIn(moved[0])], ['another transaction of the block moved the token for the account', false]);
+  const gone = [token(-4_990n * M, -5_000n * M)];
+  await heldToBalance(gone, ACCOUNT, [], async () => { throw new Error('missing trie node'); });
+  assert.deepEqual([gone[0].unjudged, differsIn(gone[0])], ["its balance across the block isn't served by the node any more", false]);
+  // Amounts that agree are left alone, and so is another account's token (the preview's own account is what is read).
+  const same = [token(-5n, -5n), { ...token(-4_990n * M, -5_000n * M), account: SAFE }];
+  await heldToBalance(same, ACCOUNT, [], async () => { throw new Error('not asked'); });
+  assert.deepEqual(same.map(t => [t.balance, t.unjudged]), [[undefined, undefined], [undefined, undefined]]);
+  assert.deepEqual(same.map(differsIn), [false, true]);
 });

@@ -353,6 +353,12 @@ export interface ReplayContext {
   before: SimulationRequest[];
   /** How many transactions the block has before this one. */
   earlier: number;
+  /**
+   * The transaction's own call. A decoder that runs part of a preview itself (a Safe's execTransaction) tells the
+   * replayed transaction by it from a call nested inside one (a Safe transaction that runs another Safe's): only
+   * the replayed transaction has the receipt, the price and the gas limit.
+   */
+  call?: { from: string; to: string | null; data: string };
   gasPrice: bigint;
   /** A blob transaction's blob hashes, and the most it would pay for blob gas. */
   blobVersionedHashes?: string[];
