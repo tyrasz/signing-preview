@@ -47,12 +47,29 @@ const EXEC = '0x6a761202';
 /** Gas over the mined transaction's limit that the stand-in run is given: the stand-ins cost a few thousand gas more a signature than the signatures that ran. */
 const STAND_IN_ROOM = 100_000n;
 const EXECUTION_SUCCESS = toEventSelector('ExecutionSuccess(bytes32,uint256)'), EXECUTION_FAILURE = toEventSelector('ExecutionFailure(bytes32,uint256)');
-/** What a Safe logs when its own configuration changes, by what the preview has to warn of. */
-const CONFIG_EVENTS: Record<string, string> = {
-  [toEventSelector('AddedOwner(address)')]: 'owners', [toEventSelector('RemovedOwner(address)')]: 'owners', [toEventSelector('ChangedThreshold(uint256)')]: 'threshold',
-  [toEventSelector('EnabledModule(address)')]: 'modules', [toEventSelector('DisabledModule(address)')]: 'modules', [toEventSelector('ChangedGuard(address)')]: 'guard',
-  [toEventSelector('ChangedFallbackHandler(address)')]: 'fallback handler', [toEventSelector('ChangedMasterCopy(address)')]: 'singleton',
+/** What a Safe logs when its own configuration changes (the owner, module, guard or handler in a topic from 1.4.1 on, in the data before). */
+const CONFIG_EVENT = {
+  added: toEventSelector('AddedOwner(address)'), removed: toEventSelector('RemovedOwner(address)'), threshold: toEventSelector('ChangedThreshold(uint256)'),
+  enabled: toEventSelector('EnabledModule(address)'), disabled: toEventSelector('DisabledModule(address)'), guard: toEventSelector('ChangedGuard(address)'),
+  fallback: toEventSelector('ChangedFallbackHandler(address)'), singleton: toEventSelector('ChangedMasterCopy(address)'),
 };
+/**
+ * What a transaction's events leave changed in the Safe, by what the preview has to warn of: the net of them. A
+ * module enabled and disabled again before the transaction ends (a flash loan's way in: DeFi Saver's recipes do it)
+ * leaves the Safe as it was, and the preview, which compares the Safe before and after, rightly says nothing.
+ */
+function configChanged(logged: readonly { topics: readonly string[]; data: string }[], before: { threshold: bigint; guard: string; fallbackHandler: string; singleton: string }): string[] {
+  const word = (l: { topics: readonly string[]; data: string }) => (l.topics[1] ?? l.data).slice(-64), address = (l: { topics: readonly string[]; data: string }) => `0x${word(l).slice(-40)}`.toLowerCase();
+  const net = (plus: string, minus: string) => { const n = new Map<string, number>(); for (const l of logged) if (l.topics[0] === plus || l.topics[0] === minus) n.set(address(l), (n.get(address(l)) ?? 0) + (l.topics[0] === plus ? 1 : -1)); return [...n.values()].some(v => v !== 0); };
+  const last = (topic: string) => logged.filter(l => l.topics[0] === topic).at(-1);
+  const moved = (topic: string, was: string) => { const l = last(topic); return !!l && address(l) !== was.toLowerCase(); };
+  const threshold = last(CONFIG_EVENT.threshold);
+  return [
+    ...(net(CONFIG_EVENT.added, CONFIG_EVENT.removed) ? ['owners'] : []), ...(threshold && BigInt(`0x${word(threshold)}`) !== before.threshold ? ['threshold'] : []),
+    ...(net(CONFIG_EVENT.enabled, CONFIG_EVENT.disabled) ? ['modules'] : []), ...(moved(CONFIG_EVENT.guard, before.guard) ? ['guard'] : []),
+    ...(moved(CONFIG_EVENT.fallback, before.fallbackHandler) ? ['fallback handler'] : []), ...(moved(CONFIG_EVENT.singleton, before.singleton) ? ['singleton'] : []),
+  ];
+}
 /** The preview's warnings of the same (the calldata's own, or what the simulated run changed: src/safe.ts, src/safe-sim.ts). */
 const CONFIG_WARNINGS: Record<string, string> = {
   safe_owners_change: 'owners', safe_owners_added: 'owners', safe_owners_removed: 'owners', safe_threshold_change: 'threshold', safe_threshold_changed: 'threshold',
@@ -209,8 +226,8 @@ async function replay(hash: string): Promise<void> {
   }
   const run = runs.filter(r => r.status === 'success').at(-1) ?? runs.at(-1);
   const gas = run?.gasUsed !== undefined && actual !== 'reverted' && preview !== 'not simulated' ? { actual: where.receipt.gasUsed.toString(), simulated: BigInt(run.gasUsed).toString() } : undefined;
-  // What the transaction changed in the Safe, which its events say: each has to be warned of.
-  const changed = actual === 'success' ? [...new Set(logged.map(l => CONFIG_EVENTS[l.topics[0]]).filter(Boolean))] : [];
+  // What the transaction left changed in the Safe, which its events say (configChanged): each has to be warned of.
+  const changed = actual === 'success' ? configChanged(logged, before) : [];
   const warned = [...new Set(p.warnings.map(w => CONFIG_WARNINGS[w.code]).filter(Boolean))];
   if (preview === 'success' && changed.some(c => !warned.includes(c))) differs.push('configuration');
   rows.push({ hash, block: number, safe, version: SAFE_SINGLETONS[before.singleton] ?? `${version} (${before.singleton})`, owners: before.owners.length, threshold: Number(before.threshold), signer: as, actual, preview, ...(how && { how }),
