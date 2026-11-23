@@ -18,7 +18,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { CHAIN_PROFILES, ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, okxDigest, simulateOperation, STUB_SIGNATURE, walletForm, zeroDevAssumed, zeroDevFlag, zeroDevSays, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, okxDigest, simulateOperation, STUB_SIGNATURE, stubSignature, walletForm, zeroDevAssumed, zeroDevFlag, zeroDevSays, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
 import type { Dependencies, Preview, SimulationRequest } from '../src/types.ts';
 import { NOW } from './helpers.ts';
 import { compiled, testChain } from './evm-chain.ts';
@@ -505,6 +505,82 @@ test('A ZeroDev passkey account with no earlier operation to tell: a real assert
   const op = zeroDevAssumed(10, false);
   assert.doesNotMatch(op, /as most/);
   assert.match(op, /taken to use a verifier contract \(P-256 in Solidity\), which needs nothing of the chain\. If the chain has a P-256 precompile and the wallet uses it, the operation takes about 335,000 gas less than shown\./);
+});
+
+test('Circle’s modular wallet: its weighted multisig plugin’s 65-byte parts by owner id, a passkey’s assertion where its part points, one part over the operation’s own digest', async () => {
+  // Base, 2026-11-23 (account 0xfdee…5d02, a passkey its only owner): the plain stand-in was refused, the gas 2% low;
+  // with this one the operation validates, within 0.07%. Its own signature began with the first part below.
+  const PLUGIN = '0x0000000c984aff541d6ce86bb697e68ec57873c8', MSCA = '0xa70f1296869da9d7cb69578123f21888e6db2b62', SENDER = '0xfdee47475a7044201c043a460a88cb25eaba5d02';
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const OWNERSHIP = [{ type: 'bytes30[]' }, { type: 'tuple[]', components: [{ name: 'weight', type: 'uint256' }, { name: 'credType', type: 'uint8' }, { name: 'addr', type: 'address' }, { name: 'publicKeyX', type: 'uint256' }, { name: 'publicKeyY', type: 'uint256' }] },
+    { type: 'tuple', components: [{ name: 'numOwners', type: 'uint256' }, { name: 'thresholdWeight', type: 'uint256' }, { name: 'totalWeight', type: 'uint256' }] }] as const;
+  const PASSKEY_ID = '0x9fe7160dd2d7dca3d06407da025d82e687c9b6704c0344b00ec03da74034', KEY = '0x00000000000000000000000000000000000000e1', OTHER = '0x00000000000000000000000000000000000000e2';
+  const id30 = (address: string) => `0x${address.slice(2).padStart(60, '0')}` as Hex;
+  const passkey = (weight: bigint) => ({ id: PASSKEY_ID as Hex, data: { weight, credType: 0, addr: `0x${'00'.repeat(20)}` as Hex, publicKeyX: 7n, publicKeyY: 8n } });
+  const key = (address: string, weight: bigint) => ({ id: id30(address), data: { weight, credType: 1, addr: address as Hex, publicKeyX: 0n, publicKeyY: 0n } });
+  let owners = [passkey(1n)], threshold = 1n;
+  const HASH = `0x${'4a'.repeat(32)}` as Hex, callData = '0x34fcd5be' as Hex, nonce = 5n;
+  const rpc = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getLogs') return [];
+    if (method === 'eth_getCode') return '0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3';
+    if (method === 'eth_getStorageAt') return `0x${MSCA.slice(2).padStart(64, '0')}`;
+    if (method === 'eth_call') {
+      const { to } = params[0] as { to: string };
+      if (to === EP) return HASH; // getUserOpHash
+      if (to.toLowerCase() === PLUGIN) return encodeAbiParameters(OWNERSHIP, [owners.map(o => o.id), owners.map(o => o.data), { numOwners: BigInt(owners.length), thresholdWeight: threshold, totalWeight: owners.reduce((sum, o) => sum + o.data.weight, 0n) }]);
+    }
+    throw new Error(`unexpected ${method}`);
+  } };
+  const first = async (signer?: string) => {
+    const tried: SimulationRequest[] = [];
+    const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return { status: 'reverted' as const, returnData: concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA24 signature error'])]), transfers: [] }; } };
+    const run = await simulateOperation({ chainId: 8453, entryPoint: EP, sender: SENDER, nonce, initCode: '0x', callData, callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x', ...(signer && { signer }) }, { rpc, simulator } as never);
+    const { args } = decodeFunctionData({ abi: parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]), data: tried[0].data as Hex });
+    return { signature: (args[0] as { signature: Hex }).signature.slice(2), overrides: tried[0].stateOverrides ?? {}, note: run?.note, why: run?.why };
+  };
+  const assertion = (hex: string) => decodeAbiParameters([{ type: 'tuple', components: [{ name: 'webAuthnData', type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' },
+    { name: 'typeIndex', type: 'uint256' }, { name: 'requireUserVerification', type: 'bool' }] }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }], `0x${hex}`)[0];
+  const b64 = (hex: Hex) => Buffer.from(hex.slice(2), 'hex').toString('base64url');
+  const actual = hashMessage({ raw: HASH });
+  // The digest owners can sign before the gas is settled: the operation with its gas fields zeroed and no paymaster.
+  const minimal = hashMessage({ raw: keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }, { type: 'uint256' }], [keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'bytes32' }, { type: 'bytes32' }],
+    [SENDER, nonce, keccak256('0x'), keccak256(callData), `0x${'00'.repeat(32)}`, 0n, `0x${'00'.repeat(32)}`, keccak256('0x')])), EP as Hex, 8453n])) });
+
+  // A passkey its only owner, the account itself asked: its id, the offset just past the one part, type 2 and 32 (over
+  // the operation's own digest), as the mined operation's; then the assertion's length and the assertion.
+  const one = await first();
+  assert.equal(one.signature.slice(0, 130), `0000${PASSKEY_ID.slice(2)}${'41'.padStart(64, '0')}22`);
+  const length = Number(BigInt(`0x${one.signature.slice(130, 194)}`));
+  assert.equal(one.signature.length / 2, 65 + 32 + length);
+  const a = assertion(one.signature.slice(194));
+  assert.deepEqual([a.webAuthnData.clientDataJSON.slice(0, 80), a.webAuthnData.challengeIndex, a.webAuthnData.typeIndex, a.webAuthnData.requireUserVerification],
+    [`{"type":"webauthn.get","challenge":"${b64(actual)}","origin":"https://`.slice(0, 80), 23n, 1n, true]);
+  assert.equal(a.webAuthnData.authenticatorData.slice(66, 68), '05', 'user present and verified');
+  assert.deepEqual([a.r, a.s], [BigInt(`0x${'5a'.repeat(32)}`), BigInt(`0x${'25'.repeat(32)}`)]);
+  assert.ok(one.overrides['0x0000000000000000000000000000000000000100'], 'the P-256 precompile stood in for');
+  assert.equal(one.note, undefined);
+  // An address its owner, named as the signer: r, s, and v with 32 added.
+  owners = [key(KEY, 1n)];
+  assert.equal((await first(KEY)).signature, `${STUB_SIGNATURE.slice(2, 130)}3c`);
+  // Two owners of weight 1 and a threshold of 2: the key signs the operation, the passkey the minimal digest (type 2
+  // alone), in the order of their ids (the key's, an address, is the lower), and the preview is told.
+  owners = [passkey(1n), key(KEY, 1n)]; threshold = 2n;
+  const two = await first(KEY);
+  assert.equal(two.signature.slice(0, 260), `${STUB_SIGNATURE.slice(2, 130)}3c0000${PASSKEY_ID.slice(2)}${'82'.padStart(64, '0')}02`);
+  assert.match(assertion(two.signature.slice(260 + 64)).webAuthnData.clientDataJSON, new RegExp(`"challenge":"${b64(minimal)}"`));
+  assert.match(two.note ?? '', /through Circle's weighted multisig plugin \(0x0000…73c8\), which takes its owners' signatures until their weights reach 2\. The signer's is 1, so another owner \(a passkey\), or others of as much weight, must sign it too/);
+  // The passkey sends it instead (the account itself asked), the key signing the minimal digest: the key's part first, as it was signed over that.
+  const other = await first();
+  assert.equal(other.signature.slice(0, 130), `${stubSignature(1).slice(2, 130)}1c`);
+  assert.equal(other.signature.slice(130, 260), `0000${PASSKEY_ID.slice(2)}${'82'.padStart(64, '0')}22`);
+  assert.match(assertion(other.signature.slice(260 + 64)).webAuthnData.clientDataJSON, new RegExp(`"challenge":"${b64(actual)}"`));
+  // A signer who is none of the owners: said, where the plugin refuses it.
+  assert.match((await first(OTHER)).why ?? '', /Circle's weighted multisig plugin \(0x0000…73c8\) takes the signatures of the account's owners \(a passkey, 0x0000…00e1\), and the signer asked isn't one of them \(a passkey wallet signs as the account itself\)/);
+  // Weights that can't reach the threshold: the plain stand-in.
+  threshold = 5n;
+  assert.equal(`0x${(await first(KEY)).signature}`, STUB_SIGNATURE);
 });
 
 test('Exa’s account (Modular Account v1, Exactly’s WebauthnOwnerPlugin): the owner’s index, then a passkey’s WebAuthn assertion or an address owner’s signature, which its real code checks', async () => {

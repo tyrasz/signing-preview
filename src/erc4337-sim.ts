@@ -2761,7 +2761,92 @@ export const SESSION_KEY_ACCOUNT = '0x7e92fa838fd4c3c7602094f0a9c70ec81f8991c7';
  * Stand-ins shaped for accounts that wrap their owner's signature, by the code the account runs (its EIP-7702
  * delegate or ERC-1967 implementation). Others get STUB_SIGNATURE as is, unless the wallet supplies its own stub.
  */
+/**
+ * Circle's modular wallet: its UpgradableMSCA (an ERC-6900 v0.7 account behind an ERC-1967 proxy) and the plugin its
+ * operations validate through, WeightedWebauthnMultisigPlugin 1.0.0 (both verified on Sourcify, Base and Ethereum).
+ */
+export const CIRCLE_MSCA = '0xa70f1296869da9d7cb69578123f21888e6db2b62', CIRCLE_WEIGHTED_PLUGIN = '0x0000000c984aff541d6ce86bb697e68ec57873c8';
+const CIRCLE_OWNERS = parseAbi(['struct OwnerData { uint256 weight; uint8 credType; address addr; uint256 publicKeyX; uint256 publicKeyY; }', 'struct OwnershipMetadata { uint256 numOwners; uint256 thresholdWeight; uint256 totalWeight; }',
+  'function ownershipInfoOf(address account) view returns (bytes30[] ownerAddresses, OwnerData[] ownersData, OwnershipMetadata ownershipMetadata)']);
+const CIRCLE_WEBAUTHN_PART = [{ type: 'tuple', components: [{ name: 'webAuthnData', type: 'tuple', components: [{ name: 'authenticatorData', type: 'bytes' }, { name: 'clientDataJSON', type: 'string' }, { name: 'challengeIndex', type: 'uint256' },
+  { name: 'typeIndex', type: 'uint256' }, { name: 'requireUserVerification', type: 'bool' }] }, { name: 'r', type: 'uint256' }, { name: 's', type: 'uint256' }] }] as const;
+/**
+ * Circle's modular wallet, as its weighted multisig plugin reads an operation's signature: owners, each a passkey or
+ * an address with a weight, and a threshold. A signature is one 65-byte part an owner, in ascending order of the
+ * owners' ids, until their weights reach the threshold; then the passkeys' assertions, each where its part points.
+ * - An address's part is r, s and v. A passkey's is its id (30 bytes, after two of zeros), the offset of its
+ *   assertion, and the type 2; the assertion is its length, then abi.encode((authenticatorData, clientDataJSON,
+ *   challengeIndex, typeIndex, requireUserVerification), r, s), its challenge the 32 bytes signed, verified by the
+ *   P-256 precompile where the chain has it.
+ * - Exactly one part is over the operation's hash in its EIP-191 form, its type 32 more (the one who sends it); the
+ *   others are over that of the operation with its gas fields zeroed and no paymaster (the "minimal" hash), so that
+ *   owners can sign before the gas is settled.
+ * The stand-in: the signer's part over the operation's own digest (a passkey's where the account itself is asked and
+ * has one), and other owners' over the minimal one, the lowest ids first, as many as it takes with the signer's
+ * weight. Owners are read from the plugin (ownershipInfoOf); the plain stand-in where they aren't, or the weights
+ * can't reach the threshold. A passkey wallet of this kind on Base (2026-11-23) refused the plain stand-in, 2% low.
+ */
+async function circleMscaStub(c: StubContext): Promise<Stub[]> {
+  const plain: Stub[] = [{ signature: STUB_SIGNATURE }];
+  const rpc = c.deps.rpc;
+  if (!rpc?.has(c.chainId)) return plain;
+  try {
+    const hash = await c.hash();
+    if (!hash) return plain;
+    const [ids, data, meta] = decodeFunctionResult({ abi: CIRCLE_OWNERS, functionName: 'ownershipInfoOf',
+      data: String(await rpc.call(c.chainId, 'eth_call', [{ to: CIRCLE_WEIGHTED_PLUGIN, data: encodeFunctionData({ abi: CIRCLE_OWNERS, functionName: 'ownershipInfoOf', args: [c.sender as Hex] }) }, 'latest'])) as Hex });
+    const owners = ids.map((id, i) => ({ id: BigInt(id), weight: data[i].weight, passkey: data[i].credType === 0, address: data[i].addr.toLowerCase() }));
+    const threshold = meta.thresholdWeight;
+    if (!owners.length || threshold === 0n) return plain;
+    const signer = c.signer.toLowerCase(), itself = signer === c.sender.toLowerCase();
+    // Who sends it: the owner whose address is the signer's; the account's passkey where the account itself is asked.
+    const mine = owners.find(o => !o.passkey && o.address === signer) ?? (itself ? owners.find(o => o.passkey) : undefined);
+    const others: typeof owners = [];
+    let weight = mine?.weight ?? 0n;
+    for (const o of [...owners].sort((a, b) => (a.id < b.id ? -1 : 1))) {
+      if (weight >= threshold || others.length >= 15) break;
+      if (o === mine) continue;
+      others.push(o);
+      weight += o.weight;
+    }
+    if (weight < threshold) return plain;
+    // What each signs: the operation's hash, and its hash with the gas fields zeroed and no paymaster, each in EIP-191 form.
+    const zero = `0x${'00'.repeat(32)}` as Hex;
+    const minimalHash = keccak256(encodeAbiParameters(parseAbiParameters('bytes32, address, uint256'), [keccak256(encodeAbiParameters(parseAbiParameters('address, uint256, bytes32, bytes32, bytes32, uint256, bytes32, bytes32'),
+      [c.sender as Hex, c.nonce, keccak256('0x'), keccak256(c.callData ?? '0x'), zero, 0n, zero, keccak256('0x')])), getAddress(c.entryPoint ?? '0x0000000071727de22e5e9d8baf0edac6f37da032'), BigInt(c.chainId)]));
+    const actual = hashMessage({ raw: hash }), minimal = hashMessage({ raw: minimalHash });
+    // Each part, by its owner's id: what the 65 bytes are (the offset filled in below), and a passkey's assertion.
+    const cosigners: Cosigner[] = [];
+    const parts: { id: bigint; part: (offset: number) => Hex; assertion?: Hex }[] = [];
+    const passkeyPart = (o: (typeof owners)[number], digest: Hex, type: number) => {
+      const encoded = encodeAbiParameters(CIRCLE_WEBAUTHN_PART, [(({ r, s: s_, ...webAuthn }) => ({ webAuthnData: { ...webAuthn, requireUserVerification: true }, r, s: s_ }))(webAuthnAuth(digest, CIRCLE_RP_ID))]);
+      parts.push({ id: o.id, part: offset => concatHex([numberToHex(o.id, { size: 32 }), numberToHex(offset, { size: 32 }), numberToHex(type, { size: 1 })]), assertion: concatHex([numberToHex((encoded.length - 2) / 2, { size: 32 }), encoded]) });
+    };
+    const keyPart = (id: bigint, signature: Hex, over32: boolean) => parts.push({ id, part: () => (over32 ? `0x${signature.slice(2, 130)}${(Number(`0x${signature.slice(130, 132)}`) + 32).toString(16)}` as Hex : signature) });
+    if (mine?.passkey) passkeyPart(mine, actual, 2 + 32);
+    // (A signer who is no owner signs all the same, as an address's part: the plugin refuses it.)
+    else keyPart(mine?.id ?? BigInt(signer), STUB_SIGNATURE, true);
+    others.forEach((o, k) => {
+      if (o.passkey) return passkeyPart(o, minimal, 2);
+      const signature = stubSignature(k + 1);
+      cosigners.push({ signature, signer: o.address, digest: minimal });
+      keyPart(o.id, signature, false);
+    });
+    parts.sort((a, b) => (a.id < b.id ? -1 : 1));
+    let offset = parts.length * 65;
+    const head: Hex[] = [], tail: Hex[] = [];
+    for (const p of parts) { head.push(p.part(offset)); if (p.assertion) { tail.push(p.assertion); offset += (p.assertion.length - 2) / 2; } }
+    const named = (o: (typeof owners)[number]) => (o.passkey ? 'a passkey' : o.address);
+    return [{ signature: concatHex([...head, ...tail]), ...(tail.length && { p256: true as const }), ...(cosigners.length && { cosigners }),
+      ...(mine && others.length && { note: `The account validates this operation through Circle's weighted multisig plugin (${shortAddr(CIRCLE_WEIGHTED_PLUGIN)}), which takes its owners' signatures until their weights reach ${threshold}. The signer's is ${mine.weight}, so ${others.length === 1 ? `another owner (${named(others[0])})` : `other owners (${others.map(named).join(', ')})`}, or others of as much weight, must sign it too before any bundler can include it: ${others.length === 1 ? 'that signature was' : 'those signatures were'} stood in for here.` }),
+      ...(!mine && { why: `Circle's weighted multisig plugin (${shortAddr(CIRCLE_WEIGHTED_PLUGIN)}) takes the signatures of the account's owners (${owners.map(o => (o.passkey ? 'a passkey' : shortAddr(o.address))).join(', ')}), and the signer asked isn't one of them${owners.some(o => o.passkey) ? ' (a passkey wallet signs as the account itself)' : ''}` }) }];
+  } catch { return plain; }
+}
+/** The relying party a Circle passkey stand-in names (its hash is in the assertion; the plugin doesn't check it). */
+const CIRCLE_RP_ID = 'modularwallets.circle.com';
 const STUB_SHAPES: Record<string, (c: StubContext) => Stub | Stub[] | Promise<Stub | Stub[]>> = {
+  // Circle's modular wallet: the form its weighted multisig plugin takes (see circleMscaStub).
+  [CIRCLE_MSCA]: circleMscaStub,
   // Alchemy's Modular Account v2 for EIP-7702: its fallback validation (0xff), an EOA signature (0x00), the signature;
   // or the validation its nonce names (see modularAccountStub).
   '0x69007702764179f14f51cdce752f4f775d74e139': modularAccountStub,
