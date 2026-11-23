@@ -876,6 +876,33 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   batches.length = 0;
   await send(d('as the receipt'), { ...replay, call: { from: alice, to: SAFE, data } });
   assert.deepEqual([batches[0][0].gasPrice, batches[0][0].gas], [9n, 200_000n]);
+  // What the transaction changed in the Safe is told against the Safe as the block's earlier transactions left it.
+  // One of them, sent to the Safe, added an owner (the block before has alice alone; where the transaction ran, and
+  // after it, alice and bob): the replayed one was said to add that owner too. And one that removes the owner the
+  // earlier one added, leaving the Safe as the block before had it, was said to change nothing.
+  const bob = BOB.toLowerCase(), toSafe: SimulationRequest = { chainId: 1, from: bob, to: SAFE, data: '0x', value: 0n };
+  const sameBlock = (afterIt: string[], reads: SimulationRequest[][]): Dependencies => ({ ...deps,
+    rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => (m === 'eth_call' ? viewsOf([alice])((p[0] as { data: string }).data) : '0x') },
+    simulator: { simulate: async r => ok(r, 0), simulateBatch: async rs => {
+      // (The reads alone, placed after the earlier transactions: the Safe as they left it.)
+      if (rs[0].data !== data) { reads.push(rs); return rs.map(r => ({ status: 'success' as const, source: 'mock', transfers: [], returnData: viewsOf([alice, bob])(r.data) })); }
+      return rs.map((r, i) => (i === 0 ? ok(r, 0) : { status: 'success' as const, source: 'mock', transfers: [], returnData: viewsOf(afterIt)(r.data) }));
+    } } });
+  const placedReads: SimulationRequest[][] = [];
+  const later = await send(sameBlock([alice, bob], placedReads), { ...replay, before: [toSafe] });
+  assert.deepEqual(codes(later).filter(c => /^safe_owners/.test(c)), [], "an earlier transaction's owner isn't this one's");
+  assert.deepEqual([placedReads.length, placedReads[0].every(r => r.at?.block === '0x10' && r.at.before?.length === 1)], [1, true]);
+  const undone = await send(sameBlock([alice], []), { ...replay, before: [toSafe] });
+  assert.ok(codes(undone).includes('safe_owners_removed'), 'and one that undoes it removes an owner');
+  // Where no earlier transaction is sent to the Safe and the run leaves it as the block before had it, there is
+  // nothing to read again.
+  const quiet: SimulationRequest[][] = [];
+  await send({ ...sameBlock([alice], quiet), rpc: d('as the receipt').rpc });
+  assert.equal(quiet.length, 0);
+  // (One that changes the Safe is read again even so: an earlier transaction can reach a Safe through another contract.)
+  const through: SimulationRequest[][] = [];
+  const indirect = await send(sameBlock([alice, bob], through));
+  assert.deepEqual([through.length, codes(indirect).filter(c => /^safe_owners/.test(c))], [1, []]);
   // Where the Safe can't be read on the replayed block (a node that no longer has it), its calls aren't run on
   // today's state instead: they were shown, "simulated at the latest block", beside a replay.
   const singles: SimulationRequest[] = [];
