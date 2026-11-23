@@ -381,7 +381,8 @@ for (const row of rows) for (const name of SIMULATORS) {
   // token, whose balance at the block's end includes what later transactions accrued), is the receipt's; for a
   // transaction run a second after its block (timeBumped), within a ten-thousandth (a second's accrual).
   const share = row.timeBumped ? 10_000n : 1_000_000n;
-  const close = (d: { actual: string; simulated: string }) => { const a = BigInt(d.actual), x = a - BigInt(d.simulated), abs = (v: bigint) => (v < 0n ? -v : v); return abs(x) <= 2n || abs(x) * share <= abs(a); };
+  const near = (by: bigint) => (d: { actual: string; simulated: string }) => { const a = BigInt(d.actual), x = a - BigInt(d.simulated), abs = (v: bigint) => (v < 0n ? -v : v); return abs(x) <= 2n || abs(x) * by <= abs(a); };
+  const close = near(share);
   // An outcome that differs for a transaction run a second after its block is reported, not failed: what it checks
   // can be that second (a deadline of the block's own timestamp).
   if (!r.outcome && row.timeBumped) r.warned = 'outcome (run a second after its block)';
@@ -391,8 +392,18 @@ for (const row of rows) for (const name of SIMULATORS) {
   // ones the state doesn't confirm, so without them none is missing that they would have found.
   const tokensDiffer = r.tokenDiffs.some((d: { actual: string; simulated: string }) => !close(d));
   const unreadTokens = !!r.unread && tokensDiffer, unreadNative = !!r.unread && !r.native && NATIVE_UNLOGGED.has(CHAIN);
-  const differs = [!r.outcome && !row.timeBumped && 'outcome', !r.unread && tokensDiffer && 'tokens',
-    !r.native && !unreadNative && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+  // Run a second after its block, a native change or a token movement can be that second's (a reward accruing, a
+  // price that moves with the time) by more than the allowance above. Where the same transaction run at its block's
+  // own time has the receipt's (the local EVM's run, when both simulators ran), the second is what moved it:
+  // reported, not failed. On BNB Chain (2026-11-20) one transaction of 199 failed the scheduled run on its native
+  // change alone, on the node a second late; the local EVM had it exactly.
+  const own = row.timeBumped && name !== 'fork' ? row.fork as Record<string, any> | undefined : undefined;
+  const ownHas = (right: (cell: Record<string, any>) => boolean) => !!own && !own.error && own.outcome === true && right(own);
+  const lateNative = !r.native && !unreadNative && ownHas(c => c.native === true);
+  const lateTokens = !r.unread && tokensDiffer && ownHas(c => !c.unread && !c.tokenDiffs.some((d: { actual: string; simulated: string }) => !near(1_000_000n)(d)));
+  if (lateNative || lateTokens) r.warned = [r.warned, `${[lateNative && 'native change', lateTokens && 'token movements'].filter(Boolean).join(' and ')} (run a second after its block; at its own time, in the local EVM, as the receipt)`].filter(Boolean).join('; ');
+  const differs = [!r.outcome && !row.timeBumped && 'outcome', !r.unread && tokensDiffer && !lateTokens && 'tokens',
+    !r.native && !unreadNative && !lateNative && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
   if (unreadTokens || unreadNative) r.warned = [r.warned, `amounts from events (the node's reads got no answer: ${r.unread})`].filter(Boolean).join('; ');
   if (differs.length) r.differs = differs;
 }
