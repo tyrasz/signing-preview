@@ -14,6 +14,8 @@ name: Transaction replays
 # Then, for five minutes, the chain's Safe transactions are previewed as the signatures their owners gave (npm run
 # accuracy:safe): each execTransaction rebuilt as its SafeTx and run where it ran with stand-ins for its signatures,
 # against the receipt. That step fails when one differs.
+# And for five more, its batches (npm run accuracy:batch): each call an account with delegated code (EIP-7702) ran
+# for its wallet, read back into its calls and previewed as the wallet_sendCalls request, against the receipt.
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
 # differences are listed in the summary. Where the node didn't answer the balance reads after a run (a rate limit),
@@ -125,6 +127,25 @@ jobs:
           set -o pipefail
           npm run accuracy:safe -- --chain "$CHAIN" --follow 300 --max 100 --strict \
             --summary-md "$GITHUB_STEP_SUMMARY" --out safe.json 2>&1 | tee safe.log
+      - name: Batches, as the calls their wallets were asked to send
+        # Recent batches run by accounts with delegated code (EIP-7702), read back into their calls and previewed as
+        # the wallet_sendCalls request, where each ran (npm run accuracy:batch): the outcome and the account's token
+        # movements against the receipt. Fails when one differs.
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+          CHAIN: ${{ matrix.chain }}
+        run: |
+          set -o pipefail
+          npm run accuracy:batch -- --chain "$CHAIN" --follow 300 --max 100 --strict \
+            --summary-md "$GITHUB_STEP_SUMMARY" --out batch.json 2>&1 | tee batch.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -139,6 +160,8 @@ jobs:
             previewer-b20.log
             safe.json
             safe.log
+            batch.json
+            batch.log
           if-no-files-found: ignore
           retention-days: 30
 

@@ -161,6 +161,8 @@ test('A gas limit too low says how much the call needs; nodes’ refusals are an
   const p = await send({ gas: toHex(30_000n), data: '0x12345678' });
   assert.equal(p.simulation?.revertReason, 'out of gas: the gas limit (30,000) is below the 50,000 gas this call needs');
   assert.equal(rejection('insufficient funds for gas * price + value: have 1 want 2'), "insufficient funds: the account can't cover the value it sends");
+  assert.equal(rejection('insufficient funds for gas * price + value: have 1 want 2', { value: 0n, gasPrice: GWEI }), "insufficient funds: the account can't cover the network fee at the price it was run at");
+  assert.match(rejection('insufficient funds for gas * price + value: have 1 want 2', { value: 5n, gasPrice: GWEI })!, /can't cover the value it sends and the network fee/);
   assert.match(rejection('intrinsic gas too low')!, /^out of gas/);
   assert.equal(rejection('execution reverted'), null);
 });
@@ -197,6 +199,13 @@ test('A transaction whose result depends on the fee it pays is shown as it runs 
   const kept = await send({ data: '0x12345678' }, { ...deps(), simulator: refusing });
   assert.deepEqual(kept.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), ['in 100']);
   assert.equal(kept.simulation?.status, 'success');
+  // And so where the node's simulator answers the refusal itself, as a failure that says only that (`limited`):
+  // an account with no coin for the fee (a gasless wallet's has none: a relayer pays) was shown failing a transfer
+  // it could make (three of 26 batches on Arbitrum One, 2026-11-23).
+  const answering = { simulate: async (r: SimulationRequest): Promise<SimulationResult> => (r.gasPrice ? { status: 'reverted', source: 'mock', revertReason: rejection('insufficient funds for gas * price + value', r)!, transfers: [], limited: true }
+    : { status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: 100_000_000n }] }) };
+  const stood = await send({ data: '0x12345678' }, { ...deps(), simulator: answering });
+  assert.deepEqual([stood.simulation?.status, stood.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`)], ['success', ['in 100']]);
 });
 
 test('A batch runs again at the price it would pay, and that run is shown when it changes what a call does', async () => {

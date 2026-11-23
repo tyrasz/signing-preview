@@ -303,8 +303,11 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         try {
           const priced: SimulationRequest = { ...request, gas: tx.gas ?? roomFor(first.gasUsed!), gasPrice: price.gasPrice, baseFee: price.baseFee };
           const again = pending.length && deps.simulator.simulateBatch ? (await deps.simulator.simulateBatch([...pending, priced]))?.at(-1) : await deps.simulator.simulate(priced);
-          // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only that.)
-          if (again && effectOf(again, tx.from) !== effectOf(first, tx.from) && !(again.stateReadError && !first.stateReadError)) {
+          // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only that.
+          // Nor one the node refused, which its simulator answers as a failure of its own, `limited`: an account with
+          // no coin for the fee, as a gasless wallet's has none, was shown failing a transfer it could make, "can't
+          // cover the value it sends", where it sent none. Whether the sender can pay the fee is the fee check's.)
+          if (again && !again.limited && effectOf(again, tx.from) !== effectOf(first, tx.from) && !(again.stateReadError && !first.stateReadError)) {
             outcome = { result: again };
             ran = [...pending, priced];
             b.note(pricedNote('transaction', price));

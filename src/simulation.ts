@@ -497,7 +497,7 @@ export class RpcSimulator implements Simulator {
     // ran before it (a replay's earlier transactions): the error may be about any of them, or about the node's own
     // allowance for one simulation, which a block's worth of transactions can use up (Sepolia's blocks hold 200
     // million gas, more than its public node allows one simulation).
-    const rejected = body.error?.message && reqs.length === 1 && !before.length ? rejection(body.error.message) : null;
+    const rejected = body.error?.message && reqs.length === 1 && !before.length ? rejection(body.error.message, reqs[0]) : null;
     if (rejected) return [{ status: 'reverted', source, revertReason: rejected, transfers: [], limited: true }];
     if (body.error && before.length && /intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(body.error.message ?? '')) {
       // The node allows one simulation so much gas, and the block's earlier transactions used more: run again after
@@ -1023,8 +1023,9 @@ const isWords = (data: string, n: number) => new RegExp(`^0x[0-9a-fA-F]{${64 * n
 const isEmpty = (data: string) => data === '0x' || data === '';
 
 /** A node's refusal that says why the transaction can't run at all, worded for the preview; null for other errors. */
-export function rejection(message: string): string | null {
-  if (/insufficient funds/i.test(message)) return "insufficient funds: the account can't cover the value it sends";
+export function rejection(message: string, request?: { value: bigint; gasPrice?: bigint }): string | null {
+  // (At a price, what the account can't cover is the fee too, or the fee alone.)
+  if (/insufficient funds/i.test(message)) return request?.gasPrice ? `insufficient funds: the account can't cover ${request.value > 0n ? 'the value it sends and the network fee' : 'the network fee'} at the price it was run at` : "insufficient funds: the account can't cover the value it sends";
   if (/intrinsic gas too low/i.test(message)) return 'out of gas: the gas limit is below the minimum any transaction with this calldata needs';
   return null;
 }
