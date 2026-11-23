@@ -151,6 +151,22 @@ export function hadRoom(earlier: SimulationRequest[], fitted: SimulationRequest[
 
 /** The gas an earlier call is given over its own limit where the calls' stand-ins made it fail (roomForStandIns). */
 const STAND_IN_ROOM = 100_000n;
+/** FailedOp(uint256,string), and "AA95 out of gas" as its reason's bytes: an EntryPoint's own check of the gas left for an operation (ranShort). */
+const FAILED_OP = '0x220266b6', AA95 = Array.from('AA95 out of gas', ch => ch.charCodeAt(0).toString(16)).join('');
+/**
+ * Whether a call that failed in a simulated block failed for want of gas. One that ran out used all it was given (a
+ * revert gives the rest back). A bundle of UserOperations fails sooner, most of its gas unused: before it runs an
+ * operation's calls its EntryPoint checks that the gas left covers what the operation asked for, and reverts with
+ * FailedOp(index, "AA95 out of gas") where it doesn't. Bundlers send on just that much. On Base (block 60,397,164,
+ * 2026-11-21) a bundle of 620,866 gas that used 240,585 failed so, 121,683 gas in, once ecrecover was moved; the
+ * interest it had accrued in a Morpho market on the chain was then left for the operation after it, which came out
+ * 8.8% over in gas.
+ */
+export function ranShort(c: { status: string; gasUsed?: string; returnData?: string; error?: { data?: string } }, limit: bigint | undefined): boolean {
+  if (c.status === '0x1' || limit === undefined) return false;
+  const data = (c.error?.data ?? c.returnData ?? '').toLowerCase();
+  return BigInt(c.gasUsed ?? 0) >= limit || (data.startsWith(FAILED_OP) && data.includes(AA95));
+}
 /**
  * A replayed block's earlier calls with room for what the reported calls' stand-ins cost them, or undefined where none
  * needs it. State overrides hold for the whole simulated block, so a precompile moved to make room for a stand-in
@@ -162,7 +178,7 @@ const STAND_IN_ROOM = 100_000n;
  * on 171,954 where nothing limits it), the transfer its sender made next had nothing to send, and the node refused
  * the block ("insufficient funds for gas * price + value").
  *
- * `failed`: the earlier calls that failed in a run having used all their gas (their indexes), or 'unpaid' where the node refused the block for
+ * `failed`: the earlier calls that failed in a run for want of gas (their indexes: ranShort), or 'unpaid' where the node refused the block for
  * one that couldn't pay (which isn't said). Those that succeeded on the chain (SimulationRequest.mined) on a gas limit
  * are given STAND_IN_ROOM more: what the stand-ins cost, not gas their code had on the chain to spend otherwise, so
  * one that still fails, or that failed on the chain, is left as it is.
@@ -393,8 +409,8 @@ export class RpcSimulator implements Simulator {
     const earlierNow = fitted ?? this.replay?.(chainId)?.before ?? reqs[0]?.at?.before ?? [];
     const roomy = before.length ? roomForStandIns(earlierNow, reqs, body.error
       ? (/insufficient funds for gas \* price \+ value/i.test(body.error.message ?? '') ? 'unpaid' : [])
-      // (Failed having used all it was given: what running short of gas looks like, where a revert gives the rest back.)
-      : (body.result?.[0]?.calls ?? []).slice(0, before.length).flatMap((c, i) => (c.status !== '0x1' && earlierNow[i]?.gas !== undefined && BigInt(c.gasUsed ?? 0) >= earlierNow[i].gas! ? [i] : []))) : undefined;
+      // (Failed for want of gas, ranShort: any other revert is the transaction's own, and more gas wouldn't change it.)
+      : (body.result?.[0]?.calls ?? []).slice(0, before.length).flatMap((c, i) => (ranShort(c, earlierNow[i]?.gas) ? [i] : []))) : undefined;
     // (Where the node won't run them so, a node that adds up the calls' gas limits for one, this run stands.)
     const again = roomy && await this.simulateAt(reqs, roomy, retried).catch(() => null);
     if (again) { this.roomGiven = Math.max(this.roomGiven, roomy!.filter(r => r.roomy).length); return again; }

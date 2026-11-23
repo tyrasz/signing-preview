@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import { readFileSync } from 'node:fs';
-import { encodeAbiParameters, encodeFunctionData, parseAbi, type Hex } from 'viem';
+import { encodeAbiParameters, encodeErrorResult, encodeFunctionData, parseAbi, type Hex } from 'viem';
 import Ajv2020Module from 'ajv/dist/2020.js';
 import { compareWithReceipt, ReplayError, replayTransaction } from '../src/replay.ts';
 import { compareWithAccessList } from '../src/evm/trace.ts';
@@ -13,7 +13,7 @@ import { afterParent, blobBaseFeeAfter, headerAfter, headerOf, keepsToBlock, nod
 import { chainsOwnLog, sameRun } from '../src/evm/trace.ts';
 import { previewRequest } from '../src/preview.ts';
 import { createPreviewServer } from '../src/server.ts';
-import { fitGas, hadRoom, NATIVE_LOG_ADDRESS, parseLogs, roomForStandIns, RpcSimulator } from '../src/simulation.ts';
+import { fitGas, hadRoom, NATIVE_LOG_ADDRESS, parseLogs, ranShort, roomForStandIns, RpcSimulator } from '../src/simulation.ts';
 import { builtinTokens, StaticTokenRegistry } from '../src/chains.ts';
 import { CHAINLINK_FEEDS, ChainlinkPrices } from '../src/prices.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, TraceCall } from '../src/types.ts';
@@ -860,6 +860,8 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   const MOVED = '0x0000000000000000000000000000000000ec0001', ECRECOVER = '0x0000000000000000000000000000000000000001';
   const sent: { gas?: string }[][] = [];
   let refuseRoomy = false;
+  // How the first earlier call fails where it is short: out of gas (all of it used), or reverting early with this data.
+  let failure: Hex | undefined;
   const node = (earlier: number) => (async (_u: string, init: { body: string }) => {
     const [{ blockStateCalls: [{ calls, stateOverrides }] }] = (JSON.parse(init.body) as { params: [{ blockStateCalls: { calls: { gas?: string }[]; stateOverrides?: Record<string, { movePrecompileToAddress?: string }> }[] }] }).params;
     sent.push(calls);
@@ -867,7 +869,7 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
     if (refuseRoomy && BigInt(calls[0].gas ?? 0) > 191_339n) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38015, message: "Block gas limit exceeded by the block's transactions" } }));
     const short = moved && BigInt(calls[0].gas ?? 0) < 250_000n;
     if (short && earlier > 1) return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -38014, message: 'insufficient funds for gas * price + value: have 61660069215600 want 781197817361895' } }));
-    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map((c, i) => (i === 0 && short ? { status: '0x0', gasUsed: c.gas, returnData: '0x', logs: [], error: { message: 'out of gas' } } : { status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] })) }] }));
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: [{ calls: calls.map((c, i) => (i === 0 && short ? (failure ? { status: '0x0', gasUsed: '0x1db53', returnData: failure, logs: [], error: { code: 3, message: 'execution reverted', data: failure } } : { status: '0x0', gasUsed: c.gas, returnData: '0x', logs: [], error: { message: 'out of gas' } }) : { status: '0x1', gasUsed: '0x5208', returnData: '0x', logs: [] })) }] }));
   }) as unknown as typeof fetch;
   const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 60_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
   const payout = (succeeded: boolean): SimulationRequest => ({ chainId: 1, from: BOB.toLowerCase(), to: ALICE, data: '0x', value: 0n, gas: 191_339n, gasPrice: 5n, mined: { succeeded } });
@@ -894,6 +896,19 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   assert.equal((await run([payout(true)])).status, 'success');
   assert.deepEqual(firstGas().slice(0, 2), [191_339n, 291_339n]);
   assert.ok(firstGas().slice(2).every(g => g === 191_339n), String(firstGas()));
+  // A bundle its EntryPoint fails before it runs an operation, for the gas left (Base, block 60,397,164: 121,683 of
+  // 620,866 used): given room as one that ran out is. Any other revert is the transaction's own, and stands.
+  refuseRoomy = false;
+  const failedOp = (reason: string) => encodeErrorResult({ abi: parseAbi(['error FailedOp(uint256 opIndex, string reason)']), errorName: 'FailedOp', args: [0n, reason] });
+  failure = failedOp('AA95 out of gas');
+  assert.equal((await run([payout(true)])).status, 'success');
+  assert.deepEqual(firstGas().slice(0, 2), [191_339n, 291_339n]);
+  failure = failedOp('AA25 invalid account nonce');
+  await run([payout(true)]);
+  assert.ok(firstGas().every(g => g === 191_339n), String(firstGas()));
+  assert.deepEqual([ranShort({ status: '0x0', gasUsed: '0x1db53', returnData: failedOp('AA95 out of gas') }, 620_866n), ranShort({ status: '0x1', gasUsed: '0x97942' }, 620_866n), ranShort({ status: '0x0', gasUsed: '0x97942' }, 620_866n),
+    ranShort({ status: '0x0', gasUsed: '0x1db53', error: { data: '0x08c379a0' } }, 620_866n), ranShort({ status: '0x0', gasUsed: '0x97942' }, undefined)], [true, false, true, false, false]);
+  failure = undefined;
   // The room is for what the stand-ins cost: given to those that failed, once.
   assert.deepEqual(roomForStandIns([payout(true), transfer], [operation([])], [0])!.map(r => [r.gas, r.roomy]), [[291_339n, true], [25_000n, undefined]]);
   assert.equal(roomForStandIns(roomForStandIns([payout(true)], [operation([])], [0])!, [operation([])], [0]), undefined);
