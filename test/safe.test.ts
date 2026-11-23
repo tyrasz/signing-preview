@@ -876,6 +876,17 @@ test("A mined execTransaction replayed: the Safe's own run is where the transact
   batches.length = 0;
   await send(d('as the receipt'), { ...replay, call: { from: alice, to: SAFE, data } });
   assert.deepEqual([batches[0][0].gasPrice, batches[0][0].gas], [9n, 200_000n]);
+  // A nested one whose result depends on the price (a gas refund in the native coin: gas × the lower of its own
+  // price and the transaction's) is run again at the price the replayed transaction paid, which is the nested
+  // call's too: run again at today's, the replay said its Safe's part was "simulated at the price a transaction
+  // would pay now" beside "at the price it paid".
+  const refunding: SimulationRequest[][] = [];
+  const refunds: Dependencies = { ...d('as the receipt'), simulator: { simulate: async r => ok(r, 0), simulateBatch: async rs => { refunding.push(rs);
+    return rs.map((r, i) => (i === 0 ? { ...ok(r, 0), transfers: r.gasPrice ? [{ asset: 'native', from: SAFE, to: r.from, raw: 140_000n * r.gasPrice }] : [] } : ok(r, i))); } } };
+  const paidFor = await send(refunds, outer);
+  assert.deepEqual(refunding.map(rs => [rs[0].gasPrice, rs[0].baseFee, rs[0].at?.block]), [[undefined, undefined, '0x10'], [9n, 7n, '0x10']]);
+  assert.match(paidFor.decoding.notes.join(' '), /it was simulated at the price the replayed transaction paid, 0\.000000009 gwei\./);
+  assert.doesNotMatch(paidFor.decoding.notes.join(' '), /the price a transaction would pay now/);
   // What the transaction changed in the Safe is told against the Safe as the block's earlier transactions left it.
   // One of them, sent to the Safe, added an owner (the block before has alice alone; where the transaction ran, and
   // after it, alice and bob): the replayed one was said to add that owner too. And one that removes the owner the
@@ -958,7 +969,7 @@ test('A Safe transaction that spends more coin than the Safe holds runs again wi
   // a delegatecall that fails is tried with the value it names though the Safe holds as much, and says why.
   const rich = env(E, 'runs');
   const viaCode = await sign(spend, rich.d);
-  assert.match(viaCode.warnings.find(w => w.code === 'safe_needs_coin')?.message ?? '', /^With no coin sent along it fails: the code it runs as the Safe \(a delegatecall\) reads the coin the transaction carries/);
+  assert.match(viaCode.warnings.find(w => w.code === 'safe_needs_coin')?.message ?? '', /^With no coin sent along it fails, and with the .* it names sent along by whoever submits it .*, it runs: that run is the one shown\. It runs another contract's code as the Safe \(a delegatecall\).*reads the coin the transaction carries, or spends more than the Safe holds without it\.$/);
   assert.deepEqual(rich.batches.map(b => b[0].value), [0n, E / 2n]);
   // A plain call from a Safe that holds what it spends fails by itself: nothing more is tried. And so does one
   // whose call fails with the coin too.

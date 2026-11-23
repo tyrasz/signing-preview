@@ -295,7 +295,9 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     // With the state the caller set for the simulation (context.stateOverrides), beneath the stand-ins'.
     const overrides = replay ? undefined : callerOverrides(env.context);
     const run = await simulateSafeExecution(t, chainId, env.deps, { executor: opts.executor, ...(request && { request }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }),
-      ...(own && { replayed: { receipt: replay!.receipt, ...(replay!.ownTimestamp !== undefined && { ownTimestamp: replay!.ownTimestamp }) } }) });
+      ...(own && { replayed: { receipt: replay!.receipt, ...(replay!.ownTimestamp !== undefined && { ownTimestamp: replay!.ownTimestamp }) } }),
+      // (A call nested in the replayed transaction has that transaction's price, tx.gasprice, for its own.)
+      ...(replay && !own && { paid: { gasPrice: replay.gasPrice, baseFee: replay.at.header.baseFeePerGas } }) });
     if (!run) return null;
     warnOverridden(b, overrides);
     // (Not in a replay: the replayed transaction's own trace is the one shown, and has the time a replay's takes.)
@@ -311,7 +313,7 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
     // gasPrice and the transaction's, and a contract the calls reach can read the price too.
     if (run.priced) {
       const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
-      b.note(`What this does for the Safe depends on the gas price of the transaction that runs it${t.gasPrice > 0n && /^0x0{40}$/.test(t.gasToken) ? " (its gas refund is paid at the lower of its own gas price and the transaction's)" : ''}: it was simulated at the price a transaction would pay now, ${gwei(run.priced.gasPrice)}${run.priced.tip ? ` (the base fee plus a ${gwei(run.priced.tip)} tip)` : ''}. At another price the result can differ.`);
+      b.note(`What this does for the Safe depends on the gas price of the transaction that runs it${t.gasPrice > 0n && /^0x0{40}$/.test(t.gasToken) ? " (its gas refund is paid at the lower of its own gas price and the transaction's)" : ''}: it was simulated at ${run.priced.paid ? 'the price the replayed transaction paid' : 'the price a transaction would pay now'}, ${gwei(run.priced.gasPrice)}${run.priced.tip && !run.priced.paid ? ` (the base fee plus a ${gwei(run.priced.tip)} tip)` : ''}.${run.priced.paid ? '' : ' At another price the result can differ.'}`);
     }
     const outcome = await safeOutcome(run.result, t.safe.toLowerCase(), chainId, env, b, replay
       ? 'What it did for the Safe: execTransaction run again as it was sent, where it ran, so guards, the gas refund and delegatecalls run as they did.'
@@ -324,7 +326,7 @@ export function viaExecTransaction(t: SafeTx, chainId: number, env: AdapterEnv, 
       const native = CHAINS[chainId]?.nativeSymbol ?? 'native', unit = (v: bigint) => `${formatUnits(v, CHAINS[chainId]?.nativeDecimals ?? 18)} ${native}`;
       b.warn('caution', 'safe_needs_coin', run.funded.held < run.funded.value
         ? `The Safe holds ${unit(run.funded.held)} and this spends ${unit(run.funded.value)}: on the Safe's own balance it fails. It was simulated with ${unit(run.funded.value)} sent along by whoever submits it (execTransaction takes coin with the call, as apps that fund a Safe's call in the same transaction send it): without that, it fails.`
-        : `With no coin sent along it fails: the code it runs as the Safe (a delegatecall) reads the coin the transaction carries, which the Safe's own balance isn't. It was simulated with the ${unit(run.funded.value)} it names sent along by whoever submits it (execTransaction takes coin with the call): without that, it fails.`);
+        : `With no coin sent along it fails, and with the ${unit(run.funded.value)} it names sent along by whoever submits it (execTransaction takes coin with the call), it runs: that run is the one shown. It runs another contract's code as the Safe (a delegatecall), which is sent no coin by the Safe itself: that code reads the coin the transaction carries, or spends more than the Safe holds without it.`);
     }
     // A signature's run is sent from the signer. What it takes out of the signer's own account (not the Safe's) is
     // told too: a contract the Safe calls that can spend the signer's tokens (an allowance to the Safe, or to what

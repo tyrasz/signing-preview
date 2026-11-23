@@ -266,11 +266,11 @@ const pct = (a: string, b: string) => (100 * (Number(b) - Number(a)) / Number(a)
 const judged = rows.filter(r => r.actual !== 'reverted' && r.preview !== 'not simulated');
 const gasOff = rows.filter(r => r.gas).map(r => pct(r.gas!.actual, r.gas!.simulated)).sort((a, b) => a - b);
 // A run that could not look (the node failing its reads) is not one that found nothing.
-const blind = couldNotLook(skipped, rows.length, blocks);
+const blind = couldNotLook({ ...skipped, 'not simulated': rows.filter(r => r.preview === 'not simulated').length }, judged.length, blocks);
 const lines = [
   `${rows.length} Safe transactions on ${chainName(CHAIN)} previewed as the SafeTx an owner signed, where each ran${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
   `  outcome: ${judged.filter(r => !r.differs.includes('outcome')).length} of ${judged.length} as the Safe logged it (${judged.filter(r => r.actual === 'failure').length} of them a call that failed)`,
-  `  tokens: ${rows.filter(r => r.tokens.length && !r.differs.includes('tokens')).length} of ${rows.filter(r => r.tokens.length).length} that moved the Safe's tokens move the receipt's amounts${rows.some(r => r.tokens.some(t => t.balance !== undefined)) ? ` (${rows.filter(r => r.tokens.some(t => t.balance !== undefined)).length} of them by the Safe's balance, where a token's logs carry its interest)` : ''}`,
+  `  tokens: ${rows.filter(r => r.tokens.length && !r.tokens.some(t => t.unjudged) && !r.differs.includes('tokens')).length} of ${rows.filter(r => r.tokens.length && !r.tokens.some(t => t.unjudged)).length} that moved the Safe's tokens move the receipt's amounts${rows.some(r => r.tokens.some(t => t.balance !== undefined)) ? ` (${rows.filter(r => r.tokens.some(t => t.balance !== undefined)).length} of them by the Safe's balance, where a token's logs carry its interest)` : ''}`,
   ...(rows.some(r => r.tokens.some(t => t.unjudged)) ? [`  tokens not judged: in ${rows.filter(r => r.tokens.some(t => t.unjudged)).length}, a token whose logs say another amount than the preview and whose balance can't say (${[...new Set(rows.flatMap(r => r.tokens.map(t => t.unjudged).filter(Boolean)))].join('; ')})`] : []),
   `  native coin: ${rows.filter(r => r.native && !r.differs.includes('native')).length} of ${rows.filter(r => r.native).length} with the Safe's balance change across the block`,
   `  configuration: ${rows.filter(r => r.config.actual.length && !r.differs.includes('configuration')).length} of ${rows.filter(r => r.config.actual.length).length} that changed the Safe warn of each change`,

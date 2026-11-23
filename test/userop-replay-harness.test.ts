@@ -2,7 +2,7 @@
 // (scripts/userop-tokens.ts), and what a replay has warm (src/simulation.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareTokens, couldNotLook, DEPOSIT, differsIn, heldToBalance, keptEarlier, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
+import { compareTokens, couldNotLook, DEPOSIT, differsIn, heldToBalance, keptEarlier, stateGone, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 
 const word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
@@ -146,6 +146,33 @@ test('a run that could not look is not a pass: no block read, or more failed rea
   const failed = { "its block's receipts could not be read": 6, 'error: fetch failed': 5, 'its state is no longer served by the node': 2 };
   assert.equal(couldNotLook(failed, 80, { read: 300, unread: 0 }), null);
   assert.match(couldNotLook(failed, 4, { read: 300, unread: 0 })!, /13 transactions could not be looked at .* against 4 compared/);
-  assert.equal(couldNotLook({ 'error: fetch failed': 9 }, 0), null);
+  assert.equal(couldNotLook({ 'error: fetch failed': 2 }, 0), null);
+  // (Three or more with none compared isn't a quiet chain, nor are previews that weren't simulated a pass.)
+  assert.match(couldNotLook({ 'error: fetch failed': 9 }, 0)!, /9 transactions/);
+  assert.match(couldNotLook({ 'not simulated': 4 }, 0)!, /4 transactions could not be looked at/);
+  assert.equal(couldNotLook({ 'not simulated': 4 }, 30), null);
   assert.match(couldNotLook({ 'a read of the Safe failed': 10 }, 0)!, /10 transactions/);
+});
+
+test('a balance that moved as the logs say leaves the difference standing, and only state the node no longer has excuses a token', async () => {
+  type Row = Compared & { balance?: string; unjudged?: string };
+  const M = 1_000_000n, held = 1_000_000n * M, row = (actual: bigint, simulated: bigint): Row => ({ token: USDT, actual: actual.toString(), simulated: simulated.toString() });
+  // The logs and the balance both say 5,000 left; the preview, 4,999.5. Within a millionth of what is held, it passed.
+  const off = [row(-5_000n * M, -4_999n * M - M / 2n)];
+  await heldToBalance(off, ACCOUNT, [], async (_t, when) => (when === 'before' ? held : held - 5_000n * M));
+  assert.deepEqual([off[0].balance, off[0].unjudged, differsIn(off[0])], [undefined, undefined, true]);
+  // A token that doesn't answer balanceOf (a revert, or nothing to read) isn't one whose state is gone.
+  for (const failure of ['execution reverted', 'Cannot convert 0x to a BigInt']) {
+    const unanswered = [row(-5_000n * M, -4_000n * M)];
+    await heldToBalance(unanswered, ACCOUNT, [], async () => { throw new Error(failure); });
+    assert.deepEqual([unanswered[0].unjudged, differsIn(unanswered[0])], [undefined, true], failure);
+  }
+  // State the node no longer has is.
+  for (const failure of ['missing trie node 5f3a (path ) state 0x12 is not available', 'header not found', 'state at block #123 is pruned', 'historical state not available', 'No state available for block 0x12']) {
+    assert.equal(stateGone(new Error(failure)), true, failure);
+    const gone = [row(-5_000n * M, -4_000n * M)];
+    await heldToBalance(gone, ACCOUNT, [], async () => { throw new Error(failure); });
+    assert.deepEqual([typeof gone[0].unjudged, differsIn(gone[0])], ['string', false], failure);
+  }
+  assert.equal(stateGone(new Error('execution reverted: ERC20: no such function')), false);
 });

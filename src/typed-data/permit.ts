@@ -193,15 +193,20 @@ export const genericTypedDataAdapter: TypedAdapter = async (data: TypedData, env
   if (data.domain.name) b.detail('Application', str(data.domain.name));
   if (data.domain.verifyingContract) b.detail('Contract', str(data.domain.verifyingContract));
   if (chainId !== null) b.detail('Chain', chainName(chainId), String(chainId));
+  // (Sixty fields are shown. The rest are counted, and said to be signed unseen: "all fields are shown" was said of
+  // a message whose fields past the sixtieth weren't.)
+  let shown = 0, left = 0;
   const walk = (prefix: string, type: string, value: unknown, depth: number) => {
     const struct = data.types[type.replace(/\[\d*\]$/, '')];
     if (Array.isArray(value)) value.forEach((v, i) => walk(`${prefix}[${i}]`, type.replace(/\[\d*\]$/, ''), v, depth + 1));
     else if (struct && value && typeof value === 'object' && depth < 4) for (const f of struct) walk(prefix ? `${prefix}.${f.name}` : f.name, f.type, (value as Record<string, unknown>)[f.name], depth + 1);
-    else if (b.details.length < 60) b.detail(prefix, str(value));
+    else if (b.details.length < 60) { b.detail(prefix, str(value)); shown++; }
+    else left++;
   };
   walk('', data.primaryType, data.message, 0);
   if (env.context.chainId && chainId !== null && chainId !== env.context.chainId) b.warn('caution', 'chain_mismatch', `The signature is for ${chainName(chainId)}, but the wallet is on ${chainName(env.context.chainId)}.`);
-  b.warn('caution', 'unknown_typed_data', `"${data.primaryType}" from ${str(data.domain.name) || 'an unnamed application'} is not a recognised format. All fields are shown as signed; make sure you understand what they authorise.`);
+  if (left) b.detail('More fields', String(left));
+  b.warn('caution', 'unknown_typed_data', `"${data.primaryType}" from ${str(data.domain.name) || 'an unnamed application'} is not a recognised format. ${left ? `Its first ${shown} fields are shown as signed, and ${left} more are signed with them that aren't shown here: what those authorise can't be seen` : 'All fields are shown as signed'}; make sure you understand what they authorise.`);
   return { title: `Sign ${data.primaryType}${data.domain.name ? ` for ${str(data.domain.name)}` : ''}`, summary: 'A structured (EIP-712) signature request in a format this previewer does not interpret.', decoder: 'eip712_generic', status: 'partial', b,
     network: chainId !== null ? { kind: 'evm', chainId, name: chainName(chainId) } : null };
 };

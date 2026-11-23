@@ -498,7 +498,7 @@ export class RpcSimulator implements Simulator {
     // allowance for one simulation, which a block's worth of transactions can use up (Sepolia's blocks hold 200
     // million gas, more than its public node allows one simulation).
     const rejected = body.error?.message && reqs.length === 1 && !before.length ? rejection(body.error.message, reqs[0]) : null;
-    if (rejected) return [{ status: 'reverted', source, revertReason: rejected, transfers: [], limited: true }];
+    if (rejected) return [{ status: 'reverted', source, revertReason: rejected, transfers: [], limited: true, refused: true }];
     if (body.error && before.length && /intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(body.error.message ?? '')) {
       // The node allows one simulation so much gas, and the block's earlier transactions used more: run again after
       // those of them that bear on the calls, and the latest of the rest (BlockAt.related), which the result says.
@@ -686,7 +686,7 @@ export class RpcSimulator implements Simulator {
     // A revert comes back as an error carrying the revert data; anything else is a transport or node problem, except
     // a sender that can't cover the value, which fails just as surely.
     const message = body.error.message ?? '';
-    if (/insufficient funds/i.test(message)) return [{ status: 'reverted', source, revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true }];
+    if (/insufficient funds/i.test(message)) return [{ status: 'reverted', source, revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true, refused: true }];
     if (!/revert/i.test(message) && !body.error.data) throw new Error(`eth_call failed: ${message}`);
     const reason = decodeRevert(body.error.data) ?? (message.replace(/^execution reverted:?\s*/i, '') || undefined);
     return [{ status: 'reverted', source, revertReason: reason, transfers: [], limited: true }];

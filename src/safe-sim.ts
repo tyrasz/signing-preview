@@ -52,7 +52,7 @@ export interface SafeConfig {
 export interface SafeRun {
   result: SimulationResult; executed: boolean; before: SafeConfig; after?: SafeConfig;
   /** The price the run shown was simulated at, when the price changes what the transaction does for the Safe. */
-  priced?: { gasPrice: bigint; tip: bigint };
+  priced?: { gasPrice: bigint; tip: bigint; paid?: true };
   /**
    * The run shown is one with the Safe transaction's own value sent along with execTransaction by whoever submits
    * it: without it the transaction fails, on the Safe's balance alone (`held`, where that is less) or because the
@@ -354,7 +354,7 @@ const SUBMITTER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
  * in that state too, so the approvals stand in for the owners it has there and the configuration is compared like
  * with like.
  */
-export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt; stateOverrides?: SimulationRequest['stateOverrides']; replayed?: { receipt: ReplayContext['receipt']; ownTimestamp?: bigint } } = {}): Promise<SafeRun | null> {
+export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: Dependencies, opts: { executor?: string | null; request?: SimulationRequest; at?: BlockAt; stateOverrides?: SimulationRequest['stateOverrides']; replayed?: { receipt: ReplayContext['receipt']; ownTimestamp?: bigint }; paid?: { gasPrice: bigint; baseFee: bigint } } = {}): Promise<SafeRun | null> {
   const rpc = deps.rpc, sim = deps.simulator;
   if (!rpc?.has(chainId) || !sim?.simulateBatch) return null;
   const safe = t.safe.toLowerCase();
@@ -437,10 +437,14 @@ export async function simulateSafeExecution(t: SafeTx, chainId: number, deps: De
   // for its gas (the owner standing in for them may hold nothing); a transaction as sent runs on its sender's own
   // balance, and a node that refuses it there leaves the first run standing.
   let priced: SafeRun['priced'];
-  // (Not a replayed transaction, which ran at the price it paid.)
+  // (Not a replayed transaction, which ran at the price it paid. A call nested in one, `paid`, is run again at the
+  // price the transaction around it paid, which is its own: run at today's, a replay said beside "at the price it
+  // paid" that the Safe's part was "simulated at the price a transaction would pay now". And one on a block that
+  // was named, at that block's base fee.)
   if (results[0].status === 'success' && !results[0].limited && results[0].gasUsed !== undefined && !opts.replayed) {
     try {
-      const price = await expectedGasPrice({ chainId, from: exec.from, to: exec.to, data: exec.data as Hex, value: exec.value }, deps);
+      const price = opts.paid ? { ...opts.paid, tip: opts.paid.gasPrice > opts.paid.baseFee ? opts.paid.gasPrice - opts.paid.baseFee : 0n, paid: true as const }
+        : await expectedGasPrice({ chainId, from: exec.from, to: exec.to, data: exec.data as Hex, value: exec.value }, deps, opts.at?.required ? opts.at.header.baseFeePerGas : undefined);
       const pricedRequests = batch({ ...exec, gas: exec.gas ?? roomFor(results[0].gasUsed), gasPrice: price?.gasPrice, baseFee: price?.baseFee,
         ...(!opts.request && !funded && { stateOverrides: { ...exec.stateOverrides, [exec.from]: { ...exec.stateOverrides?.[exec.from], balance: SUBMITTER_BALANCE } } }) });
       const again = price && await sim.simulateBatch(pricedRequests);

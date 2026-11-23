@@ -2817,7 +2817,7 @@ export class ForkSimulator implements Simulator {
         // node says so. (For the first call the node runs: this EVM's state is the one it starts from. For the ones
         // after, the node's refusal says so.)
         const ranBy = `chain ${chainId}'s node, ${nodeReason(why)}`;
-        const unpaid = (reason: string) => { results.push({ status: 'reverted', source: ranBy, revertReason: `insufficient funds: ${reason}`, transfers: [], basis: 'fork' }); byRequest[i] = []; };
+        const unpaid = (reason: string) => { results.push({ status: 'reverted', source: ranBy, revertReason: `insufficient funds: ${reason}`, transfers: [], basis: 'fork', refused: true }); byRequest[i] = []; };
         // The sender's nonce as each call starts, which the node counts in its charge for L1 data: as this EVM has it
         // where the node takes over, then up by one for each call it sent that the node ran since, and for each
         // authorization of its own (EIP-7702) for the nonce it had by then.
@@ -2898,7 +2898,7 @@ export class ForkSimulator implements Simulator {
           : !req.to && (req.authorizationList?.length || req.unsignedAuthorizations?.length) ? 'a transaction with EIP-7702 authorizations can\'t create a contract: the network refuses it'
           : req.gas !== undefined && req.gasPrice && req.gas * req.gasPrice + blobs + req.value > await native(caller) ? `insufficient funds: the account holds ${units(chainId, await native(caller))}, and the gas limit at its price and what the call sends come to ${units(chainId, req.gas * req.gasPrice + blobs + req.value)}`
           : undefined;
-        if (refused) { results.push({ status: 'reverted', source: source_, revertReason: refused, transfers: [], basis: 'fork' }); continue; }
+        if (refused) { results.push({ status: 'reverted', source: source_, revertReason: refused, transfers: [], basis: 'fork', refused: true }); continue; }
       }
       // As at the start of a transaction: nothing warm but the sender, the target, the fee recipient, the precompiles
       // and the access list (EIP-2929, EIP-3651), and "original" storage values taken afresh (EIP-2200).

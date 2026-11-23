@@ -182,8 +182,10 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
             const price = await expectedGasPrice(txs[0], deps, named?.at.header.baseFeePerGas);
             const pricedRequests = requests.map((q, i) => ({ ...q, gas: txs[i].gas ?? roomFor(results![i].gasUsed!), gasPrice: price?.gasPrice, baseFee: price?.baseFee }));
             const again = price && await deps.simulator.simulateBatch(pricedRequests);
-            // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only that.)
-            const unread = again?.some((r, i) => r.stateReadError && !results![i].stateReadError);
+            // (Not a priced run whose balances couldn't be read, where the first run's were: what differs may be only
+            // that. Nor one with a call refused before it ran, as a single transaction's isn't: a batch from an
+            // account with no coin for the fee, which a relayer or a paymaster pays, was shown failing.)
+            const unread = again?.some((r, i) => (r.stateReadError && !results![i].stateReadError) || r.refused || r.limited);
             if (price && again && again.length === txs.length && !unread && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
           } catch { /* the node refused the priced run: the first stands */ }
         }

@@ -43,6 +43,17 @@ test('Single calls (packed ERC-7579, execute(address,uint256,bytes)), executeBat
   const dc = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [mode('ff'), concatHex([BOB, '0xdeadbeef'])] }));
   assert.ok(codes(dc).includes('smart_account_delegatecall'));
   assert.equal(dc.attention, 'danger');
+  // Under a mode selector that isn't known, too: its packed layout as accounts that read only the call type run it,
+  // and, where the bytes are another layout (an execution with a signature after), unread but still a delegatecall.
+  const selected = (callType: string) => `0x${callType}00000000001234abcd${'00'.repeat(22)}` as Hex;
+  const dcOther = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [selected('ff'), concatHex([BOB, '0xdeadbeef'])] }));
+  assert.deepEqual([codes(dcOther).includes('smart_account_delegatecall'), dcOther.attention], [true, 'danger']);
+  assert.equal((await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [selected('00'), single] }))).title, 'Send 1 USDC');
+  const wrapped = encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [single, '0x1234']);
+  const dcUnread = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [selected('ff'), wrapped] }));
+  assert.deepEqual([codes(dcUnread).includes('smart_account_delegatecall'), codes(dcUnread).includes('smart_account_unread'), dcUnread.attention, dcUnread.decoding.decoder], [true, true, 'danger', 'smart_account']);
+  const unread = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [selected('00'), wrapped] }));
+  assert.deepEqual([codes(unread).includes('smart_account_unread'), codes(unread).includes('smart_account_delegatecall'), unread.attention, unread.assetChanges.length], [true, false, 'caution', 0]);
   // Not a self-call: an ordinary contract's execute is left to the other decoders.
   const other = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: BOB, data: encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [USDC, 0n, transfer] }), chainId: '0x1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry() });
   assert.notEqual(other.decoding.decoder, 'smart_account');

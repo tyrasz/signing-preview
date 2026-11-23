@@ -40,7 +40,7 @@ type Call = { target: string; value: bigint; data: Hex };
  * value, calldata), batch (abi-encoded calls, optionally followed by ERC-7821's opData) or delegatecall (packed
  * target, calldata). Null when it doesn't parse.
  */
-function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean } | null {
+function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean; unread?: boolean } | null {
   const callType = mode.slice(2, 4), tryMode = mode.slice(4, 6) === '01', selector = mode.slice(14, 22);
   // The execution with a signature for it after (ERC-7821's opData, mode selector 0x78210001), as
   // UniversalGaslessDelegate takes one a relayer submits (src/typed-data/authorized-executions.ts):
@@ -48,10 +48,18 @@ function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: bool
   // that re-encodes to the same bytes fits.
   const SIGNED = [{ type: 'bytes' }, { type: 'bytes' }] as const;
   const signed = (): Hex | null => { try { const [execution, op] = decodeAbiParameters(SIGNED, data); return encodeAbiParameters(SIGNED, [execution, op]).toLowerCase() === data.toLowerCase() ? execution : null; } catch { return null; } };
-  // (A single call or a delegatecall under another mode selector is laid out as that mode's account has it: the
-  // packed layout, read from any bytes, made a call with a value of 9e30 of an execution that sends 5,500 USDC.)
-  const inner = callType === '00' && selector === '78210001' ? signed() : null;
-  if ((callType === '00' || callType === 'ff') && selector !== '00000000' && !inner) return null;
+  // A single call or a delegatecall under another mode selector. Accounts that read only the mode's call type
+  // (ERC-7579's own do) take the packed layout whatever the selector says, so it is read as packed, unless the bytes
+  // are that other layout exactly (a packed call can't be: its target would be the zero address). Read as packed
+  // they made a call with a value of 9e30 of an execution that sends 5,500 USDC. Under ERC-7821's selector they are
+  // the execution a signature follows; under any other, or as a delegatecall, the layout isn't known and the call
+  // isn't read: said so, and still said to be a delegatecall where it is one (returning nothing here dropped that
+  // warning, and the call was shown as a plain call to the account).
+  let inner: Hex | null = null;
+  if ((callType === '00' || callType === 'ff') && selector !== '00000000') {
+    inner = signed();
+    if (inner && !(callType === '00' && selector === '78210001')) return { calls: [], delegatecall: callType === 'ff', tryMode, unread: true };
+  }
   const body = (inner ?? data).slice(2);
   if (callType === '00') {
     if (body.length < 104) return null;
@@ -78,7 +86,7 @@ function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: bool
  * a wallet asked to send those calls (wallet_sendCalls) puts on the chain: scripts/accuracy-batch.ts reads mined
  * batches back with it.
  */
-export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean; standard: string } | null {
+export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean; standard: string; unread?: boolean } | null {
   try {
     const call = decodeFunctionData({ abi: ABI, data });
     if (WALLET_CORE.has(call.functionName)) return { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: `WalletCore ${call.functionName}` };
@@ -100,7 +108,7 @@ export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; t
 export const smartAccountAdapter: Adapter = async (tx, env) => {
   if (!tx.to || !sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
   const parsed = batchCalls(tx.data);
-  if (!parsed || !parsed.calls.length) return null;
+  if (!parsed || (!parsed.calls.length && !parsed.unread)) return null;
 
   const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', parsed.standard);
   // Only code at the account runs the calls: a delegation set in this transaction, or one (or a contract) already there.
@@ -113,6 +121,16 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
       b.warn('caution', 'smart_account_no_code', 'Your account has no code (no EIP-7702 delegation), so this call to it runs nothing: the calls it lists would not happen.');
       return decoded({ title: `Call your own account (${tx.data.slice(0, 10)})`, summary: 'A call to your own account, which has no code to run it.', decoder: 'smart_account', status: 'partial', b });
     }
+  }
+  // An execution laid out for a mode this doesn't know: what it runs isn't shown, and that is said, with what the
+  // mode's call type alone tells (a delegatecall is one whatever its layout).
+  if (parsed.unread) {
+    const mode = `0x${tx.data.slice(10, 74)}`;
+    b.detail('Mode', mode);
+    b.warn('caution', 'smart_account_unread', `What your account is asked to run isn't read: its execution is laid out for a mode (selector 0x${mode.slice(14, 22)}) this doesn't know, so the call, its target and what it moves aren't shown.`);
+    if (parsed.delegatecall) b.warn('danger', 'smart_account_delegatecall', "This runs another contract's code inside your account (delegatecall): it can do anything with the account and everything in it. Which contract isn't read.");
+    return decoded({ title: parsed.delegatecall ? "Run code inside your account (a delegatecall that isn't read)" : "Run a call from your account that isn't read",
+      summary: `Your account runs ${parsed.delegatecall ? "another contract's code as its own" : 'a call'} through its own code, in a layout that isn't read.`, decoder: 'smart_account', status: 'opaque', b });
   }
   const native = CHAINS[tx.chainId]?.nativeSymbol ?? 'native';
   const inner: Decoded[] = [];

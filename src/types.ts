@@ -572,6 +572,13 @@ export interface SimulationResult {
    */
   limited?: boolean;
   /**
+   * The call didn't run: the network refuses the transaction as it stands, before any of it runs (its sender can't
+   * pay for its gas at its price and what it sends; its gas limit is under what its calldata alone costs). Said by
+   * the chain's node of the whole simulation, and by the local EVM of a call. A run made to see what a price changes
+   * that is refused so tells nothing of what the call does, and doesn't replace the run it was made after.
+   */
+  refused?: boolean;
+  /**
    * A replay's: how many of its block's earlier transactions didn't run before it. The node couldn't run them all
    * within the gas it allows one simulation, so those that bear on the transaction ran, and the latest of the rest
    * (BlockAt.related).

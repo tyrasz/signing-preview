@@ -206,6 +206,28 @@ test('A transaction whose result depends on the fee it pays is shown as it runs 
     : { status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: 100_000_000n }] }) };
   const stood = await send({ data: '0x12345678' }, { ...deps(), simulator: answering });
   assert.deepEqual([stood.simulation?.status, stood.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`)], ['success', ['in 100']]);
+  // And where the local EVM refuses it (a chain whose node has no eth_simulateV1): it answers a call it didn't run
+  // as a failure too, with all a run has (`refused`, not `limited`), and that replaced the first run just the same.
+  const local = { simulate: async (r: SimulationRequest): Promise<SimulationResult> => (r.gasPrice ? { status: 'reverted', source: 'mock', revertReason: 'insufficient funds: the account holds 0 ETH, and the gas limit at its price and what the call sends come to 0.0002 ETH', transfers: [], basis: 'fork', refused: true }
+    : { status: 'success', source: 'mock', gasUsed: 50_000n, transfers: [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: 100_000_000n }] }) };
+  const locally = await send({ data: '0x12345678' }, { ...deps(), simulator: local });
+  assert.deepEqual([locally.simulation?.status, locally.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), codes(locally).includes('simulation_reverted')], ['success', ['in 100'], false]);
+});
+
+test('A gas limit named with no fee cap is checked against the balance: the whole limit at the base fee', async () => {
+  // The network asks for the gas limit's cost before the transaction runs, whatever it then uses. A limit of ten
+  // million from an account that could pay for the fifty thousand the call uses passed with nothing said (the run
+  // at a price, refused by the node, had said it until a refused run stopped replacing the first).
+  const short = await send({ gas: toHex(10_000_000n) }, deps(10n ** 15n));
+  const said = short.warnings.find(w => w.code === 'insufficient_funds_for_gas');
+  assert.equal(said?.severity, 'danger');
+  assert.match(said?.message ?? '', /doesn't cover the value plus its gas limit \(10,000,000\) at the current base fee \(0\.010000000000000001 ETH\): the network asks for the whole limit's cost before it runs/);
+  assert.equal(short.attention, 'danger');
+  // One it can pay for at the base fee: nothing, or a caution where the estimate with its tip is over the balance.
+  assert.ok(!codes(await send({ gas: toHex(100_000n) }, deps(10n ** 15n))).includes('insufficient_funds_for_gas'));
+  assert.ok(!codes(await send({ gas: toHex(10_000_000n) })).includes('insufficient_funds_for_gas'));
+  // (With no limit named, as before: the estimate.)
+  assert.equal((await send({}, deps(10n ** 13n))).warnings.find(w => w.code === 'insufficient_funds_for_gas')?.severity, 'caution');
 });
 
 test('A batch runs again at the price it would pay, and that run is shown when it changes what a call does', async () => {
@@ -229,4 +251,13 @@ test('A batch runs again at the price it would pay, and that run is shown when i
   const q = await batch({ ...deps(), simulator: flat });
   assert.equal(runs.length, 2);
   assert.ok(!/depends on the fee/.test(q.decoding.notes.join(' ')));
+  // A priced run with a call refused before it ran (an account with no coin for the fee, which a relayer or a
+  // paymaster pays for a batch) doesn't replace the first: it was shown, and the batch said to fail.
+  for (const flag of [{ refused: true }, { limited: true }]) {
+    const refusing = { ...taxed, simulateBatch: async (rs: SimulationRequest[]): Promise<SimulationResult[]> => rs.map((r, i) => (r.gasPrice && i === 0
+      ? { status: 'reverted' as const, source: 'mock', revertReason: 'insufficient funds: the account holds 0 ETH', transfers: [], ...flag }
+      : { status: 'success' as const, source: 'mock', gasUsed: 60_000n, transfers: i === 1 ? [{ asset: USDC, from: BOB.toLowerCase(), to: ALICE.toLowerCase(), raw: 100_000_000n }] : [] })) };
+    const kept = await batch({ ...deps(), simulator: refusing });
+    assert.deepEqual([kept.assetChanges.filter(c => c.symbol === 'USDC').map(c => `${c.direction} ${c.amount}`), codes(kept).some(c => /^batch_(will_fail|partial_failure)$/.test(c))], [['in 100'], false]);
+  }
 });

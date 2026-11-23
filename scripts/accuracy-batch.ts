@@ -88,7 +88,15 @@ async function replay(hash: string): Promise<void> {
   try { code = String(await call('eth_getCode', [account, parent])).toLowerCase(); } catch { return skip('its state is no longer served by the node'); }
   const self = tx.from.toLowerCase() === account;
   if (!code.startsWith('0xef0100') && !(self && tx.authorizationList?.length)) return skip('not an account running delegated code (a contract account: its batches are UserOperations, or its own format)');
-  const delegate = code.startsWith('0xef0100') ? `0x${code.slice(8)}` : 'set in the transaction';
+  // (An authorization that didn't apply, on its nonce or its chain, leaves the account with no code: its call to
+  // itself then runs nothing and goes through. Told from the account's code once the block is done.)
+  let delegate = code.startsWith('0xef0100') ? `0x${code.slice(8)}` : '';
+  if (!delegate) {
+    let after: string;
+    try { after = String(await call('eth_getCode', [account, hex(number)])).toLowerCase(); } catch { return skip('its state is no longer served by the node'); }
+    if (!after.startsWith('0xef0100')) return skip("an authorization in the transaction that didn't apply: the account ran no code");
+    delegate = `0x${after.slice(8)}`;
+  }
   const receipts = await blockReceipts(hex(number)).catch(() => undefined);
   const own = receipts?.find(r => r.transactionHash.toLowerCase() === hash.toLowerCase());
   if (!receipts || !own) return skip("its block's receipts could not be read");
@@ -122,10 +130,15 @@ async function replay(hash: string): Promise<void> {
   const preview: Row['preview'] = sim?.status === 'success' ? 'success' : sim?.status === 'reverted' ? 'fails' : 'not simulated';
   const how = preview === 'fails' ? sim!.revertReason ?? 'reverted' : preview === 'not simulated' ? sim?.error ?? p.warnings.find(w => /simulation/.test(w.code))?.message.slice(0, 160) ?? 'no simulation' : undefined;
   const actual: Row['actual'] = where.receipt.status;
-  const unjudged = actual === 'reverted' ? 'the transaction reverted (on its signature or its gas, perhaps: a request has neither)' : batch.tryMode ? 'a batch in "try" mode: its calls may fail one by one' : undefined;
+  // A transaction that went through and logged nothing, of calls previewed as moving tokens, ran none of them: the
+  // account's code has no such function and takes any call (UniversalGaslessDelegate's fallback does), or swallows
+  // what fails. Not the preview's to match: a wallet asked to send calls to such an account doesn't send them so.
+  const ranNothing = actual === 'success' && !own.logs.length && (p.assetChanges ?? []).some(c => c.asset !== 'native' && c.basis !== 'requested');
+  const unjudged = actual === 'reverted' ? 'the transaction reverted (on its signature or its gas, perhaps: a request has neither)' : batch.tryMode ? 'a batch in "try" mode: its calls may fail one by one'
+    : ranNothing ? "the transaction logged nothing: the account's code ran none of its calls" : undefined;
   const differs: string[] = [];
   if (!unjudged && preview === 'fails') differs.push('outcome');
-  const tokens: Row['tokens'] = actual === 'success' && preview === 'success' && !batch.tryMode ? await compareTokens(own.logs, account, p.assetChanges ?? [], tokenLike) : [];
+  const tokens: Row['tokens'] = actual === 'success' && preview === 'success' && !batch.tryMode && !ranNothing ? await compareTokens(own.logs, account, p.assetChanges ?? [], tokenLike) : [];
   await heldToBalance(tokens, account, others, async (token, when) => BigInt(String(await call('eth_call', [{ to: token, data: `0x70a08231${account.slice(2).padStart(64, '0')}` }, when === 'before' ? parent : hex(number)]))));
   if (tokens.some(differsIn)) differs.push('tokens');
   // Its native coin across the block, with the fee it paid where it sent the transaction itself: reported.
@@ -174,14 +187,14 @@ const judged = rows.filter(r => !r.unjudged && r.preview !== 'not simulated');
 const nativeOf = rows.filter(r => r.native);
 const delegates = [...new Set(rows.map(r => r.delegate))];
 // A run that could not look (the node failing its reads) is not one that found nothing.
-const blind = couldNotLook(skipped, rows.length, blocks);
+const blind = couldNotLook({ ...skipped, 'not simulated': rows.filter(r => r.preview === 'not simulated').length }, judged.length, blocks);
 const lines = [
   `${rows.length} batches on ${chainName(CHAIN)} previewed as the calls their wallets were asked to send, where each ran${rows.length ? ` (blocks ${Math.min(...rows.map(r => r.block))}-${Math.max(...rows.map(r => r.block))})` : ''}:`,
   `  outcome: ${judged.filter(r => !r.differs.includes('outcome')).length} of ${judged.length} that went through previewed with no call failing`,
-  `  tokens: ${rows.filter(r => r.tokens.length && !r.differs.includes('tokens')).length} of ${rows.filter(r => r.tokens.length).length} that moved the account's tokens move the receipt's amounts${rows.some(r => r.tokens.some(t => t.balance !== undefined)) ? ` (${rows.filter(r => r.tokens.some(t => t.balance !== undefined)).length} of them by the account's balance, where a token's logs carry its interest)` : ''}`,
+  `  tokens: ${rows.filter(r => r.tokens.length && !r.tokens.some(t => t.unjudged) && !r.differs.includes('tokens')).length} of ${rows.filter(r => r.tokens.length && !r.tokens.some(t => t.unjudged)).length} that moved the account's tokens move the receipt's amounts${rows.some(r => r.tokens.some(t => t.balance !== undefined)) ? ` (${rows.filter(r => r.tokens.some(t => t.balance !== undefined)).length} of them by the account's balance, where a token's logs carry its interest)` : ''}`,
   ...(rows.some(r => r.tokens.some(t => t.unjudged)) ? [`  tokens not judged: in ${rows.filter(r => r.tokens.some(t => t.unjudged)).length}, a token whose logs say another amount than the preview and whose balance can't say (${[...new Set(rows.flatMap(r => r.tokens.map(t => t.unjudged).filter(Boolean)))].join('; ')})`] : []),
   `  native coin (reported, not judged): ${nativeOf.filter(r => r.native!.actual === r.native!.simulated).length} of ${nativeOf.length} with the account's balance change across the block`,
-  ...(rows.some(r => r.unjudged) ? [`  not judged: ${rows.filter(r => r.actual === 'reverted').length} whose transaction reverted (the preview: ${rows.filter(r => r.actual === 'reverted' && r.preview === 'fails').length} with a call expected to fail), ${rows.filter(r => r.actual !== 'reverted' && r.unjudged).length} in "try" mode`] : []),
+  ...(rows.some(r => r.unjudged) ? [`  not judged: ${rows.filter(r => r.actual === 'reverted').length} whose transaction reverted (the preview: ${rows.filter(r => r.actual === 'reverted' && r.preview === 'fails').length} with a call expected to fail), ${rows.filter(r => r.actual !== 'reverted' && /try/.test(r.unjudged ?? '')).length} in "try" mode, ${rows.filter(r => /logged nothing/.test(r.unjudged ?? '')).length} that logged nothing (the account's code ran none of its calls)`] : []),
   ...(rows.some(r => r.preview === 'not simulated') ? [`  not simulated: ${rows.filter(r => r.preview === 'not simulated').length}`] : []),
   `  ${rows.filter(r => r.calls > 1).length} of several calls, ${rows.filter(r => r.calls === 1).length} of one; ${rows.filter(r => r.sentBy === 'the account').length} sent by the account, ${rows.filter(r => r.sentBy === 'a relayer').length} by a relayer; ${delegates.length} kind${delegates.length === 1 ? '' : 's'} of account code`,
   ...Object.entries(skipped).map(([why, n]) => `  skipped: ${n} ${why}`),

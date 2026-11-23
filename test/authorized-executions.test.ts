@@ -2,7 +2,7 @@
 // and the same executions read back from the chain (src/evm/smart-account.ts, batchCalls).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, hashTypedData, parseAbi, recoverAddress, type Hex } from 'viem';
+import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, hashTypedData, parseAbi, recoverAddress, type Hex, toFunctionSelector } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
 import { batchCalls } from '../src/evm/smart-account.ts';
@@ -48,9 +48,19 @@ test('The typed data of a mined execution is what its account signed, and its ca
   const calls = [{ target: USDC as Hex, value: 0n, data: transfer(1n) }, { target: RECIPIENT as Hex, value: 7n, data: '0x' as Hex }];
   const batch = encodeFunctionData({ abi: EXECUTE, functionName: 'execute', args: [BATCH, encodeAbiParameters([{ type: 'bytes' }, { type: 'bytes' }], [encodeAbiParameters(CALLS, [calls]), opData])] });
   assert.deepEqual(batchCalls(batch)!.calls.map(c => [c.target.toLowerCase(), c.value, c.data]), calls.map(c => [c.target, c.value, c.data]));
-  // A single call under a mode selector that isn't known is laid out as its own account has it: not guessed at.
-  const other = `0x00000000000012345678${'00'.repeat(22)}` as Hex;
-  assert.equal(batchCalls(encodeFunctionData({ abi: EXECUTE, functionName: 'execute', args: [other, executionData] })), null);
+  // The same bytes under a mode selector that isn't known are laid out as that mode's account has them: not guessed
+  // at, and said to be unread. As a delegatecall they are still one.
+  const other = `0x00000000000012345678${'00'.repeat(22)}` as Hex, otherDelegate = `0xff000000000012345678${'00'.repeat(22)}` as Hex;
+  const execute = (mode: Hex, data: Hex) => encodeFunctionData({ abi: EXECUTE, functionName: 'execute', args: [mode, data] });
+  assert.deepEqual([batchCalls(execute(other, executionData))!.calls.length, batchCalls(execute(other, executionData))!.unread, batchCalls(execute(other, executionData))!.delegatecall], [0, true, false]);
+  assert.deepEqual([batchCalls(execute(otherDelegate, executionData))!.unread, batchCalls(execute(otherDelegate, executionData))!.delegatecall], [true, true]);
+  assert.deepEqual([batchCalls(execute(`0xff000000000078210001${'00'.repeat(22)}` as Hex, executionData))!.unread, batchCalls(execute(`0xff000000000078210001${'00'.repeat(22)}` as Hex, executionData))!.delegatecall], [true, true]);
+  // A packed call under any selector is the packed call: accounts that read only the mode's call type run it so.
+  // (Refused with the rest, a transfer under such a mode became a plain call to the account, and a delegatecall
+  // lost its warning.)
+  const packedCall = `${USDC}${'00'.repeat(32)}${transfer(1n).slice(2)}` as Hex, packedDelegate = `${USDC}${transfer(1n).slice(2)}` as Hex;
+  for (const m of [other, SINGLE]) assert.deepEqual(batchCalls(execute(m, packedCall))!.calls.map(c => [c.target, c.value, c.data]), [[USDC, 0n, transfer(1n)]]);
+  assert.deepEqual([batchCalls(execute(otherDelegate, packedDelegate))!.delegatecall, batchCalls(execute(otherDelegate, packedDelegate))!.calls[0].target], [true, USDC]);
   // (The plain single call, and ERC-7821's batch with opData, as before.)
   const plain = `0x${'00'.repeat(32)}` as Hex, packed = `${USDC}${'00'.repeat(32)}${transfer(1n).slice(2)}` as Hex;
   assert.deepEqual(batchCalls(encodeFunctionData({ abi: EXECUTE, functionName: 'execute', args: [plain, packed] }))!.calls.map(c => [c.target, c.data]), [[USDC, transfer(1n)]]);
@@ -63,7 +73,7 @@ test('A signed gasless execution is previewed as its call, made by the relayer a
   const p = await sign(typed());
   assert.equal(p.decoding.decoder, 'authorized_executions');
   assert.equal(p.title, 'Gasless call as you: Send 5,500 USDC');
-  assert.match(p.summary, /^A signed gasless execution \(UniversalGaslessDelegate\): the relayer 0xfa17…d27f may make this call as your account 0x034c…b026, all or nothing\.$/);
+  assert.match(p.summary, /^A signed gasless execution \(UniversalGaslessDelegate\): the relayer 0xfa17…d27f may make this call as your account 0x034c…b026, all or nothing\. Transfers 5,500 USDC to 0xc51e…cB08\.$/);
   assert.equal(detail(p, 'Account code'), `UniversalGaslessDelegate (${DELEGATE})`);
   assert.equal(detail(p, 'Relayer'), RELAYER);
   assert.equal(detail(p, 'Valid until'), '2026-11-23T07:52:43Z');
@@ -122,4 +132,58 @@ test('A gasless execution against the chain: the account’s code, the nonce, an
   assert.deepEqual(batch.sims.find(s => s.length === 2)!.map(r => [r.from, r.to]), [[ACCOUNT, USDC], [ACCOUNT, USDC]]);
   assert.deepEqual(q.assetChanges.map(c => [c.direction, c.raw]), [['out', '3000000']]);
   assert.deepEqual([detail(q, 'Call 1'), detail(q, 'Call 2')], ['Send 1 USDC (0xa0b8…eb48)', 'Send 2 USDC (0xa0b8…eb48)']);
+  // Each call with who it sends to: with its title and target alone, a batch named the token's contract and no
+  // recipient anywhere.
+  assert.deepEqual([detail(q, 'Call 1: Recipient')?.toLowerCase(), detail(q, 'Call 2: Amount')], [RECIPIENT, '2 USDC']);
+  assert.match(q.summary, /all or nothing\. .*\(1\) Transfers 1 USDC to 0x/);
+  // The delegate's kill switch: paused, it refuses every execution.
+  const paused = env();
+  const inner = paused.d.rpc!.call;
+  paused.d.rpc!.call = async (c: number, m: string, params: unknown[]) => (m === 'eth_call' && (params[0] as { data: string }).data === '0xb187bd26' ? `0x${'0'.repeat(63)}1` : inner(c, m, params));
+  assert.match((await sign(typed(), paused.d)).warnings.find(w => w.code === 'gasless_exec_paused')?.message ?? '', /paused now \(its kill switch\): it refuses every execution/);
+  // A call to the account itself: the delegate refuses any but invalidateNonce (ReentrantCall), and run as the
+  // account's own call it isn't refused, so the run shown isn't what a relayer's submission does.
+  const self = await sign(typed({ calls: [{ target: ACCOUNT, value: '0', data: '0xe9ae5c53' + '00'.repeat(64) }] }), env().d);
+  assert.match(self.warnings.find(w => w.code === 'gasless_exec_self_call')?.message ?? '', /^The call is to your account itself, which the account code refuses in an execution/);
+  assert.equal(self.decoding.status, 'partial');
+  const invalidate = await sign(typed({ calls: [{ target: ACCOUNT, value: '0', data: `0x${'f2a4e5f1'}${'00'.repeat(32)}` }] }), env().d);
+  assert.equal(codes(invalidate).includes('gasless_exec_self_call'), toFunctionSelector('invalidateNonce(uint256)') !== '0xf2a4e5f1');
+  assert.ok(!codes(await sign(typed({ calls: [{ target: ACCOUNT, value: '0', data: `${toFunctionSelector('invalidateNonce(uint256)')}${'00'.repeat(32)}` }] }), env().d)).includes('gasless_exec_self_call'));
+});
+
+test('A gasless execution that isn’t all read says so: more calls than are read, another domain, calls that can’t be decoded', async () => {
+  // Thirty-three calls (the delegate has no cap): shown field by field, as typed data in no known format is, they
+  // were cut at the twentieth call under "All fields are shown as signed", with no relayer and no deadline.
+  const many = Array.from({ length: 33 }, (_, i) => ({ target: USDC, value: '0', data: transfer(BigInt(i + 1)) }));
+  const p = await sign(typed({ mode: BATCH, calls: many }));
+  assert.deepEqual([p.decoding.decoder, p.decoding.status, p.attention], ['authorized_executions', 'opaque', 'danger']);
+  assert.match(p.warnings.find(w => w.code === 'gasless_exec_too_many')?.message ?? '', /^It lists 33 calls, more than the 32 that are read here: none is decoded or simulated, and 1 aren't shown at all/);
+  assert.deepEqual([detail(p, 'Relayer'), detail(p, 'Valid until'), detail(p, 'More calls'), detail(p, 'Call 32')], [RELAYER, '2026-11-23T07:52:43Z', '1', `0xa9059cbb on ${USDC}`]);
+  assert.deepEqual(p.assetChanges, []);
+  // A domain with a name and a version too: the delegate's digest is under the chain and the account code alone.
+  const named = typed({}, { name: 'Anything', version: '9' });
+  named.types.EIP712Domain = [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, ...named.types.EIP712Domain];
+  const q = await sign(named);
+  assert.match(q.warnings.find(w => w.code === 'gasless_exec_domain')?.message ?? '', /also has "name", "version": UniversalGaslessDelegate checks signatures under the chain and the account code alone/);
+  assert.equal(q.decoding.status, 'partial');
+  // Of code this wasn't read from, nothing is said to be refused by it.
+  const elsewhere = await sign(typed({ mode: `0x${'00'.repeat(32)}` }, { verifyingContract: '0x00000000000000000000000000000000000000aa' }));
+  assert.match(elsewhere.warnings.find(w => w.code === 'gasless_exec_mode')?.message ?? '', /isn't one UniversalGaslessDelegate, whose format this is, runs on a signature/);
+  // With no signer named the calls can't be read for an account: they are shown as signed, calldata and all.
+  const unsigned = await previewRequest({ method: 'eth_signTypedData_v4', params: [null, JSON.stringify(typed())] } as never, { now: NOW, chainId: 1 }, offline);
+  assert.deepEqual([detail(unsigned, 'Call 1'), detail(unsigned, 'Call 1 calldata')], [`0xa9059cbb on ${USDC}`, transfer(5_500_000_000n)]);
+});
+
+test('Typed data in no known format with more fields than are shown says how many are signed unseen', async () => {
+  const fields = Array.from({ length: 70 }, (_, i) => ({ name: `f${i}`, type: 'uint256' }));
+  const data = { domain: { name: 'Some app', chainId: 1 }, types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'chainId', type: 'uint256' }], Thing: fields }, primaryType: 'Thing', message: Object.fromEntries(fields.map((f, i) => [f.name, String(i)])) };
+  const p = await previewRequest({ method: 'eth_signTypedData_v4', params: [ACCOUNT, JSON.stringify(data)] }, { now: NOW }, offline);
+  const said = p.warnings.find(w => w.code === 'unknown_typed_data')?.message ?? '';
+  assert.match(said, /Its first \d+ fields are shown as signed, and \d+ more are signed with them that aren't shown here/);
+  assert.doesNotMatch(said, /All fields are shown/);
+  const shown = Number(/first (\d+) fields/.exec(said)![1]), more = Number(detail(p, 'More fields'));
+  assert.equal(shown + more, 70);
+  // (All of a short one's are shown, and said to be.)
+  const short = { ...data, types: { ...data.types, Thing: fields.slice(0, 3) }, message: { f0: '0', f1: '1', f2: '2' } };
+  assert.match((await previewRequest({ method: 'eth_signTypedData_v4', params: [ACCOUNT, JSON.stringify(short)] }, { now: NOW }, offline)).warnings.find(w => w.code === 'unknown_typed_data')?.message ?? '', /All fields are shown as signed/);
 });
