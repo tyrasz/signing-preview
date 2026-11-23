@@ -59,6 +59,13 @@ export interface AdapterEnv {
 
 export type Adapter = (tx: Tx, env: AdapterEnv) => Promise<Decoded | null>;
 
+/**
+ * The block a decoder's own reads of the chain are of: for a replayed transaction, the block before its own (what
+ * it found, but for the transactions before it in its block); else the latest. Read on the latest state, what a
+ * replayed claim had already claimed was all of it: the claim itself.
+ */
+export const readsAt = (env: AdapterEnv): string => env.context.replay?.at.block ?? 'latest';
+
 export function decoded(partial: Omit<Decoded, 'b' | 'assetChanges'> & { b?: PreviewBuilder; assetChanges?: AssetChange[] }): Decoded {
   return { b: partial.b ?? new PreviewBuilder(), assetChanges: partial.assetChanges ?? [], ...partial } as Decoded;
 }

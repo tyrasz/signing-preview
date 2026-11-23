@@ -23,6 +23,7 @@ import { hyperlendIsolatedAdapter } from './hyperlend-isolated.ts';
 import { beaconDepositAdapter } from './beacon-deposit.ts';
 import { validatorRequestAdapter } from './validator-requests.ts';
 import { uniswapV4PositionAdapter } from './uniswap-v4-positions.ts';
+import { merkleClaimAdapter } from './merkle-claim.ts';
 import { lendingManagerAdapter } from './lending-managers.ts';
 import { eip3009TxAdapter } from './eip3009.ts';
 import { thorchainAdapter } from './thorchain.ts';
@@ -71,6 +72,7 @@ export const ADAPTERS: Adapter[] = [
   creditDelegationAdapter,
   eip3009TxAdapter,
   thorchainAdapter,
+  merkleClaimAdapter,
   erc20Adapter,
   universalRouterAdapter,
   abiAdapter,
