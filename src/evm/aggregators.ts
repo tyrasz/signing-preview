@@ -353,4 +353,94 @@ const kyberAdapter: Adapter = async (tx, env) => {
   return decoded({ title: `Swap ${sent} for at least ${least} on KyberSwap`, summary: `Swaps ${sent} through KyberSwap's aggregator, for at least ${least}.`, decoder: 'kyberswap', status: 'full', b });
 };
 
-export const aggregatorAdapters: Adapter[] = [oneInchAdapter, metaMaskAdapter, acrossAdapter, okxAdapter, kyberAdapter];
+// --- 0x: AllowanceHolder and the Settlers a taker calls through it (all verified on Sourcify) ---
+// AllowanceHolder.exec(operator, token, amount, target, data) lets `operator` take up to `amount` of `token` from the
+// sender for the length of the call, then calls `target` with `data`. 0x's apps name a Settler as both: the one for
+// swaps a taker submits, execute(slippage, actions, zid), which checks at the end that at least minAmountOut of
+// buyToken went to recipient; or the one for bridges, execute(actions, zid). Settlers rotate: 0x's deployer
+// (0x0000…ceae, the same on every chain) names the current one for each feature (ownerOf: 2 taker-submitted swaps,
+// 5 bridges) and the one before it (prev). An operator that isn't one of them is whatever it is: it can take the
+// tokens, bound by nothing shown. (They were calls that couldn't be decoded: five in ten Ethereum blocks, 2026-11-23.)
+const ALLOWANCE_HOLDER = '0x0000000000001ff3684f28c67538d4d072c22734', ZEROEX_DEPLOYER = '0x00000000000004533fe15556b1e086bb1a72ceae';
+const SLIPPAGE = '(address recipient, address buyToken, uint256 minAmountOut) slippage';
+const ZEROEX_ABI = parseAbi([
+  'function exec(address operator, address token, uint256 amount, address target, bytes data) payable returns (bytes)',
+  `function execute(${SLIPPAGE}, bytes[] actions, bytes32 zidAndAffiliate) payable returns (bool)`,
+  `function executeWithPermit(${SLIPPAGE}, bytes[] actions, bytes32 zidAndAffiliate, bytes permitData) payable returns (bool)`,
+  'function execute(bytes[] actions, bytes32 zidAndAffiliate) payable returns (bool)',
+]);
+/** Which of 0x's Settlers an address is, by its deployer: 2 (swaps a taker submits), 5 (bridges), null (neither), undefined (not read). */
+async function settlerFeature(env: AdapterEnv, chainId: number, address: string): Promise<2 | 5 | null | undefined> {
+  const rpc = env.deps.rpc;
+  if (!rpc?.has(chainId)) return undefined;
+  try {
+    const named = async (selector: string, feature: number) => { const r = await rpc.call(chainId, 'eth_call', [{ to: ZEROEX_DEPLOYER, data: `${selector}${feature.toString(16).padStart(64, '0')}` }, 'latest']).catch(() => '0x'); return typeof r === 'string' && r.length === 66 && sameAddress(`0x${r.slice(26)}`, address); };
+    const [swap, swapBefore, bridge, bridgeBefore] = await Promise.all([named('0x6352211e', 2), named('0xe2603dc2', 2), named('0x6352211e', 5), named('0xe2603dc2', 5)]);
+    return swap || swapBefore ? 2 : bridge || bridgeBefore ? 5 : null;
+  } catch { return undefined; }
+}
+
+const zeroExAdapter: Adapter = async (tx, env) => {
+  if (!tx.to) return null;
+  const to = tx.to.toLowerCase(), chain = CHAINS[tx.chainId], coin = (v: bigint) => `${formatUnits(v, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? 'native'}`;
+  let outer;
+  try { outer = decodeFunctionData({ abi: ZEROEX_ABI, data: tx.data }); } catch { return null; }
+  const b = new PreviewBuilder();
+  let settler = to, inner: typeof outer | null = outer, sold: { token: string; amount: bigint } | null = null, feature: 2 | 5 | null | undefined;
+  if (outer.functionName === 'exec') {
+    if (to !== ALLOWANCE_HOLDER) return null;
+    const [operator, token, amount, target, data] = outer.args as readonly [string, string, bigint, string, Hex];
+    settler = operator.toLowerCase();
+    try { inner = decodeFunctionData({ abi: ZEROEX_ABI, data }); } catch { inner = null; }
+    if (inner?.functionName === 'exec') inner = null;
+    // (The native coin isn't taken by allowance: what is sold of it is what the transaction carries.)
+    if (!isNative(token) && amount > 0n) sold = { token: token.toLowerCase(), amount };
+    feature = await settlerFeature(env, tx.chainId, settler);
+    b.detail('Contract', `0x AllowanceHolder (${ALLOWANCE_HOLDER})`, ALLOWANCE_HOLDER);
+    b.detail('Called through it', feature ? `0x's Settler for ${feature === 2 ? 'swaps' : 'bridges'} (${target.toLowerCase()})` : target.toLowerCase(), target.toLowerCase());
+    const take = sold ? await amountOf(env, tx.chainId, sold.token, sold.amount) : null;
+    if (take) b.detail('May take from you', `up to ${take}, during this call`, sold!.amount.toString());
+    // Who is allowed the tokens is the operator: a Settler holds what it does to the minimum shown, anything else doesn't.
+    if (!sameAddress(operator, target)) b.warn('caution', 'zeroex_operator_differs', `It lets ${shortAddress(settler)} take ${take ? `up to ${take}` : 'tokens'} from you while ${shortAddress(target.toLowerCase())} is the contract called: 0x's own apps name one Settler as both.`);
+    if (feature === null && take) b.warn('danger', 'zeroex_unknown_operator', `This lets ${settler} take up to ${take} from you during the call, and it isn't one of 0x's Settlers (0x's deployer, ${shortAddress(ZEROEX_DEPLOYER)}, names others): what it does with them is bound by nothing shown here.`);
+    else if (feature === null) b.warn('caution', 'zeroex_unknown_operator', `${settler} isn't one of 0x's Settlers (0x's deployer, ${shortAddress(ZEROEX_DEPLOYER)}, names others): what this call does there isn't read.`);
+    else if (feature === undefined && take) b.warn('caution', 'zeroex_unchecked_operator', `Whether ${shortAddress(settler)}, which may take up to ${take} from you during the call, is one of 0x's Settlers wasn't checked (no RPC): only a Settler holds the swap to the minimum and recipient shown.`);
+  } else {
+    // A call straight to a Settler (ETH sold, or tokens taken on a Permit2 signature in its actions): only where
+    // 0x's deployer says it is one. These functions' names are anyone's.
+    feature = await settlerFeature(env, tx.chainId, to);
+    if (!feature) return null;
+    b.detail('Contract', `0x's Settler for ${feature === 2 ? 'swaps' : 'bridges'} (${to})`, to);
+  }
+  const sent = [sold ? await amountOf(env, tx.chainId, sold.token, sold.amount) : null, tx.value > 0n ? coin(tx.value) : null].filter((x): x is string => !!x).join(' and ');
+  if (tx.value > 0n && sold) b.detail('Coin sent with it', coin(tx.value), tx.value.toString());
+  if (!inner || feature === null) {
+    b.warn('caution', 'zeroex_unread', `What ${shortAddress(settler)} is called to do isn't read${inner ? " (it isn't one of 0x's Settlers, whose functions these are)" : ''}.`);
+    return decoded({ title: `Call ${shortAddress(settler)} through 0x's AllowanceHolder${sent ? `, with up to ${sent}` : ''}`, summary: `Calls a contract through 0x's AllowanceHolder${sold ? ', which lets it take tokens from you during the call' : ''}.`, decoder: 'zeroex', status: 'opaque', b });
+  }
+  if (inner.functionName === 'execute' && inner.args.length === 2) {
+    // A bridge: where the tokens go on the other chain is in its actions, which aren't read.
+    b.detail('Actions', String((inner.args[0] as readonly unknown[]).length));
+    b.warn('caution', 'zeroex_bridge_unread', `A bridge through 0x: where ${sent || 'what it takes'} goes on the other chain, and to whom, is in its actions, which aren't read here.`);
+    return decoded({ title: `Bridge ${sent ? `up to ${sent}` : 'tokens'} through 0x`, summary: `Bridges ${sent ? `up to ${sent}` : 'tokens'} through 0x's bridge Settler; the destination isn't read.`, decoder: 'zeroex', status: 'partial', b });
+  }
+  const slippage = inner.args[0] as { recipient: string; buyToken: string; minAmountOut: bigint };
+  // (Settler's native coin is 0xeeee…; with no token named and no minimum it checks nothing at the end, and what the
+  // swap buys is whatever its actions send where.)
+  const named = !/^0x0{40}$/.test(slippage.buyToken);
+  const least = named ? await amountOf(env, tx.chainId, slippage.buyToken, slippage.minAmountOut) : null;
+  b.detail('You send', sent ? `up to ${sent}` : 'tokens taken on a Permit2 signature inside its actions (not read)')
+    .detail('You receive at least', least ?? 'nothing is checked: no token and no minimum are named, and what it buys is in its actions, which aren\'t read', slippage.minAmountOut.toString());
+  b.detail('Actions', String((inner.args[1] as readonly unknown[]).length));
+  if (!/^0x0{40}$/.test(slippage.recipient) && !sameAddress(slippage.recipient, tx.from)) {
+    b.detail('Recipient', slippage.recipient.toLowerCase(), slippage.recipient.toLowerCase());
+    b.warn('caution', 'recipient_not_sender', `The tokens you buy go to ${shortAddress(slippage.recipient.toLowerCase())}, not to you.`);
+  }
+  // (No recipient named: Settler checks no minimum at all, whatever the amount says.)
+  if (slippage.minAmountOut <= 1n || !named) b.warn('caution', 'no_slippage_limit', 'Nothing limits the price: the minimum received is zero, so the swap would go through at any rate.');
+  if (feature === 5) b.warn('caution', 'zeroex_unread', "This is a swap's call sent to 0x's bridge Settler, which has no such function: it reverts.");
+  const what = sent ? `up to ${sent}` : 'tokens';
+  return decoded({ title: least ? `Swap ${what} for at least ${least} on 0x` : `Swap ${what} on 0x, with no minimum`, summary: `Swaps ${what} through 0x's Settler${least ? `, for at least ${least}` : ', which is given no minimum to hold it to'}.`, decoder: 'zeroex', status: sent && least ? 'full' : 'partial', b });
+};
+
+export const aggregatorAdapters: Adapter[] = [oneInchAdapter, metaMaskAdapter, acrossAdapter, okxAdapter, kyberAdapter, zeroExAdapter];
