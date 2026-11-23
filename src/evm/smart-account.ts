@@ -109,10 +109,25 @@ export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; t
   } catch { return null; }
 }
 
+/**
+ * A batch with the batches nested in it laid out: a call back into the account that is itself a batch runs its calls
+ * as the account too, so they take its place, to four levels. Left as "Call your own account", an unlimited approval
+ * one level down went with nothing said of it. (A nested delegatecall, or one that can't be read, stays a call back
+ * into the account, and is warned of as one.)
+ */
+function laidOut(calls: Call[], account: string, depth = 1): Call[] {
+  return calls.flatMap(c => {
+    if (!sameAddress(c.target, account) || depth >= 4) return [c];
+    const inner = batchCalls(c.data);
+    return !inner || inner.delegatecall || inner.unread || !inner.calls.length ? [c] : laidOut(inner.calls, account, depth + 1);
+  });
+}
+
 export const smartAccountAdapter: Adapter = async (tx, env) => {
   if (!tx.to || !sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
-  const parsed = batchCalls(tx.data);
-  if (!parsed || (!parsed.calls.length && !parsed.unread)) return null;
+  const read = batchCalls(tx.data);
+  if (!read || (!read.calls.length && !read.unread)) return null;
+  const parsed = read.delegatecall ? read : { ...read, calls: laidOut(read.calls, tx.from) };
 
   const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', parsed.standard);
   // Only code at the account runs the calls: a delegation set in this transaction, or one (or a contract) already there.
@@ -141,7 +156,14 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   // (Past the twentieth call, with no RPC and no simulator: from the calldata alone.)
   const fromCalldata = { ...env.deps, rpc: undefined, simulator: undefined };
   for (const [i, c] of parsed.calls.slice(0, MAX_LISTED).entries()) {
-    // A call back into the account itself isn't unpacked again.
+    // A call back into the account itself that isn't a batch laid out above: the account's own code runs it, with
+    // the account's own authority (an upgrade, a new owner or module, a batch in a layout that isn't read). What it
+    // is isn't read, which is said; a delegatecall is said to be one.
+    const back = sameAddress(c.target, tx.from) ? batchCalls(c.data) : null;
+    if (sameAddress(c.target, tx.from)) {
+      if (back?.delegatecall) b.warn('danger', 'smart_account_delegatecall', `Call ${i + 1}: has your account run ${back.calls[0] ? `${shortAddress(back.calls[0].target)}'s` : "another contract's"} code inside itself (a delegatecall, through a call back into the account): it can do anything with the account and everything in it.`);
+      else if (c.data.length >= 10) b.warn('caution', 'smart_account_self_call', `Call ${i + 1}: a call back into your account (${c.data.slice(0, 10)}) that isn't read: the account's own code runs it with the account's own authority, which is how an account's code, owners or modules are changed.`);
+    }
     const d = sameAddress(c.target, tx.from)
       ? decoded({ title: `Call your own account (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: 'partial' })
       : await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, i < MAX_CALLS ? env.deps : fromCalldata, env.context);

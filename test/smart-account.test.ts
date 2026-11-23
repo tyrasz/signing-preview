@@ -46,6 +46,25 @@ test('A batch of more than twenty calls: every call decoded to the two hundredth
   assert.match(beyond.warnings.find(w => w.code === 'smart_account_calls_unread')?.message ?? '', /^The batch has 201 calls, and the 1 after the first 200 aren't decoded here/);
 });
 
+test('A batch nested in a batch is laid out, and a call back into the account that isn’t one is said to be unread', async () => {
+  const batch = (calls: { target: Hex; value: bigint; data: Hex }[]) => encodeFunctionData({ abi: ACCOUNT, functionName: 'executeBatch', args: [calls] });
+  // A call back into the account that is a batch of its own runs its calls as the account too. Left as "Call your
+  // own account", an unlimited approval a level down went with nothing said of it.
+  const nested = await send(batch([{ target: USDC, value: 0n, data: transfer }, { target: ALICE as Hex, value: 0n, data: batch([{ target: WETH, value: 0n, data: approve }]) }]));
+  assert.match(nested.warnings.find(w => w.code === 'unlimited_approval')?.message ?? '', /^Call 2: /);
+  assert.match(detail(nested, 'Call 2') ?? '', /^Allow .* to spend unlimited WETH/);
+  assert.ok(!codes(nested).includes('smart_account_self_call'));
+  // One that isn't a batch (an upgrade, a new owner: whatever the account's code does with it) isn't read: said.
+  const upgrade = await send(batch([{ target: USDC, value: 0n, data: transfer }, { target: ALICE as Hex, value: 0n, data: '0x3659cfe6000000000000000000000000000000000000000000000000000000000000dead' }]));
+  assert.match(upgrade.warnings.find(w => w.code === 'smart_account_self_call')?.message ?? '', /^Call 2: a call back into your account \(0x3659cfe6\) that isn't read/);
+  assert.equal(upgrade.attention, 'caution');
+  // And one that has the account delegatecall another contract is the danger a delegatecall is.
+  const dc = await send(batch([{ target: ALICE as Hex, value: 0n, data: encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [mode('ff'), concatHex([BOB, '0xdeadbeef'])] }) }]));
+  assert.deepEqual([dc.attention, codes(dc).includes('smart_account_delegatecall')], ['danger', true]);
+  // (A plain send to the account itself, with no calldata, has nothing to read.)
+  assert.ok(!codes(await send(batch([{ target: USDC, value: 0n, data: transfer }, { target: ALICE as Hex, value: 1n, data: '0x' }]))).includes('smart_account_self_call'));
+});
+
 test('Single calls (packed ERC-7579, execute(address,uint256,bytes)), executeBatch, and delegatecall', async () => {
   const single = concatHex([USDC, numberToHex(0n, { size: 32 }), transfer]);
   assert.equal((await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [mode('00'), single] }))).title, 'Send 1 USDC');

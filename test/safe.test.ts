@@ -151,6 +151,36 @@ test('A batch of more than twenty calls: every call decoded to the two hundredth
   assert.match(beyond.warnings.find(w => w.code === 'safe_delegatecall')?.message ?? '', /^Call 202: a delegatecall to 0x9622/);
 });
 
+test('A batch nested in a batch is laid out: its calls run as the Safe too, and a delegatecall among them is the same danger', async () => {
+  const MULTISEND = '0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761', EVIL = '0x96221423681a6d52e184d440a8efcebb105c7242', SIGN_LIB = '0xA65387F16B013cf2Af4605Ad8aA5ec25a2cbA3a2';
+  const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [EVIL, (1n << 256n) - 1n] });
+  const outer = (second: [number, string, bigint, Hex]) => sign({ to: MULTISEND, operation: 1, data: multiSend([[0, USDC, 0n, transfer], second]) });
+  // A delegatecall to MultiSend is to one of Safe's libraries, and so no danger of itself. Left as one call, a
+  // delegatecall to unknown code inside its batch was "a call that couldn't be decoded": a caution.
+  const rogue = await outer([1, MULTISEND, 0n, multiSend([[1, EVIL, 0n, '0xdeadbeef']])]);
+  assert.equal(rogue.attention, 'danger');
+  assert.match(rogue.warnings.find(w => w.code === 'safe_delegatecall')?.message ?? '', /^Call 2: a delegatecall to 0x96221423681a6d52e184d440a8efcebb105c7242 inside the batch/);
+  // An approval a level down, or two (through MultiSendCallOnly too, which runs its batch as the Safe when delegatecalled).
+  for (const nested of [multiSend([[0, USDC, 0n, approve]]), multiSend([[1, MULTISEND_CALL_ONLY, 0n, multiSend([[0, USDC, 0n, approve]])]])]) {
+    const p = await outer([1, MULTISEND, 0n, nested]);
+    assert.match(p.warnings.find(w => w.code === 'unlimited_approval')?.message ?? '', /^Call 2: /);
+    assert.match(detail(p, 'Call 2') ?? '', /^Allow 0x9622…7242 to spend unlimited USDC/);
+    assert.match(detail(p, 'Batch') ?? '', /^2 calls through MultiSend 1\.3\.0 \(1 of them from a batch nested in it, which run as the Safe too\)$/);
+  }
+  // A nested batch that can't be read (malformed, or nested too deep) is a danger: its calls run as the Safe.
+  const malformed = await outer([1, MULTISEND, 0n, '0x8d80ff0a00'] );
+  assert.match(malformed.warnings.find(w => w.code === 'safe_delegatecall')?.message ?? '', /^Call 2: delegatecalls MultiSend 1\.3\.0 with a batch of its own that can't be read here/);
+  assert.deepEqual([malformed.attention, malformed.decoding.status], ['danger', 'partial']);
+  let deep = multiSend([[0, USDC, 0n, approve]]);
+  for (let i = 0; i < 4; i++) deep = multiSend([[1, MULTISEND, 0n, deep]]);
+  const tooDeep = await sign({ to: MULTISEND, operation: 1, data: deep });
+  assert.deepEqual([tooDeep.attention, codes(tooDeep).includes('safe_delegatecall')], ['danger', true]);
+  // Safe's other libraries inside a batch say what they do, as when one is the whole transaction.
+  const signing = await outer([1, SIGN_LIB, 0n, encodeFunctionData({ abi: parseAbi(['function signMessage(bytes)']), functionName: 'signMessage', args: ['0x1234'] })]);
+  assert.match(signing.warnings.find(w => w.code === 'safe_sign_message')?.message ?? '', /^Call 2: signs a message in the Safe's name/);
+  assert.equal(detail(signing, 'Call 2')?.startsWith('(delegatecall) Sign a message as the Safe'), true);
+});
+
 test('SafeOp checks: delegatecalls, an unknown module or EntryPoint, a plain call to MultiSend, and a used nonce', async () => {
   const rogue = await signOp(SAFE_OP_V03, { callData: execute('0x96221423681a6d52e184d440a8efcebb105c7242', '0xa9059cbb', 1) });
   assert.equal(rogue.attention, 'danger');

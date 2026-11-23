@@ -184,6 +184,7 @@ export const abiAdapter: Adapter = async (tx, env) => {
       const c = contract && data.length >= 10 ? decodeStrict(contract.abi, data) : null;
       b.detail(`Batched call ${i + 1}`, c ? describeCall(c) : `${data.slice(0, 10)} (not decoded)`);
     }
+    if ((inner?.length ?? 0) > 10) b.detail('More batched calls', String(inner!.length - 10));
   }
   if (basis === 'signature') b.warn('caution', 'unverified_signature', `The function was identified by its selector${builtIn ? ' from a list of common functions' : ' from a public signature database'}, not from this contract's verified source. The name "${call.fn.name}" is a guess that fits the data.`);
   if (rivals.length) b.warn('caution', 'ambiguous_signature', `${rivals.length + 1} functions registered for this selector fit the data. The earliest registered, ${typesOf(call)}, is shown; also possible: ${rivals.slice(0, 3).map(typesOf).join(', ')}${rivals.length > 3 ? ` and ${rivals.length - 3} more` : ''}.`);

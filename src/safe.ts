@@ -47,7 +47,27 @@ const ZERO = '0x0000000000000000000000000000000000000000';
 const MAX_CALLS = 20, MAX_LISTED = 200;
 
 export interface SafeTx { safe: string; to: string; value: bigint; data: Hex; operation: number; safeTxGas: bigint; baseGas: bigint; gasPrice: bigint; gasToken: string; refundReceiver: string; nonce?: bigint }
-interface Call { operation: number; to: string; value: bigint; data: Hex }
+interface Call { operation: number; to: string; value: bigint; data: Hex; /** A delegatecall to MultiSend whose own batch couldn't be read (or is nested too deep). */ unread?: boolean }
+
+/**
+ * A batch with the batches nested in it laid out: a call that delegatecalls MultiSend (or MultiSendCallOnly) runs a
+ * batch of its own as the Safe, so its calls take its place, to four levels. Left as one call "to MultiSend", which
+ * is one of Safe's libraries and so no danger, a delegatecall to unknown code one level down showed as a call that
+ * couldn't be decoded: a caution, where the same call in the outer batch is the Bybit pattern's danger.
+ */
+function laidOut(calls: Call[], depth = 1): { calls: Call[]; nested: number } {
+  let nested = 0;
+  const out = calls.flatMap(c => {
+    const kind = c.operation === 1 ? SAFE_LIBRARIES[c.to.toLowerCase()]?.kind : undefined;
+    if (kind !== 'multisend' && kind !== 'multisend_call_only') return [c];
+    const inner = depth < 4 ? multiSendCalls(c.data) : null;
+    if (!inner) return [{ ...c, unread: true }];
+    const below = laidOut(inner, depth + 1);
+    nested += below.calls.length;
+    return below.calls;
+  });
+  return { calls: out, nested };
+}
 
 /** MultiSend's packed batch: per call, operation (1 byte), to (20), value (32), data length (32), data. */
 export function multiSendCalls(data: Hex): Call[] | null {
@@ -148,9 +168,10 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   if (t.operation === 1 && (lib?.kind === 'multisend' || lib?.kind === 'multisend_call_only')) {
     const parsed = multiSendCalls(t.data);
     if (!parsed) { b.warn('danger', 'safe_delegatecall', `This delegatecalls ${lib.name} with a batch that can't be read.`); return { title: 'Run an unreadable Safe batch', summary: 'A MultiSend batch that could not be decoded.', status: 'opaque', assetChanges: [] }; }
-    calls = parsed;
+    const flat = laidOut(parsed);
+    calls = flat.calls;
     label = lib.name;
-    b.detail('Batch', `${calls.length} call${calls.length === 1 ? '' : 's'} through ${lib.name}`);
+    b.detail('Batch', `${calls.length} call${calls.length === 1 ? '' : 's'} through ${lib.name}${flat.nested ? ` (${flat.nested} of them from ${flat.nested === 1 ? 'a batch' : 'batches'} nested in it, which run as the Safe too)` : ''}`);
   } else if (t.operation === 1 && lib?.kind === 'sign_message') {
     b.warn('info', 'safe_sign_message', `This signs a message in the Safe's name (${lib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's.`);
     return early({ title: 'Sign a message as the Safe', summary: `Marks a message as signed by the Safe, through ${lib.name}.`, status: 'full' as const, assetChanges: [] });
@@ -185,7 +206,23 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     const p = calls.length > 1 ? `Call ${i + 1}: ` : '';
     if (calls.length > 1 && c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()]) b.warn('danger', 'safe_delegatecall', `${p}a delegatecall to ${c.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
     const from = b.warnings.length;
-    const d = await describeCall(c, safe, chainId, i < MAX_CALLS ? env : fromCalldata, b, p);
+    // Safe's own libraries, delegatecalled from inside the batch: what each does to the Safe, as when one is the
+    // whole transaction. (A nested batch that could be read is already laid out above.)
+    const inLib = c.operation === 1 ? SAFE_LIBRARIES[c.to.toLowerCase()] : undefined;
+    let d: { title: string; status: Decoded['status']; watch?: string[] };
+    if (c.unread) {
+      b.warn('danger', 'safe_delegatecall', `${p}delegatecalls ${inLib?.name ?? 'MultiSend'} with a batch of its own that can't be read here (malformed, or nested more than four deep): its calls run as the Safe, and any of them can move what it holds or change it.`);
+      d = { title: 'Run an unreadable nested batch', status: 'opaque' };
+    } else if (inLib?.kind === 'sign_message') {
+      b.warn('info', 'safe_sign_message', `${p}signs a message in the Safe's name (${inLib.name}): contracts that check the Safe's signature (ERC-1271) will accept it as the Safe's.`);
+      d = { title: 'Sign a message as the Safe', status: 'full' };
+    } else if (inLib?.kind === 'migration') {
+      b.warn('caution', 'safe_migration', `${p}upgrades the Safe's code through Safe's official ${inLib.name} contract. Only sign it if you meant to upgrade the Safe.`);
+      d = { title: `Upgrade the Safe (${inLib.name})`, status: 'full' };
+    } else if (inLib?.kind === 'create_call') {
+      b.warn('info', 'safe_create_call', `${p}deploys a contract from the Safe (${inLib.name}).`);
+      d = { title: 'Deploy a contract from the Safe', status: 'full' };
+    } else d = await describeCall(c, safe, chainId, i < MAX_CALLS ? env : fromCalldata, b, p);
     if (i > 0 && isExecTransaction(c)) for (const w of b.warnings.slice(from)) if (w.code === 'safe_tx_reverts') alone.push({ call: i, warning: w });
     decoded.push(d);
     const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}` : '';
