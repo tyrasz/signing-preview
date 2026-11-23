@@ -15,7 +15,7 @@
 import { decodeAbiParameters, decodeFunctionData, parseAbi, type Hex } from 'viem';
 import { formatTimestamp, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
-import { decoded, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
+import { decoded, readsAt, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
 
 /** PositionManager, by chain (each verified on Sourcify as PositionManager). */
 export const V4_POSITION_MANAGERS: Record<number, string> = {
@@ -75,7 +75,7 @@ async function describe(unlockData: Hex, tx: { chainId: number; from: string; to
     const rpc = env.deps.rpc;
     if (rpc?.has(tx.chainId)) {
       try {
-        const out = String(await rpc.call(tx.chainId, 'eth_call', [{ to: tx.to, data: `0x7ba03aad${id.toString(16).padStart(64, '0')}` }, 'latest'])) as Hex;
+        const out = String(await rpc.call(tx.chainId, 'eth_call', [{ to: tx.to, data: `0x7ba03aad${id.toString(16).padStart(64, '0')}` }, readsAt(env)])) as Hex;
         const [k] = decodeAbiParameters(POOL_KEY, out);
         if (!(ZERO.test(k.currency0) && ZERO.test(k.currency1))) key = k as PoolKey;
       } catch { key = inferred; }

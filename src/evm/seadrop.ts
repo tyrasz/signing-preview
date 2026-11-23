@@ -4,7 +4,7 @@ import { decodeFunctionData, parseAbi } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import { collectionLabel } from './effects.ts';
-import { decoded, type Adapter } from './common.ts';
+import { decoded, readsAt, type Adapter } from './common.ts';
 
 const SEADROP = '0x00005ea00ac477b1030ce78506496e8c2de24bf5';
 const MINT_PARAMS = '(uint256 mintPrice, uint256 maxTotalMintableByWallet, uint256 startTime, uint256 endTime, uint256 dropStageIndex, uint256 maxTokenSupplyForStage, uint256 feeBps, bool restrictFeeRecipients) mintParams';
@@ -36,7 +36,7 @@ export const seaDropAdapter: Adapter = async (tx, env) => {
   // The price per NFT: the signed or allow-list stage's, or the public drop's read from SeaDrop.
   let price = params?.mintPrice;
   if (price === undefined && call.functionName === 'mintPublic' && env.deps.rpc?.has(tx.chainId)) {
-    try { price = BigInt(`0x${String(await env.deps.rpc.call(tx.chainId, 'eth_call', [{ to: SEADROP, data: `0xbc6a629c${nft.slice(2).toLowerCase().padStart(64, '0')}` }, 'latest'])).slice(2, 66)}`); } catch { price = undefined; }
+    try { price = BigInt(`0x${String(await env.deps.rpc.call(tx.chainId, 'eth_call', [{ to: SEADROP, data: `0xbc6a629c${nft.slice(2).toLowerCase().padStart(64, '0')}` }, readsAt(env)])).slice(2, 66)}`); } catch { price = undefined; }
   }
   if (price !== undefined) {
     b.detail('Price per NFT', eth(price));

@@ -8,7 +8,7 @@
 // answers baseToken() with an address and CometExt's isAllowed(owner, manager) with a bool.
 import { decodeFunctionData, parseAbi } from 'viem';
 import { PreviewBuilder, shortAddress } from '../format.ts';
-import { decoded, type Adapter } from './common.ts';
+import { decoded, readsAt, type Adapter } from './common.ts';
 import { isMorpho, keyAccount } from '../typed-data/morpho.ts';
 
 const MORPHO_ABI = parseAbi(['function setAuthorization(address authorized, bool newIsAuthorized)']);
@@ -34,9 +34,9 @@ export const lendingManagerAdapter: Adapter = async (tx, env) => {
     // A Compound III market answers baseToken() and isAllowed(owner, manager); without an RPC, nothing says it is one.
     try {
       if (!rpc) return null;
-      const base = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: '0xc55dae63' }, 'latest']));
+      const base = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: '0xc55dae63' }, readsAt(env)]));
       if (!/^0x0{24}[0-9a-f]{40}$/i.test(base) || /^0x0+$/.test(base)) return null;
-      const allowed = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: `0xa1654379${tx.from.slice(2).toLowerCase().padStart(64, '0')}${who.slice(2).padStart(64, '0')}` }, 'latest']));
+      const allowed = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: `0xa1654379${tx.from.slice(2).toLowerCase().padStart(64, '0')}${who.slice(2).padStart(64, '0')}` }, readsAt(env)]));
       if (!/^0x0{63}[01]$/.test(allowed)) return null;
     } catch { return null; }
   }

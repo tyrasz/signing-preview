@@ -5,7 +5,7 @@ import { decodeFunctionData, encodeFunctionData, parseAbi, type Hex } from 'viem
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress, utcDate } from '../format.ts';
 import { builtinTokens, CHAINS } from '../chains.ts';
 import { wrappedNative } from './universal-router.ts';
-import { decoded, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
+import { decoded, readsAt, tokenInfo, type Adapter, type AdapterEnv } from './common.ts';
 import { chainLabel } from './universal-router.ts';
 
 const NATIVE_ALIASES = ['0x0000000000000000000000000000000000000000', '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'];
@@ -374,7 +374,7 @@ async function settlerFeature(env: AdapterEnv, chainId: number, address: string)
   const rpc = env.deps.rpc;
   if (!rpc?.has(chainId)) return undefined;
   try {
-    const named = async (selector: string, feature: number) => { const r = await rpc.call(chainId, 'eth_call', [{ to: ZEROEX_DEPLOYER, data: `${selector}${feature.toString(16).padStart(64, '0')}` }, 'latest']).catch(() => '0x'); return typeof r === 'string' && r.length === 66 && sameAddress(`0x${r.slice(26)}`, address); };
+    const named = async (selector: string, feature: number) => { const r = await rpc.call(chainId, 'eth_call', [{ to: ZEROEX_DEPLOYER, data: `${selector}${feature.toString(16).padStart(64, '0')}` }, readsAt(env)]).catch(() => '0x'); return typeof r === 'string' && r.length === 66 && sameAddress(`0x${r.slice(26)}`, address); };
     const [swap, swapBefore, bridge, bridgeBefore] = await Promise.all([named('0x6352211e', 2), named('0xe2603dc2', 2), named('0x6352211e', 5), named('0xe2603dc2', 5)]);
     return swap || swapBefore ? 2 : bridge || bridgeBefore ? 5 : null;
   } catch { return undefined; }

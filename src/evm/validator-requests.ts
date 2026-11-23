@@ -17,7 +17,7 @@
 // consensus layer does not require to be the caller's. Validators aren't readable from here (they live on the
 // consensus layer), so who the target pays can't be checked: the preview says what to check.
 import { formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
-import { decoded, type Adapter } from './common.ts';
+import { decoded, readsAt, type Adapter } from './common.ts';
 
 export const WITHDRAWAL_REQUESTS = '0x00000961ef480eb55e80d19ad83579a64c007002', CONSOLIDATION_REQUESTS = '0x0000bbddc7ce488642fb579f8b00f3a590007251';
 /** Where the contracts are what they are on Ethereum: Ethereum and Sepolia. */
@@ -46,7 +46,7 @@ export const validatorRequestAdapter: Adapter = async (tx, env) => {
   let fee: bigint | undefined;
   const rpc = env.deps.rpc;
   if (rpc?.has(tx.chainId)) {
-    try { const answer = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: '0x' }, 'latest'])); if (/^0x[0-9a-f]{64}$/i.test(answer)) fee = BigInt(answer); } catch { fee = undefined; }
+    try { const answer = String(await rpc.call(tx.chainId, 'eth_call', [{ to, data: '0x' }, readsAt(env)])); if (/^0x[0-9a-f]{64}$/i.test(answer)) fee = BigInt(answer); } catch { fee = undefined; }
   }
   b.detail('Fee sent', `${eth(tx.value)}${fee !== undefined ? ` (the fee is ${eth(fee)} now)` : ''}`, tx.value.toString());
   if (tx.value === 0n || (fee !== undefined && tx.value < fee)) b.warn('danger', 'validator_request_fee', `This sends ${eth(tx.value)} with the request, ${fee !== undefined ? `less than the fee now (${eth(fee)})` : 'and the fee is never less than 1 wei'}: the contract reverts.`);

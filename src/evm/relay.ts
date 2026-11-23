@@ -7,7 +7,7 @@ import { decodeFunctionData, parseAbi, type Hex } from 'viem';
 import { formatTimestamp, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import type { AssetChange } from '../types.ts';
-import { decoded, nativeAmount, tokenAmount, tokenInfo, type Adapter, type AdapterEnv, type Decoded } from './common.ts';
+import { decoded, nativeAmount, readsAt, tokenAmount, tokenInfo, type Adapter, type AdapterEnv, type Decoded } from './common.ts';
 import { decodeTransaction } from './transaction.ts';
 
 /** The same contract (17,258 bytes of code) on Ethereum, Arbitrum One and HyperEVM. */
@@ -51,7 +51,7 @@ export const relayAdapter: Adapter = async (tx, env) => {
     let amount: bigint | null = call.args.length === 4 ? call.args[2] as bigint : null;
     // The three-argument form deposits the whole allowance the sender gave the depository.
     if (amount === null && env.deps.rpc?.has(tx.chainId)) {
-      try { amount = BigInt(String(await env.deps.rpc.call(tx.chainId, 'eth_call', [{ to: token, data: `0xdd62ed3e${tx.from.slice(2).padStart(64, '0')}${RELAY_DEPOSITORY.slice(2).padStart(64, '0')}` }, 'latest']))); } catch { amount = null; }
+      try { amount = BigInt(String(await env.deps.rpc.call(tx.chainId, 'eth_call', [{ to: token, data: `0xdd62ed3e${tx.from.slice(2).padStart(64, '0')}${RELAY_DEPOSITORY.slice(2).padStart(64, '0')}` }, readsAt(env)]))); } catch { amount = null; }
     }
     const what = amount !== null ? tokenAmount(amount, info, token) : `your whole ${info?.symbol ?? shortAddress(token)} allowance to the depository`;
     b.detail('You deposit', what, token).detail('Relay request', id, id);

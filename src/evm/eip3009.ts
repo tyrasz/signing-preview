@@ -6,7 +6,7 @@
 // one outside its window (validAfter < now < validBefore) or whose nonce was used or cancelled (authorizationState).
 import { decodeFunctionData, parseAbi } from 'viem';
 import { formatTimestamp, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
-import { decoded, tokenAmount, tokenInfo, tokenSourceWarnings, type Adapter } from './common.ts';
+import { decoded, readsAt, tokenAmount, tokenInfo, tokenSourceWarnings, type Adapter } from './common.ts';
 
 const ABI = parseAbi([
   'function transferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s)',
@@ -37,7 +37,7 @@ export const eip3009TxAdapter: Adapter = async (tx, env) => {
   const used = async (authorizer: string, nonce: string) => {
     if (!readable) return undefined;
     try {
-      const r = String(await env.deps.rpc!.call(tx.chainId, 'eth_call', [{ to: token, data: `0xe94a0102${authorizer.slice(2).toLowerCase().padStart(64, '0')}${nonce.slice(2)}` }, 'latest']));
+      const r = String(await env.deps.rpc!.call(tx.chainId, 'eth_call', [{ to: token, data: `0xe94a0102${authorizer.slice(2).toLowerCase().padStart(64, '0')}${nonce.slice(2)}` }, readsAt(env)]));
       return /^0x0{63}[01]$/.test(r) ? r.endsWith('1') : undefined;
     } catch { return undefined; }
   };

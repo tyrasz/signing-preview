@@ -12,7 +12,7 @@
 import { decodeAbiParameters, decodeFunctionData, encodeAbiParameters, parseAbi, type Hex } from 'viem';
 import { formatTimestamp, formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
-import { decoded, type Adapter, type Decoded } from './common.ts';
+import { decoded, readsAt, type Adapter, type Decoded } from './common.ts';
 import { decodeTransaction } from './transaction.ts';
 import { ownDelegateAfter } from './eip7702.ts';
 
@@ -269,7 +269,7 @@ async function caliburOwn(tx: Parameters<Adapter>[0], env: Parameters<Adapter>[1
   let runs = await ownDelegateAfter(tx);
   if (runs === null) return null;
   if (runs === undefined && env.deps.rpc?.has(tx.chainId)) {
-    const code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, 'latest']).catch(() => undefined);
+    const code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, readsAt(env)]).catch(() => undefined);
     if (typeof code === 'string' && code.toLowerCase().startsWith('0xef0100')) runs = `0x${code.slice(8, 48)}`.toLowerCase();
   }
   if (!runs || !CALIBUR_CODES[runs]) return null;
@@ -291,7 +291,7 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   let runs: string | undefined = delegate ?? undefined;
   if (delegate === undefined && !tx.codeInPlace && env.deps.rpc?.has(tx.chainId)) {
     let code: unknown;
-    try { code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, 'latest']); } catch { code = undefined; }
+    try { code = await env.deps.rpc.call(tx.chainId, 'eth_getCode', [tx.from, readsAt(env)]); } catch { code = undefined; }
     if (typeof code === 'string' && code.toLowerCase().startsWith('0xef0100')) runs = `0x${code.slice(8, 48)}`.toLowerCase();
     if (code === '0x') {
       b.warn('caution', 'smart_account_no_code', 'Your account has no code (no EIP-7702 delegation), so this call to it runs nothing: the calls it lists would not happen.');
