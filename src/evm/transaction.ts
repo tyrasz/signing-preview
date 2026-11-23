@@ -22,6 +22,7 @@ import { bscFeeRouterAdapter } from './bsc-fee-router.ts';
 import { hyperlendIsolatedAdapter } from './hyperlend-isolated.ts';
 import { beaconDepositAdapter } from './beacon-deposit.ts';
 import { validatorRequestAdapter } from './validator-requests.ts';
+import { uniswapV4PositionAdapter } from './uniswap-v4-positions.ts';
 import { lendingManagerAdapter } from './lending-managers.ts';
 import { eip3009TxAdapter } from './eip3009.ts';
 import { thorchainAdapter } from './thorchain.ts';
@@ -51,6 +52,7 @@ export const ADAPTERS: Adapter[] = [
   hyperlendIsolatedAdapter,
   beaconDepositAdapter,
   validatorRequestAdapter,
+  uniswapV4PositionAdapter,
   lendingManagerAdapter,
   orbitInboxAdapter,
   ...aggregatorAdapters,
