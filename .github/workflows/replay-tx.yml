@@ -11,6 +11,9 @@ name: Transaction replays
 # trace changed against the block's access list. That step fails when more than ten replays differ (of up to 300:
 # BNB Chain's same-second blocks leave one or two in a hundred, and Arbitrum's events that carry a transaction's own
 # L1 fee a few).
+# Then, for five minutes, the chain's Safe transactions are previewed as the signatures their owners gave (npm run
+# accuracy:safe): each execTransaction rebuilt as its SafeTx and run where it ran with stand-ins for its signatures,
+# against the receipt. That step fails when one differs.
 # Fails when a transaction's outcome, the sender's token movements (beyond 2 base units), its native coin change or
 # its approvals differ from the receipt, or its gas by 10% or more (scripts/accuracy.ts --strict); smaller gas
 # differences are listed in the summary. Where the node didn't answer the balance reads after a run (a rate limit),
@@ -103,6 +106,25 @@ jobs:
               --summary-md "$GITHUB_STEP_SUMMARY" --out previewer-b20.json 2>&1 | tee previewer-b20.log || status=$?
           fi
           exit $status
+      - name: Safe transactions, as the signatures their owners gave
+        # Recent execTransaction calls rebuilt as the SafeTx an owner signed and previewed where each ran, with none
+        # of its signatures (npm run accuracy:safe): the outcome the Safe logged, its token and native movements,
+        # and each change to the Safe itself against the preview's warnings. Fails when one differs.
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+          ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+          OPTIMISM_RPC_URL: ${{ secrets.OPTIMISM_RPC_URL }}
+          POLYGON_RPC_URL: ${{ secrets.POLYGON_RPC_URL }}
+          BSC_RPC_URL: ${{ secrets.BSC_RPC_URL }}
+          SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+          CHAIN: ${{ matrix.chain }}
+        run: |
+          set -o pipefail
+          npm run accuracy:safe -- --chain "$CHAIN" --follow 300 --max 100 --strict \
+            --summary-md "$GITHUB_STEP_SUMMARY" --out safe.json 2>&1 | tee safe.log
       - name: Upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -115,6 +137,8 @@ jobs:
             previewer.log
             previewer-b20.json
             previewer-b20.log
+            safe.json
+            safe.log
           if-no-files-found: ignore
           retention-days: 30
 

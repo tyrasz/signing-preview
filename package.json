@@ -72,6 +72,7 @@
     "build:probe": "node scripts/build-probe.ts",
     "accuracy": "NODE_USE_ENV_PROXY=1 node scripts/accuracy.ts",
     "accuracy:4337": "NODE_USE_ENV_PROXY=1 node scripts/accuracy-4337.ts",
+    "accuracy:safe": "NODE_USE_ENV_PROXY=1 node scripts/accuracy-safe.ts",
     "rules": "NODE_USE_ENV_PROXY=1 node scripts/rules-check.ts",
     "replays": "NODE_USE_ENV_PROXY=1 node scripts/replay-check.ts",
     "build:entrypoints": "NODE_USE_ENV_PROXY=1 node scripts/build-entrypoint-simulations.ts",

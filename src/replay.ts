@@ -107,6 +107,25 @@ export const REREAD_MS = 1_000;
  * when there is no such transaction, it isn't mined yet, it is the chain's own, or the chain has no RPC here.
  */
 export async function replayTransaction(input: { chainId: number; hash: string }, context: Pick<PreviewContext, 'trace' | 'now'>, deps: Dependencies): Promise<Preview> {
+  const { tx, replay } = await replayContext(input, deps);
+  const request = {
+    method: 'eth_sendTransaction',
+    params: [{
+      from: tx.from, ...(tx.to && { to: tx.to }), data: tx.input, value: tx.value, gas: tx.gas, nonce: tx.nonce, chainId: `0x${input.chainId.toString(16)}`,
+      ...(tx.maxFeePerGas !== undefined ? { maxFeePerGas: tx.maxFeePerGas, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? '0x0' } : tx.gasPrice !== undefined && { gasPrice: tx.gasPrice }),
+      ...(tx.accessList?.length && { accessList: tx.accessList }), ...(tx.authorizationList?.length && { authorizationList: tx.authorizationList }),
+    }],
+  };
+  return previewRequest(request as never, { chainId: input.chainId, account: tx.from, ...(context.trace && { trace: true }), ...(context.now !== undefined && { now: context.now }), replay }, deps);
+}
+
+/**
+ * Where a mined transaction ran, as a preview is to run it again (ReplayContext): its parent block's state, its
+ * block's header and the block's earlier transactions (or what they left), with its receipt. The transaction too,
+ * as the node has it. A harness that previews what a mined transaction's signer signed, on the state the
+ * transaction met, starts here (scripts/accuracy-safe.ts).
+ */
+export async function replayContext(input: { chainId: number; hash: string }, deps: Dependencies): Promise<{ tx: RpcTx; replay: ReplayContext }> {
   const { chainId, hash } = input;
   if (!Number.isSafeInteger(chainId) || chainId <= 0) throw new ReplayError('INVALID_REQUEST', '"chainId" must be a chain\'s number');
   if (typeof hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(hash)) throw new ReplayError('INVALID_REQUEST', '"hash" must be a transaction hash (32 bytes in hex)');
@@ -196,15 +215,7 @@ export async function replayTransaction(input: { chainId: number; hash: string }
     when: { block: tx.blockNumber, time }, ...(shifted && { shifted, ownTimestamp: BigInt(block.timestamp), ...(!state && { sameSecond: once(() => sameSecond(chainId, block, index, { ...header, timestamp: BigInt(block.timestamp), ...(blobBaseFee !== undefined && { blobBaseFee }) }, deps)) }) }),
     ...(own && { recorded: { changes: own, sender: tx.from.toLowerCase(), nonce: BigInt(tx.nonce), coinbase: header.coinbase.toLowerCase(), fee: gasUsed * gasPrice + extra, tip: gasUsed * (gasPrice > header.baseFeePerGas ? gasPrice - header.baseFeePerGas : 0n) } }),
   };
-  const request = {
-    method: 'eth_sendTransaction',
-    params: [{
-      from: tx.from, ...(tx.to && { to: tx.to }), data: tx.input, value: tx.value, gas: tx.gas, nonce: tx.nonce, chainId: `0x${chainId.toString(16)}`,
-      ...(tx.maxFeePerGas !== undefined ? { maxFeePerGas: tx.maxFeePerGas, maxPriorityFeePerGas: tx.maxPriorityFeePerGas ?? '0x0' } : tx.gasPrice !== undefined && { gasPrice: tx.gasPrice }),
-      ...(tx.accessList?.length && { accessList: tx.accessList }), ...(tx.authorizationList?.length && { authorizationList: tx.authorizationList }),
-    }],
-  };
-  return previewRequest(request as never, { chainId, account: tx.from, ...(context.trace && { trace: true }), ...(context.now !== undefined && { now: context.now }), replay }, deps);
+  return { tx, replay };
 }
 
 type Logged = { address: string; topics: string[] };
