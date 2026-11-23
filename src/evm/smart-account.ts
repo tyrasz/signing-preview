@@ -32,8 +32,18 @@ type Call = { target: string; value: bigint; data: Hex };
  * target, calldata). Null when it doesn't parse.
  */
 function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean } | null {
-  const callType = mode.slice(2, 4), tryMode = mode.slice(4, 6) === '01';
-  const body = data.slice(2);
+  const callType = mode.slice(2, 4), tryMode = mode.slice(4, 6) === '01', selector = mode.slice(14, 22);
+  // The execution with a signature for it after (ERC-7821's opData, mode selector 0x78210001), as
+  // UniversalGaslessDelegate takes one a relayer submits (src/typed-data/authorized-executions.ts):
+  // abi.encode(bytes execution, bytes opData), the execution a packed single call or abi.encode(calls). Only a layout
+  // that re-encodes to the same bytes fits.
+  const SIGNED = [{ type: 'bytes' }, { type: 'bytes' }] as const;
+  const signed = (): Hex | null => { try { const [execution, op] = decodeAbiParameters(SIGNED, data); return encodeAbiParameters(SIGNED, [execution, op]).toLowerCase() === data.toLowerCase() ? execution : null; } catch { return null; } };
+  // (A single call or a delegatecall under another mode selector is laid out as that mode's account has it: the
+  // packed layout, read from any bytes, made a call with a value of 9e30 of an execution that sends 5,500 USDC.)
+  const inner = callType === '00' && selector === '78210001' ? signed() : null;
+  if ((callType === '00' || callType === 'ff') && selector !== '00000000' && !inner) return null;
+  const body = (inner ?? data).slice(2);
   if (callType === '00') {
     if (body.length < 104) return null;
     return { calls: [{ target: `0x${body.slice(0, 40)}`, value: BigInt(`0x${body.slice(40, 104)}`), data: `0x${body.slice(104)}` }], delegatecall: false, tryMode };
@@ -47,29 +57,38 @@ function erc7579Calls(mode: Hex, data: Hex): { calls: Call[]; delegatecall: bool
   const WITH_OP = [...CALLS, { type: 'bytes' }] as const;
   const same = (x: Hex) => x.toLowerCase() === data.toLowerCase();
   try { const [calls] = decodeAbiParameters(CALLS, data); if (same(encodeAbiParameters(CALLS, [calls]))) return { calls: [...calls], delegatecall: false, tryMode }; } catch { /* next */ }
-  try { const [calls, op] = decodeAbiParameters(WITH_OP, data); if (same(encodeAbiParameters(WITH_OP, [calls, op]))) return { calls: [...calls], delegatecall: false, tryMode }; } catch { /* neither */ }
+  try { const [calls, op] = decodeAbiParameters(WITH_OP, data); if (same(encodeAbiParameters(WITH_OP, [calls, op]))) return { calls: [...calls], delegatecall: false, tryMode }; } catch { /* next */ }
+  // (And UniversalGaslessDelegate's batch on a signature: the calls encoded on their own, as bytes, before opData.)
+  const batch = selector === '78210001' ? signed() : null;
+  if (batch) try { const [calls] = decodeAbiParameters(CALLS, batch); if (encodeAbiParameters(CALLS, [calls]).toLowerCase() === batch.toLowerCase()) return { calls: [...calls], delegatecall: false, tryMode }; } catch { /* none of them */ }
   return null;
 }
 
-export const smartAccountAdapter: Adapter = async (tx, env) => {
-  if (!tx.to || !sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
-  let parsed: { calls: Call[]; delegatecall: boolean; tryMode: boolean; standard: string } | null = null;
+/**
+ * The calls a smart account's batch call holds (the formats above), null when the calldata isn't one of them. What
+ * a wallet asked to send those calls (wallet_sendCalls) puts on the chain: scripts/accuracy-batch.ts reads mined
+ * batches back with it.
+ */
+export function batchCalls(data: Hex): { calls: Call[]; delegatecall: boolean; tryMode: boolean; standard: string } | null {
   try {
-    const call = decodeFunctionData({ abi: ABI, data: tx.data });
-    if (call.functionName === 'executeBatch' && call.args.length === 1) parsed = { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: 'executeBatch' };
-    else if (call.functionName === 'executeBatch') {
+    const call = decodeFunctionData({ abi: ABI, data });
+    if (call.functionName === 'executeBatch' && call.args.length === 1) return { calls: call.args[0] as unknown as Call[], delegatecall: false, tryMode: false, standard: 'executeBatch' };
+    if (call.functionName === 'executeBatch') {
       // Parallel arrays: targets, (values,) calldata. The account requires equal lengths (an empty value list means none).
       const [dest, a, b] = call.args as unknown as [string[], readonly unknown[], readonly Hex[] | undefined];
       const values = b ? a as readonly bigint[] : [], datas = (b ?? a) as readonly Hex[];
       if (dest.length !== datas.length || (values.length && values.length !== dest.length)) return null;
-      parsed = { calls: dest.map((target, i) => ({ target, value: values[i] ?? 0n, data: datas[i] })), delegatecall: false, tryMode: false, standard: b ? 'executeBatch(address[],uint256[],bytes[])' : 'executeBatch(address[],bytes[])' };
+      return { calls: dest.map((target, i) => ({ target, value: values[i] ?? 0n, data: datas[i] })), delegatecall: false, tryMode: false, standard: b ? 'executeBatch(address[],uint256[],bytes[])' : 'executeBatch(address[],bytes[])' };
     }
-    else if (call.args.length === 3) parsed = { calls: [{ target: call.args[0], value: call.args[1], data: call.args[2] }], delegatecall: false, tryMode: false, standard: 'execute(address,uint256,bytes)' };
-    else {
-      const p = erc7579Calls(call.args[0] as Hex, call.args[1] as Hex);
-      parsed = p && { ...p, standard: 'ERC-7579 / ERC-7821 execute' };
-    }
+    if (call.args.length === 3) return { calls: [{ target: call.args[0], value: call.args[1], data: call.args[2] }], delegatecall: false, tryMode: false, standard: 'execute(address,uint256,bytes)' };
+    const p = erc7579Calls(call.args[0] as Hex, call.args[1] as Hex);
+    return p && { ...p, standard: 'ERC-7579 / ERC-7821 execute' };
   } catch { return null; }
+}
+
+export const smartAccountAdapter: Adapter = async (tx, env) => {
+  if (!tx.to || !sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
+  const parsed = batchCalls(tx.data);
   if (!parsed || !parsed.calls.length) return null;
 
   const b = new PreviewBuilder().detail('Account', `your account (${tx.from})`).detail('Format', parsed.standard);
