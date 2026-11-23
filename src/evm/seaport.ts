@@ -76,6 +76,13 @@ export const seaportTxAdapter: Adapter = async (tx, env) => {
       b.warn('caution', 'seaport_recipient', `What you buy goes to ${shortAddress(recipient)}, not to you.`);
     }
   };
+  // Orders past the tenth aren't read, and that is said (a transaction of twelve read "fully decoded" on ten).
+  const allRead = (count: number, meaning: string | null): 'full' | 'partial' => {
+    if (count <= MAX_ORDERS) return 'full';
+    b.detail('More orders', String(count - MAX_ORDERS));
+    if (meaning) b.warn('danger', 'seaport_orders_unread', `It has ${count} orders; the ${count - MAX_ORDERS} after the first ${MAX_ORDERS} aren't read here, and ${meaning}.`);
+    return 'partial';
+  };
   switch (call.functionName) {
     case 'incrementCounter':
       b.warn('info', 'seaport_cancel_all', 'This cancels every Seaport order you have signed so far (listings and offers): their signatures stop working.');
@@ -85,7 +92,8 @@ export const seaportTxAdapter: Adapter = async (tx, env) => {
       const titles = [];
       for (const [i, o] of orders.slice(0, MAX_ORDERS).entries()) titles.push((await describeOrder(o, from, e, new PreviewBuilder())).title);
       titles.forEach((t, i) => b.detail(`Order ${i + 1}`, t));
-      return decoded({ title: orders.length === 1 ? `Cancel a Seaport order (${titles[0]})` : `Cancel ${orders.length} Seaport orders`, summary: 'Cancels the orders, so their signatures can no longer be used.', decoder: 'seaport', status: 'full', b });
+      // (Cancelling an order gives nothing away: the ones not listed are counted, and nothing more.)
+      return decoded({ title: orders.length === 1 ? `Cancel a Seaport order (${titles[0]})` : `Cancel ${orders.length} Seaport orders`, summary: 'Cancels the orders, so their signatures can no longer be used.', decoder: 'seaport', status: allRead(orders.length, null), b });
     }
     case 'validate': {
       // Validating publishes the orders on-chain: they can then be filled with no signature at all.
@@ -97,7 +105,8 @@ export const seaportTxAdapter: Adapter = async (tx, env) => {
         orderTerms(o, b, env.context.now ?? Date.now(), n);
       }
       b.warn('info', 'seaport_validate', 'Validating an order publishes it on-chain: anyone can then fill it without a signature, until it expires or you cancel it.');
-      return decoded({ title: orders.length === 1 ? `Publish a Seaport order: ${titles[0]}` : `Publish ${orders.length} Seaport orders`, summary: 'Validates the orders on-chain, so they can be filled without your signature.', decoder: 'seaport', status: 'full', b });
+      return decoded({ title: orders.length === 1 ? `Publish a Seaport order: ${titles[0]}` : `Publish ${orders.length} Seaport orders`, summary: 'Validates the orders on-chain, so they can be filled without your signature.', decoder: 'seaport',
+        status: allRead(orders.length, 'each is published as the others are: any of them could give your tokens away for nothing'), b });
     }
     case 'fulfillBasicOrder':
     case 'fulfillBasicOrder_efficient_6GL6yc': {
@@ -121,12 +130,14 @@ export const seaportTxAdapter: Adapter = async (tx, env) => {
       if (call.functionName === 'matchAdvancedOrders') { recipientCheck(call.args[3] as string); resolveCriteria(orders, call.args[1] as never); }
       if (call.functionName.startsWith('match')) {
         const { title } = await describeMatch(orders.slice(0, MAX_ORDERS), from, e, b);
-        return decoded({ title, summary: `Matches ${orders.length} Seaport orders in one transaction: ${title.charAt(0).toLowerCase()}${title.slice(1)}.`, decoder: 'seaport', status: 'full', b });
+        return decoded({ title, summary: `Matches ${orders.length} Seaport orders in one transaction: ${title.charAt(0).toLowerCase()}${title.slice(1)}.`, decoder: 'seaport',
+          status: allRead(orders.length, 'what the match gives and takes is told from the first ones alone: the rest can change it'), b });
       }
       const titles = [];
       for (const [i, o] of orders.slice(0, MAX_ORDERS).entries()) titles.push((await describeFill(o, from, e, b, orders.length > 1 ? `Order ${i + 1}` : '')).title);
       return decoded({ title: orders.length === 1 ? titles[0] : `Fill ${orders.length} Seaport orders: ${titles.slice(0, 2).join('; ')}${orders.length > 2 ? '; …' : ''}`,
-        summary: `Fills ${orders.length} Seaport order${orders.length === 1 ? '' : 's'} in one transaction (a sweep: those already taken are skipped).`, decoder: 'seaport', status: 'full', b });
+        summary: `Fills ${orders.length} Seaport order${orders.length === 1 ? '' : 's'} in one transaction (a sweep: those already taken are skipped).`, decoder: 'seaport',
+        status: allRead(orders.length, 'what filling them costs you is told only by the simulated changes, if any are shown'), b });
     }
   }
   return null;

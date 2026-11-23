@@ -83,14 +83,18 @@ export const relayAdapter: Adapter = async (tx, env) => {
     if (mine) for (const a of d.assetChanges) assetChanges.push({ ...a, direction: 'in', account: tx.from });
     b.detail(calls.length > 1 ? `Call ${i + 1}` : 'Call', `${title}${c.value > 0n && !/^Send /.test(d.title) ? `, with ${nativeAmount(tx.chainId, c.value)}` : ''}${c.allowFailure ? ' (allowed to fail)' : ''}`, recipient ?? c.to.toLowerCase());
   }
-  if (calls.length > MAX_CALLS) b.detail('More calls', String(calls.length - MAX_CALLS));
+  // (Past the tenth they aren't read: said, though they run from the depository's funds and nothing of the sender's.)
+  if (calls.length > MAX_CALLS) {
+    b.detail('More calls', String(calls.length - MAX_CALLS));
+    b.warn('info', 'relay_payout_calls_unread', `It has ${calls.length} calls, and the ${calls.length - MAX_CALLS} after the first ${MAX_CALLS} aren't read here. They run from Relay's depository, with its funds.`);
+  }
   b.detail('Signed by', "Relay's allocator").detail('Valid until', formatTimestamp(Number(request.expiration) * 1000));
   if (Number(request.expiration) * 1000 < (env.context.now ?? Date.now())) b.warn('info', 'relay_request_expired', 'This signed request has expired, so the depository will reject it.');
   b.note("These calls were signed by Relay's allocator and run from Relay's depository, with its funds: a refund or payout, which anyone may submit. Nothing leaves your wallet but gas.");
   return decoded({
     title: calls.length === 1 ? `Relay payout: ${titles[0]}` : `Relay payout: ${calls.length} calls from the depository`,
     summary: `Submits a request signed by Relay's allocator: the depository ${titles.slice(0, 3).join('; ')}${calls.length > 3 ? '; …' : ''}.`,
-    decoder: 'relay_execute', status: inner.some(d => d.status !== 'full') ? 'partial' : 'full', b, assetChanges,
+    decoder: 'relay_execute', status: calls.length > MAX_CALLS || inner.some(d => d.status !== 'full') ? 'partial' : 'full', b, assetChanges,
   });
 };
 

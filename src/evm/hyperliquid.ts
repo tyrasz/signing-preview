@@ -185,7 +185,11 @@ export async function simulatedCoreActions(actions: { user: string; data: string
     b.detail(`HyperCore action${n}`, `${r.title}${sameAddress(a.user, from) ? '' : ` (sent by ${shortAddress(a.user)}, for its own HyperCore account)`}`, a.data);
     for (const w of sub.warnings) if (w.severity !== 'info') b.warn(w.severity, w.code, `HyperCore action${n}: ${w.message}`);
   }
-  if (actions.length > 10) b.detail('More HyperCore actions', String(actions.length - 10));
+  // (Past the tenth they aren't read, and that is said: their checks against the HyperCore account weren't made.)
+  if (actions.length > 10) {
+    b.detail('More HyperCore actions', String(actions.length - 10));
+    b.warn('caution', 'corewriter_actions_unread', `It sends ${actions.length} HyperCore actions, and the ${actions.length - 10} after the first 10 aren't read here: what they do on HyperCore isn't shown.`);
+  }
   const one = actions.length === 1;
   b.warn('info', 'corewriter_async', `This transaction sends ${one ? 'a HyperCore action' : `${actions.length} HyperCore actions`} through CoreWriter. HyperCore runs ${one ? 'it' : 'them'} after the HyperEVM block; if ${one ? 'it fails' : 'one fails'}, the EVM transaction still succeeds and gas is spent.`);
 }

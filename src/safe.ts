@@ -39,7 +39,12 @@ export const SAFE_LIBRARIES: Record<string, { name: string; kind: 'multisend' | 
   '0x6439e7abd8bb915a5263094784c5cf561c4172ac': { name: 'SafeMigration 1.5.0', kind: 'migration' },
 };
 const ZERO = '0x0000000000000000000000000000000000000000';
-const MAX_CALLS = 20;
+/**
+ * How many of a batch's calls are decoded with reads of the chain (a token's name, an account's code), and how many
+ * are decoded at all: those after the first twenty from their calldata alone, so that a batch of two hundred
+ * transfers (an airdrop's, a payroll's) is read whole without two hundred calls' worth of lookups.
+ */
+const MAX_CALLS = 20, MAX_LISTED = 200;
 
 export interface SafeTx { safe: string; to: string; value: bigint; data: Hex; operation: number; safeTxGas: bigint; baseGas: bigint; gasPrice: bigint; gasToken: string; refundReceiver: string; nonce?: bigint }
 interface Call { operation: number; to: string; value: bigint; data: Hex }
@@ -174,18 +179,32 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   // 1.3.0 always, from it with a safeTxGas or a gas price). On Base, a SafeOp sent a token to a Safe it then deployed
   // and ran a transaction on: shown failing (ERC20InsufficientBalance), it ran.
   const alone: { call: number; warning: Warning }[] = [];
-  for (const [i, c] of calls.slice(0, MAX_CALLS).entries()) {
+  // (Past the twentieth call, with no RPC and no simulator: from the calldata alone.)
+  const fromCalldata: AdapterEnv = { ...env, deps: { ...env.deps, rpc: undefined, simulator: undefined } };
+  for (const [i, c] of calls.slice(0, MAX_LISTED).entries()) {
     const p = calls.length > 1 ? `Call ${i + 1}: ` : '';
     if (calls.length > 1 && c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()]) b.warn('danger', 'safe_delegatecall', `${p}a delegatecall to ${c.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
     const from = b.warnings.length;
-    const d = await describeCall(c, safe, chainId, env, b, p);
+    const d = await describeCall(c, safe, chainId, i < MAX_CALLS ? env : fromCalldata, b, p);
     if (i > 0 && isExecTransaction(c)) for (const w of b.warnings.slice(from)) if (w.code === 'safe_tx_reverts') alone.push({ call: i, warning: w });
     decoded.push(d);
     const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[chainId]?.nativeDecimals ?? 18)} ${CHAINS[chainId]?.nativeSymbol ?? 'native'}` : '';
     titles.push(d.title);
     if (calls.length > 1) b.detail(`Call ${i + 1}`, `${c.operation === 1 ? '(delegatecall) ' : ''}${d.title}${value} (${shortAddress(c.to.toLowerCase())})`, c.to.toLowerCase());
   }
-  if (calls.length > MAX_CALLS) b.detail('More calls', String(calls.length - MAX_CALLS));
+  // Every call is decoded, to the two hundredth (calls past the twentieth weren't: behind twenty transfers, a
+  // delegatecall to unknown code or an unlimited approval went with nothing warned of, the batch "fully decoded").
+  // Past that they aren't, and that is said, with what is cheap to tell of them and matters most: a delegatecall
+  // inside the batch runs as the Safe wherever in it it is.
+  if (calls.length > MAX_CALLS) b.note(`The calls after the first ${MAX_CALLS} are decoded from their calldata alone, without the reads of the chain the first ${MAX_CALLS} get (a token this doesn't know is shown by its address).`);
+  if (calls.length > MAX_LISTED) {
+    const rest = calls.slice(MAX_LISTED);
+    const rogue = rest.flatMap((c, j) => (c.operation === 1 && !SAFE_LIBRARIES[c.to.toLowerCase()] ? [{ n: MAX_LISTED + j + 1, to: c.to }] : []));
+    for (const r of rogue.slice(0, 3)) b.warn('danger', 'safe_delegatecall', `Call ${r.n}: a delegatecall to ${r.to} inside the batch: its code would run as the Safe itself, able to change its owners, move everything in it or replace its code.`);
+    if (rogue.length > 3) b.warn('danger', 'safe_delegatecall', `${rogue.length - 3} more of the batch's calls are delegatecalls to contracts that aren't Safe's libraries (calls ${rogue.slice(3, 9).map(r => r.n).join(', ')}${rogue.length > 9 ? ', …' : ''}).`);
+    b.detail('More calls', String(rest.length));
+    b.warn('danger', 'safe_calls_unread', `The batch has ${calls.length} calls, and the ${rest.length} after the first ${MAX_LISTED} aren't decoded here: any of them can move what the Safe holds, approve a spender or change the Safe. Don't sign it on the calls listed alone${env.deps.simulator ? ': what a simulation of the whole batch shows, if one is shown below, is all that is told of them' : ''}.`);
+  }
 
   // Gas refund: the Safe pays whoever executes (or refundReceiver) up to (safeTxGas + baseGas) × gasPrice of gasToken.
   if (t.gasPrice > 0n) {
@@ -214,7 +233,7 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
   // the calls on today's state are another transaction's, and the replay itself says what this one did.)
   if (!ran && sim && calls.every(c => c.operation === 0) && !env.context.replay) {
     const overrides = callerOverrides(env.context);
-    const reqs = calls.map((c, i) => ({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data, value: c.value, ...((decoded[i] as Decoded).watch?.length && { watch: (decoded[i] as Decoded).watch }), ...(overrides && { stateOverrides: overrides }) }));
+    const reqs = calls.map((c, i) => ({ chainId, from: safe, to: c.to.toLowerCase(), data: c.data, value: c.value, ...((decoded[i] as Decoded | undefined)?.watch?.length && { watch: (decoded[i] as Decoded).watch }), ...(overrides && { stateOverrides: overrides }) }));
     try {
       const results = reqs.length === 1 ? [await sim.simulate(reqs[0])] : sim.simulateBatch ? await sim.simulateBatch(reqs) : null;
       if (results?.every(r => r)) warnOverridden(b, overrides);
@@ -242,7 +261,7 @@ export async function describeSafeTx(t: SafeTx, chainId: number, env: AdapterEnv
     b.note(`Call ${call + 1}'s Safe transaction fails when simulated on its own, without the calls before it${why ? ` (${why})` : ''}; run after them, as the batch runs it, it succeeds (its Safe logs ExecutionSuccess).`);
   }
   const statuses = decoded.map(d => d.status);
-  const status = statuses.includes('opaque') ? 'partial' : statuses.includes('partial') ? 'partial' : 'full';
+  const status = calls.length > MAX_LISTED || statuses.includes('opaque') ? 'partial' : statuses.includes('partial') ? 'partial' : 'full';
   // A delegatecall to an unknown contract is titled for what it is: whatever its calldata looks like (in the Bybit
   // theft it looked like a plain transfer), the contract's own code runs as the Safe.
   const rogue = t.operation === 1 && !lib;

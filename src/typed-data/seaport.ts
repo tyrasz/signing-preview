@@ -97,7 +97,12 @@ export const seaportAdapter: TypedAdapter = async (data, env) => {
     summaries.push(s);
     assetChanges.push(...s.assetChanges);
   }
-  if (orders.length > MAX_ORDERS) b.detail('More orders', String(orders.length - MAX_ORDERS));
+  // Orders past the twentieth aren't read, and that is said: one signature covers them all, and one of them giving
+  // a token away for nothing went unseen behind twenty listings, the signature "fully decoded".
+  if (orders.length > MAX_ORDERS) {
+    b.detail('More orders', String(orders.length - MAX_ORDERS));
+    b.warn('danger', 'seaport_orders_unread', `One signature for ${orders.length} orders, and the ${orders.length - MAX_ORDERS} after the first ${MAX_ORDERS} aren't read here: each can be filled on its own, and any of them could give your tokens away for nothing.`);
+  }
   if (bulk && orders.length > 1) b.warn('info', 'seaport_bulk_order', `One signature for ${orders.length} orders: each can be filled on its own until it expires or you cancel it.`);
   b.note("This is an off-chain signature; it costs no gas now. Anyone holding it can fill the order until it expires or you cancel it (Seaport's cancel, or incrementCounter for all your orders at once).");
   const listing = summaries.every(s => s.title.startsWith('List '));
@@ -105,6 +110,6 @@ export const seaportAdapter: TypedAdapter = async (data, env) => {
   return {
     title, summary: summaries.length === 1 ? `Signs a Seaport order: you give ${summaries[0].gives.join(', ') || 'nothing'} and receive ${summaries[0].gets.join(', ') || 'nothing'}.`
       : `Signs ${orders.length} Seaport orders at once: ${summaries.slice(0, 3).map(s => s.title).join('; ')}${orders.length > 3 ? '; …' : ''}.`,
-    decoder: bulk ? 'seaport_bulk_order' : 'seaport_order', status: 'full', b, network, assetChanges,
+    decoder: bulk ? 'seaport_bulk_order' : 'seaport_order', status: orders.length > MAX_ORDERS ? 'partial' : 'full', b, network, assetChanges,
   };
 };

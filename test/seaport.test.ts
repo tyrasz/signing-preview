@@ -76,6 +76,13 @@ test('A bulk listing: every order in the tree, padding left out', async () => {
   const sneaky = await sign({ tree: [[components([nft(1)], [eth(E, ALICE)]), components([nft(2)], [eth(1n, BOB)])], [empty, empty]] }, 'BulkOrder', types);
   assert.equal(sneaky.attention, 'danger');
   assert.match(sneaky.warnings.find(w => w.code === 'seaport_nothing_in_return')!.message, /^Order 2: /);
+  // More orders than are read: said, and not "fully decoded". Behind twenty listings, a twenty-first order giving
+  // an NFT away for nothing went unseen.
+  const leaves = [...Array.from({ length: 20 }, (_, i) => components([nft(i + 1)], [eth(E, ALICE)])), components([nft(99)], [eth(1n, BOB)]), ...Array.from({ length: 11 }, () => empty)];
+  const wide = await sign({ tree: leaves }, 'BulkOrder', { ...TYPES, BulkOrder: [{ name: 'tree', type: 'OrderComponents[32]' }] });
+  assert.deepEqual([wide.attention, wide.decoding.status, detail(wide, 'More orders')], ['danger', 'partial', '1']);
+  assert.match(wide.warnings.find(w => w.code === 'seaport_orders_unread')?.message ?? '', /^One signature for 21 orders, and the 1 after the first 20 aren't read here/);
+  assert.ok(!codes(p).includes('seaport_orders_unread'));
 });
 
 // Transactions to Seaport, from the side of whoever sends them.
@@ -125,6 +132,22 @@ test('A matched buy is judged as a whole; validating a give-away order and cance
   assert.ok(codes(v).includes('seaport_validate'));
   const all = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'incrementCounter' }));
   assert.equal(all.title, 'Cancel all your Seaport orders');
+  // More orders than are read (ten): said. Eleven validated, the eleventh a give-away, read "fully decoded".
+  const fair = (id: bigint) => params(BOB, [item(2, APES, id, 1n)], [item(0, ZERO, 0n, E, BOB)]);
+  const eleven = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'validate', args: [[...Array.from({ length: 10 }, (_, i) => ({ parameters: fair(BigInt(i + 1)), signature: '0x' })), { parameters: giveaway, signature: '0x' }] as never] }));
+  assert.deepEqual([eleven.attention, eleven.decoding.status, detail(eleven, 'More orders')], ['danger', 'partial', '1']);
+  assert.match(eleven.warnings.find(w => w.code === 'seaport_orders_unread')?.message ?? '', /^It has 11 orders; the 1 after the first 10 aren't read here, and each is published as the others are/);
+  const ten = await send(encodeFunctionData({ abi: TX_ABI, functionName: 'validate', args: [Array.from({ length: 10 }, (_, i) => ({ parameters: fair(BigInt(i + 1)), signature: '0x' })) as never] }));
+  assert.deepEqual([codes(ten).includes('seaport_orders_unread'), ten.decoding.status], [false, 'full']);
+  // (Cancelling gives nothing away: the orders not listed are counted, with no warning.)
+  const CANCEL = parseAbi([
+    'struct OfferItem { uint8 itemType; address token; uint256 identifierOrCriteria; uint256 startAmount; uint256 endAmount; }',
+    'struct ConsiderationItem { uint8 itemType; address token; uint256 identifierOrCriteria; uint256 startAmount; uint256 endAmount; address recipient; }',
+    'struct OrderComponents { address offerer; address zone; OfferItem[] offer; ConsiderationItem[] consideration; uint8 orderType; uint256 startTime; uint256 endTime; bytes32 zoneHash; uint256 salt; bytes32 conduitKey; uint256 counter; }',
+    'function cancel(OrderComponents[] orders) returns (bool)',
+  ]);
+  const cancelled = await send(encodeFunctionData({ abi: CANCEL, functionName: 'cancel', args: [Array.from({ length: 11 }, (_, i) => ({ ...fair(BigInt(i + 1)), counter: 0n })) as never] }));
+  assert.deepEqual([codes(cancelled).includes('seaport_orders_unread'), detail(cancelled, 'More orders'), cancelled.decoding.status], [false, '1', 'partial']);
 });
 
 test('SeaDrop mints: the collection, quantity and price, overpaying the drop, and minting for someone else', async () => {

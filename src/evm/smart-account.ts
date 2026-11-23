@@ -31,7 +31,11 @@ const ABI = parseAbi([
 ]);
 const WALLET_CORE = new Set(['executeFromSelf', 'executeWithValidator', 'initializeExecuteWithValidator', 'executeFromExecutor']);
 const CALLS = [{ type: 'tuple[]', components: [{ name: 'target', type: 'address' }, { name: 'value', type: 'uint256' }, { name: 'data', type: 'bytes' }] }] as const;
-const MAX_CALLS = 20;
+/**
+ * How many of a batch's calls are decoded with reads of the chain, and how many are decoded at all: those after the
+ * first twenty from their calldata alone (as a Safe's batch is: src/safe.ts).
+ */
+const MAX_CALLS = 20, MAX_LISTED = 200;
 
 type Call = { target: string; value: bigint; data: Hex };
 
@@ -134,11 +138,13 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
   }
   const native = CHAINS[tx.chainId]?.nativeSymbol ?? 'native';
   const inner: Decoded[] = [];
-  for (const [i, c] of parsed.calls.slice(0, MAX_CALLS).entries()) {
+  // (Past the twentieth call, with no RPC and no simulator: from the calldata alone.)
+  const fromCalldata = { ...env.deps, rpc: undefined, simulator: undefined };
+  for (const [i, c] of parsed.calls.slice(0, MAX_LISTED).entries()) {
     // A call back into the account itself isn't unpacked again.
     const d = sameAddress(c.target, tx.from)
       ? decoded({ title: `Call your own account (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: 'partial' })
-      : await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, env.deps, env.context);
+      : await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, i < MAX_CALLS ? env.deps : fromCalldata, env.context);
     inner.push(d);
     const value = c.value > 0n && !/\b(send|deposit|stake)\b/i.test(d.title) ? `, with ${formatUnits(c.value, CHAINS[tx.chainId]?.nativeDecimals ?? 18)} ${native}` : '';
     b.detail(`Call ${i + 1}`, `${d.title}${value} (${shortAddress(c.target.toLowerCase())})`, c.target.toLowerCase());
@@ -146,13 +152,20 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     // caller's state (from a Safe a call runs execTransaction on), which is said once.
     for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `Call ${i + 1}: ${w.message}` });
   }
-  if (parsed.calls.length > MAX_CALLS) b.detail('More calls', String(parsed.calls.length - MAX_CALLS));
+  // Every call is decoded, to the two hundredth (calls past the twentieth weren't: a batch read "fully decoded" on
+  // its first twenty, with nothing of what the rest approve or send). Past that they aren't, and that is said.
+  if (parsed.calls.length > MAX_CALLS) b.note(`The calls after the first ${MAX_CALLS} are decoded from their calldata alone, without the reads of the chain the first ${MAX_CALLS} get (a token this doesn't know is shown by its address).`);
+  if (parsed.calls.length > MAX_LISTED) {
+    b.detail('More calls', String(parsed.calls.length - MAX_LISTED));
+    b.warn('danger', 'smart_account_calls_unread', `The batch has ${parsed.calls.length} calls, and the ${parsed.calls.length - MAX_LISTED} after the first ${MAX_LISTED} aren't decoded here: any of them can move what your account holds or approve a spender. What they do is told only by the simulated changes, if any are shown.`);
+  }
   if (parsed.delegatecall) b.warn('danger', 'smart_account_delegatecall', `This runs ${shortAddress(parsed.calls[0].target)}'s code inside your account (delegatecall): it can do anything with the account and everything in it.`);
   if (parsed.tryMode && parsed.calls.length > 1) b.note('The batch is in "try" mode: a call that fails is skipped and the others still take effect.');
 
   const n = parsed.calls.length;
   const statuses = inner.map(d => d.status);
-  const status = statuses.includes('opaque') ? (statuses.every(s => s === 'opaque') ? 'opaque' : 'partial') : statuses.includes('partial') ? 'partial' : 'full';
+  const some = statuses.includes('opaque') ? (statuses.every(s => s === 'opaque') ? 'opaque' : 'partial') : statuses.includes('partial') ? 'partial' : 'full';
+  const status = parsed.calls.length > MAX_LISTED && some === 'full' ? 'partial' : some;
   return decoded({
     title: n === 1 ? inner[0].title : `Run ${n} calls from your account`,
     summary: n === 1 ? `${inner[0].summary.replace(/\.$/, '')}${inner[0].summary ? '. ' : ''}Your account runs it through its own code.`

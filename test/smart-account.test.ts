@@ -33,6 +33,19 @@ test('ERC-7579 / ERC-7821 batches: every call decoded, with its own warnings num
   assert.ok(q.decoding.notes.some(n => /"try" mode/.test(n)));
 });
 
+test('A batch of more than twenty calls: every call decoded to the two hundredth, and what is past that said to be unread', async () => {
+  const many = (n: number, last: { target: Hex; value: bigint; data: Hex }) => encodeFunctionData({ abi: ACCOUNT, functionName: 'executeBatch', args: [[...Array.from({ length: n }, () => ({ target: USDC as Hex, value: 0n, data: transfer })), last]] });
+  // Behind twenty transfers an unlimited approval went with nothing warned of: calls past the twentieth weren't read.
+  const hidden = await send(many(20, { target: WETH, value: 0n, data: approve }));
+  assert.match(hidden.warnings.find(w => w.code === 'unlimited_approval')?.message ?? '', /^Call 21: /);
+  assert.match(detail(hidden, 'Call 21') ?? '', /^Allow .* to spend unlimited WETH/);
+  assert.equal(detail(hidden, 'More calls'), undefined);
+  // Past the two hundredth they aren't decoded, which is said.
+  const beyond = await send(many(200, { target: WETH, value: 0n, data: approve }));
+  assert.deepEqual([beyond.attention, beyond.decoding.status, detail(beyond, 'More calls')], ['danger', 'partial', '1']);
+  assert.match(beyond.warnings.find(w => w.code === 'smart_account_calls_unread')?.message ?? '', /^The batch has 201 calls, and the 1 after the first 200 aren't decoded here/);
+});
+
 test('Single calls (packed ERC-7579, execute(address,uint256,bytes)), executeBatch, and delegatecall', async () => {
   const single = concatHex([USDC, numberToHex(0n, { size: 32 }), transfer]);
   assert.equal((await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [mode('00'), single] }))).title, 'Send 1 USDC');

@@ -117,6 +117,40 @@ test('A SafeOp (Safe’s 4337 module, v0.3.0 and v0.2.0): the call the Safe make
   assert.equal(detail(v02, 'EIP-712 digest'), V02_DIGEST);
 });
 
+test('A batch of more than twenty calls: every call decoded to the two hundredth, and what is past that said to be unread', async () => {
+  const benign = Array.from({ length: 20 }, () => [0, USDC, 0n, transfer] as [number, string, bigint, Hex]);
+  const EVIL = '0x96221423681a6d52e184d440a8efcebb105c7242';
+  const batch = (calls: [number, string, bigint, Hex][], d = deps) => sign({ to: MULTISEND_CALL_ONLY, operation: 1, data: multiSend(calls) }, d);
+  // Behind twenty transfers, a delegatecall to unknown code (the Bybit pattern) went with nothing warned of, the
+  // batch "fully decoded" with nothing to look at: calls past the twentieth weren't read, nor said not to be.
+  const hidden = await batch([...benign, [1, EVIL, 0n, '0xdeadbeef']]);
+  assert.equal(hidden.attention, 'danger');
+  assert.match(hidden.warnings.find(w => w.code === 'safe_delegatecall')?.message ?? '', /^Call 21: a delegatecall to 0x96221423681a6d52e184d440a8efcebb105c7242 inside the batch/);
+  assert.match(detail(hidden, 'Call 21') ?? '', /^\(delegatecall\) /);
+  // An unlimited approval there too.
+  const approve = encodeFunctionData({ abi: parseAbi(['function approve(address,uint256)']), functionName: 'approve', args: [EVIL, (1n << 256n) - 1n] });
+  const approving = await batch([...benign, [0, USDC, 0n, approve]]);
+  assert.match(approving.warnings.find(w => w.code === 'unlimited_approval')?.message ?? '', /^Call 21: /);
+  assert.match(detail(approving, 'Call 21') ?? '', /^Allow 0x9622…7242 to spend unlimited USDC/);
+  assert.match(approving.decoding.notes.join(' '), /The calls after the first 20 are decoded from their calldata alone/);
+  // And a change to the Safe itself.
+  const owner = await batch([...benign, [0, SAFE, 0n, encodeFunctionData({ abi: ABI, functionName: 'addOwnerWithThreshold', args: [BOB, 1n] })]]);
+  assert.ok(codes(owner).some(c => /^safe_owners/.test(c)), codes(owner).join());
+  // With a simulator and no way to run execTransaction, the calls are run from the Safe in order: with more than
+  // twenty it threw (the twenty-first call had no decoding to take its watch list from).
+  const sims: number[] = [];
+  const simulated = await batch([...benign, [0, USDC, 0n, transfer]], { ...deps, simulator: { simulate: async () => ({ status: 'success', source: 'mock', gasUsed: 1n, transfers: [] }), simulateBatch: async rs => { sims.push(rs.length); return rs.map(() => ({ status: 'success' as const, source: 'mock', gasUsed: 1n, transfers: [] })); } } });
+  assert.deepEqual([sims, simulated.decoding.status], [[21], 'full']);
+  // An airdrop of two hundred transfers reads whole, with nothing to warn of.
+  const airdrop = await batch(Array.from({ length: 200 }, () => [0, USDC, 0n, transfer] as [number, string, bigint, Hex]));
+  assert.deepEqual([airdrop.attention, airdrop.decoding.status, detail(airdrop, 'Call 200'), detail(airdrop, 'More calls')], ['none', 'full', 'Send 1,000 USDC (0xa0b8…eb48)', undefined]);
+  // Past the two hundredth they aren't decoded, which is said; a delegatecall among them still is.
+  const beyond = await batch([...Array.from({ length: 200 }, () => [0, USDC, 0n, transfer] as [number, string, bigint, Hex]), [0, USDC, 0n, approve], [1, EVIL, 0n, '0xdeadbeef']]);
+  assert.deepEqual([beyond.attention, beyond.decoding.status, detail(beyond, 'More calls')], ['danger', 'partial', '2']);
+  assert.match(beyond.warnings.find(w => w.code === 'safe_calls_unread')?.message ?? '', /^The batch has 202 calls, and the 2 after the first 200 aren't decoded here/);
+  assert.match(beyond.warnings.find(w => w.code === 'safe_delegatecall')?.message ?? '', /^Call 202: a delegatecall to 0x9622/);
+});
+
 test('SafeOp checks: delegatecalls, an unknown module or EntryPoint, a plain call to MultiSend, and a used nonce', async () => {
   const rogue = await signOp(SAFE_OP_V03, { callData: execute('0x96221423681a6d52e184d440a8efcebb105c7242', '0xa9059cbb', 1) });
   assert.equal(rogue.attention, 'danger');
