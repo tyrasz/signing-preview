@@ -710,7 +710,9 @@ class StateSource {
    * Reads are of the state after these calls (the transactions before a replayed one in its block), which the node
    * runs first, in a simulated block of their own (see fetchAfter). `sent`: how many of them each address sent.
    */
-  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges; /** The calls on less gas each, for a node that adds their limits up against the block's (fitGas); undefined when they can't be. */ fit?: () => Promise<{ requests: SimulationRequest[]; calls: unknown[] } | undefined>; /** Set once the calls are the fitted ones: none may have run short on its gas (hadRoom, against `earlier`). */ fitted?: SimulationRequest[]; earlier?: SimulationRequest[] };
+  after?: { calls: unknown[]; blockOverrides: Record<string, string>; /** What moved each address's nonce among those calls, in order: a transaction it sent, or an EIP-7702 authorization it signed for the nonce given (applied only if that is its nonce by then). */ bumps: Map<string, (bigint | 'sent')[]>; /** What the block had changed before those calls (BlockAt.state): they run on it. */ state?: StateChanges; /** The calls on less gas each, for a node that adds their limits up against the block's (fitGas); undefined when they can't be. */ fit?: () => Promise<{ requests: SimulationRequest[]; calls: unknown[] } | undefined>; /** Set once the calls are the fitted ones: none may have run short on its gas (hadRoom, against `earlier`). */ fitted?: SimulationRequest[]; earlier?: SimulationRequest[];
+    /** Those of the calls to run where the node can't run them all within the gas it allows one simulation (BlockAt.related), as the node's own simulation of the replay ran; undefined when there is no such choice. Set `narrowed` once they are the calls. */
+    related?: () => Promise<{ calls: unknown[]; earlier: SimulationRequest[] } | undefined>; narrowed?: boolean };
 
   async fetch(m: Misses): Promise<void> {
     // What is already set isn't read over: a simulation's storage overrides, or what a block's earlier transactions
@@ -800,6 +802,12 @@ class StateSource {
               // blob transactions as the plain calls they also are, at their price.
               noBlobs = true;
               after.calls = plain(after.calls);
+            } else if (/intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(message) && !after.narrowed && !after.fitted) {
+              // The calls used more gas than the node allows one simulation (Ethereum's public node: 50 million):
+              // those that bear on the replayed transaction, as the simulation shown ran after (RpcSimulator).
+              const part = await after.related?.();
+              if (!part) throw e;
+              after.calls = noBlobs ? plain(part.calls) : part.calls; after.earlier = part.earlier; after.narrowed = true;
             } else throw e;
             (blocks[0] as { calls: unknown[] }).calls = after.calls;
           }
@@ -1925,7 +1933,8 @@ export class ForkSimulator implements Simulator {
       const toCall = (r: SimulationRequest) => ({ from: r.from, ...(r.to && { to: r.to }), data: r.data, value: hex(r.value), ...(r.gas !== undefined && { gas: hex(r.gas) }), ...priceFields(r),
         ...(r.accessList && { accessList: r.accessList }), ...(r.authorizationList?.length && { authorizationList: authorizationsForNode(r.authorizationList) }) });
       const earlier = options.after;
-      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: earlier.map(toCall), earlier, fit: async () => { const requests = fitGas(earlier, await at.beforeUsed?.(), at.header.gasLimit); return requests && { requests, calls: requests.map(toCall) }; } };
+      source.after = { bumps, ...(at.state && { state: at.state }), blockOverrides: nodeOverrides(at.header), calls: earlier.map(toCall), earlier, fit: async () => { const requests = fitGas(earlier, await at.beforeUsed?.(), at.header.gasLimit); return requests && { requests, calls: requests.map(toCall) }; },
+        related: async () => { const kept = await at.related?.().catch(() => undefined); const part = kept && kept.length < earlier.length ? kept.map(i => earlier[i]) : undefined; return part && { calls: part.map(toCall), earlier: part }; } };
     }
     // EIP-7702 authorizations are applied as the chain does, before each call; the code overrides standing in for
     // them (for simulators that can't) are left out, so each authority's real code and nonce decide whether it applies.

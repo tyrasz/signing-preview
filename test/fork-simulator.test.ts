@@ -1109,6 +1109,34 @@ test('A node that adds up a block’s gas limits gets the earlier transactions o
   } finally { chain.simulateV1 = false; }
 });
 
+test('A node that can’t run all of a block’s earlier transactions within its gas for one simulation gets those that bear on the replayed one', async () => {
+  // Ethereum's public node allows a simulation 50 million gas, its blocks hold 60: a trace of a transaction past that
+  // in its block had none. Here Bob's transfer of 30 USDC only works after the user's 50 to him, the first of two
+  // earlier transactions, and the node refuses a simulated block with both.
+  const CAROL = '0xca401000000000000000000000000000000000c4';
+  const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
+  const earlier: SimulationRequest[] = [50_000_000n, 1n].map(amount => ({ chainId: 999, from: USER, to: usdc, data: call('transfer', [BOB, amount]), value: 0n, gas: 100_000n }));
+  const target: SimulationRequest = { chainId: 999, from: BOB, to: usdc, data: call('transfer', [CAROL, 30_000_000n]), value: 0n };
+  await chain.setBalance(BOB, E);
+  const asked: number[] = [];
+  const capped = (async (url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { id: number; method: string; params: [{ blockStateCalls: { calls: unknown[] }[] }] }[];
+    const sim = Array.isArray(body) ? body.find(b => b.method === 'eth_simulateV1') : undefined;
+    if (sim) asked.push(sim.params[0].blockStateCalls[0].calls.length);
+    if (sim && sim.params[0].blockStateCalls[0].calls.length > 1) return new Response(JSON.stringify(body.map(b => ({ jsonrpc: '2.0', id: b.id, error: { code: -38013, message: 'intrinsic gas too low' } }))), { headers: { 'content-type': 'application/json' } });
+    return chain.fetchImpl(url, init);
+  }) as typeof fetch;
+  chain.simulateV1 = true;
+  try {
+    const [r] = (await fork({ fetchImpl: capped }).trace([{ ...target, at: { block: '0x10', header, before: earlier, related: async () => [0] } }]))!;
+    assert.equal(r.status, 'success');
+    assert.deepEqual([asked[0], [...new Set(asked.slice(1))]], [2, [1]]);
+    // With nothing to narrow to (none worked out, or all of them named), the node's refusal stands.
+    await assert.rejects(fork({ fetchImpl: capped }).trace([{ ...target, at: { block: '0x10', header, before: earlier } }]), /intrinsic gas too low/);
+    await assert.rejects(fork({ fetchImpl: capped }).trace([{ ...target, at: { block: '0x10', header, before: earlier, related: async () => [0, 1] } }]), /intrinsic gas too low/);
+  } finally { chain.simulateV1 = false; }
+});
+
 test('After a block’s earlier transactions, each storage reader is given gas for the chain’s price of a cold read', async () => {
   // Polygon charges 5,460 for a cold read, not 2,100: a reader of 65 slots on 3,000 each ran out there.
   const header = { number: 17n, timestamp: 0x65000001n, coinbase: '0x0000000000000000000000000000000000000000', gasLimit: 30_000_000n, baseFeePerGas: 0n, prevRandao: `0x${'00'.repeat(32)}` as Hex };
