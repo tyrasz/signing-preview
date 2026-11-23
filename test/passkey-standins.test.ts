@@ -18,7 +18,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { CHAIN_PROFILES, ForkSimulator } from '../src/fork-simulator.ts';
 import { ENTRY_POINT_SIMULATIONS_V06, ENTRY_POINT_SIMULATIONS_V07 } from '../src/entrypoint-simulations.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, okxDigest, simulateOperation, STUB_SIGNATURE, walletForm, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, ecdsaOffsets, implementationOf, okxDigest, simulateOperation, STUB_SIGNATURE, walletForm, zeroDevAssumed, zeroDevFlag, zeroDevWebAuthnStub } from '../src/erc4337-sim.ts';
 import type { Dependencies, Preview, SimulationRequest } from '../src/types.ts';
 import { NOW } from './helpers.ts';
 import { compiled, testChain } from './evm-chain.ts';
@@ -437,6 +437,51 @@ test('A ZeroDev passkey account whose last operation is beyond the usual lookup:
   assert.ok(tried[0].stateOverrides?.['0xc2b78104907f722dabac4c69f826a522b2754de4'], 'Daimo’s verifier stood in for');
   // The usual lookup's windows first (10,000 blocks each, back to 100,000), then one wide read beyond them.
   assert.ok(windows.some(([from, to]) => to === HEAD - 1n - 100_000n && to - from + 1n === 10_000_000n), JSON.stringify(windows.map(w => w.map(String))));
+});
+
+test('A ZeroDev passkey account with no earlier operation to tell: a wallet’s stub that names the precompile is taken at its word, one that doesn’t says nothing', async () => {
+  // @zerodev/passkey-validator's getStubSignature wrote usePrecompiled false whatever its signing did until 5.6.1
+  // (November 2026), which sets it as the signing does: true only from a wallet that signs so.
+  const KERNEL = '0xbac849bb641841b44e965fb01a4bf5f074f84b4d', VALIDATOR = '0x7ab16ff354acb328452f1d445b3ddee9a91e9e69', P256 = '0x0000000000000000000000000000000000000100', DAIMO = '0xc2b78104907f722dabac4c69f826a522b2754de4';
+  const OP = '(address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature)';
+  const rpc = { has: () => true, call: async (_c: number, method: string, params: unknown[]) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x1c9c380', baseFeePerGas: '0x1' };
+    if (method === 'eth_maxPriorityFeePerGas') return '0x0';
+    if (method === 'eth_getCode') return '0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3';
+    if (method === 'eth_getStorageAt') return `0x${KERNEL.slice(2).padStart(64, '0')}`;
+    if (method === 'eth_getLogs') return []; // no earlier operation
+    if (method === 'eth_call') {
+      const { to, data } = params[0] as { to: string; data: string };
+      if (to === EP) return `0x${'4a'.repeat(32)}`; // getUserOpHash
+      if (data.startsWith('0xf1f7f0f9')) return `0x01${VALIDATOR.slice(2)}${'00'.repeat(11)}`; // rootValidator()
+    }
+    throw new Error(`unexpected ${method}`);
+  } };
+  // The stand-ins tried for the account on a chain, with a wallet's stub or none: each one's flag, and the verifier stood in for.
+  const standIns = async (chainId: number, sender: string, signature?: Hex) => {
+    const tried: SimulationRequest[] = [];
+    const simulator = { simulate: async (q: SimulationRequest) => { tried.push(q); return null; } };
+    await simulateOperation({ chainId, entryPoint: EP, sender, nonce: BigInt(`0x0000${VALIDATOR.slice(2)}0000`) << 64n, initCode: '0x', callData: '0x', callGasLimit: 1n, verificationGasLimit: 1n, preVerificationGas: 1n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x', ...(signature && { signature }) }, { rpc, simulator } as never);
+    return tried.map(q => {
+      const { args } = decodeFunctionData({ abi: parseAbi([`function simulateHandleOp(${OP} op, address target, bytes targetCallData)`]), data: q.data as Hex });
+      const sent = (args[0] as { signature: Hex }).signature;
+      return { own: sent === signature, precompiled: zeroDevFlag(sent), verifier: q.stateOverrides?.[P256] ? 'precompile' : q.stateOverrides?.[DAIMO] ? 'daimo' : 'none' };
+    });
+  };
+  const stub = (precompiled: boolean) => zeroDevWebAuthnStub(`0x${'22'.repeat(32)}`, precompiled);
+  // Ethereum, where most sign without the precompile: no stub, so; a stub naming it (run first as it is, with no
+  // verifier stood in for), with it.
+  assert.deepEqual(await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2601'), [{ own: false, precompiled: false, verifier: 'daimo' }]);
+  // (Between the two, the stub with an ECDSA stand-in where its r and s read as a signature's: walletForm.)
+  const ends = <T>(all: T[]) => [all[0], all[all.length - 1]];
+  assert.deepEqual(ends(await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2602', stub(true))), [{ own: true, precompiled: true, verifier: 'none' }, { own: false, precompiled: true, verifier: 'precompile' }]);
+  // Base, where most sign with it: a stub that doesn't name it is what every wallet's was, and changes nothing.
+  assert.deepEqual(ends(await standIns(8453, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2603', stub(false))), [{ own: true, precompiled: false, verifier: 'none' }, { own: false, precompiled: true, verifier: 'precompile' }]);
+  // And on Ethereum such a stub leaves the chain's usual way, the verifier contract.
+  assert.deepEqual(ends(await standIns(1, '0x4a1dddee6d5ead88920c4127ec366c9d3f0f2604', stub(false))), [{ own: true, precompiled: false, verifier: 'none' }, { own: false, precompiled: false, verifier: 'daimo' }]);
+  // What the preview says where it only took the chain's usual way.
+  assert.match(zeroDevAssumed(8453, true), /isn't known: no earlier operation of the account's was found to show it, and nothing supplied with this one says\. It is taken to use the chain's P-256 precompile, as most ZeroDev passkey wallets on Base do\. If it uses a verifier contract \(P-256 in Solidity\) instead, the operation takes about 335,000 gas more than shown\./);
+  assert.match(zeroDevAssumed(1, false), /taken to use a verifier contract \(P-256 in Solidity\), as most ZeroDev passkey wallets on Ethereum do\. If it uses the chain's P-256 precompile instead, the operation takes about 335,000 gas less than shown\./);
 });
 
 test('Exa’s account (Modular Account v1, Exactly’s WebauthnOwnerPlugin): the owner’s index, then a passkey’s WebAuthn assertion or an address owner’s signature, which its real code checks', async () => {

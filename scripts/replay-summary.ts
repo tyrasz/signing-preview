@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { chainName } from '../src/chains.ts';
 
 type Row = {
-  hash: string; kind: string; outcome: boolean; whole: boolean; standIn?: string; passkeyExtraKey?: boolean; notSimulated?: boolean; prefix?: string;
+  hash: string; kind: string; outcome: boolean; whole: boolean; standIn?: string; passkeyExtraKey?: boolean; passkeyVerifierAssumed?: boolean; notSimulated?: boolean; prefix?: string;
   bundle?: { size: number; index: number }; gas?: { percent: number }; timeBumped?: boolean; relayedBy?: string; tokens?: string; callsOnlyBecause?: string; tokenDiffs?: unknown;
   /** The node failed the whole operation's simulation (see scripts/accuracy-4337.ts): not the stand-in, not the account. */
   nodeFailed?: boolean;
@@ -43,8 +43,9 @@ for (const name of readdirSync(dir).sort()) {
   // Not one run a second after its block (BNB Chain): what writes once a second costs more there.
   // Nor one whose account rejected the stand-in (its signature check didn't run).
   // Nor one relayed by a bundler's contract (it warms state before the EntryPoint runs).
-  // Nor one whose passkey's clientDataJSON has the key Chrome adds to some (see scripts/accuracy-4337.ts).
-  const gas = rows.filter(r => r.gas && !r.bundle && !r.relayedBy && !r.timeBumped && r.standIn !== 'rejected' && !r.passkeyExtraKey && judged(r));
+  // Nor one whose passkey's clientDataJSON has the key Chrome adds to some, or whose ZeroDev passkey wallet verifies
+  // another way than the preview, saying it didn't know, took it to (see scripts/accuracy-4337.ts).
+  const gas = rows.filter(r => r.gas && !r.bundle && !r.relayedBy && !r.timeBumped && r.standIn !== 'rejected' && !r.passkeyExtraKey && !r.passkeyVerifierAssumed && judged(r));
   const tokens = rows.filter(r => r.tokens);
   const wrong = rows.filter(r => r.differs?.length);
   total += rows.length; wrongTotal += wrong.length;

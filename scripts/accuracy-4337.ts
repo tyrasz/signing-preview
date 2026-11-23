@@ -54,7 +54,7 @@ import { JsonRpcClient } from '../src/rpc.ts';
 import { headerOf, stateBefore, type BlockAt, type RpcHeader } from '../src/block.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { readOperation, userOpHash } from '../src/userop-hash.ts';
-import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, OKX_FACTORY, OKX_IMPLEMENTATION, ORDINARY_GAS_CAP, SHRINCS_IMPLEMENTATIONS, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, type KernelEnable } from '../src/erc4337-sim.ts';
+import { AMBIRE_IMPLEMENTATION, BULLBIT_IMPLEMENTATION, implementationOf, OKX_FACTORY, OKX_IMPLEMENTATION, ORDINARY_GAS_CAP, SHRINCS_IMPLEMENTATIONS, ecdsaOffsets, K1MEE_VALIDATOR, K1MEE_VALIDATOR_110, k1meeOwnTyped, KERNEL_DEPLOY_SELECTORS, KERNEL_FACTORY_CREATE, kernelEnableSignature, okxDigest, OWNABLE_VALIDATOR, readKernelEnable, smartSessionOf, STUB_SIGNATURE, zeroDevFlag, type KernelEnable } from '../src/erc4337-sim.ts';
 import { replayTransaction } from '../src/replay.ts';
 import { SUPER_TX_ARRAY_TYPEHASH } from '../src/supertransaction.ts';
 import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
@@ -1024,11 +1024,18 @@ async function replay(item: string): Promise<void> {
   // for that wallet only. For the others measured (ZeroDev's and Safe's passkeys) the key costs nothing measurable, and
   // not judging it hid real errors (190% and -23%, of stand-ins on another verification path).
   if (op.signature.toLowerCase().includes(CHROME_EXTRA_KEY) && await implementationOf(deps, CHAIN, sender) === BULLBIT_IMPLEMENTATION) row.passkeyExtraKey = true;
+  // A ZeroDev passkey account whose wallet's way of verifying wasn't known (no earlier operation of its in the node's
+  // reach, and none said with the operation: the preview takes its chain's usual way and says so, with what the other
+  // costs, zeroDevAssumed), and which signed the other way: on Base (2026-11-22) a walllet account, without the
+  // precompile where 34 of 34 others had used it, its last operation 3,000,000 blocks back, 58% low. What the preview
+  // said it didn't know isn't a wrong preview: its gas is reported, not judged.
+  const assumed = p.decoding.notes.find(x => /How this account's wallet has a passkey's signature verified isn't known/.test(x));
+  if (assumed && zeroDevFlag(op.signature) === !/taken to use the chain's P-256 precompile/.test(assumed)) row.passkeyVerifierAssumed = true;
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
     // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas
     // (a post-quantum SPHINCS+ wallet on Base, 40%); a shape to add, not a wrong preview, as for calls simulated alone.
-    judged && !timeBumped && !relayed && row.standIn !== 'rejected' && !row.passkeyExtraKey && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
+    judged && !timeBumped && !relayed && row.standIn !== 'rejected' && !row.passkeyExtraKey && !row.passkeyVerifierAssumed && ops.length === 1 && gasPercent !== undefined && Math.abs(gasPercent) >= 5 && 'gas',
     // (Whether or not the node answered the balance reads after the run: both sides here are events, the receipt's
     // and, without the reads, the run's.)
     judged && row.tokens === 'other' && 'tokens',
@@ -1130,7 +1137,7 @@ if (count(r => !!bg(r))) say(`  in bundles of several or relayed by a bundler's 
 if (Object.keys(skipped).length) say(`  skipped: ${Object.entries(skipped).map(([k, v]) => `${k}: ${v}`).join('; ')}`);
 for (const r of rows) {
   const issues = [!r.outcome && `outcome: simulated ${r.succeeded ? 'failing' : 'succeeding'}, the receipt ${r.succeeded ? 'succeeded' : 'failed'}${r.minedOutcome ? ` (as mined: ${r.minedOutcome})` : ''}`, !r.whole && `${r.nodeFailed ? 'not whole, the node failed it' : 'calls only'}: ${String(r.callsOnlyBecause ?? '').slice(0, 140)}`,
-    r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`,
+    r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : r.passkeyVerifierAssumed ? " (a ZeroDev passkey wallet that verifies the other way than most on its chain, with no earlier operation in reach to show it, as the preview said: not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`,
     nat(r)?.match === 'other' && `native coin: simulated ${nat(r)!.simulated}, actual ${nat(r)!.actual}${nat(r)!.mixed ? ` (${nat(r)!.mixed})` : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
 }
