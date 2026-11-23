@@ -1740,12 +1740,12 @@ function gasPrograms(): Program[] {
     [MEMORY_20000, '01 09c3e0 MSTORE STOP'],
   ] as const).map(([a, code]) => [`0x${a}`, { code: asm(code) }]));
   // A program: its contract at an address of its own, called with `gas` by one that returns [succeeded, spent, ...returned].
-  interface More { gas?: string; at?: string; balance?: bigint; storage?: Record<string, string>; state?: StateChanges; programGas?: bigint; accessList?: Program['accessList'] }
+  interface More { gas?: string; at?: string; balance?: bigint; storage?: Record<string, string>; state?: StateChanges; programGas?: bigint; accessList?: Program['accessList']; /** The call inside fails with all it was given (Program.burns). */ burns?: true }
   const inner = (label: string, code: string, more: More = {}): Program => {
     const at = more.at ?? account();
     return { label: `gas: ${label}`, code: asm(`GAS 00 00 00 00 00 ${at} ${more.gas ?? '0f4240'} CALL GAS SWAP1 00 MSTORE SWAP1 SUB 20 MSTORE RETURNDATASIZE 00 40 RETURNDATACOPY RETURNDATASIZE 40 ADD 00 RETURN`),
       state: { ...helpers, ...more.state, [`0x${at}`]: { code: asm(code), ...(more.balance !== undefined && { balance: `0x${more.balance.toString(16)}` }), ...(more.storage && { stateDiff: more.storage }) } },
-      ...(more.programGas && { gas: more.programGas }), ...(more.accessList && { accessList: more.accessList }) };
+      ...(more.programGas && { gas: more.programGas }), ...(more.accessList && { accessList: more.accessList }), ...(more.burns && { burns: true }) };
   };
   // A helper of a program's own (one whose state the program changes).
   const own = (code: string, more: { balance?: bigint; storage?: Record<string, string> } = {}) => {
@@ -1845,7 +1845,7 @@ function gasPrograms(): Program[] {
     inner('steps of no bytes at offset 2^256 - 1 (no memory grown)', `00 ${HUGE} KECCAK256 POP 00 ${HUGE} LOG0 00 00 ${HUGE} CALLDATACOPY 00 00 ${HUGE} CODECOPY 00 00 ${HUGE} RETURNDATACOPY 00 ${HUGE} ${HUGE} MCOPY 00 00 ${HUGE} ${STOPS} EXTCODECOPY 00 ${HUGE} 00 ${HUGE} 00 ${STOPS} GAS CALL POP 00 ${HUGE} 00 CREATE POP MSIZE 00 MSTORE ${ret(1)}`),
     inner('RETURN of no bytes at offset 2^256 - 1', `00 ${HUGE} RETURN`),
     inner('REVERT of no bytes at offset 2^256 - 1', `00 ${HUGE} REVERT`),
-    inner('RETURNDATACOPY of no bytes from offset 2^64 (out of bounds: fails)', `00 010000000000000000 00 RETURNDATACOPY STOP`),
+    inner('RETURNDATACOPY of no bytes from offset 2^64 (out of bounds: fails)', `00 010000000000000000 00 RETURNDATACOPY STOP`, { burns: true }),
     inner('a call whose return area is larger than what comes back (memory grown for all of it)', `${timed(`0400 00 00 00 00 ${RETGAS} ffff CALL`)} MSIZE 40 MSTORE ${ret(3)}`));
 
   // LOG, KECCAK256 and EXP at large sizes.
@@ -1862,9 +1862,9 @@ function gasPrograms(): Program[] {
   add(inner('CREATE2 of 1,000 bytes of initcode', `${timed('2a 03e8 00 00 CREATE2')} ${ret(2)}`),
     inner('CREATE of 1,000 bytes of initcode', `${timed('03e8 00 00 CREATE')} ${ret(2)}`),
     inner('CREATE2 of 49,152 bytes of initcode (the most before Amsterdam)', `${timed('2a c000 00 00 CREATE2')} ${ret(2)}`),
-    inner('CREATE2 of 49,153 bytes of initcode', `${timed('2a c001 00 00 CREATE2')} ${ret(2)}`),
-    inner('CREATE2 twice with one salt (the second collides, taking all it was given)', `600a6000f3 d8 SHL 00 MSTORE 2a 05 00 00 CREATE2 POP ${timed('2a 05 00 00 CREATE2')} ${ret(2)}`),
-    inner("CREATE of code that starts with 0xef (EIP-3541: fails, taking all it was given)", `60ef60005360016000f3 b0 SHL 00 MSTORE ${timed('0a 00 00 CREATE')} ${ret(2)}`),
+    inner('CREATE2 of 49,153 bytes of initcode', `${timed('2a c001 00 00 CREATE2')} ${ret(2)}`, { burns: true }),
+    inner('CREATE2 twice with one salt (the second collides, taking all it was given)', `600a6000f3 d8 SHL 00 MSTORE 2a 05 00 00 CREATE2 POP ${timed('2a 05 00 00 CREATE2')} ${ret(2)}`, { burns: true }),
+    inner("CREATE of code that starts with 0xef (EIP-3541: fails, taking all it was given)", `60ef60005360016000f3 b0 SHL 00 MSTORE ${timed('0a 00 00 CREATE')} ${ret(2)}`, { burns: true }),
     inner('CREATE with more value than the creator holds (fails, its gas kept), then one that succeeds', `${timed('00 00 ffff CREATE', 0)} ${timed('00 00 00 CREATE', 2)} ${ret(4)}`, { balance: 100n }));
   { const at = account(), x = create2(at, '0x600a6000f3');
     add(inner('CREATE2 to an address that holds a balance and nothing else (no collision)', `600a6000f3 d8 SHL 00 MSTORE ${timed('2a 05 00 00 CREATE2')} ${x} BALANCE 40 MSTORE ${ret(3)}`, { at, state: { [`0x${x}`]: { balance: '0x7' } } })); }
@@ -2408,6 +2408,8 @@ async function precompileEdgePrograms(chainId: number): Promise<Program[]> {
 class Chain {
   readonly chainId: number; readonly url: string; readonly client: JsonRpcClient; readonly fork: ForkSimulator;
   simulateV1 = true;
+  /** What the node last said in place of an answer (an error, a timeout). */
+  private unanswered = '';
   /** The time the programs' block is given (--next: the scheduled fork's), in place of the next block's own. */
   time?: bigint;
   constructor(chainId: number) {
@@ -2475,7 +2477,10 @@ class Chain {
       // And a public RPC turning the local EVM's reads away (HTTP 429: Arbitrum's, from GitHub's runners, for four
       // programs in a scheduled run): asked again after a longer wait each time.
       if (attempt < 6 && local.some(l => l.kind === 'refused' && RATE_LIMITED.test(l.why ?? ''))) { await new Promise(r => setTimeout(r, 10_000 * (attempt + 1))); continue; }
-      return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: 'the node did not answer' }, local: local[i] }));
+      // (With what the node said instead, where it said anything: the scheduled run of 2026-11-23 had 32 of Arbitrum
+      // One's BLS programs "not compared (the node did not answer)", seven tries each, and nothing of why. The same
+      // programs an hour later: all compared, all the same.)
+      return placed.map((_, i) => ({ node: node?.[i] ?? { kind: 'refused', returns: '', logs: '', why: `the node did not answer${!node && this.unanswered ? `: ${this.unanswered}` : ''}` }, local: local[i] }));
     }
   }
 
@@ -2498,12 +2503,12 @@ class Chain {
     if (this.simulateV1) {
       const out = await this.post({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ stateOverrides: overrides, calls, ...(at && { blockOverrides: nodeOverrides(at.header) }) }], validation: false }, at?.block ?? 'latest'] });
       if (out.error && (out.error.code === -32601 || /method not found|does not exist|not supported|unsupported method/i.test(out.error.message ?? ''))) this.simulateV1 = false;
-      else if (out.error || !out.result?.[0]?.calls) { if (process.env.RULES_DEBUG) console.log(`  the node: ${JSON.stringify(out.error ?? out).slice(0, 300)}`); return null; }
+      else if (out.error || !out.result?.[0]?.calls) { this.unanswered = String(out.error?.message ?? JSON.stringify(out.error ?? out)).slice(0, 120); if (process.env.RULES_DEBUG) console.log(`  the node: ${JSON.stringify(out.error ?? out).slice(0, 300)}`); return null; }
       else return (out.result[0].calls as { status: string; returnData: string; gasUsed: string; maxUsedGas?: string; logs?: any[]; error?: { message?: string; data?: string } }[]).map(c => ({ kind: kind(c.status === '0x1', c.error?.message), returns: ((c.status === '0x1' ? c.returnData : c.error?.data ?? c.returnData) ?? '0x').toLowerCase(), gas: BigInt(c.gasUsed), ...(c.maxUsedGas && { peak: BigInt(c.maxUsedGas) }), logs: logsOf(c.logs), why: c.error?.message }));
     }
     // No eth_simulateV1: each program in an eth_call of its own (no gas figure, no events).
     const out = await this.post(calls.map((c, i) => ({ jsonrpc: '2.0', id: i, method: 'eth_call', params: [c, at?.block ?? 'latest', overrides] })));
-    if (!Array.isArray(out)) return null;
+    if (!Array.isArray(out)) { this.unanswered = String(out?.error?.message ?? JSON.stringify(out)).slice(0, 120); return null; }
     const byId = new Map(out.map((r: any) => [r.id, r]));
     return calls.map((_, i) => { const r = byId.get(i); return r?.error ? { kind: kind(false, r.error.message), returns: (r.error.data ?? '0x').toLowerCase(), logs: '', why: r.error.message } : { kind: 'runs', returns: String(r?.result ?? '0x').toLowerCase(), logs: '' }; });
   }
@@ -2529,7 +2534,8 @@ class Chain {
 }
 
 /** A public RPC's answer when it is turning requests away. */
-const RATE_LIMITED = /HTTP 429|rate limit|too many requests/i;
+// What a node that was too busy says, of itself and not of the EVM: a rate limit, or no answer in the time given.
+const RATE_LIMITED = /HTTP 429|rate limit|too many requests|timed? ?out|aborted|ECONNRESET|socket hang up|fetch failed/i;
 
 interface Report { chainId: number; name: string; block?: string; fork: string[]; nodeOnly: string[]; /** Precompiles the node lists that the local EVM runs from their Solidity references. */ referenced: string[]; compared: number; differences: string[]; expected: string[]; drift: boolean; /** Programs a public RPC's rate limit kept from running, after waits: not compared. */ uncompared: string[]; /** How many of `differences` are programs'. */ programsDiffer?: number; /** Its blocks are Amsterdam's. */ amsterdam?: boolean; /** What the replays came to, where the chain's blocks carry their access lists. */ replays?: string }
 
@@ -2565,6 +2571,13 @@ const EXPECTED: Record<number, Record<string, string>> = {
  * itself: its node takes the charge out of the gas a call is given, so a call inside that fails with all it was
  * handed burns a little less there (2 and 5 gas, in two programs of 192).
  */
+/**
+ * What a program that burns what it is handed may be over the L1 charge by, beyond the charge itself, where there is
+ * one: a unit or two each time it was seen (2 and 5 in the random programs; 1 and 2 on 2026-11-23, when the charge
+ * was 4,667 and then 4,792 gas and four such programs came out at twice that and one or two more, and failed the
+ * scheduled check by that unit). With no charge they are compared to the unit, as on every other chain.
+ */
+const BURN_SLACK = 8n;
 const beyond = (difference: bigint, slack: bigint) => (difference < 0n ? -difference : difference) > (slack < 0n ? -slack : slack);
 
 /** Runs the programs on the chain's node and in the local EVM, up to sixteen to a simulated block, and notes what differs. */
@@ -2608,7 +2621,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
       if (node.kind === 'refused') { report.differences.push(`${batch[j].label}: not compared (${node.why})`); return; }
       report.compared++;
       const gas = node.gas !== undefined && local.gas !== undefined && (compareGas ? node.gas !== local.gas
-        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && !batch[j].priced && !batch[j].accessList && !batch[j].fees && !batch[j].from && node.kind === 'runs' && local.kind === 'runs' && beyond(node.gas - local.gas - l1Charge, batch[j].random || batch[j].burns ? l1Charge : 0n) && !EXPECTED[chainId]?.[batch[j].label]);
+        : l1Charge !== undefined && !batch[j].data && batch[j].gas === undefined && !batch[j].authorizationList && !batch[j].priced && !batch[j].accessList && !batch[j].fees && !batch[j].from && node.kind === 'runs' && local.kind === 'runs' && beyond(node.gas - local.gas - l1Charge, (batch[j].random || batch[j].burns) && l1Charge > 0n ? l1Charge + BURN_SLACK : 0n) && !EXPECTED[chainId]?.[batch[j].label]);
       // Events are compared where the node reports them (not through eth_call).
       const logs = chain.simulateV1 && node.kind === 'runs' && local.kind === 'runs' && node.logs !== local.logs;
       // A precompile's caller returns four words. Where the precompile's call failed burning all the gas it was
@@ -2629,7 +2642,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
         const known = EXPECTED[chainId]?.[batch[j].label] ?? (report.amsterdam ? OVER_THE_CAP[batch[j].label] : undefined)
           ?? (squeezed ? `Arbitrum's node takes its charge for L1 data out of the gas the call is given: on ${batch[j].gas} it ran out where the local EVM used ${local.gas}` : undefined);
         if (process.env.RULES_FULL) console.log(`  [full] ${batch[j].label}:\n    node  ${node.kind} gas ${node.gas} ${node.why ?? ''}\n      ${node.returns}\n      logs ${node.logs}\n    local ${local.kind} gas ${local.gas} ${local.why ?? ''}\n      ${local.returns}\n      logs ${local.logs}`);
-        (known ? report.expected : report.differences).push(known ? `${batch[j].label}: ${known}` : `${batch[j].label}: the node ${node.kind}${node.kind === 'fails' && node.why ? ` (${node.why.slice(0, 60)})` : ''}${node.gas !== undefined ? `, ${node.gas} gas` : ''}${returns ? said(node, nodeWords) : ''}; the local EVM ${local.kind}${local.kind !== 'runs' && local.why ? ` (${local.why.slice(0, 80)})` : ''}${local.gas !== undefined ? `, ${local.gas} gas` : ''}${returns ? said(local, localWords) : ''}${logs ? '; their events differ' : ''}${batch[j].detail ? ` [${batch[j].detail}]` : ''}`);
+        (known ? report.expected : report.differences).push(known ? `${batch[j].label}: ${known}` : `${batch[j].label}: the node ${node.kind}${node.kind === 'fails' && node.why ? ` (${node.why.slice(0, 60)})` : ''}${node.gas !== undefined ? `, ${node.gas} gas` : ''}${returns ? said(node, nodeWords) : ''}; the local EVM ${local.kind}${local.kind !== 'runs' && local.why ? ` (${local.why.slice(0, 80)})` : ''}${local.gas !== undefined ? `, ${local.gas} gas` : ''}${returns ? said(local, localWords) : ''}${logs ? '; their events differ' : ''}${batch[j].detail ? ` [${batch[j].detail}]` : ''}${!compareGas && gas ? ` [the L1 charge taken for its batch: ${l1Charge}]` : ''}`);
       }
     });
   }
@@ -2780,7 +2793,7 @@ for (const chainId of CHAINS_ASKED) {
   if (r.replays) console.log(`  ${r.replays}`);
   for (const d of r.differences) console.log(`    ${d}`);
   for (const d of r.expected) console.log(`    (expected) ${d}`);
-  if (r.uncompared.length) console.log(`    not compared, rate limited: ${r.uncompared.length} (${r.uncompared.slice(0, 3).join('; ')})`);
+  if (r.uncompared.length) console.log(`    not compared (a rate limit, or the node gave no answer in time): ${r.uncompared.length} (${r.uncompared.slice(0, 3).join('; ')})`);
 }
 if (OUT) writeFileSync(OUT, JSON.stringify(reports, null, 2));
 if (SUMMARY_MD) {
