@@ -1098,6 +1098,13 @@ async function frakStub(c: StubContext, enableData?: Hex): Promise<Stub[] | unde
     u24(37), u24(clientDataJSON.length), authenticatorData, stringToHex(clientDataJSON)]);
   return [precompiled ? { signature, p256: true } : { signature, verifier: FRAK_P256_VERIFIER }];
 }
+/**
+ * What the preview says where a weighted validator's stand-in carries other guardians' approvals: the signer's weight
+ * alone is under the threshold, so the operation validates only once those guardians (or others of as much weight)
+ * approve it too. Without it the preview read as if the signer's signature were all the operation needed.
+ */
+const guardiansNote = (name: string, validator: string, threshold: number, own: number, others: string[]): string =>
+  `The account validates this operation through ${name} (${shortAddr(validator)}), which takes guardians' signatures until their weights reach ${threshold}. The signer's is ${own}, so ${others.length === 1 ? `another guardian (${others[0]})` : `other guardians (${others.join(', ')})`}, or others of as much weight, must approve the operation too before any bundler can include it: ${others.length === 1 ? 'its approval was' : 'their approvals were'} stood in for here, recovered as ${others.length === 1 ? "that guardian's" : "those guardians'"}.`;
 /** ZeroDev's WeightedECDSAValidator 0.0.3 (verified on Sourcify, Sepolia): guardians with weights, and a threshold. */
 const ZERODEV_WEIGHTED_VALIDATOR = '0xed89244160cfe273800b58b1b534031699dfeeee';
 const WEIGHTED = parseAbi(['function weightedStorage(address kernel) view returns (uint24 totalWeight, uint24 threshold, uint48 delay, address firstGuardian)',
@@ -1148,6 +1155,7 @@ async function weightedStub(c: StubContext, installData?: Hex): Promise<Stub[] |
     types: { Approve: [{ name: 'callDataAndNonceHash', type: 'bytes32' }] }, primaryType: 'Approve', message: { callDataAndNonceHash } });
   const cosigners = others.map((signer, k) => ({ signature: stubSignature(k + 1), signer, digest: approve }));
   return [{ signature: concatHex([...cosigners.map(x => x.signature), STUB_SIGNATURE]), ...(cosigners.length && { cosigners }),
+    ...(own && others.length && { note: guardiansNote("ZeroDev's weighted ECDSA validator", ZERODEV_WEIGHTED_VALIDATOR, threshold, own, others) }),
     ...(!own && { why: `ZeroDev's weighted ECDSA validator (${shortAddr(ZERODEV_WEIGHTED_VALIDATOR)}) takes the signatures of the account's guardians (${guardians.map(g => shortAddr(g.address)).join(', ')}), and the signer asked isn't one of them` }) }];
 }
 /**
@@ -1210,6 +1218,7 @@ async function typedWeightedStub(c: StubContext, validator: string, installData?
   // (A signer who is no guardian's key signs last all the same, at a key's index: the validator refuses it.)
   const last = own >= 0 ? own : others[0];
   return [{ signature: encodeAbiParameters([{ type: 'bytes[]' }], [[...others.map((i, k) => entry(i, cosigners[k].signature)), entry(last, STUB_SIGNATURE)]]), ...(cosigners.length && { cosigners }),
+    ...(own >= 0 && others.length && { note: guardiansNote("ZeroDev's weighted validator", validator, threshold, guardians[own].weight, cosigners.map(x => x.signer)) }),
     ...(own < 0 && { why: `ZeroDev's weighted validator (${shortAddr(validator)}) takes the signatures of the account's guardians (${guardians.map(g => (g.type === 1 && g.key.length === 42 ? shortAddr(g.key.toLowerCase()) : 'a passkey')).join(', ')}), and the signer asked isn't one of their keys` }) }];
 }
 // --- ZeroDev Kernel v3's enable mode ---

@@ -377,12 +377,15 @@ test('Kernel v3 on ZeroDev’s weighted ECDSA validator: other guardians’ appr
   const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
   const op = { chainId: 11155111, entryPoint: EP, nonce: 0n, callData: '0xe9ae5c53' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
   // g1 signs (weight 1): g2's approval (weight 1) reaches the threshold, then g1's own.
-  await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: g1 }, { rpc: node, simulator } as never);
+  const short = await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: g1 }, { rpc: node, simulator } as never);
   assert.equal(tried[0], concatHex([stubSignature(1), STUB_SIGNATURE]));
+  // (And the preview is told so: the signer's signature alone doesn't validate the operation.)
+  assert.match(short?.note ?? '', /through ZeroDev's weighted ECDSA validator \(0xed89…eeee\), which takes guardians' signatures until their weights reach 2\. The signer's is 1, so another guardian \(0x2222222222222222222222222222222222222222\), or others of as much weight, must approve the operation too before any bundler can include it: its approval was stood in for here/);
   // g3 (weight 2) reaches it alone: its own signature only.
   tried.length = 0;
-  await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: g3 }, { rpc: node, simulator } as never);
+  const alone = await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: g3 }, { rpc: node, simulator } as never);
   assert.equal(tried[0], STUB_SIGNATURE);
+  assert.equal(alone?.note, undefined);
   // Someone who isn't a guardian: guardians to the threshold (g1 and g2), then the signer's, which the validator refuses.
   tried.length = 0;
   const run = await simulateOperation({ ...op, sender: SENDER, initCode: '0x', signer: '0x4444444444444444444444444444444444444444' }, { rpc: node, simulator } as never);
@@ -436,7 +439,7 @@ test('Kernel v3 on ZeroDev’s weighted validator with typed guardians: an array
   const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); recovers.push(q.stateOverrides?.['0x0000000000000000000000000000000000000001']?.code ?? ''); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
   const op = { chainId: 11155111, entryPoint: EP, nonce: 0n, callData: '0xe9ae5c53' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
   const array = (...entries: [number, Hex][]) => encodeAbiParameters([{ type: 'bytes[]' }], [entries.map(([i, signature]) => concatHex([`0x0${i}`, signature]))]);
-  const first = async (signer: string, sender = SENDER, initCode: Hex = '0x') => { tried.length = 0; const run = await simulateOperation({ ...op, sender, initCode, signer }, { rpc: node, simulator } as never); return { signature: tried[0], why: run?.why }; };
+  const first = async (signer: string, sender = SENDER, initCode: Hex = '0x') => { tried.length = 0; const run = await simulateOperation({ ...op, sender, initCode, signer }, { rpc: node, simulator } as never); return { signature: tried[0], why: run?.why, note: run?.note }; };
   // g2 signs (index 1, weight 1): g1's approval (index 0) reaches the threshold, then g2's own.
   recovers.length = 0;
   assert.equal((await first(g2)).signature, array([0, stubSignature(1)], [1, STUB_SIGNATURE]));
@@ -447,9 +450,11 @@ test('Kernel v3 on ZeroDev’s weighted validator with typed guardians: an array
     message: { callDataAndNonceHash: keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes' }, { type: 'uint256' }], [SENDER, op.callData, op.nonce])) } });
   assert.ok(recovers[0].includes(approve.slice(2)) && recovers[0].includes(g1.slice(2)), 'the stand-in recovers the approval over the Approve digest');
   assert.equal((await first(g1)).signature, array([1, stubSignature(1)], [0, STUB_SIGNATURE]));
-  // Threshold 1: the signer's alone.
+  // (Said in the preview: the operation needs the other guardian's approval too.)
+  assert.match((await first(g2)).note ?? '', /through ZeroDev's weighted validator \(0x144f…e44b\), which takes guardians' signatures until their weights reach 2\. The signer's is 1, so another guardian \(0x1111111111111111111111111111111111111111\), or others of as much weight, must approve the operation too/);
+  // Threshold 1: the signer's alone, and nothing to say.
   threshold = 1;
-  assert.equal((await first(g2)).signature, array([1, STUB_SIGNATURE]));
+  assert.deepEqual(await first(g2), { signature: array([1, STUB_SIGNATURE]), why: undefined, note: undefined });
   // Someone who is no guardian's key: the keys' approvals to the threshold, then theirs as a key's, which the validator refuses.
   threshold = 2;
   const refused = await first(outsider);
