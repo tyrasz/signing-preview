@@ -593,6 +593,23 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
     while (usdcHolder && await usdcOf(usdcHolder) < 2_000_000n) { console.log(`  (${usdcHolder} no longer holds 2 USDC: another recent recipient is used)`); usdcHolder = await scan(false); }
     return usdcHolder;
   };
+  /**
+   * The HYPE holder, still holding 12 HYPE now: another recent sender if it has spent them. It is a sender, chosen
+   * minutes before it is used: the scheduled run of 2026-11-23 had the stake come back unsimulated ("requested")
+   * under both simulators, and didn't say why; the same checks passed an hour later.
+   */
+  const hypeOf = async (a: string) => BigInt(String(await live.call(999, 'eth_getBalance', [a, 'latest'])));
+  const holdingHype = async () => {
+    if (hypeHolder && await hypeOf(hypeHolder) >= 12n * E) return hypeHolder;
+    if (hypeHolder) console.log(`  (${hypeHolder} no longer holds 12 HYPE: another recent sender is used)`);
+    hypeHolder = undefined;
+    const tip = BigInt(String(await live.call(999, 'eth_blockNumber', [])));
+    for (let n = tip - 1n; n > tip - 300n && !hypeHolder; n -= 3n) {
+      const blk = await live.call(999, 'eth_getBlockByNumber', [toHex(n), true]) as { transactions: { from: string }[] };
+      for (const t of blk.transactions) if (!hypeHolder && await hypeOf(t.from) >= 12n * E && await eoa(t.from)) hypeHolder = t.from.toLowerCase();
+    }
+    return hypeHolder;
+  };
   // Both HyperEVM simulators: the fork simulator (every log; a long budget here so it is what answers) and the probe.
   const simulators = [
     ['fork', new RpcSimulator({ 999: urls[999] }, { fork: new ForkSimulator({ 999: urls[999] }, { timeoutMs: 60_000 }), forkBudgetMs: 60_000 }), /local EVM/],
@@ -611,13 +628,13 @@ console.log('\n10. HyperEVM simulation: the fork simulator and the state-overrid
       for (let i = 0; i < 2 && !sourcePattern.test(p.simulation?.source ?? ''); i++) { await new Promise(r => setTimeout(r, 65_000)); p = await run(); }
       return p;
     };
-    if (hypeHolder) {
+    if (await holdingHype()) {
       const accountant = String(await readAt(hl, k.stakingManager as Address, 'function stakingAccountant() view returns (address)'));
       const quote = await readAt(hl, accountant as Address, 'function HYPEToKHYPE(uint256) view returns (uint256)', [10n * E]) as bigint;
       const p = await patient(() => sendWith(hypeHolder!, k.stakingManager, '0x3a4b66f1', 10n * E));
       const kIn = p.assetChanges.find(c => c.asset === k.kHYPE && c.direction === 'in');
       check(!by(p) && p.simulation?.status === 'success' && p.assetChanges.some(c => c.asset === 'native' && c.direction === 'out' && c.raw === (10n * E).toString() && c.basis === 'simulated_state') && kIn?.raw === quote.toString(),
-        `${name}: Kinetiq stake 10 HYPE`.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE${by(p)}`);
+        `${name}: Kinetiq stake 10 HYPE`.padEnd(34), `${moved(p)}; Kinetiq quotes ${formatUnits(quote, 18)} kHYPE${by(p)}${p.simulation?.status === 'success' ? '' : ` [${hypeHolder}: ${p.simulation?.revertReason ?? p.simulation?.error ?? p.simulation?.status ?? 'not simulated'}; it holds ${formatUnits(await hypeOf(hypeHolder!), 18)} HYPE now]`}`);
     } else console.log('skip stake: no recent EOA sender holding 12 HYPE');
     if (await holdingUsdc()) {
       const t = await patient(() => sendWith(usdcHolder!, H.usdc, encodeFunctionData({ abi: parseAbi(['function transfer(address,uint256)']), functionName: 'transfer', args: ['0x000000000000000000000000000000000000dEaD', 1_000_000n] })));

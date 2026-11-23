@@ -19,6 +19,7 @@
 // about 30 seconds): --blocks takes the latest blocks, newest first; --follow watches for new ones.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import type { Hex } from 'viem';
+import { recoverAuthorizationAddress } from 'viem/utils';
 import { previewRequest } from '../src/preview.ts';
 import { liveDependencies } from '../src/server.ts';
 import { JsonRpcClient } from '../src/rpc.ts';
@@ -72,6 +73,17 @@ const tokenLike = (address: string): Promise<boolean> => {
 type Receipt = { transactionHash: string; from: string; to: string | null; gasUsed: Hex; effectiveGasPrice?: Hex; l1Fee?: Hex; logs: { address: string; topics: Hex[]; data: Hex }[] };
 const RECEIPTS = new Map<string, Promise<Receipt[]>>();
 const blockReceipts = (block: string) => { let r = RECEIPTS.get(block); if (!r) { RECEIPTS.clear(); RECEIPTS.set(block, r = call<Receipt[]>('eth_getBlockReceipts', [block])); } return r; };
+
+/** How many of a transaction's authorizations are for accounts other than `account` (their signers, recovered). */
+async function othersDelegated(list: readonly { chainId: string; address: string; nonce: string; yParity?: string; v?: string; r: string; s: string }[] | undefined, account: string): Promise<number> {
+  let n = 0;
+  for (const a of list ?? []) {
+    const yParity = a.yParity !== undefined ? Number(a.yParity) : a.v !== undefined ? Number(BigInt(a.v) % 2n === 0n ? 1 : 0) : 0;
+    const signer = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity } }).catch(() => null);
+    if (signer && signer.toLowerCase() !== account) n++;
+  }
+  return n;
+}
 
 async function replay(hash: string): Promise<void> {
   const base = liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false });
@@ -139,8 +151,13 @@ async function replay(hash: string): Promise<void> {
   // account's code has no such function and takes any call (UniversalGaslessDelegate's fallback does), or swallows
   // what fails. Not the preview's to match: a wallet asked to send calls to such an account doesn't send them so.
   const ranNothing = actual === 'success' && !own.logs.length && (p.assetChanges ?? []).some(c => c.asset !== 'native' && c.basis !== 'requested');
+  // An authorization in the transaction for another account sets code there before the calls run, which they can
+  // rely on (a batch on Ethereum, 2026-11-23, called into an account its own transaction delegated: without it both
+  // calls fail). A wallet_sendCalls request holds no authorization for another account: not the preview's to match.
+  const foreign = await othersDelegated(tx.authorizationList, account);
   const unjudged = actual === 'reverted' ? 'the transaction reverted (on its signature or its gas, perhaps: a request has neither)' : batch.tryMode ? 'a batch in "try" mode: its calls may fail one by one'
-    : ranNothing ? "the transaction logged nothing: the account's code ran none of its calls" : undefined;
+    : ranNothing ? "the transaction logged nothing: the account's code ran none of its calls"
+    : foreign ? `the transaction also delegated ${foreign === 1 ? 'another account' : `${foreign} other accounts`} (EIP-7702), which a request for its calls doesn't hold` : undefined;
   const differs: string[] = [];
   if (!unjudged && preview === 'fails') differs.push('outcome');
   const tokens: Row['tokens'] = actual === 'success' && preview === 'success' && !batch.tryMode && !ranNothing ? await compareTokens(own.logs, account, p.assetChanges ?? [], tokenLike) : [];
@@ -199,7 +216,7 @@ const lines = [
   `  tokens: ${rows.filter(r => r.tokens.length && !r.tokens.some(t => t.unjudged) && !r.differs.includes('tokens')).length} of ${rows.filter(r => r.tokens.length && !r.tokens.some(t => t.unjudged)).length} that moved the account's tokens move the receipt's amounts${rows.some(r => r.tokens.some(t => t.balance !== undefined)) ? ` (${rows.filter(r => r.tokens.some(t => t.balance !== undefined)).length} of them by the account's balance, where a token's logs carry its interest)` : ''}`,
   ...(rows.some(r => r.tokens.some(t => t.unjudged)) ? [`  tokens not judged: in ${rows.filter(r => r.tokens.some(t => t.unjudged)).length}, a token whose logs say another amount than the preview and whose balance can't say (${[...new Set(rows.flatMap(r => r.tokens.map(t => t.unjudged).filter(Boolean)))].join('; ')})`] : []),
   `  native coin (reported, not judged): ${nativeOf.filter(r => r.native!.actual === r.native!.simulated).length} of ${nativeOf.length} with the account's balance change across the block`,
-  ...(rows.some(r => r.unjudged) ? [`  not judged: ${rows.filter(r => r.actual === 'reverted').length} whose transaction reverted (the preview: ${rows.filter(r => r.actual === 'reverted' && r.preview === 'fails').length} with a call expected to fail), ${rows.filter(r => r.actual !== 'reverted' && /try/.test(r.unjudged ?? '')).length} in "try" mode, ${rows.filter(r => /logged nothing/.test(r.unjudged ?? '')).length} that logged nothing (the account's code ran none of its calls)`] : []),
+  ...(rows.some(r => r.unjudged) ? [`  not judged: ${rows.filter(r => r.actual === 'reverted').length} whose transaction reverted (the preview: ${rows.filter(r => r.actual === 'reverted' && r.preview === 'fails').length} with a call expected to fail), ${rows.filter(r => r.actual !== 'reverted' && /try/.test(r.unjudged ?? '')).length} in "try" mode, ${rows.filter(r => /logged nothing/.test(r.unjudged ?? '')).length} that logged nothing (the account's code ran none of its calls), ${rows.filter(r => /also delegated/.test(r.unjudged ?? '')).length} whose transaction also delegated another account`] : []),
   ...(rows.some(r => r.preview === 'not simulated') ? [`  not simulated: ${rows.filter(r => r.preview === 'not simulated').length}`] : []),
   `  ${rows.filter(r => r.calls > 1).length} of several calls, ${rows.filter(r => r.calls === 1).length} of one; ${rows.filter(r => r.sentBy === 'the account').length} sent by the account, ${rows.filter(r => r.sentBy === 'a relayer').length} by a relayer; ${delegates.length} kind${delegates.length === 1 ? '' : 's'} of account code`,
   ...Object.entries(skipped).map(([why, n]) => `  skipped: ${n} ${why}`),

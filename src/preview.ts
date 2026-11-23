@@ -36,6 +36,7 @@ import { authorizedExecutionsAdapter } from './typed-data/authorized-executions.
 import { walletCoreSessionAdapter } from './typed-data/wallet-core-session.ts';
 import { caliburSignedBatchAdapter } from './typed-data/calibur.ts';
 import { CALIBUR_CODES } from './evm/smart-account.ts';
+import { asOneTransaction } from './evm/one-transaction.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, veloraDeltaAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, relayMulticallAdapter, metaTransactionAdapter, authorizedExecutionsAdapter, caliburSignedBatchAdapter, walletCoreSessionAdapter, genericTypedDataAdapter];
 
@@ -176,6 +177,9 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   let priced: { gasPrice: bigint; tip: bigint } | undefined;
   // What was simulated for the results shown, for tracing them.
   let ran: SimulationRequest[] | undefined;
+  // The calls run as one transaction, where that is what the sender's code makes of them and they go through so
+  // (src/evm/one-transaction.ts): its result, and which call failed run one transaction each, and why.
+  let whole: { result: SimulationResult; failed: number; reason?: string } | undefined;
   let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
@@ -202,7 +206,24 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
             if (price && again && again.length === txs.length && !unread && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
           } catch { /* the node refused the priced run: the first stands */ }
         }
-        presets = txs.map((_, i) => ({ result: results?.[i] ?? null }));
+        // A batch an account with code runs is one transaction, and what a call leaves for the transaction's length
+        // the next one finds: where a call fails run one transaction each, they are run as the one they are.
+        const failing = results?.findIndex(r => r.status === 'reverted') ?? -1;
+        if (results && failing !== -1 && txs.every(t => t.to && t.from === txs[0].from) && deps.rpc?.has(txs[0].chainId)) {
+          try {
+            const code = await deps.rpc.call(txs[0].chainId, 'eth_getCode', [txs[0].from, 'latest']);
+            const one = typeof code === 'string' && code !== '0x' ? asOneTransaction(txs[0].from, code, txs) : null;
+            if (one) {
+              const watch = [...new Set(requests.flatMap(q => q.watch ?? []))], gas = txs.every(t => t.gas !== undefined) ? txs.reduce((sum, t) => sum + t.gas!, 0n) : undefined;
+              const request: SimulationRequest = { chainId: txs[0].chainId, from: txs[0].from, to: txs[0].from, data: one.data, value: 0n, ...(watch.length && { watch }), ...(gas !== undefined && { gas }), ...(at && { at }),
+                stateOverrides: { ...context.stateOverrides, ...one.overrides, [txs[0].from.toLowerCase()]: { ...context.stateOverrides?.[txs[0].from.toLowerCase()], ...one.overrides[txs[0].from.toLowerCase()] } } };
+              const result = await deps.simulator.simulate(request);
+              if (result?.status === 'success' && !result.limited && !result.refused) { whole = { result, failed: failing, reason: results[failing].revertReason }; ran = [request]; }
+            }
+          } catch { /* not run so: the calls' own results stand */ }
+        }
+        // (Run as one, the calls have no results of their own: each is shown as it is decoded, the batch as it ran.)
+        presets = txs.map((_, i) => ({ result: whole ? null : results?.[i] ?? null }));
       } catch (error) {
         results = null;
         presets = (error as Error)?.name === 'BatchSimulationUnsupported'
@@ -217,10 +238,13 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   for (const [i, tx] of txs.entries()) calls.push(await previewTransaction(tx, deps, context, 'wallet_sendCalls', presets[i], decoded[i]));
   // Each call's trace (PreviewContext.trace), from the calls run in order where they can be traced.
   let untraced: string | undefined;
+  let wholeTrace: Preview['trace'];
   if (context.trace && results && ran) {
     const env: TraceEnv = { chainId: txs[0].chainId, account: txs[0].from, deps };
-    const traces = await tracePreviews(ran, results, env);
-    for (const [i, t] of (traces ?? []).entries()) if (t) calls[i].trace = t;
+    const traces = await tracePreviews(ran, whole ? [whole.result] : results, env);
+    // (Run as one transaction, the trace is the batch's: the account calling itself, and each call under that.)
+    if (whole) wholeTrace = traces?.[0];
+    else for (const [i, t] of (traces ?? []).entries()) if (t) calls[i].trace = t;
     if (!traces) untraced = noTrace(env);
   }
 
@@ -238,7 +262,19 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   let assetChanges: AssetChange[] = calls.flatMap(c => c.assetChanges);
   let approvals: ApprovalChange[] = [];
   let simulation: SimulationSummary | undefined;
-  if (results) {
+  if (results && whole) {
+    const r = whole.result, account = txs[0];
+    simulation = { status: 'success', source: `${r.source}, ${txs.length} calls as one transaction`, ...(r.gasUsed !== undefined && { gasUsed: r.gasUsed.toString() }), ...(named && { block: named.number.toString() }), ...(r.stateReadError && { stateReadError: r.stateReadError }) };
+    b.note(`Run one transaction each, call ${whole.failed + 1} fails${whole.reason ? ` (${whole.reason})` : ''}; run as one transaction, as an account with code runs a batch, they all go through: a call relies on what an earlier one leaves for the length of the transaction. What is shown is of the one transaction, the account making the calls in order.`);
+    if (named) b.note(`Simulated on the state after ${blockText(named.number, named.time)}, in the block that followed: what the calls would have done then, not now.`);
+    if (context.stateOverrides) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
+    if (untraced) b.note(untraced);
+    if (r.basis === 'state' || r.basis === 'fork' || r.balancesRead) b.note(simulationNote({ basis: r.basis, tokensRead: r.tokensRead ?? 0, balancesRead: !!r.balancesRead }));
+    const basis = r.basis === 'state' || r.basis === 'fork' || r.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
+    assetChanges = [...await netChanges(r.transfers, account, deps, b, basis), ...await nftChanges(r.nftTransfers ?? [], account, deps, b, basis)];
+    // (An approval a call makes on its own target is one the call names: the others were set along the way.)
+    approvals = await approvalChanges((r.approvals ?? []).map(approval => ({ approval, callTo: txs.find(t => t.to?.toLowerCase() === approval.emitter.toLowerCase())?.to ?? null })), account, deps, r.approvalState);
+  } else if (results) {
     const failed = results.findIndex(r => r.status === 'reverted');
     const gasUsed = results.reduce((sum, r) => sum + (r.gasUsed ?? 0n), 0n);
     simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
@@ -279,6 +315,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings, attention: attentionOf(warnings),
     decoding: { status: statuses.every(s => s === 'full') ? 'full' : statuses.every(s => s === 'opaque') ? 'opaque' : 'partial', decoder: 'batch', notes: b.notes },
     ...(simulation && { simulation }),
+    ...(wholeTrace && { trace: wholeTrace }),
     calls,
   };
 }
