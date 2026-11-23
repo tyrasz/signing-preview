@@ -765,32 +765,58 @@ export async function lastSignature(c: { deps: Dependencies; chainId: number; se
   return signature;
 }
 /**
- * Whether a ZeroDev passkey account's wallet signs with the P256 precompile: where the signature supplied with the
- * operation says it does, it does (a wallet's stub: @zerodev/passkey-validator's getStubSignature sets usePrecompiled
- * as its signing does from 5.6.1, November 2026, and always wrote false before, "the estimate may be high, never too
- * low", so a stub's false says nothing); else as its latest earlier operation did (its signature's usePrecompiled,
+ * Whether a ZeroDev passkey account's wallet signs with the P256 precompile: as the signature supplied with the
+ * operation says, unless that is ZeroDev's SDK's own stub saying it doesn't (zeroDevSays: its stubs said so whatever
+ * the wallet signed with, until 5.6.1); else as its latest earlier operation did (its signature's usePrecompiled,
  * after the 0xff of a permission's; see lastSignature); else as most do on its chain (ZERODEV_PRECOMPILED), which is
- * then `assumed`: the preview says so (zeroDevAssumed). Blofin's wallet signs without the precompile on Arbitrum One, where 141 of
- * 147 operations had it: by the chain's default its operations came out 27-47% low. On Base (2026-11-22) an account
- * of the walllet app's, which signs without it where 34 of 34 others had it, came out 58% low: its earlier operation
- * was more than 3,000,000 blocks back, beyond what Base's public node serves of one sender's logs.
+ * then `assumed`: the preview says so (zeroDevAssumed), and whether such a `stub` came with it. Blofin's wallet signs
+ * without the precompile on Arbitrum One, where 141 of 147 operations had it: by the chain's default its operations
+ * came out 27-47% low. On Base (2026-11-22) an account of the walllet app's, which signs without it where 34 of 34
+ * others had it, came out 58% low: its earlier operation was more than 3,000,000 blocks back, beyond what Base's
+ * public node serves of one sender's logs.
  */
-async function zeroDevPrecompiled(c: StubContext): Promise<{ precompiled: boolean; assumed?: true }> {
-  const flag = (sig: Hex | undefined) => (sig ? zeroDevFlag(sig) : undefined);
-  if (flag(c.signature) === true) return { precompiled: true };
+async function zeroDevPrecompiled(c: StubContext, own = c.signature): Promise<{ precompiled: boolean; assumed?: true; stub?: true }> {
+  const said = own ? zeroDevSays(own) : undefined;
+  if (said?.settles) return { precompiled: said.precompiled };
   // Beyond the usual reach too: what the flag costs either way (above) is worth a read more. An account of Blofin's
   // on Arbitrum One whose last operation was 2,460,000 blocks back (a week) came out 53% low by the chain's default.
-  const last = flag(await lastSignature(c) ?? await lastSignature({ ...c, wide: true, key: 'wide' }));
-  return last !== undefined ? { precompiled: last } : { precompiled: ZERODEV_PRECOMPILED.has(c.chainId), assumed: true };
+  const earlier = await lastSignature(c) ?? await lastSignature({ ...c, wide: true, key: 'wide' });
+  const last = earlier ? zeroDevFlag(earlier) : undefined;
+  return last !== undefined ? { precompiled: last } : { precompiled: ZERODEV_PRECOMPILED.has(c.chainId), assumed: true, ...(said && { stub: true }) };
 }
 /** The usePrecompiled flag of a signature in ZeroDev's passkey form (after the 0xff of a permission's signer's), or undefined for any other. */
 export function zeroDevFlag(signature: Hex): boolean | undefined {
-  const read = (sig: Hex) => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
+  return zeroDevSays(signature)?.precompiled;
+}
+/** The r of the stub signature ZeroDev's SDK builds for gas estimation (@zerodev/passkey-validator and its weighted validator's passkey signer, 5.5.5 to 5.6.1 read): the same in each. */
+const ZERODEV_STUB_R = 0x635bc6d0f68ff895cae8a288ecf7542a6a9cd555df784b73e1e2ea7e9104b1dbn;
+/**
+ * What a signature in ZeroDev's passkey form says of how the wallet verifies, and whether that `settles` it. A real
+ * assertion does, either way: it is the wallet's own. The SDK's stub (its fixed r) does only where it names the
+ * precompile: @zerodev/passkey-validator's getStubSignature sets usePrecompiled as its signing does from 5.6.1
+ * (November 2026), and wrote false in every stub before, "the estimate may be high, never too low".
+ */
+export function zeroDevSays(signature: Hex): { precompiled: boolean; settles: boolean } | undefined {
+  const read = (sig: Hex) => { try { const [, , , r, , precompiled] = decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig); return { precompiled, settles: precompiled || r !== ZERODEV_STUB_R }; } catch { return undefined; } };
   return read(signature) ?? (signature.startsWith('0xff') ? read(`0x${signature.slice(4)}`) : undefined);
 }
-/** What the preview says of a ZeroDev passkey stand-in whose verifier is only its chain's usual one (zeroDevPrecompiled's `assumed`). */
-export const zeroDevAssumed = (chainId: number, precompiled: boolean): string =>
-  `How this account's wallet has a passkey's signature verified isn't known: no earlier operation of the account's was found to show it, and nothing supplied with this one says. It is taken to use ${precompiled ? "the chain's P-256 precompile" : 'a verifier contract (P-256 in Solidity)'}, as most ZeroDev passkey wallets on ${chainName(chainId)} do. If it uses ${precompiled ? 'a verifier contract (P-256 in Solidity)' : "the chain's P-256 precompile"} instead, the operation takes about 335,000 gas ${precompiled ? 'more' : 'less'} than shown.`;
+/** The chains ZeroDev's passkey wallets were counted on (ZERODEV_PRECOMPILED's comment): what "most do" can be said of. */
+const ZERODEV_COUNTED = new Set([1, 56, 137, 8453, 42161, 11155111]);
+/**
+ * What the preview says of a ZeroDev passkey stand-in whose verifier is only its chain's usual one
+ * (zeroDevPrecompiled's `assumed`): with `stub`, that the SDK's stub came with the operation and why it doesn't say;
+ * `signatures`, how many such signatures the operation carries (an enable-mode operation's can be two).
+ */
+export const zeroDevAssumed = (chainId: number, precompiled: boolean, more: { stub?: boolean; signatures?: number } = {}): string => {
+  const counted = ZERODEV_COUNTED.has(chainId), gas = `about ${(335_000 * (more.signatures ?? 1)).toLocaleString('en-US')} gas`;
+  const supplied = more.stub ? "the signature supplied with this one is the stub of ZeroDev's SDK, which named a verifier contract whatever the wallet signed with until its version 5.6.1" : 'nothing supplied with this one says';
+  const taken = precompiled ? "the chain's P-256 precompile" : 'a verifier contract (P-256 in Solidity)';
+  const why = counted ? `, as most ZeroDev passkey wallets on ${chainName(chainId)} do` : precompiled ? '' : ', which needs nothing of the chain';
+  const other = precompiled ? `If it uses a verifier contract (P-256 in Solidity) instead, the operation takes ${gas} more than shown.`
+    : counted ? `If it uses the chain's P-256 precompile instead, the operation takes ${gas} less than shown.`
+      : `If the chain has a P-256 precompile and the wallet uses it, the operation takes ${gas} less than shown.`;
+  return `How this account's wallet has a passkey's signature verified isn't known: no earlier operation of the account's was found to show it, and ${supplied}. It is taken to use ${taken}${why}. ${other}`;
+};
 /**
  * A Kernel v3 validator that keeps signers by id (0x9334…04ba, unpublished; its layout read from its set-up and
  * operations, Sepolia and Polygon, 2026-11-13): its data is abi.encode((bytes32 id, address signer, bytes data)[]),
@@ -969,8 +995,8 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
   if (type === '01' && ZERODEV_PASSKEY_VALIDATORS.has(`0x${id}`.toLowerCase())) {
     const hash = await c.hash();
     if (!hash) return ecdsa;
-    const { precompiled, assumed } = await zeroDevPrecompiled(c);
-    return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo', ...(assumed && { note: zeroDevAssumed(c.chainId, precompiled) }) }];
+    const { precompiled, assumed, stub } = await zeroDevPrecompiled(c);
+    return [{ signature: zeroDevWebAuthnStub(hash, precompiled), p256: precompiled || 'daimo', ...(assumed && { note: zeroDevAssumed(c.chainId, precompiled, { stub }) }) }];
   }
   if (type === '01' && `0x${id}`.toLowerCase() === ZERODEV_WEIGHTED_VALIDATOR) {
     try { const weighted = await weightedStub(c, deploying?.installs.get(`0x01${id}`.toLowerCase())); if (weighted) return weighted; } catch { /* unreadable: the ECDSA forms */ }
@@ -999,7 +1025,7 @@ async function kernelV3Stub(c: StubContext, deploying?: KernelSetup): Promise<St
       // validator takes it (zeroDevWebAuthnStub).
       if (config && ZERODEV_WEBAUTHN_SIGNERS.has(config.signer.toLowerCase())) {
         const hash = await c.hash();
-        if (hash) { const { precompiled, assumed } = await zeroDevPrecompiled(c); return [{ signature: `0xff${zeroDevWebAuthnStub(hash, precompiled).slice(2)}` as Hex, p256: precompiled || 'daimo', ...(assumed && { note: zeroDevAssumed(c.chainId, precompiled) }) }]; }
+        if (hash) { const { precompiled, assumed, stub } = await zeroDevPrecompiled(c); return [{ signature: `0xff${zeroDevWebAuthnStub(hash, precompiled).slice(2)}` as Hex, p256: precompiled || 'daimo', ...(assumed && { note: zeroDevAssumed(c.chainId, precompiled, { stub }) }) }]; }
       }
       // Bleap's cosigning signers: 0xff, the owner's signature, then its cosigner's. The owner is the one the module
       // records for the account (a deploying account's in its install data): where the signer asked isn't it, the
@@ -1270,7 +1296,6 @@ const KERNEL_STATE = parseAbi(['function currentNonce() view returns (uint32)', 
  */
 const ENABLE_OWNER = stubSignature(6), ENABLE_KEY = stubSignature(3), ENABLE_OWNER_COSIGNER = stubSignature(12), ENABLE_KEY_COSIGNER = stubSignature(14);
 /** A ZeroDev passkey signature's usePrecompiled, where `sig` is one (a wallet's dummy included). */
-const precompiledIn = (sig: Hex): boolean | undefined => { try { return decodeAbiParameters(ZERODEV_WEBAUTHN_SIGNATURE, sig)[5]; } catch { return undefined; } };
 /**
  * A Kernel v3 operation in enable mode, signed: its own enable data (`e`) with stand-ins for both signatures.
  * - enableSig, by the root (read from the account, or from its set-up when the operation deploys it): ZeroDev's ECDSA
@@ -1344,12 +1369,12 @@ export async function kernelEnableStub(c: StubContext, e: KernelEnable, deployin
     return usual === 'hash' ? hash : message;
   };
   const passkeys: (boolean | 'daimo')[] = [];
-  // (The flag of the operation's own signature in that place; one the chain's usual way only, said so: zeroDevAssumed.)
-  let assumed: string | undefined;
+  // (As the operation's own signature in that place says, where it settles it: zeroDevPrecompiled. Each one that is
+  // only the chain's usual way is counted, and the preview says so: zeroDevAssumed.)
+  const unknown = { signatures: 0, stub: false, precompiled: false };
   const passkey = async (hash: Hex, own: Hex) => {
-    const known = precompiledIn(own), found = known === undefined ? await zeroDevPrecompiled({ ...c, signature: undefined }) : undefined;
-    const precompiled = known ?? found!.precompiled;
-    if (found?.assumed) assumed = zeroDevAssumed(c.chainId, precompiled);
+    const { precompiled, assumed, stub } = await zeroDevPrecompiled(c, own);
+    if (assumed) { unknown.signatures++; unknown.stub ||= !!stub; unknown.precompiled = precompiled; }
     passkeys.push(precompiled || 'daimo');
     return zeroDevWebAuthnStub(hash, precompiled);
   };
@@ -1436,7 +1461,7 @@ export async function kernelEnableStub(c: StubContext, e: KernelEnable, deployin
     }
     // The passkeys' verifier: the precompile, Daimo's contract, or both.
     const p256 = passkeys.includes(true) ? true : passkeys.length ? 'daimo' as const : undefined;
-    return [{ signature: kernelEnableSignature({ ...e, enableSig, userOpSig }), enable: true, ...(cosigners.length && { cosigners }), ...(p256 && { p256 }), ...(p256 === true && passkeys.includes('daimo') && { verifier: DAIMO_P256_VERIFIER }), ...(assumed && { note: assumed }) }];
+    return [{ signature: kernelEnableSignature({ ...e, enableSig, userOpSig }), enable: true, ...(cosigners.length && { cosigners }), ...(p256 && { p256 }), ...(p256 === true && passkeys.includes('daimo') && { verifier: DAIMO_P256_VERIFIER }), ...(unknown.signatures && { note: zeroDevAssumed(c.chainId, unknown.precompiled, unknown) }) }];
   } catch { return []; }
 }
 const coinbaseWrapper = (ownerIndex: bigint, signatureData: Hex) => encodeAbiParameters([{ type: 'tuple', components: [{ name: 'ownerIndex', type: 'uint256' }, { name: 'signatureData', type: 'bytes' }] }], [{ ownerIndex, signatureData }]);
@@ -3284,7 +3309,7 @@ async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Pr
   // account on Sepolia took a bare 65-byte signature by a path 29,000 gas cheaper than its wallet's own form).
   // (Not a passkey's assertion in ZeroDev's form: its r and s, with the flag's word after them, read as an ECDSA
   // signature's, and each such stub cost a run the account could only refuse.)
-  const forms = supplied && zeroDevFlag(supplied.signature) === undefined ? walletForm(supplied.signature) : [];
+  const forms = supplied && !zeroDevSays(supplied.signature) ? walletForm(supplied.signature) : [];
   const stubs: Stub[] = supplied ? [...enable, supplied, ...forms.map(signature => ({ signature, walletForm: true }))] : await stubFor(context, op.delegate, op.initCode);
   const fee = await baseFee(deps, op.chainId);
   // The first run waits for the lookup 1.5 s at most (then runs as BUNDLER); a refusal waits for all of it.

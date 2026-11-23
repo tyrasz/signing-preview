@@ -911,6 +911,8 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   // One whose inner call ran out, reverting on the sixty-fourth it kept (BNB Chain: 109,188 of 110,414 used): short too;
   // one that reverted with most of its gas left isn't.
   assert.deepEqual([ranShort({ status: '0x0', gasUsed: '0x1aa84' }, 110_414n), ranShort({ status: '0x0', gasUsed: '0x97f4' }, 321_145n)], [true, false]);
+  // (Within a sixteenth of the limit: 15,000 of 16,000 is, 14,999 isn't.)
+  assert.deepEqual([ranShort({ status: '0x0', gasUsed: '0x3a98' }, 16_000n), ranShort({ status: '0x0', gasUsed: '0x3a97' }, 16_000n)], [true, false]);
   failure = undefined;
   // The same block run again with the same stand-ins (a replayed operation is simulated several times over): its
   // earlier calls start with the room found. Without the stand-ins, they run on their own limits as ever.
@@ -920,6 +922,16 @@ test('An earlier transaction the calls’ stand-ins make fail, where it succeede
   // (Each run asks twice, the calls and then its reads: the first run's first ask alone is on the payout's own limit.)
   assert.deepEqual(firstGas(), [191_339n, 291_339n, 291_339n, 291_339n, 291_339n, 191_339n, 191_339n]);
   assert.equal(simulator.roomGiven, 1);
+  // The room found is for those stand-ins: calls that put code at another address too (a verifier contract's stand-in)
+  // start on the block's own limits, and find their own.
+  sent.length = 0;
+  const withVerifier = (): SimulationRequest => { const q = operation(earlier); return { ...q, stateOverrides: { ...q.stateOverrides, '0x00000000000000000000000000000000000d41a0': { code: '0x00' } } }; };
+  for (let k = 0; k < 2; k++) await simulator.simulateBatch([withVerifier()]);
+  assert.deepEqual(firstGas(), [191_339n, 291_339n, 291_339n, 291_339n, 291_339n]);
+  // Nor is it another block's: the same calls in a list of their own start on their limits.
+  sent.length = 0;
+  await simulator.simulateBatch([operation([payout(true)])]);
+  assert.equal(firstGas()[0], 191_339n);
   // The room is for what the stand-ins cost: given to those that failed, once.
   assert.deepEqual(roomForStandIns([payout(true), transfer], [operation([])], [0])!.map(r => [r.gas, r.roomy]), [[291_339n, true], [25_000n, undefined]]);
   assert.equal(roomForStandIns(roomForStandIns([payout(true)], [operation([])], [0])!, [operation([])], [0]), undefined);

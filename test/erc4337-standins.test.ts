@@ -5,7 +5,7 @@
 // at Send's implementation and SmartSession's addresses).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, keccak256, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
+import { concatHex, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData, getAddress, hashTypedData, keccak256, numberToHex, parseAbi, sha256, stringToHex, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
@@ -432,12 +432,20 @@ test('Kernel v3 on ZeroDev’s weighted validator with typed guardians: an array
     throw new Error(`unexpected ${method}`);
   } };
   const failed = concatHex(['0x220266b6', encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }], [0n, 'AA23 reverted'])]);
-  const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
+  const recovers: string[] = [];
+  const simulator = { simulate: async (q: SimulationRequest) => { tried.push((decodeFunctionData({ abi: HANDLE, data: q.data as Hex }).args[0] as { signature: Hex }).signature); recovers.push(q.stateOverrides?.['0x0000000000000000000000000000000000000001']?.code ?? ''); return { status: 'reverted' as const, returnData: failed, transfers: [] }; } };
   const op = { chainId: 11155111, entryPoint: EP, nonce: 0n, callData: '0xe9ae5c53' as Hex, callGasLimit: 100_000n, verificationGasLimit: 500_000n, preVerificationGas: 50_000n, maxFeePerGas: 1n, maxPriorityFeePerGas: 0n, paymasterAndData: '0x' as Hex };
   const array = (...entries: [number, Hex][]) => encodeAbiParameters([{ type: 'bytes[]' }], [entries.map(([i, signature]) => concatHex([`0x0${i}`, signature]))]);
   const first = async (signer: string, sender = SENDER, initCode: Hex = '0x') => { tried.length = 0; const run = await simulateOperation({ ...op, sender, initCode, signer }, { rpc: node, simulator } as never); return { signature: tried[0], why: run?.why }; };
   // g2 signs (index 1, weight 1): g1's approval (index 0) reaches the threshold, then g2's own.
+  recovers.length = 0;
   assert.equal((await first(g2)).signature, array([0, stubSignature(1)], [1, STUB_SIGNATURE]));
+  // The approval is recovered as g1's over the validator's own Approve digest and no other: EIP-712, domain
+  // WeightedValidator 0.0.1 (the 0.0.2 contract's too), the chain and the validator; Approve(bytes32
+  // callDataAndNonceHash), the hash of abi.encode(account, callData, nonce).
+  const approve = hashTypedData({ domain: { name: 'WeightedValidator', version: '0.0.1', chainId: 11155111, verifyingContract: getAddress(V2) }, types: { Approve: [{ name: 'callDataAndNonceHash', type: 'bytes32' }] }, primaryType: 'Approve',
+    message: { callDataAndNonceHash: keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'bytes' }, { type: 'uint256' }], [SENDER, op.callData, op.nonce])) } });
+  assert.ok(recovers[0].includes(approve.slice(2)) && recovers[0].includes(g1.slice(2)), 'the stand-in recovers the approval over the Approve digest');
   assert.equal((await first(g1)).signature, array([1, stubSignature(1)], [0, STUB_SIGNATURE]));
   // Threshold 1: the signer's alone.
   threshold = 1;

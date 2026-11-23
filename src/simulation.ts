@@ -282,7 +282,8 @@ export class RpcSimulator implements Simulator {
   roomGiven = 0;
   /**
    * A replayed block's earlier calls with the room a run found them to need (roomForStandIns), by the list they came
-   * from and the precompiles that run's calls moved: the block's next run with the same ones moved starts with it. A
+   * from and the addresses that run's calls put code at (the moved precompiles' and any other stand-in's): the
+   * block's next run with code at the same ones starts with it. A
    * replayed operation is simulated several times over (each signer tried, each form of stand-in), and on Polygon,
    * where every block carries USDC transfers by signature sent on about 2,000 gas more than they use, each of those
    * runs otherwise failed them first and was asked again.
@@ -397,7 +398,9 @@ export class RpcSimulator implements Simulator {
     if (this.noSimulate.has(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
     // (Earlier calls a run of this block found to need room for these stand-ins start with it: roomyFor.)
     const earlier = this.replay?.(chainId)?.before ?? reqs[0]?.at?.before;
-    const moved = reqs.flatMap(r => Object.entries(r.stateOverrides ?? {}).filter(([, o]) => o.movePrecompileToAddress).map(([address]) => address.toLowerCase())).sort().join(',');
+    // (By what the calls put code at, moved precompile or not: what an earlier call costs under them turns on each.)
+    const standIns = [...new Set(reqs.flatMap(r => Object.entries(r.stateOverrides ?? {}).filter(([, o]) => o.movePrecompileToAddress || o.code !== undefined).map(([address]) => address.toLowerCase())))].sort();
+    const moved = reqs.some(r => Object.values(r.stateOverrides ?? {}).some(o => o.movePrecompileToAddress)) ? standIns.join(',') : '';
     const known = !fitted && earlier && moved ? this.roomyFor.get(earlier)?.get(moved) : undefined;
     if (known) {
       const ran = await this.simulateAt(reqs, known, retried).catch(() => null);
@@ -434,8 +437,11 @@ export class RpcSimulator implements Simulator {
     const again = roomy && await this.simulateAt(reqs, roomy, retried).catch(() => null);
     if (again) {
       this.roomGiven = Math.max(this.roomGiven, roomy!.filter(r => r.roomy).length);
-      // (Remembered for the block's own list, or for one remembered before that needed more; not for one cut to fit a node's gas: fitGas.)
-      if (earlier && moved && (!fitted || this.roomyFor.get(earlier)?.get(moved) === fitted)) this.roomyFor.set(earlier, (this.roomyFor.get(earlier) ?? new Map<string, SimulationRequest[]>()).set(moved, roomy!));
+      // Remembered where it is the block's own list with room and nothing else (not one cut to fit a node's gas,
+      // fitGas), and no fuller one is: a rerun that found more calls short remembers its own before this one returns.
+      const roomIn = (list: SimulationRequest[]) => list.filter(r => r.roomy).length;
+      const ownWithRoom = !!earlier && roomy!.length === earlier.length && roomy!.every((r, i) => r.roomy || r.gas === earlier[i].gas);
+      if (earlier && moved && ownWithRoom && roomIn(this.roomyFor.get(earlier)?.get(moved) ?? []) < roomIn(roomy!)) this.roomyFor.set(earlier, (this.roomyFor.get(earlier) ?? new Map<string, SimulationRequest[]>()).set(moved, roomy!));
       return again;
     }
     // A node that adds up the gas limits of the block's calls and won't have them pass the block's (fitGas): the

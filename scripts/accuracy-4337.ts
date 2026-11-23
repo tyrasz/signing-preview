@@ -1029,8 +1029,17 @@ async function replay(item: string): Promise<void> {
   // costs, zeroDevAssumed), and which signed the other way: on Base (2026-11-22) a walllet account, without the
   // precompile where 34 of 34 others had used it, its last operation 3,000,000 blocks back, 58% low. What the preview
   // said it didn't know isn't a wrong preview: its gas is reported, not judged.
+  // Only where the gas is off as that verifier's cost is: the way taken the cheaper one, the operation short by about
+  // 335,000 gas (250,000 to 420,000: what the contract's check costs moves with the signature), or over by it the
+  // other way. Anything else is judged as any operation's.
   const assumed = p.decoding.notes.find(x => /How this account's wallet has a passkey's signature verified isn't known/.test(x));
-  if (assumed && zeroDevFlag(op.signature) === !/taken to use the chain's P-256 precompile/.test(assumed)) row.passkeyVerifierAssumed = true;
+  if (assumed && gasCompared && zeroDevFlag(op.signature) === !/taken to use the chain's P-256 precompile/.test(assumed)) {
+    const tookPrecompile = /taken to use the chain's P-256 precompile/.test(assumed);
+    // (In gas: the cost's difference at the price the operation paid.)
+    const short = gasCompared.gasless ? gasCompared.actual - BigInt(gasCompared.simulated) : (gasCompared.actual - BigInt(gasCompared.simulated)) * actualGasUsed / gasCompared.actual;
+    const gap = tookPrecompile ? short : -short;
+    if (gap >= 250_000n && gap <= 420_000n) row.passkeyVerifierAssumed = true;
+  }
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
     // Not for an account that rejected the stand-in: its own signature check didn't run, which can be most of the gas

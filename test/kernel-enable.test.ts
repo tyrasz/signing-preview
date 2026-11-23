@@ -151,6 +151,13 @@ test('Real grants: who gets the key, what its policies allow, and how much atten
   const odd = await sign(typedData([`0x03000064${K1.slice(2)}`], 100), '0x17f579f3390de3b59bac621ca4f6292b4c61e558');
   assert.match(detail(odd, 'Validator data')!, /^0x000064000000000000/);
   assert.equal(detail(odd, 'Guardian 1'), undefined);
+  // (The validator is one known here; its data is what couldn't be read, and the caution says that.)
+  assert.ok(codes(odd).includes('kernel_enable_validator_data_unread') && !codes(odd).includes('kernel_enable_unknown_validator'), String(codes(odd)));
+  assert.match(odd.warnings.map(w => w.message).join(' '), /The data this installs ZeroDev's weighted validator 0\.0\.2 \(guardians' keys and passkeys\) with isn't in the form that validator takes/);
+  // No guardians at all: the same, never "0 guardians".
+  const none = await sign(typedData([], 1), '0x17f579f3390de3b59bac621ca4f6292b4c61e558');
+  assert.doesNotMatch(none.title, /0 guardian/);
+  assert.ok(codes(none).includes('kernel_enable_validator_data_unread'), String(codes(none)));
 
   // An unknown policy, with a handler for a function of its own run by delegatecall (its code runs as the account):
   // named by address, no limit claimed, and danger.

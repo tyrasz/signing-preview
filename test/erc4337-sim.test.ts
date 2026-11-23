@@ -514,7 +514,7 @@ test('A Kernel v3.1 passkey account: the stand-in passes ZeroDev’s own WebAuth
   assert.deepEqual(usdcChange(p), ['out 50']);
   // Which verifier its wallet signs for isn't known here (no earlier operation of the account's, no stub): the preview
   // says which it took, and what the other costs.
-  assert.match(p.decoding.notes.join(' | '), /How this account's wallet has a passkey's signature verified isn't known: .*It is taken to use a verifier contract \(P-256 in Solidity\), as most ZeroDev passkey wallets on .+ do\. If it uses the chain's P-256 precompile instead, the operation takes about 335,000 gas less than shown\./);
+  assert.match(p.decoding.notes.join(' | '), /How this account's wallet has a passkey's signature verified isn't known: .*It is taken to use a verifier contract \(P-256 in Solidity\), which needs nothing of the chain\. If the chain has a P-256 precompile and the wallet uses it, the operation takes about 335,000 gas less than shown\./);
 });
 
 test('Calls run alone on Kernel v3 (executeUserOp) run inside the execution hook their validation was installed with, which can refuse them', async () => {

@@ -365,7 +365,7 @@ function readValidator(validator: string, data: Hex, b: PreviewBuilder): Reading
     if (guardians.length > LIST_MAX) b.detail('Guardians not listed', String(guardians.length - LIST_MAX));
     b.detail('Guardians needed', `weight ${threshold} of ${total}${delay ? `, ${formatDuration(delay * 1000)} after they agree` : ''}`);
     reading.who = guardians.length === 1 ? `guardian key ${shortAddress(guardians[0].toLowerCase())}` : `${guardians.length} guardian keys (together weight ${threshold} of ${total})`;
-  } else if (v?.kind === 'weighted-typed' && readTypedWeighted(data)?.guardians.every(g => (g.type === 1 && g.key.length === 42) || (g.type === 2 && g.key.length === 194))) {
+  } else if (v?.kind === 'weighted-typed' && readTypedWeighted(data)?.guardians.length && readTypedWeighted(data)!.guardians.every(g => (g.type === 1 && g.key.length === 42) || (g.type === 2 && g.key.length === 194))) {
     // (Each guardian an Ethereum key or a passkey, as the validator itself requires; the delay its data carries it never reads.)
     const { guardians, threshold } = readTypedWeighted(data)!;
     const total = guardians.reduce((a, g) => a + g.weight, 0), passkeys = guardians.filter(g => g.type === 2).length;
@@ -378,7 +378,9 @@ function readValidator(validator: string, data: Hex, b: PreviewBuilder): Reading
     if (data.length > 2) b.detail('Validator data', data.length > 130 ? `${data.slice(0, 130)}…` : data);
     reading.who = `validator ${shortAddress(validator)}`;
     reading.partial = true;
-    reading.cautions.push(['kernel_enable_unknown_validator', `The validator ${validator} isn't one this previewer knows: who holds the key it checks can't be shown.`]);
+    // (A validator known here whose data isn't in its form: the data is what can't be read, not the validator.)
+    reading.cautions.push(v ? ['kernel_enable_validator_data_unread', `The data this installs ${v.name} with isn't in the form that validator takes, so who it lets act for your account can't be shown.`]
+      : ['kernel_enable_unknown_validator', `The validator ${validator} isn't one this previewer knows: who holds the key it checks can't be shown.`]);
   }
   return reading;
 }
