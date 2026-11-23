@@ -39,9 +39,10 @@ const hex = (v: bigint | number) => `0x${v.toString(16)}`;
 /**
  * The selectors batchCalls reads: execute(bytes32,bytes), executeBatch((address,uint256,bytes)[]),
  * execute(address,uint256,bytes), executeBatch(address[],bytes[]), executeBatch(address[],uint256[],bytes[]); and
- * WalletCore's executeFromSelf, executeWithValidator, initializeExecuteWithValidator and executeFromExecutor.
+ * WalletCore's executeFromSelf, executeWithValidator, initializeExecuteWithValidator and executeFromExecutor; and
+ * Calibur's execute(BatchedCall) and execute(SignedBatchedCall,bytes).
  */
-const SELECTORS = new Set(['0xe9ae5c53', '0x34fcd5be', '0xb61d27f6', '0x18dfb3c7', '0x47e1da2a', '0x893aa9f6', '0xfcfbd33a', '0x32fba9bb', '0x4da6d8e5']);
+const SELECTORS = new Set(['0xe9ae5c53', '0x34fcd5be', '0xb61d27f6', '0x18dfb3c7', '0x47e1da2a', '0x893aa9f6', '0xfcfbd33a', '0x32fba9bb', '0x4da6d8e5', '0x99e1d016', '0xc3c16ee4']);
 
 interface Row {
   hash: string; block: number; account: string;
@@ -121,7 +122,8 @@ async function replay(hash: string): Promise<void> {
     ...(funded && { stateOverrides: { ...q.stateOverrides, [account]: { ...q.stateOverrides?.[account], balance: funded } } }) });
   const simulator = { simulate: (q: SimulationRequest) => base.simulator!.simulate(placed(q)), simulateBatch: (qs: SimulationRequest[]) => base.simulator!.simulateBatch!(qs.map(placed)) };
   const request = { method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: hex(CHAIN), from: account, atomicRequired: !batch.tryMode,
-    calls: batch.calls.map(c => ({ to: c.target, data: c.data, value: hex(c.value) })) }] };
+    // (A call to the zero address is one to the account itself, at an ERC-7821 account: Calibur makes it so.)
+    calls: batch.calls.map(c => ({ to: /^0x0{40}$/.test(c.target) && c.data.length >= 10 ? account : c.target, data: c.data, value: hex(c.value) })) }] };
   let p: Preview;
   try { p = await previewRequest(request as never, { chainId: CHAIN, account, now: where.when.time * 1000 }, { ...base, rpc: atParent, simulator }); } catch (e) { return skip(`error: ${(e as Error).message.slice(0, 80)}`); }
   if (DUMP) writeFileSync(DUMP, JSON.stringify(p, (_, v) => (typeof v === 'bigint' ? v.toString() : v), 1));
