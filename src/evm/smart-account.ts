@@ -343,14 +343,19 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     }
     if (calibur) return { d: decoded({ title: calibur, summary: '', decoder: 'smart_account', status: 'full' }), sub };
     if (self) return { d: decoded({ title: `Call your own account (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: back?.calls.length ? 'opaque' : 'partial' }), sub };
-    return { d: await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value }, env.deps, env.context), sub };
+    // (With the transaction's authorizations: a call into another account this same transaction delegates runs that
+    // account's new code. Without them, six accounts a sponsor delegated and then called were each "no code".)
+    return { d: await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value, ...(tx.authorizations && { authorizations: tx.authorizations }) }, env.deps, env.context), sub };
   };
   const described: { d: Decoded; sub: PreviewBuilder }[] = [];
   for (let i = 0; i < listed.length; i += 8) described.push(...await Promise.all(listed.slice(i, i + 8).map((c, j) => describe(c, i + j))));
   const inner: Decoded[] = [];
+  // Calls that hand calls on to another account in turn (accountCallAdapter): said once, with which.
+  const handedOn: { call: number; account: string }[] = [];
   for (const [i, c] of listed.entries()) {
     const { d, sub } = described[i];
     inner.push(d);
+    if (d.account) handedOn.push({ call: i + 1, account: d.account });
     // The coin a call sends, wherever its title doesn't already say it (a token transfer with 100 ETH attached was
     // titled as the transfer, the coin nowhere).
     const value = c.value > 0n && !d.title.includes(coin(c.value)) ? `, with ${coin(c.value)}` : '';
@@ -360,7 +365,11 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     for (const w of sub.warnings) b.warnings.push(w);
     // Every call's own warnings, numbered (two calls can raise the same kind), except the caution that a run used the
     // caller's state (from a Safe a call runs execTransaction on), which is said once.
-    for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else b.warnings.push({ ...w, message: `Call ${i + 1}: ${w.message}` });
+    for (const w of d.b.warnings) if (w.code === 'state_overridden') b.warn(w.severity, w.code, w.message); else if (w.code !== 'account_call' || !d.account) b.warnings.push({ ...w, message: `Call ${i + 1}: ${w.message}` });
+  }
+  if (handedOn.length) {
+    const others = [...new Set(handedOn.map(h => h.account))];
+    b.warn('info', 'account_call', `${handedOn.length === 1 ? `Call ${handedOn[0].call} hands` : `Calls ${handedOn.slice(0, 12).map(h => h.call).join(', ')}${handedOn.length > 12 ? ` and ${handedOn.length - 12} more` : ''} hand`} calls on to ${others.length === 1 ? `another account (${others[0]})` : `${others.length} other accounts (${others.slice(0, 3).map(a => shortAddress(a)).join(', ')}${others.length > 3 ? ', …' : ''})`}, whose code makes them as its own: what those move or approve is that account's, not your account's.`);
   }
   // Past the two hundredth they aren't decoded, and that is said.
   if (parsed.calls.length > MAX_LISTED) {
@@ -389,4 +398,38 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     declaredApprovals: inner.flatMap(d => d.declaredApprovals ?? []),
     watch: inner.flatMap(d => d.watch ?? []),
   });
+};
+
+/**
+ * The same calls, handed to an account that isn't the sender: an owner calling the contract wallet it controls, a
+ * relayer or a session's key calling an account with delegated code, any contract that makes the calls it is given
+ * for whoever its code lets. Its code makes them as that account: what they move and approve is the account's.
+ *
+ * They were "Call contract 0x…", a function that isn't known, and the simulation told of the sender's own account,
+ * which such a transaction mostly leaves as it was: a wallet's whole balance sent out by its owner previewed with
+ * nothing moving. 121 of 10,276 transactions in a sample of 40 Ethereum blocks (2026-11-23) were such calls
+ * (execute(address,uint256,bytes), ERC-7579's execute and executeBatch), to accounts that weren't their senders.
+ *
+ * The calls are read as the account's own, as when it calls itself (smartAccountAdapter), and said to be that
+ * account's. `Decoded.account` names it: the simulation's changes are then read for it too. Whether the account
+ * takes the calls from this sender is its code's to say, which the simulation runs.
+ */
+export const accountCallAdapter: Adapter = async (tx, env) => {
+  if (!tx.to || sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
+  const read = batchCalls(tx.data);
+  if (!read || (!read.calls.length && !read.unread)) return null;
+  const account = tx.to.toLowerCase(), short = shortAddress(account);
+  // (An authorization the sender hasn't signed yet is the sender's own, not this account's.)
+  const d = await smartAccountAdapter({ ...tx, from: account, ...(tx.authorizations && { authorizations: tx.authorizations.filter(a => a.signature) }) }, env);
+  if (!d) return null;
+  const theirs = (text: string) => text.replace(/\b([Yy])our (?:own )?account\b/g, (_m, y: string) => `${y === 'Y' ? 'The' : 'the'} account ${short}`);
+  const b = new PreviewBuilder();
+  for (const x of d.b.details) b.detail(x.label, theirs(x.value), x.raw);
+  const n = read.calls.length;
+  b.warn('info', 'account_call', `This has the account ${account} make ${n === 1 ? 'the call' : `the ${n} calls`} below, not the account sending it: its code runs ${n === 1 ? 'it' : 'them'} as that account, and what ${n === 1 ? 'it moves or approves' : 'they move or approve'} is that account's. Whether it takes ${n === 1 ? 'the call' : 'them'} from you (as its owner, a key or a module it accepts) is for its code to say.`);
+  for (const w of d.b.warnings) b.warnings.push({ ...w, message: theirs(w.message) });
+  for (const note of d.b.notes) b.note(theirs(note));
+  b.note(`Each call is read as ${short}'s own: where a line says "you" or "your", that account is meant, not the one sending this.`);
+  const title = theirs(d.title);
+  return { ...d, b, title: title.includes(short) ? title : `As the account ${short}: ${title}`, summary: theirs(d.summary), decoder: 'account_call', account };
 };

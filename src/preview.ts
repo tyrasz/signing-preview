@@ -302,6 +302,16 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
       b.warn('caution', 'batch_partial_failure', `Call ${failed + 1} is expected to fail. The batch is not marked all-or-nothing, so the wallet may still carry out the other calls, leaving them in effect without it.`);
     }
   }
+  // A call that has another account act (src/evm/smart-account.ts, accountCallAdapter): the batch's run read the
+  // sender's balances, and what such a call has that account move is kept beside them, as the call asks it.
+  if (results && assetChanges.every(c => c.basis !== 'requested')) {
+    const theirs = calls.flatMap((c, i) => (c.decoding.decoder === 'account_call' ? c.assetChanges.filter(x => x.basis === 'requested' && x.account.toLowerCase() !== txs[0].from.toLowerCase()).map(x => ({ i, x })) : []));
+    if (theirs.length) {
+      const which = [...new Set(theirs.map(t => t.i + 1))], one = which.length === 1;
+      assetChanges = [...assetChanges, ...theirs.map(t => t.x)];
+      b.note(`Call${one ? '' : 's'} ${which.join(', ')} ${one ? 'has' : 'have'} another account make calls: what ${one ? 'it moves' : 'they move'} for that account is shown as the call${one ? ' asks' : 's ask'}. The batch's simulation read your own account's balances, not that account's.`);
+    }
+  }
   // A call's own 'state_overridden' (from a run its decoder made with them, as for a Safe's execTransaction) is said
   // once, for the batch.
   if (context.stateOverrides && calls.some(c => c.warnings.some(w => w.code === 'state_overridden'))) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));

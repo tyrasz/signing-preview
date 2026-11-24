@@ -50,6 +50,12 @@ export interface Decoded {
    * for simulators that read balances rather than logs.
    */
   watch?: string[];
+  /**
+   * The account the transaction has act, where that isn't its sender: a smart account whose own code makes the calls
+   * the sender hands it (src/evm/smart-account.ts, accountCallAdapter). The decoded changes are that account's, and a
+   * simulation's are told of it as well as of the sender (src/evm/transaction.ts).
+   */
+  account?: string;
 }
 
 export interface AdapterEnv {
