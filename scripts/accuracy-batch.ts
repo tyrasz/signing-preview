@@ -27,7 +27,7 @@ import { replayContext, ReplayError } from '../src/replay.ts';
 import { batchCalls } from '../src/evm/smart-account.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
-import { compareTokens, couldNotLook, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
+import { balanceAtTime, compareTokens, couldNotLook, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), BLOCKS = Number(arg('blocks', '100')), FOLLOW = Number(arg('follow', '0')), MAX = Number(arg('max', '40'));
@@ -161,7 +161,7 @@ async function replay(hash: string): Promise<void> {
   const differs: string[] = [];
   if (!unjudged && preview === 'fails') differs.push('outcome');
   const tokens: Row['tokens'] = actual === 'success' && preview === 'success' && !batch.tryMode && !ranNothing ? await compareTokens(own.logs, account, p.assetChanges ?? [], tokenLike) : [];
-  await heldToBalance(tokens, account, others, async (token, when) => BigInt(String(await call('eth_call', [{ to: token, data: `0x70a08231${account.slice(2).padStart(64, '0')}` }, when === 'before' ? parent : hex(number)]))));
+  await heldToBalance(tokens, account, others, async (token, when) => (when === 'before' ? balanceAtTime(call, token, account, parent, where.when.time) : BigInt(String(await call('eth_call', [{ to: token, data: `0x70a08231${account.slice(2).padStart(64, '0')}` }, hex(number)])))));
   if (tokens.some(differsIn)) differs.push('tokens');
   // Its native coin across the block, with the fee it paid where it sent the transaction itself: reported.
   let native: Row['native'];

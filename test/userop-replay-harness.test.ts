@@ -2,7 +2,7 @@
 // (scripts/userop-tokens.ts), and what a replay has warm (src/simulation.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { compareTokens, couldNotLook, DEPOSIT, differsIn, heldToBalance, keptEarlier, stateGone, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
+import { balanceAtTime, compareTokens, couldNotLook, DEPOSIT, differsIn, heldToBalance, keptEarlier, stateGone, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 
 const word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
@@ -102,6 +102,38 @@ test("Past 400 earlier transactions, a replay keeps those that logged the bundle
   assert.ok(most.slice(0, -1).every(i => i % 2 === 1 || i >= 689 - 400), String(most.slice(0, 5)));
   // No more than the cap: all of them, in order.
   assert.deepEqual(keptEarlier(earlier.slice(0, 3), receipts, own, 400), [0, 1, 2]);
+});
+
+test("A balance that time alone wears away is read, before the transaction, at the time of the transaction's block", async () => {
+  // Inverse FiRM's borrowing-rights token (DBR): a debt wears the balance away by the second, and the token logs
+  // what was worn away as burned at the borrower's next movement. A batch on Ethereum (2026-11-24, 0x5c20ffdd…4055)
+  // repaid part of a debt of 50,000: its receipt burned 11,495.6 DBR, its preview showed none moving, and the
+  // balance, 2,617.14 after it, was 0.019 more on the parent block: twelve seconds of the debt.
+  type Row = Compared & { balance?: string; unjudged?: string };
+  const E = 10n ** 18n, burned = 11_495_605022831050228310n, after = 2_617_146081304479787386n, twelveSeconds = 50_000n * E * 12n / 31_536_000n;
+  const row = (): Row[] => [{ token: USDT, actual: (-burned).toString(), simulated: '0' }];
+  const balances = (before: bigint) => async (_t: string, when: 'before' | 'after') => (when === 'before' ? before : after);
+  // Read at the parent's own time, the balance across the block is neither the logs' nor the preview's: seven
+  // millionths of what is held, where a block's interest is allowed one.
+  const drifted = row();
+  await heldToBalance(drifted, ACCOUNT, [], balances(after + twelveSeconds));
+  assert.deepEqual([drifted[0].balance, differsIn(drifted[0])], [undefined, true]);
+  // Read at the block's time, it didn't move: the preview's.
+  const aligned = row();
+  await heldToBalance(aligned, ACCOUNT, [], balances(after));
+  assert.deepEqual([aligned[0].balance, differsIn(aligned[0])], ['0', false]);
+
+  // balanceAtTime asks the node's simulation for the balance on a block's state at another time.
+  const asked: [string, unknown[]][] = [];
+  const word = (v: bigint) => `0x${v.toString(16).padStart(64, '0')}`;
+  const node = (simulate: () => unknown) => async (method: string, params: unknown[]) => { asked.push([method, params]); if (method === 'eth_simulateV1') return simulate(); return word(after + twelveSeconds); };
+  assert.equal(await balanceAtTime(node(() => [{ calls: [{ status: '0x1', returnData: word(after) }] }]), USDT, ACCOUNT, '0x1942737', 1_795_532_435), after);
+  assert.deepEqual(asked, [['eth_simulateV1', [{ blockStateCalls: [{ blockOverrides: { time: '0x6b05a693' }, calls: [{ to: USDT, data: `0x70a08231${ACCOUNT.slice(2).toLowerCase().padStart(64, '0')}` }] }] }, '0x1942737']]]);
+  // A node that won't simulate, or whose simulated call fails, answers with the balance at the block's own time.
+  for (const simulate of [() => { throw new Error('the method eth_simulateV1 does not exist/is not available'); }, () => [{ calls: [{ status: '0x0', returnData: '0x' }] }], () => undefined])
+    assert.equal(await balanceAtTime(node(simulate), USDT, ACCOUNT, '0x1942737', 1_795_532_435), after + twelveSeconds);
+  // State the node no longer has is said, not answered around.
+  await assert.rejects(balanceAtTime(async () => { throw new Error('missing trie node'); }, USDT, ACCOUNT, '0x1942737', 1_795_532_435), /missing trie node/);
 });
 
 test("A token whose logs carry its interest is held to the account's balance across the block, within what a block adds to the whole of it", async () => {

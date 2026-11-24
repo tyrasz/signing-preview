@@ -140,6 +140,29 @@ export async function heldToBalance(tokens: (Compared & { balance?: string; unju
   }
 }
 
+/**
+ * An account's balance of a token on a block's state, as a block at another time would find it: the parent block's
+ * state at the time of the block a transaction ran in, which is the balance the transaction met. For heldToBalance's
+ * `before`, of a balance that moves with time alone. Read at the parent's own time, twelve seconds earlier, the
+ * difference across the block held those seconds' worth too: a batch on Ethereum (2026-11-24) repaid a loan on
+ * Inverse's FiRM, whose borrowing-rights token (DBR, 0xad03…d710) a debt wears away by the second and logs as burned
+ * at the borrower's next movement (11,495.6 here, for more than a year of it). The preview showed no DBR moving,
+ * as the balance says; across the block it fell 0.019, twelve seconds of a debt of 50,000, seven millionths of the
+ * 2,617 held, and the batch was a difference.
+ *
+ * Asked of the node's simulation (eth_simulateV1, a block with that time on that state). Where the node won't say
+ * so, the balance at the block's own time, as before.
+ */
+export async function balanceAtTime(call: (method: string, params: unknown[]) => Promise<unknown>, token: string, account: string, block: string, time: number): Promise<bigint> {
+  const data = `0x70a08231${account.slice(2).toLowerCase().padStart(64, '0')}`;
+  try {
+    const r = await call('eth_simulateV1', [{ blockStateCalls: [{ blockOverrides: { time: `0x${time.toString(16)}` }, calls: [{ to: token, data }] }] }, block]) as { calls?: { status?: string; returnData?: string }[] }[] | undefined;
+    const c = r?.[0]?.calls?.[0];
+    if (c?.status === '0x1' && /^0x[0-9a-f]{64}$/i.test(c.returnData ?? '')) return BigInt(c.returnData!);
+  } catch (e) { if (stateGone(e)) throw e; }
+  return BigInt(String(await call('eth_call', [{ to: token, data }, block])));
+}
+
 /** Whether a read failed because the node no longer has the block's state (not because the call reverted, or answered nothing). */
 export const stateGone = (e: unknown): boolean => /missing trie node|header not found|block not found|pruned|historical state|state (is |at .* is )?(not available|unavailable|not found)|no state available|unknown block/i.test(e instanceof Error ? e.message : String(e));
 

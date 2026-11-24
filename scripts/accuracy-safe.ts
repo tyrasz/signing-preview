@@ -27,7 +27,7 @@ import { replayContext, ReplayError } from '../src/replay.ts';
 import { readConfig, SAFE_SINGLETONS } from '../src/safe-sim.ts';
 import { chainName, EVM_RPCS, rpcUrlFor } from '../src/chains.ts';
 import type { Preview, SimulationRequest, SimulationResult } from '../src/types.ts';
-import { compareTokens, couldNotLook, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
+import { balanceAtTime, compareTokens, couldNotLook, differsIn, heldToBalance, type Compared } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), BLOCKS = Number(arg('blocks', '100')), FOLLOW = Number(arg('follow', '0')), MAX = Number(arg('max', '40'));
@@ -210,7 +210,7 @@ async function replay(hash: string): Promise<void> {
   const abs = (x: bigint) => (x < 0n ? -x : x);
   // A token whose logs say another amount than the preview is held to the Safe's balance across the block (an
   // aToken's logs carry its interest: scripts/userop-tokens.ts, heldToBalance).
-  await heldToBalance(tokens, safe, others, async (token, when) => BigInt(String(await call('eth_call', [{ to: token, data: `0x70a08231${safe.slice(2).padStart(64, '0')}` }, when === 'before' ? parent : hex(number)]))));
+  await heldToBalance(tokens, safe, others, async (token, when) => (when === 'before' ? balanceAtTime(call, token, safe, parent, where.when.time) : BigInt(String(await call('eth_call', [{ to: token, data: `0x70a08231${safe.slice(2).padStart(64, '0')}` }, hex(number)])))));
   if (tokens.some(differsIn)) differs.push('tokens');
   // Its native coin: its balance across the block, where nothing else in the block touched the Safe (a Safe logs
   // what it receives, and sends only by a transaction or a module's, which it logs too).
