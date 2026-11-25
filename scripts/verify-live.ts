@@ -28,6 +28,7 @@ import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { builtinTokens, CHAINS, EVM_RPCS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
 import { LEAST_TIP } from '../src/evm/tx-checks.ts';
+import { RANGO } from '../src/evm/rango.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
 import type { RpcClient } from '../src/rpc.ts';
@@ -678,6 +679,15 @@ console.log('\n# Contracts read from their layout or signed types: still the cod
   for (const [id, facet] of Object.entries(FACETS)) {
     const now = word(await rpcCall(Number(id), 'eth_call', [{ to: '0xb300000b72deaeb607a12d5f54773d1c19c7028d', data: `0xcdffacc6810c705b${'0'.repeat(56)}` }, 'latest']));
     check(now === facet, `Binance Web3 Wallet facet, ${CHAINS[Number(id)].name}`.padEnd(34), now);
+  }
+  // Rango's diamond (src/evm/rango.ts): the facets behind its swaps and bridges, whose sources its calls were read
+  // from, on each chain read (the older swap's, then the bridge facet's; HyperEVM's older swap facet isn't read).
+  const RANGO_A = ['0xe7746a3aca8f94fc09c4e6d9d69bfe8384e971c7', '0x30bb630f1b94f5b2435fb06d405aa7712e3bbf75'], RANGO_B = ['0xdd5674d5abe40278cb38cac4c320bbb60c192fc0', '0xd7d133d84be7e95da182a49b369b1f7ab9d876ce'];
+  const RANGO_FACETS: Record<number, string[]> = { 1: RANGO_A, 10: RANGO_A, 56: RANGO_B, 137: RANGO_B, 42161: RANGO_B, 8453: RANGO_B, 999: ['', RANGO_B[1]] };
+  for (const [id, [swapper, bridge]] of Object.entries(RANGO_FACETS)) {
+    const facetOf = async (selector: string) => word(await rpcCall(Number(id), 'eth_call', [{ to: RANGO, data: `0xcdffacc6${selector}${'0'.repeat(56)}` }, 'latest']));
+    const now = [swapper ? await facetOf('14d08fca') : '', await facetOf('ead31fbc'), await facetOf('b25b1c31'), await facetOf('35019106')];
+    check(now[0] === swapper && now.slice(1).every(f => f === bridge), `Rango facets, ${CHAINS[Number(id)].name}`.padEnd(34), now.filter(Boolean).join(' '));
   }
   // predict.fun's exchange (src/typed-data/polymarket.ts): its EIP-712 domain, and its fee module still naming it.
   const exchange = word(await rpcCall(56, 'eth_call', [{ to: '0xdcffeb0c30263888a48485a664ec9563a54891a1', data: '0xd2f7265a' }, 'latest']));
