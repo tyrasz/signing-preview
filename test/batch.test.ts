@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
-import { RpcSimulator } from '../src/simulation.ts';
+import { faultReason, RpcSimulator } from '../src/simulation.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, Simulator } from '../src/types.ts';
 import { ALICE, ROUTER } from '../mocks/data.ts';
 import { codes, NOW, sample } from './helpers.ts';
@@ -156,8 +156,55 @@ test('A call that uses up all the gas it is given leaves the calls after it none
   assert.deepEqual(asked[0], [null, null]);
   assert.deepEqual(asked[1], ['0x1000000', '0x1000000']);
   assert.match(results![0].revertReason ?? '', /^the contract stopped on a failed check of its own \(an invalid opcode, an older contract's assert: it gives no reason, and takes all the gas the call was given\)$/);
+  // (Only the INVALID opcode, as each node words it: an opcode the chain doesn't have is another matter.)
+  assert.deepEqual(['invalid opcode: INVALID', 'EVM error: InvalidFEOpcode', 'invalid opcode: opcode 0xfe not defined'].map(m => /failed check of its own/.test(faultReason(m)!)), [true, true, true]);
+  assert.deepEqual(['invalid opcode: opcode 0x5f not defined', 'EVM error: OpcodeNotFound', 'out of gas', undefined].map(faultReason), ['invalid opcode: opcode 0x5f not defined', 'EVM error: OpcodeNotFound', 'out of gas', undefined]);
   // In the preview: the first call fails, where it was two calls that "could not be simulated", as information.
   const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, atomicRequired: true, calls: [{ to: USDT, data: transfer }, { to: USDT, data: transfer }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
   assert.deepEqual([p.simulation?.status, codes(p).includes('batch_will_fail'), codes(p).includes('simulation_unavailable')], ['reverted', true, false]);
   assert.match(p.simulation?.revertReason ?? '', /^call 1: the contract stopped on a failed check of its own/);
+});
+
+test('Shared gas: a call that uses up a share smaller than a transaction may have is run again on that much', async () => {
+  // A node that allows one simulation 50 million gas. Each call needs what `needs` says (Infinity: it takes all it is
+  // given, as an invalid opcode does); one that names no limit has what is left of the allowance.
+  const T = (n: number) => `0x${n.toString(16).padStart(40, '0')}`, ALLOWANCE = 50_000_000;
+  const node = (needs: number[]) => {
+    const asked: (number | null)[][] = [];
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as { method: string; params: [{ blockStateCalls: { calls: { to?: string; gas?: string }[] }[] }] };
+      if (body.method !== 'eth_simulateV1') return new Response(JSON.stringify({ result: '0x' }));
+      const calls = body.params[0].blockStateCalls[0].calls, index = (c: { to?: string }) => needs.findIndex((_, i) => T(i + 1) === c.to);
+      if (calls.length === 1 && index(calls[0]) === -1) return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x0', gasUsed: `0x${ALLOWANCE.toString(16)}`, returnData: '0x', error: { message: 'out of gas' } }] }] }));
+      asked.push(calls.filter(c => index(c) !== -1).map(c => (c.gas ? Number(c.gas) : null)));
+      let left = ALLOWANCE;
+      const out: unknown[] = [];
+      for (const c of calls) {
+        const i = index(c), need = i === -1 ? 30_000 : needs[i], given = c.gas ? Number(c.gas) : left;
+        if (given < 21_000 || given > left) return new Response(JSON.stringify({ error: { code: -32000, message: 'intrinsic gas too low' } }));
+        const used = Math.min(need, given);
+        left -= used;
+        out.push(need > given ? { status: '0x0', gasUsed: `0x${used.toString(16)}`, returnData: '0x', error: { message: need === Infinity ? 'invalid opcode: INVALID' : 'out of gas' } } : { status: '0x1', gasUsed: `0x${used.toString(16)}`, returnData: i === -1 ? `0x${'00'.repeat(32)}` : '0x', logs: [] });
+      }
+      return new Response(JSON.stringify({ result: [{ calls: out }] }));
+    }) as typeof fetch;
+    return { asked, run: () => new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }).simulateBatch(needs.map((_, i) => ({ chainId: 1, from: ALICE, to: T(i + 1), data: '0x' as const, value: 0n }))) };
+  };
+  // Five calls, the third taking all it is given: a fifth of the allowance each (9,980,000) is less than a
+  // transaction may have, so the third is run again on that much (16,777,216), and fails on it too: it does fail.
+  const burner = node([50_000, 50_000, Infinity, 50_000, 50_000]);
+  assert.deepEqual((await burner.run())?.map(r => r.status), ['success', 'success', 'reverted', 'success', 'success']);
+  assert.deepEqual(burner.asked[0], [null, null, null, null, null]);
+  assert.deepEqual(burner.asked[1], [9_980_000, 9_980_000, 9_980_000, 9_980_000, 9_980_000]);
+  assert.deepEqual(burner.asked.find(a => a[2] === 16_777_216), [125_000, 125_000, 16_777_216, 125_000, 125_000]);
+  // A call after it that needs more than the share (12 million) isn't one that fails: run again on as much as a
+  // transaction may have, it goes through.
+  const heavy = node([50_000, Infinity, 12_000_000, 50_000, 50_000]);
+  const ran = (await heavy.run())!;
+  assert.deepEqual(ran.map(r => r.status), ['success', 'reverted', 'success', 'success', 'success']);
+  assert.equal(ran[2].gasUsed, 12_000_000n);
+  // Nothing is asked twice of a batch the node runs as it is.
+  const plain = node([50_000, 12_000_000, 50_000]);
+  assert.deepEqual((await plain.run())?.map(r => r.status), ['success', 'success', 'success']);
+  assert.ok(plain.asked.every(a => a.every(g => g === null)), JSON.stringify(plain.asked));
 });

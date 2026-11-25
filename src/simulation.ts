@@ -428,9 +428,9 @@ export class RpcSimulator implements Simulator {
   /**
    * A batch's calls, each that names no gas limit given one: a share of what the node allows one simulation, and no
    * more than a transaction may have where the chain caps it (CAPPED). A call that uses up a share smaller than
-   * that isn't told from one that needed more by it: it is run once more on as much as a transaction may have, the
-   * calls that went through on what they used and half as much again. Undefined where the node's allowance isn't
-   * known, or the calls don't run so either.
+   * that isn't told from one that needed more by it: such calls are run once more on as much as a transaction may
+   * have (or as the node's allowance leaves them), the calls that went through on what they used and half as much
+   * again. Undefined where the node's allowance isn't known, or the calls don't run so either.
    */
   private async withSharedGas(reqs: SimulationRequest[], url: string, chainId: number): Promise<SimulationResult[] | undefined> {
     const allowance = await this.allowance(url, chainId);
@@ -446,15 +446,15 @@ export class RpcSimulator implements Simulator {
     if (!ran || ran.length !== reqs.length) return undefined;
     // (Used up: within a sixty-fourth of its limit, what a call keeps back from one it makes.)
     const usedUp = (r: SimulationResult, limit: bigint) => r.status === 'reverted' && r.gasUsed !== undefined && r.gasUsed * 64n >= limit * 63n;
-    const short = ran.findIndex((r, i) => reqs[i].gas === undefined && limits[i] < most && usedUp(r, limits[i]));
-    if (short !== -1) {
-      const lean = ran.map((r, i) => (i === short || reqs[i].gas !== undefined ? limits[i] : r.status === 'success' && r.gasUsed !== undefined && r.gasUsed * 3n / 2n + 50_000n < limits[i] ? r.gasUsed * 3n / 2n + 50_000n : limits[i]));
-      const left = allowance - MARGIN - lean.reduce((sum, l, i) => (i === short ? sum : sum + l), 0n);
-      lean[short] = left < most ? left : most;
-      if (lean[short] > limits[short]) {
+    const short = ran.flatMap((r, i) => (reqs[i].gas === undefined && limits[i] < most && usedUp(r, limits[i]) ? [i] : []));
+    if (short.length) {
+      const lean = ran.map((r, i) => (short.includes(i) || reqs[i].gas !== undefined ? limits[i] : r.status === 'success' && r.gasUsed !== undefined && r.gasUsed * 3n / 2n + 50_000n < limits[i] ? r.gasUsed * 3n / 2n + 50_000n : limits[i]));
+      const left = (allowance - MARGIN - lean.reduce((sum, l, i) => (short.includes(i) ? sum : sum + l), 0n)) / BigInt(short.length);
+      for (const i of short) lean[i] = left < most ? left : most;
+      if (lean[short[0]] > limits[short[0]]) {
         const again = await run(lean);
-        // (Kept where the calls before it went as they had: on less gas one of them may have gone otherwise.)
-        if (again && again.length === reqs.length && again.slice(0, short).every((r, i) => r.status === ran![i].status)) ran = again;
+        // (Kept where the calls before the first of them went as they had: on less gas one may have gone otherwise.)
+        if (again && again.length === reqs.length && again.slice(0, short[0]).every((r, i) => r.status === ran![i].status)) ran = again;
       }
     }
     return ran;
@@ -1073,13 +1073,14 @@ const isWords = (data: string, n: number) => new RegExp(`^0x[0-9a-fA-F]{${64 * n
 const isEmpty = (data: string) => data === '0x' || data === '';
 
 /**
- * A node's word for a call that stopped on an invalid opcode, as a reason: geth's "invalid opcode: INVALID", reth's
- * "EVM error: InvalidFEOpcode". It is how a contract compiled before Solidity 0.8 fails a check of its own (assert:
- * Tether's USDT, on a transfer of more than is held), and it takes all the gas the call was given. Other messages
- * as they are.
+ * A node's word for a call that stopped on the INVALID opcode (0xfe), as a reason: geth's "invalid opcode: INVALID",
+ * reth's "EVM error: InvalidFEOpcode". It is how a contract compiled before Solidity 0.8 fails a check of its own
+ * (assert: Tether's USDT, on a transfer of more than is held), and it takes all the gas the call was given. Not an
+ * opcode the chain doesn't have (geth's "opcode 0x5f not defined", reth's "OpcodeNotFound"), which is another
+ * matter: that and every other message as they are.
  */
 export function faultReason(message: string | undefined): string | undefined {
-  return message && /invalid ?fe ?opcode|invalid opcode|opcode 0xfe not defined/i.test(message) ? "the contract stopped on a failed check of its own (an invalid opcode, an older contract's assert: it gives no reason, and takes all the gas the call was given)" : message;
+  return message && /invalid ?fe ?opcode|invalid opcode: invalid\b|opcode 0xfe not defined/i.test(message) ? "the contract stopped on a failed check of its own (an invalid opcode, an older contract's assert: it gives no reason, and takes all the gas the call was given)" : message;
 }
 
 /** A node's refusal that says why the transaction can't run at all, worded for the preview; null for other errors. */
