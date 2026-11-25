@@ -8,7 +8,7 @@ import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
 import { ForkSimulator } from '../src/fork-simulator.ts';
 import { RpcSimulator } from '../src/simulation.ts';
-import { asOneTransaction, batchData, BATCHER, MOVED } from '../src/evm/one-transaction.ts';
+import { accountStandInCode, asOneTransaction, asOneTransactionOfPlain, batchData, BATCHER, failedCall, MOVED } from '../src/evm/one-transaction.ts';
 import type { Dependencies, SimulationRequest } from '../src/types.ts';
 import { codes, NOW } from './helpers.ts';
 import { testChain } from './evm-chain.ts';
@@ -84,7 +84,7 @@ test('A wallet_sendCalls batch from an account with code that fails one transact
     if (j.error) throw new Error(j.error.message);
     return j.result;
   } } };
-  const send = (cs: typeof calls, from = USER) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from, atomicRequired: true, calls: cs.map(c => ({ to: c.to, data: c.data, value: `0x${c.value.toString(16)}` })) }] }, { now: NOW }, deps);
+  const send = (cs: typeof calls, from = USER, atomicRequired = true) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from, atomicRequired, calls: cs.map(c => ({ to: c.to, data: c.data, value: `0x${c.value.toString(16)}` })) }] }, { now: NOW }, deps);
   // It was "This batch is all-or-nothing, and call 3 is expected to fail": a danger, of a batch that goes through.
   const p = await send(calls);
   assert.equal(p.simulation?.status, 'success');
@@ -95,9 +95,59 @@ test('A wallet_sendCalls batch from an account with code that fails one transact
   // One that fails as one transaction too is the failure it was.
   const failing = await send([calls[1], calls[2]]);
   assert.deepEqual([failing.simulation?.status, codes(failing).includes('batch_will_fail')], ['reverted', true]);
-  // A plain account's calls are a transaction each: nothing is run again.
+  // A plain account's calls are a transaction each, where the batch needn't be all or nothing: nothing is run again.
   const PLAIN = '0x00000000000000000000000000000000000b0b00';
   await chain.setBalance(PLAIN, 10n ** 18n);
-  const plain = await send([calls[0], calls[2]], PLAIN);
-  assert.deepEqual([plain.simulation?.status, codes(plain).includes('batch_will_fail')], ['reverted', true]);
+  await chain.exec(usdc, encodeFunctionData({ abi: T, functionName: 'mint', args: [PLAIN as Hex, 100_000_000n] }));
+  const each = await send([calls[0], calls[2]], PLAIN, false);
+  assert.deepEqual([each.simulation?.status, codes(each).includes('batch_partial_failure'), /as one transaction/.test(each.simulation?.source ?? '')], ['reverted', true, false]);
+
+  // An all-or-nothing batch of a plain account's is one transaction: the wallet gives the account code for it
+  // (EIP-7702). It was "call 3 is expected to fail, so none of the calls would take effect", of a batch that goes
+  // through so: run on a stand-in for that code, the session the first call opens is there for the third.
+  const atomic = await send(calls, PLAIN);
+  assert.equal(atomic.simulation?.status, 'success');
+  assert.match(atomic.simulation?.source ?? '', /3 calls as one transaction$/);
+  assert.ok(!codes(atomic).includes('batch_will_fail') && !codes(atomic).includes('simulation_reverted'), codes(atomic).join());
+  assert.deepEqual(atomic.assetChanges.map(c => [c.asset, c.direction, c.raw, c.basis]), [[usdc, 'out', '5000000', 'simulated_state']], JSON.stringify(atomic.assetChanges));
+  assert.match(atomic.decoding.notes.join(' '), /Run one transaction each, call 3 fails\. The batch is all-or-nothing, which a wallet makes of a plain account's calls by giving the account smart-account code \(EIP-7702\) and running them as one transaction: run so, on a stand-in for that code \(which code is the wallet's choice\), they all go through/);
+  // One that fails as one transaction too is the failure it was.
+  const stillFails = await send([calls[1], calls[2]], PLAIN);
+  assert.deepEqual([stillFails.simulation?.status, codes(stillFails).includes('batch_will_fail')], ['reverted', true]);
+
+  // And the other way: calls that go through a transaction each, and fail as the one transaction, where a contract
+  // takes no caller that has code (EXTCODESIZE of its caller). Shown as run, a transaction each, with that said.
+  const NO_CODE_ONLY = '0x0c0de00000000000000000000000000000000001';
+  await chain.putCode(NO_CODE_ONLY, '0x333b600657005b60006000fd');
+  const picky = await send([{ to: NO_CODE_ONLY, value: 0n, data: '0x' }, calls[1]], PLAIN);
+  assert.equal(picky.simulation?.status, 'success');
+  assert.match(picky.simulation?.source ?? '', /2 calls in order$/);
+  assert.match(picky.warnings.find(w => w.code === 'atomic_batch_fails_as_one')?.message ?? '', /Run so here, on a stand-in for that code \(which code is the wallet's choice\), call 1 fails, and with it the whole batch: a contract can refuse or treat differently a caller that has code\. What is shown is the calls run a transaction each, which go through\.$/);
+  assert.equal(picky.attention, 'caution');
+  // (Not said of a batch that goes through both ways, nor of one that needn't be all or nothing.)
+  assert.ok(!codes(await send([calls[1]].concat([calls[1]]), PLAIN)).includes('atomic_batch_fails_as_one'));
+  assert.ok(!codes(await send([{ to: NO_CODE_ONLY, value: 0n, data: '0x' }, calls[1]], PLAIN, false)).includes('atomic_batch_fails_as_one'));
+});
+
+test('The stand-in for the code a wallet gives a plain account: coin is taken, and a call is answered with its selector', async () => {
+  const PLAIN = '0x00000000000000000000000000000000000b0b01';
+  await chain.setBalance(PLAIN, 10n ** 18n);
+  const o = asOneTransactionOfPlain(PLAIN, calls)!;
+  assert.deepEqual([Object.keys(o.overrides).sort(), o.overrides[PLAIN].code, o.overrides[MOVED].code], [[PLAIN, BATCHER, MOVED].sort(), `0xef0100${BATCHER.slice(2)}`, accountStandInCode()]);
+  // From outside, as a token asks an account that has code whether it takes a transfer (onERC721Received), or a
+  // contract whether a signature is the account's (isValidSignature): its own selector, in a word.
+  for (const selector of ['150b7a02', '1626ba7e', 'f23a6e61']) {
+    const asked = (await sim.simulate({ chainId: 1, from: BOB, to: PLAIN, data: `0x${selector}${'00'.repeat(96)}`, value: 0n, stateOverrides: o.overrides }))!;
+    assert.deepEqual([asked.status, asked.returnData], ['success', `0x${selector}${'00'.repeat(28)}`]);
+  }
+  // Coin sent to it is taken.
+  await chain.setBalance(BOB, 10n ** 18n);
+  const paid = (await sim.simulate({ chainId: 1, from: BOB, to: PLAIN, data: '0x', value: 5n, stateOverrides: o.overrides }))!;
+  assert.equal(paid.status, 'success');
+  // A creation isn't a call.
+  assert.equal(asOneTransactionOfPlain(PLAIN, [{ to: null, value: 0n, data: '0x6000' }]), null);
+  // What the batching code reverts with says which call failed, and what it returned.
+  assert.deepEqual(failedCall(`0x${'00'.repeat(31)}02deadbeef`), { index: 2, data: '0xdeadbeef' });
+  assert.deepEqual(failedCall(`0x${'00'.repeat(32)}`), { index: 0, data: '0x' });
+  assert.deepEqual([failedCall('0x08c379a0'), failedCall(undefined), failedCall(`0x${'ff'.repeat(32)}`)], [null, null, null]);
 });

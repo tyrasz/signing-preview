@@ -4,6 +4,7 @@ import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext
 import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
+import { decodeRevert } from './simulation.ts';
 import { addUsdValues } from './prices.ts';
 import { noTrace, tracePreviews, type TraceEnv } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
@@ -36,7 +37,7 @@ import { authorizedExecutionsAdapter } from './typed-data/authorized-executions.
 import { walletCoreSessionAdapter } from './typed-data/wallet-core-session.ts';
 import { caliburSignedBatchAdapter } from './typed-data/calibur.ts';
 import { CALIBUR_CODES } from './evm/smart-account.ts';
-import { asOneTransaction } from './evm/one-transaction.ts';
+import { asOneTransaction, asOneTransactionOfPlain, failedCall } from './evm/one-transaction.ts';
 
 export const TYPED_DATA_ADAPTERS: TypedAdapter[] = [hyperliquidL1Adapter, hyperliquidUserSignedAdapter, eip3009Adapter, creditDelegationTypedAdapter, userOperationAdapter, safeTxAdapter, seaportAdapter, cowOrderAdapter, oneInchOrderAdapter, veloraDeltaAdapter, permitAdapter, kernelEnableAdapter, delegationAdapter, spendPermissionAdapter, polymarketAdapter, morphoAuthorizationAdapter, cometAuthorizationAdapter, snapshotAdapter, governanceAdapter, relayMulticallAdapter, metaTransactionAdapter, authorizedExecutionsAdapter, caliburSignedBatchAdapter, walletCoreSessionAdapter, genericTypedDataAdapter];
 
@@ -179,7 +180,10 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   let ran: SimulationRequest[] | undefined;
   // The calls run as one transaction, where that is what the sender's code makes of them and they go through so
   // (src/evm/one-transaction.ts): its result, and which call failed run one transaction each, and why.
-  let whole: { result: SimulationResult; failed: number; reason?: string } | undefined;
+  let whole: { result: SimulationResult; failed: number; reason?: string; plain?: boolean } | undefined;
+  // An all-or-nothing batch of a plain account's, whose calls go through a transaction each and fail as the one
+  // transaction a wallet makes of them (the account given code, EIP-7702): which call, and why.
+  let asOneFails: { call?: number; reason?: string } | undefined;
   let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
@@ -209,16 +213,27 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         // A batch an account with code runs is one transaction, and what a call leaves for the transaction's length
         // the next one finds: where a call fails run one transaction each, they are run as the one they are.
         const failing = results?.findIndex(r => r.status === 'reverted') ?? -1;
-        if (results && failing !== -1 && txs.every(t => t.to && t.from === txs[0].from) && deps.rpc?.has(txs[0].chainId)) {
+        // A plain account (no code) sends its calls a transaction each, as they were run above, unless the batch
+        // must be all or nothing: a wallet makes that of them by giving the account code (EIP-7702) and running
+        // them as one transaction. So such a batch is run as one too, on a stand-in for that code: where it fails
+        // a transaction each and goes through as one, the one is what it does; where it goes through a transaction
+        // each and fails as one (a contract that takes no caller with code), that is said.
+        if (results && (failing !== -1 || batch.atomicRequired) && txs.every(t => t.to && t.from === txs[0].from) && deps.rpc?.has(txs[0].chainId)) {
           try {
             const code = await deps.rpc.call(txs[0].chainId, 'eth_getCode', [txs[0].from, 'latest']);
-            const one = typeof code === 'string' && code !== '0x' ? asOneTransaction(txs[0].from, code, txs) : null;
+            const plain = code === '0x';
+            const one = typeof code !== 'string' ? null : !plain ? (failing !== -1 ? asOneTransaction(txs[0].from, code, txs) : null) : batch.atomicRequired ? asOneTransactionOfPlain(txs[0].from, txs) : null;
             if (one) {
               const watch = [...new Set(requests.flatMap(q => q.watch ?? []))], gas = txs.every(t => t.gas !== undefined) ? txs.reduce((sum, t) => sum + t.gas!, 0n) : undefined;
               const request: SimulationRequest = { chainId: txs[0].chainId, from: txs[0].from, to: txs[0].from, data: one.data, value: 0n, ...(watch.length && { watch }), ...(gas !== undefined && { gas }), ...(at && { at }),
                 stateOverrides: { ...context.stateOverrides, ...one.overrides, [txs[0].from.toLowerCase()]: { ...context.stateOverrides?.[txs[0].from.toLowerCase()], ...one.overrides[txs[0].from.toLowerCase()] } } };
               const result = await deps.simulator.simulate(request);
-              if (result?.status === 'success' && !result.limited && !result.refused) { whole = { result, failed: failing, reason: results[failing].revertReason }; ran = [request]; }
+              if (failing !== -1) {
+                if (result?.status === 'success' && !result.limited && !result.refused) { whole = { result, failed: failing, reason: results[failing].revertReason, ...(plain && { plain }) }; ran = [request]; }
+              } else if (result?.status === 'reverted' && !result.limited && !result.refused) {
+                const failed = failedCall(result.returnData);
+                asOneFails = { ...(failed && failed.index < txs.length && { call: failed.index + 1 }), reason: failed ? decodeRevert(failed.data) : result.revertReason };
+              }
             }
           } catch { /* not run so: the calls' own results stand */ }
         }
@@ -265,7 +280,8 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   if (results && whole) {
     const r = whole.result, account = txs[0];
     simulation = { status: 'success', source: `${r.source}, ${txs.length} calls as one transaction`, ...(r.gasUsed !== undefined && { gasUsed: r.gasUsed.toString() }), ...(named && { block: named.number.toString() }), ...(r.stateReadError && { stateReadError: r.stateReadError }) };
-    b.note(`Run one transaction each, call ${whole.failed + 1} fails${whole.reason ? ` (${whole.reason})` : ''}; run as one transaction, as an account with code runs a batch, they all go through: a call relies on what an earlier one leaves for the length of the transaction. What is shown is of the one transaction, the account making the calls in order.`);
+    if (whole.plain) b.note(`Run one transaction each, call ${whole.failed + 1} fails${whole.reason ? ` (${whole.reason})` : ''}. The batch is all-or-nothing, which a wallet makes of a plain account's calls by giving the account smart-account code (EIP-7702) and running them as one transaction: run so, on a stand-in for that code (which code is the wallet's choice), they all go through, a call relying on what an earlier one leaves for the length of the transaction. What is shown is of the one transaction.`);
+    else b.note(`Run one transaction each, call ${whole.failed + 1} fails${whole.reason ? ` (${whole.reason})` : ''}; run as one transaction, as an account with code runs a batch, they all go through: a call relies on what an earlier one leaves for the length of the transaction. What is shown is of the one transaction, the account making the calls in order.`);
     if (named) b.note(`Simulated on the state after ${blockText(named.number, named.time)}, in the block that followed: what the calls would have done then, not now.`);
     if (context.stateOverrides) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
     if (untraced) b.note(untraced);
@@ -281,6 +297,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }), ...(named && { block: named.number.toString() }),
       ...(results[0].stateReadError && { stateReadError: results[0].stateReadError }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (asOneFails) b.warn('caution', 'atomic_batch_fails_as_one', `This batch is all-or-nothing, which a wallet makes of a plain account's calls by giving the account smart-account code (EIP-7702) and running them as one transaction. Run so here, on a stand-in for that code (which code is the wallet's choice), ${asOneFails.call ? `call ${asOneFails.call}` : 'a call'} fails${asOneFails.reason ? ` (${asOneFails.reason})` : ''}, and with it the whole batch: a contract can refuse or treat differently a caller that has code. What is shown is the calls run a transaction each, which go through.`);
     if (named) b.note(`Simulated on the state after ${blockText(named.number, named.time)}, in the block that followed: what the calls would have done then, not now.`);
     if (context.stateOverrides) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));
     if (untraced) b.note(untraced);

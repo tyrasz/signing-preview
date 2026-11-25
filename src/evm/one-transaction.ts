@@ -15,6 +15,14 @@
 //     signature it is asked to check runs what it would.
 // The transaction is from the account to itself, as an account with delegated code sends its own batch: the calls
 // see the account as msg.sender and as tx.origin.
+//
+// A plain account (no code) sends its calls a transaction each, unless the batch must be all or nothing
+// (wallet_sendCalls with atomicRequired): a wallet can only make that of a plain account's calls by giving the
+// account code (EIP-7702) and running them as one transaction. Which code is the wallet's choice, not known here:
+// the run then has a stand-in for it at MOVED, which takes coin sent to the account and answers any other call with
+// the call's own selector, as an account's code answers a token's or a signature check's question of it
+// (onERC721Received, onERC1155Received, isValidSignature). What differs from a transaction each is what a callee
+// makes of a caller that has code, and what lasts for one transaction.
 import type { Hex } from 'viem';
 import type { SimulationRequest } from '../types.ts';
 
@@ -24,7 +32,7 @@ export const BATCHER = '0x000000000000000000000000000000005b5c7a01', MOVED = '0x
 export const SELECTOR = '5b5c7a01';
 
 type Op = number | { push: string } | { label: string } | { jump: string } | { jumpi: string };
-const O = { STOP: 0x00, ADD: 0x01, GT: 0x11, EQ: 0x14, ISZERO: 0x15, SHR: 0x1c, ADDRESS: 0x30, CALLER: 0x33, CALLDATALOAD: 0x35, CALLDATASIZE: 0x36, CALLDATACOPY: 0x37,
+const O = { STOP: 0x00, ADD: 0x01, GT: 0x11, EQ: 0x14, ISZERO: 0x15, SHL: 0x1b, SHR: 0x1c, ADDRESS: 0x30, CALLER: 0x33, CALLDATALOAD: 0x35, CALLDATASIZE: 0x36, CALLDATACOPY: 0x37,
   RETURNDATASIZE: 0x3d, RETURNDATACOPY: 0x3e, MLOAD: 0x51, MSTORE: 0x52, GAS: 0x5a, JUMPDEST: 0x5b, DUP1: 0x80, DUP3: 0x82, DUP6: 0x85, DUP7: 0x86, CALL: 0xf1, RETURN: 0xf3,
   DELEGATECALL: 0xf4, REVERT: 0xfd } as const;
 const p = (hex: string): Op => ({ push: hex });
@@ -84,6 +92,19 @@ export function batcherCode(real: string): Hex {
   ]);
 }
 
+/**
+ * A stand-in for the code a wallet gives a plain account to run a batch: coin sent to the account (fewer than four
+ * bytes of calldata) is taken, and any other call is answered with its own selector, left-aligned in a word.
+ */
+export function accountStandInCode(): Hex {
+  return assemble([
+    O.CALLDATASIZE, p('04'), O.GT, { jumpi: 'coin' },
+    p('00'), O.CALLDATALOAD, p('e0'), O.SHR, p('e0'), O.SHL, p('00'), O.MSTORE,
+    p('20'), p('00'), O.RETURN,
+    { label: 'coin' }, O.STOP,
+  ]);
+}
+
 /** The calls, as the batching code takes them. */
 export function batchData(calls: readonly { to: string; value: bigint; data: string }[]): Hex {
   const word = (v: bigint) => v.toString(16).padStart(64, '0');
@@ -103,4 +124,23 @@ export function asOneTransaction(account: string, code: string, calls: readonly 
     data: batchData(calls as { to: string; value: bigint; data: string }[]),
     overrides: { [account.toLowerCase()]: { code: `0xef0100${BATCHER.slice(2)}` }, [BATCHER]: { code: batcherCode(delegate ?? MOVED) }, ...(!delegate && { [MOVED]: { code: own } }) },
   };
+}
+
+/**
+ * The calls of a plain account (no code) as the one transaction a wallet makes of an all-or-nothing batch, the
+ * account given code for it: here the batching code over a stand-in (accountStandInCode). Null for a creation.
+ */
+export function asOneTransactionOfPlain(account: string, calls: readonly { to: string | null; value: bigint; data: string }[]): { data: Hex; overrides: NonNullable<SimulationRequest['stateOverrides']> } | null {
+  if (calls.some(c => !c.to)) return null;
+  return {
+    data: batchData(calls as { to: string; value: bigint; data: string }[]),
+    overrides: { [account.toLowerCase()]: { code: `0xef0100${BATCHER.slice(2)}` }, [BATCHER]: { code: batcherCode(MOVED) }, [MOVED]: { code: accountStandInCode() } },
+  };
+}
+
+/** Which call failed, and what it returned, from what the batching code reverts with (the call's index, then that). */
+export function failedCall(returnData: string | undefined): { index: number; data: Hex } | null {
+  if (!returnData || !/^0x([0-9a-f]{2}){32,}$/i.test(returnData)) return null;
+  const index = BigInt(returnData.slice(0, 66));
+  return index < 1_000n ? { index: Number(index), data: `0x${returnData.slice(66)}` } : null;
 }
