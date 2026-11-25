@@ -126,3 +126,38 @@ test('The demo batch (approve + Bridge2 deposit) shows the simulated 20 USDC dep
   assert.deepEqual(p.assetChanges.map(c => [c.direction, c.amount, c.symbol, c.basis]), [['out', '20', 'USDC', 'simulated_events']]);
   assert.ok(codes(p).includes('unlimited_approval'));
 });
+
+test('A call that uses up all the gas it is given leaves the calls after it none: the batch is run again with a limit for each', async () => {
+  // Tether's USDT fails a transfer of more than is held on an invalid opcode (an assert of its day), which takes all
+  // the gas the call has: with no limit of its own, all the node allows one simulation (50 million on geth and reth).
+  // The next call then has none, and the node refuses the request: two such transfers were "could not be simulated".
+  const USDT = '0xdac17f958d2ee523a2206206994597c13d831ec7', asked: (string | null)[][] = [];
+  type Call = { to?: string; gas?: string };
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string; params: [{ blockStateCalls: { calls: Call[]; stateOverrides?: Record<string, { code?: string }> }[] }] };
+    if (body.method !== 'eth_simulateV1') return new Response(JSON.stringify({ result: '0x' }));
+    const calls = body.params[0].blockStateCalls[0].calls, mine = calls.filter(c => c.to === USDT);
+    // (What the node allows one simulation: its answer to a call that never ends.)
+    if (!mine.length && calls.length === 1) return new Response(JSON.stringify({ result: [{ calls: [{ status: '0x0', gasUsed: '0x2faf080', returnData: '0x', error: { message: 'out of gas: gas required exceeds: 50000000' } }] }] }));
+    asked.push(mine.map(c => c.gas ?? null));
+    if (mine.some(c => c.gas === undefined)) return new Response(JSON.stringify({ error: { code: -32000, message: 'intrinsic gas too low' } }));
+    let first = true;
+    return new Response(JSON.stringify({ result: [{ calls: calls.map(c => {
+      if (c.to !== USDT) return { status: '0x1', gasUsed: '0x5208', returnData: `0x${'00'.repeat(32)}`, logs: [] };
+      if (first) { first = false; return { status: '0x0', gasUsed: c.gas, returnData: '0x', error: { message: 'EVM error: InvalidFEOpcode' } }; }
+      return { status: '0x1', gasUsed: '0xa410', returnData: '0x', logs: [] };
+    }) }] }));
+  }) as typeof fetch;
+  const transfer = `0xa9059cbb${'b0b'.padStart(64, '0')}${'1'.padStart(64, '0')}`;
+  const request = { chainId: 1, from: ALICE, to: USDT, data: transfer as `0x${string}`, value: 0n };
+  const results = await new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }).simulateBatch([request, request]);
+  assert.deepEqual(results?.map(r => r.status), ['reverted', 'success']);
+  // Each call on no more than a transaction may have there (16,777,216), which two fit in what the node allows.
+  assert.deepEqual(asked[0], [null, null]);
+  assert.deepEqual(asked[1], ['0x1000000', '0x1000000']);
+  assert.match(results![0].revertReason ?? '', /^the contract stopped on a failed check of its own \(an invalid opcode, an older contract's assert: it gives no reason, and takes all the gas the call was given\)$/);
+  // In the preview: the first call fails, where it was two calls that "could not be simulated", as information.
+  const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, atomicRequired: true, calls: [{ to: USDT, data: transfer }, { to: USDT, data: transfer }] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: new RpcSimulator({ 1: 'http://rpc.invalid' }, { fetchImpl }) });
+  assert.deepEqual([p.simulation?.status, codes(p).includes('batch_will_fail'), codes(p).includes('simulation_unavailable')], ['reverted', true, false]);
+  assert.match(p.simulation?.revertReason ?? '', /^call 1: the contract stopped on a failed check of its own/);
+});

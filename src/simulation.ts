@@ -425,7 +425,42 @@ export class RpcSimulator implements Simulator {
     return known;
   }
 
-  private async simulateAt(reqs: SimulationRequest[], fitted?: SimulationRequest[], retried = false): Promise<SimulationResult[] | null> {
+  /**
+   * A batch's calls, each that names no gas limit given one: a share of what the node allows one simulation, and no
+   * more than a transaction may have where the chain caps it (CAPPED). A call that uses up a share smaller than
+   * that isn't told from one that needed more by it: it is run once more on as much as a transaction may have, the
+   * calls that went through on what they used and half as much again. Undefined where the node's allowance isn't
+   * known, or the calls don't run so either.
+   */
+  private async withSharedGas(reqs: SimulationRequest[], url: string, chainId: number): Promise<SimulationResult[] | undefined> {
+    const allowance = await this.allowance(url, chainId);
+    if (allowance === undefined) return undefined;
+    const most = CAPPED.has(chainId) && TRANSACTION_GAS_CAP < allowance ? TRANSACTION_GAS_CAP : allowance, MARGIN = 100_000n;
+    const free = reqs.filter(r => r.gas === undefined).length, named = reqs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n);
+    const room = allowance - named - MARGIN;
+    if (room < BigInt(free) * 100_000n) return undefined;
+    const share = room / BigInt(free) < most ? room / BigInt(free) : most;
+    const limits = reqs.map(r => r.gas ?? share);
+    const run = (ls: bigint[]) => this.simulateAt(reqs.map((r, i) => ({ ...r, gas: ls[i] })), undefined, false, true).catch(() => null);
+    let ran = await run(limits);
+    if (!ran || ran.length !== reqs.length) return undefined;
+    // (Used up: within a sixty-fourth of its limit, what a call keeps back from one it makes.)
+    const usedUp = (r: SimulationResult, limit: bigint) => r.status === 'reverted' && r.gasUsed !== undefined && r.gasUsed * 64n >= limit * 63n;
+    const short = ran.findIndex((r, i) => reqs[i].gas === undefined && limits[i] < most && usedUp(r, limits[i]));
+    if (short !== -1) {
+      const lean = ran.map((r, i) => (i === short || reqs[i].gas !== undefined ? limits[i] : r.status === 'success' && r.gasUsed !== undefined && r.gasUsed * 3n / 2n + 50_000n < limits[i] ? r.gasUsed * 3n / 2n + 50_000n : limits[i]));
+      const left = allowance - MARGIN - lean.reduce((sum, l, i) => (i === short ? sum : sum + l), 0n);
+      lean[short] = left < most ? left : most;
+      if (lean[short] > limits[short]) {
+        const again = await run(lean);
+        // (Kept where the calls before it went as they had: on less gas one of them may have gone otherwise.)
+        if (again && again.length === reqs.length && again.slice(0, short).every((r, i) => r.status === ran![i].status)) ran = again;
+      }
+    }
+    return ran;
+  }
+
+  private async simulateAt(reqs: SimulationRequest[], fitted?: SimulationRequest[], retried = false, shared = false): Promise<SimulationResult[] | null> {
     if (!reqs.length) return [];
     const chainId = reqs[0].chainId;
     if (reqs.some(r => r.chainId !== chainId)) throw new Error('A batch must be on one chain');
@@ -506,6 +541,15 @@ export class RpcSimulator implements Simulator {
       if (ran) return ran;
       throw new Error(`the chain's node couldn't run the ${before.length} transactions before this one in its block within its gas allowance for one simulation (${body.error.message}); a node with a higher allowance can`);
     }
+    // A batch's call that uses up all the gas it is given, with no limit of its own, is given all the node allows one
+    // simulation, and the calls after it none: the node then refuses the lot. An old contract's failed check does so
+    // (an invalid opcode takes all the gas: Tether's USDT on a transfer of more than is held), and a batch of two USDT
+    // transfers from an account without the USDT was "could not be simulated", as information, where its first call
+    // fails. Asked again with a limit for each call that names none (withSharedGas).
+    if (body.error && !before.length && !shared && reqs.length > 1 && reqs.some(r => r.gas === undefined) && /intrinsic gas too low|gas limit reached|out of gas|gas required exceeds/i.test(body.error.message ?? '')) {
+      const ran = await this.withSharedGas(reqs, url, chainId).catch(() => undefined);
+      if (ran) return ran;
+    }
     if (body.error || !results || results.length !== reqs.length) throw new Error(`eth_simulateV1 failed: ${body.error?.message ?? 'unexpected result'}`);
     // The same allowance, met without a word: what the block's earlier transactions used comes out of it, and a
     // call after them is given what is left where that is under its own limit. On Ethereum's public node a Safe
@@ -531,7 +575,7 @@ export class RpcSimulator implements Simulator {
       const gasUsed = BigInt(result.gasUsed), peak = result.maxUsedGas ? BigInt(result.maxUsedGas) : undefined;
       const gasPeak = peak !== undefined && peak > gasUsed ? { gasPeak: peak } : {};
       return result.status !== '0x1'
-        ? { status: 'reverted', source, gasUsed, ...gasPeak, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? result.error?.message, transfers: [], ...((result.error?.data ?? result.returnData) && { returnData: result.error?.data ?? result.returnData }) }
+        ? { status: 'reverted', source, gasUsed, ...gasPeak, revertReason: decodeRevert(result.error?.data ?? result.returnData) ?? faultReason(result.error?.message), transfers: [], ...((result.error?.data ?? result.returnData) && { returnData: result.error?.data ?? result.returnData }) }
         : { status: 'success', source, gasUsed, ...gasPeak, ...parseLogs(result.logs ?? []), ...(result.returnData && { returnData: result.returnData }),
           // Without the native transfers traceTransfers adds (logged by a pseudo-address).
           logs: (result.logs ?? []).filter(l => l.address.toLowerCase() !== NATIVE_PSEUDO_TOKEN).map(l => ({ address: l.address.toLowerCase(), topics: l.topics, data: l.data })) };
@@ -1017,10 +1061,26 @@ export function decodeState(a: SimulatedApproval, data: Hex): SimulatedApproval 
   } catch { return null; }
 }
 
+/**
+ * The most gas a transaction may have on the chains that cap it (src/evm/tx-checks.ts, GAS_CAPPED): a call of a
+ * batch that names no limit runs on no more, where the batch is run with a limit for each (withSharedGas).
+ */
+const TRANSACTION_GAS_CAP = 16_777_216n, CAPPED = new Set([1, 56, 8453, 10]);
+
 type Log = { address: string; topics: string[]; data: string };
 const topicAddress = (t: string) => '0x' + t.slice(26).toLowerCase();
 const isWords = (data: string, n: number) => new RegExp(`^0x[0-9a-fA-F]{${64 * n}}$`).test(data);
 const isEmpty = (data: string) => data === '0x' || data === '';
+
+/**
+ * A node's word for a call that stopped on an invalid opcode, as a reason: geth's "invalid opcode: INVALID", reth's
+ * "EVM error: InvalidFEOpcode". It is how a contract compiled before Solidity 0.8 fails a check of its own (assert:
+ * Tether's USDT, on a transfer of more than is held), and it takes all the gas the call was given. Other messages
+ * as they are.
+ */
+export function faultReason(message: string | undefined): string | undefined {
+  return message && /invalid ?fe ?opcode|invalid opcode|opcode 0xfe not defined/i.test(message) ? "the contract stopped on a failed check of its own (an invalid opcode, an older contract's assert: it gives no reason, and takes all the gas the call was given)" : message;
+}
 
 /** A node's refusal that says why the transaction can't run at all, worded for the preview; null for other errors. */
 export function rejection(message: string, request?: { value: bigint; gasPrice?: bigint }): string | null {
