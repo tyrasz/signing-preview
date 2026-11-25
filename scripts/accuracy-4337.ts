@@ -323,6 +323,9 @@ const EIP712_DOMAIN = parseAbi(['function eip712Domain() view returns (bytes1 fi
 const MEE_USER_OP = [{ name: 'userOpHash', type: 'bytes32' }, { name: 'lowerBoundTimestamp', type: 'uint256' }, { name: 'upperBoundTimestamp', type: 'uint256' }];
 
 type Row = Record<string, unknown>;
+/** Another sender for a mined bundle than its own: the address the previewer simulates a bundle from when it knows no bundler (src/erc4337-sim.ts). */
+const OTHER_BUNDLER = '0x0000000000000000000000000000000000004337';
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const rows: Row[] = [];
 const blocks = new Set<number>();
 const skipped: Record<string, number> = {};
@@ -950,6 +953,18 @@ async function replay(item: string): Promise<void> {
     const run = (await (local ? local([mined]) : node.simulateBatch([mined])).catch(() => null))?.[0], own = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
     minedOutcome = !run ? 'not run' : run.status !== 'success' ? `its bundle reverted here: ${String(run.revertReason ?? '').slice(0, 80)}`
       : !own ? 'its operation not run here' : (BigInt(`0x${own.data.slice(66, 130)}`) === 1n) === succeeded ? 'as on the chain' : `as the preview did, ${succeeded ? 'failing' : 'succeeding'}: the state or the run isn't the chain's`;
+    // Where it fares as on the chain, once more as sent by another address than its bundler (the preview's stand-in
+    // for a bundler it can't know): calls that read who sends the bundle (tx.origin: a relayer an app trusts, a
+    // seed for a draw) come out otherwise, and neither the stand-in signature nor the gas is why. Said with the
+    // outcome, for a state that is gone by the time anyone reads this (Arbitrum One's public node keeps it about
+    // thirty seconds, and the run of 2026-11-25 left "simulated failing, the receipt succeeded (as mined: as on the
+    // chain)" with nothing to tell the two apart).
+    if (minedOutcome === 'as on the chain' && !local && tx.from.toLowerCase() !== OTHER_BUNDLER) {
+      const other = (await node.simulateBatch([{ ...mined, from: OTHER_BUNDLER, stateOverrides: { ...mined.stateOverrides, [OTHER_BUNDLER]: { balance: `0x${(10n ** 24n).toString(16)}` } } }]).catch(() => null))?.[0];
+      const event = other?.status === 'success' ? opEvent(other.logs ?? []) : undefined;
+      minedOutcome += !other ? '; from another sender: not run' : !event ? `; from another sender: its bundle didn't run (${String(other.revertReason ?? other.status).slice(0, 60)})`
+        : (BigInt(`0x${event.data.slice(66, 130)}`) === 1n) === succeeded ? '; from another sender than its bundler too' : `; from another sender than its bundler it fares as the preview did: its calls read who sends the bundle (tx.origin)`;
+    }
   }
   // The native coin: what the preview shows the account's calls moving (its EntryPoint deposit counted as its own,
   // without the gas: src/erc4337-sim.ts withoutGas), against what its balance and its deposit together did across the
@@ -1079,6 +1094,38 @@ async function replay(item: string): Promise<void> {
     }
   }
   if (differs.length) row.differs = differs;
+  // What a differing operation was and what its preview said, in a line of the log: its row and preview are kept
+  // whole (--differing), in a file that isn't always at hand when the log is. Also for one only reported (an outcome,
+  // a token amount, or gas 5% off that isn't held against the preview).
+  // Gas or tokens that differ: the operation as it was mined, run on the state the preview ran on, from its own
+  // bundler and from another sender. As mined it is the receipt's, or the state isn't the chain's; from another
+  // sender it is the receipt's too, or what ran reads who sends the bundle (a paymaster that works otherwise for a
+  // bundler it doesn't know: on Arbitrum One, 2026-11-25, a preview of an account's first operation was 39.8% short
+  // in gas and showed no fee paid to its paymaster, and nothing kept said which of these it was).
+  let asMined: string | undefined;
+  if (differs.includes('gas') || differs.includes('tokens')) {
+    const fared = async (from: string) => {
+      const run = (await node.simulateBatch([{ ...mined, from, ...(from !== mined.from && { stateOverrides: { ...mined.stateOverrides, [from]: { balance: `0x${(10n ** 24n).toString(16)}` } } }) }]).catch(() => null))?.[0];
+      const event = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
+      // (FailedOp, FailedOpWithRevert: the EntryPoint turns the operation away in validation, as a paymaster that
+      // takes only its own bundlers makes it. On Ethereum, Pimlico's does, from any other sender.)
+      if (!event) return !run ? 'not run' : /0x220266b6|0x65c8fd4d|^AA\d\d/.test(String(run.revertReason ?? '')) ? `the EntryPoint turns it away in validation (${String(run.revertReason).slice(0, 60)})` : `not run (${String(run.revertReason ?? run.status).slice(0, 60)})`;
+      const moved = (run!.logs ?? []).filter(l => l.topics[0] === TRANSFER_TOPIC && l.topics.length === 3 && (`0x${l.topics[1].slice(26)}` === sender || `0x${l.topics[2].slice(26)}` === sender)).length;
+      return `${BigInt(`0x${event.data.slice(66, 130)}`) === 1n ? 'succeeds' : 'fails'}, gas used ${BigInt(`0x${event.data.slice(194, 258)}`)}, paid ${BigInt(`0x${event.data.slice(130, 194)}`)}, ${moved} token transfer${moved === 1 ? '' : 's'} of the account's`;
+    };
+    const [own, other] = [await fared(mined.from), tx.from.toLowerCase() === OTHER_BUNDLER ? undefined : await fared(OTHER_BUNDLER)];
+    asMined = `as mined on the preview's state: ${own}${other ? `; from another sender than its bundler: ${other}` : ''} (the receipt: gas used ${actualGasUsed}, paid ${actualGasCost})`;
+  }
+  if (differs.length || !row.outcome || row.tokens === 'other' || (gasPercent !== undefined && Math.abs(gasPercent) >= 5)) {
+    const sim = p.simulation, firstOfKey = (BigInt(op.nonce) & ((1n << 64n) - 1n)) === 0n;
+    const shown = (p.assetChanges ?? []).filter(c => c.asset !== 'native').map(c => `${c.direction === 'out' ? '-' : '+'}${c.raw ?? c.amount} ${c.asset}${(c.account ?? sender).toLowerCase() === sender ? '' : ` (of ${c.account})`}`);
+    row.digest = [`sender ${sender}`, paymaster && !/^0x0{40}$/.test(paymaster) && `paymaster ${paymaster}`, `bundler ${tx.from.toLowerCase()}`,
+      firstOfKey && 'nonce 0 of its key', op.initCode !== '0x' && `initCode ${op.initCode.slice(0, 42)}`, !!tx.authorizationList?.length && 'its bundle carries EIP-7702 authorizations',
+      gasCompared && `gas ${gasCompared.gasless ? 'used' : 'paid'}: simulated ${gasCompared.simulated}, actual ${gasCompared.actual}`,
+      `preview "${p.title.slice(0, 90)}"`, sim && `simulation ${sim.status}${sim.revertReason ? ` (${sim.revertReason.slice(0, 160)})` : ''}`,
+      p.warnings.some(w => w.severity !== 'info') && `warns ${p.warnings.filter(w => w.severity !== 'info').map(w => w.code).join(', ')}`,
+      shown.length ? `shows ${shown.join(', ').slice(0, 300)}` : 'shows no token moving', asMined].filter(Boolean).join(' | ');
+  }
   // --differing <dir>: each differing operation's row and preview, kept to look at once its state is gone.
   if (differs.length && arg('differing', '')) {
     mkdirSync(arg('differing', ''), { recursive: true });
@@ -1163,6 +1210,7 @@ for (const r of rows) {
     r.standIn === 'rejected' && `the account rejected the stand-in (${r.rejectedWhy ?? 'signer unknown'})`, r.standIn === 'as signed' && "Kernel's enable mode: no stand-in made (run with its signatures as they were)", g(r) && Math.abs(g(r)!.percent) >= 0.5 && `gas ${g(r)!.percent}%${r.passkeyExtraKey ? " (its passkey's clientDataJSON has the key Chrome adds to some; not judged)" : r.passkeyVerifierAssumed ? " (a ZeroDev passkey wallet that verifies the other way than most on its chain, with no earlier operation in reach to show it, as the preview said: not judged)" : ''}`, r.tokens === 'other' && `tokens ${JSON.stringify(r.tokenDiffs)}${r.tokensAtOwnTime ? ' (run a second after its block; the bundle a second late missed its receipt, at its own time it matches: not judged)' : ''}`,
     nat(r)?.match === 'other' && `native coin: simulated ${nat(r)!.simulated}, actual ${nat(r)!.actual}${nat(r)!.mixed ? ` (${nat(r)!.mixed})` : ''}`].filter(Boolean);
   if (issues.length) say(`    ${r.hash} (${r.kind}): ${issues.join('; ')}`);
+  if (issues.length && r.digest) say(`      ${r.digest}`);
 }
 
 // The operations whose preview was wrong (each row's `differs`, set where it was replayed).

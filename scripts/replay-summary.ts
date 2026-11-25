@@ -14,6 +14,8 @@ type Row = {
   nodeFailed?: boolean;
   /** What the harness found the preview got wrong (see scripts/accuracy-4337.ts): 'outcome', 'gas', 'tokens'. */
   differs?: string[];
+  /** For a differing operation: how it fared run as mined, and what it was and its preview said, in a line (see scripts/accuracy-4337.ts). */
+  minedOutcome?: string; digest?: string;
   /** An outcome the preview got wrong while warning it might (see scripts/accuracy-4337.ts). */
   warned?: string;
 };
@@ -50,7 +52,7 @@ for (const name of readdirSync(dir).sort()) {
   const wrong = rows.filter(r => r.differs?.length);
   total += rows.length; wrongTotal += wrong.length;
   lines.push(`| ${CHAINS[m[1]] ?? m[1]} | v${m[2]} | ${rows.length} | ${pct(rows.filter(r => r.outcome).length, rows.length)} | ${pct(rows.filter(r => r.whole).length, rows.length)} | ${pct(rows.filter(r => r.standIn === 'validated').length, rows.filter(r => r.whole).length)} | ${pct(gas.filter(r => Math.abs(r.gas!.percent) < 0.5).length, gas.length)} | ${pct(gas.filter(r => Math.abs(r.gas!.percent) < 0.05).length, gas.length)} | ${pct(tokens.filter(r => r.tokens !== 'other').length, tokens.length)} | ${wrong.length || ''} | ${skippedTotal || ''} |`);
-  for (const r of wrong) differing.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`${r.bundle ? ` (operation ${r.bundle.index + 1} of ${r.bundle.size})` : ''}: ${r.differs!.map(d => d === 'outcome' ? 'outcome differs' : d === 'gas' ? `gas ${r.gas?.percent}%` : `tokens ${JSON.stringify(r.tokenDiffs)}`).join('; ')}`);
+  for (const r of wrong) differing.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`${r.bundle ? ` (operation ${r.bundle.index + 1} of ${r.bundle.size})` : ''}: ${r.differs!.map(d => d === 'outcome' ? `outcome differs${r.minedOutcome ? ` (as mined: ${r.minedOutcome})` : ''}` : d === 'gas' ? `gas ${r.gas?.percent}%` : `tokens ${JSON.stringify(r.tokenDiffs)}`).join('; ')}${r.digest ? `\n  - ${r.digest}` : ''}`);
   for (const r of rows.filter(x => x.warned)) warned.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`${r.warned !== 'outcome' ? `: ${r.warned}` : ''}`);
   for (const r of rows.filter(x => !x.whole && x.nodeFailed)) nodeFailures.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`: ${(r.callsOnlyBecause ?? '').slice(0, 160)}`);
   for (const r of rows.filter(x => !x.whole && !x.notSimulated && !x.nodeFailed)) fallbacks.push(`- ${CHAINS[m[1]] ?? m[1]} v${m[2]}: \`${r.hash}\`: ${(r.callsOnlyBecause ?? '').slice(0, 160)}`);
