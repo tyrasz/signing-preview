@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
-import { faultReason, RpcSimulator } from '../src/simulation.ts';
+import { faultReason, rejection, RpcSimulator } from '../src/simulation.ts';
 import type { Dependencies, SimulationRequest, SimulationResult, Simulator } from '../src/types.ts';
 import { ALICE, ROUTER } from '../mocks/data.ts';
 import { codes, NOW, sample } from './helpers.ts';
@@ -223,19 +223,71 @@ test('A batch with a call the account can’t pay for says which call, where the
   const batch = (calls: unknown[], atomicRequired = false) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, atomicRequired, calls }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
   const p = await batch([send, pay, send]);
   assert.deepEqual([p.simulation?.status, p.simulation?.revertReason], ['reverted', "call 2: insufficient funds: the account can't cover the value it sends"]);
-  assert.deepEqual(p.calls?.map(c => c.simulation?.status), ['success', 'reverted', 'unavailable']);
+  // The call before it as it ran, it as refused, and the one after it run without it: a transaction the network
+  // doesn't take changes nothing for those after it.
+  assert.deepEqual(p.calls?.map(c => c.simulation?.status), ['success', 'reverted', 'success']);
   assert.match(p.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^Call 2: The network would refuse this transaction as it stands: insufficient funds: the account can't cover the value it sends\. It would not be mined\.$/);
-  assert.match(p.warnings.find(w => w.code === 'batch_partial_failure')?.message ?? '', /^Call 2 can't be paid for \(insufficient funds: the account can't cover the value it sends\)\. The batch is not marked all-or-nothing/);
-  assert.ok(!codes(p).includes('simulation_unavailable'), codes(p).join());
-  assert.match(p.warnings.find(w => w.code === 'simulation_skipped')?.message ?? '', /^Call 3: This call was not simulated: call 2 can't be paid for, and nothing after it was run\.$/);
+  assert.match(p.warnings.find(w => w.code === 'batch_partial_failure')?.message ?? '', /^The network would refuse call 2 as it stands \(insufficient funds: the account can't cover the value it sends\)\. The batch is not marked all-or-nothing/);
+  assert.ok(!codes(p).includes('simulation_unavailable') && !codes(p).includes('simulation_skipped'), codes(p).join());
   // All or nothing: none of it happens.
   const atomic = await batch([send, pay], true);
-  assert.match(atomic.warnings.find(w => w.code === 'batch_will_fail')?.message ?? '', /^This batch is all-or-nothing, and call 2 can't be paid for \(insufficient funds: the account can't cover the value it sends\), so none of the calls would take effect\.$/);
+  assert.match(atomic.warnings.find(w => w.code === 'batch_will_fail')?.message ?? '', /^This batch is all-or-nothing, and the network would refuse call 2 as it stands \(insufficient funds: the account can't cover the value it sends\), so none of the calls would take effect\.$/);
   assert.equal(atomic.attention, 'danger');
   // The first call: found from the call alone.
   const first = await batch([pay, send]);
-  assert.deepEqual([first.simulation?.revertReason, first.calls?.map(c => c.simulation?.status)], ["call 1: insufficient funds: the account can't cover the value it sends", ['reverted', 'unavailable']]);
+  assert.deepEqual([first.simulation?.revertReason, first.calls?.map(c => c.simulation?.status)], ["call 1: insufficient funds: the account can't cover the value it sends", ['reverted', 'success']]);
+  // A long batch: found by halving (the tenth of twelve), and two of them (the third and the seventh of eight).
+  const long = await batch(Array.from({ length: 12 }, (_, i) => (i === 9 ? pay : send)));
+  assert.deepEqual([long.simulation?.revertReason, long.calls?.map(c => c.simulation?.status[0]).join('')], ["call 10: insufficient funds: the account can't cover the value it sends", 'sssssssssrss']);
+  const two = await batch(Array.from({ length: 8 }, (_, i) => (i === 2 || i === 6 ? pay : send)));
+  assert.equal(two.calls?.map(c => c.simulation?.status[0]).join(''), 'ssrsssrs');
+  // (More than three of them: left as the node's refusal of the lot.)
+  const many = await batch([pay, pay, pay, pay, send]);
+  assert.ok(codes(many).includes('simulation_unavailable'));
   // A node error that says nothing of the kind is as it was.
   const other = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [send, send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ok(), simulateBatch: async () => { throw new Error('RPC HTTP 503'); } } });
   assert.ok(codes(other).includes('simulation_unavailable'));
+});
+
+test('What a node says in place of a simulation is said where it tells something: a gas limit no block holds, a rate limit', async () => {
+  const send = { to: USDC, data: approve(ROUTER, 1n).data };
+  // A transaction whose own gas limit is more than a block holds is one no block can include: the node says so in
+  // its own words, and it was "could not be simulated" (on Polygon, with no other warning).
+  for (const words of ["Block gas limit exceeded by the block's transactions", 'block gas limit reached: remaining: 160000000, required: 1000000000'])
+    assert.equal(rejection(words, { value: 0n, gas: 1_000_000_000n }), 'gas limit too high: the gas limit (1,000,000,000) is more than a block holds here, so no block can include the transaction');
+  // (Only of a request that names its limit: the same words are a node's of a block's worth of calls.)
+  assert.equal(rejection("Block gas limit exceeded by the block's transactions", { value: 0n }), null);
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string };
+    return new Response(JSON.stringify(body.method === 'eth_simulateV1' ? { error: { code: -32000, message: "Block gas limit exceeded by the block's transactions" } } : { result: '0x' }));
+  }) as typeof fetch;
+  const high = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, ...send, gas: '0x3b9aca00', chainId: '0x89' }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: new RpcSimulator({ 137: 'http://rpc.invalid' }, { fetchImpl }) });
+  assert.deepEqual([high.simulation?.status, high.attention], ['reverted', 'danger']);
+  assert.match(high.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^The network would refuse this transaction as it stands: gas limit too high: the gas limit \(1,000,000,000\) is more than a block holds here, so no block can include the transaction\. It would not be mined\.$/);
+
+  // A node that is limiting requests: said, with what to do, where it was only "could not be simulated".
+  const limited = (message: string) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, ...send, chainId: '0xa4b1' }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => { throw new Error(message); } } });
+  assert.match((await limited('RPC HTTP 429: Too Many Requests')).warnings.find(w => w.code === 'simulation_unavailable')?.message ?? '', /could not be simulated, so balance changes are based on the decoded request only\. The chain's node is limiting requests \(a public RPC's limits\): try again in a moment, or use an RPC of your own\.$/);
+  assert.match((await limited('The operation was aborted due to timeout')).warnings.find(w => w.code === 'simulation_unavailable')?.message ?? '', /The chain's node didn't answer: try again in a moment\.$/);
+  assert.match((await limited('eth_simulateV1 failed: something else')).warnings.find(w => w.code === 'simulation_unavailable')?.message ?? '', /based on the decoded request only\.$/);
+
+  // A batch of one call is that call: its simulation is the batch's.
+  const one = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ({ status: 'success', source: 'mock', gasUsed: 46_000n, transfers: [] }) } });
+  assert.deepEqual([one.simulation?.status, one.simulation?.source], ['success', 'mock']);
+});
+
+test('A batch of more calls than a node takes in one simulation is run by the local EVM', async () => {
+  // Arbitrum One's public node answers a simulation of more than 30 calls with HTTP 429, every time: a batch of 32
+  // was "could not be simulated", after seconds of asking again. Where a local EVM is set up, it runs the batch.
+  const asked: string[] = [];
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    asked.push((JSON.parse(String(init.body)) as { method: string }).method);
+    return new Response('', { status: 429 });
+  }) as typeof fetch;
+  const ran: number[] = [];
+  const fork = { covers: (chainId: number) => chainId === 42161, simulateBatch: async (reqs: SimulationRequest[]): Promise<SimulationResult[]> => { ran.push(reqs.length); return reqs.map(() => ({ status: 'success', source: 'the local EVM', gasUsed: 21_000n, transfers: [], basis: 'fork' })); } };
+  const sim = new RpcSimulator({ 42161: 'http://rpc.invalid' }, { fetchImpl, fork: fork as never });
+  const pay = (n: number): SimulationRequest[] => Array.from({ length: n }, () => ({ chainId: 42161, from: ALICE, to: USDC, data: '0x' as const, value: 1n }));
+  const results = await sim.simulateBatch(pay(31));
+  assert.deepEqual([results?.length, results?.every(r => r.status === 'success'), ran, asked.includes('eth_simulateV1')], [31, true, [31], false]);
 });

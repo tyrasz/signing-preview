@@ -342,12 +342,16 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     b.warn('info', 'simulation_skipped', outcome.skipped);
   } else if (outcome && 'error' in outcome) {
     simulation = { status: 'unavailable', source: 'simulator', error: outcome.error };
-    b.warn('info', 'simulation_unavailable', 'The transaction could not be simulated, so balance changes are based on the decoded request only.');
+    // (With why, where it is the node's doing and passes: a public RPC limiting requests, or not answering.)
+    const why = /\b429\b|rate limit|too many requests/i.test(outcome.error) ? " The chain's node is limiting requests (a public RPC's limits): try again in a moment, or use an RPC of your own."
+      : /timed? ?out|timeout|aborted|fetch failed|ECONN|ENOTFOUND|socket/i.test(outcome.error) ? " The chain's node didn't answer: try again in a moment." : '';
+    b.warn('info', 'simulation_unavailable', `The transaction could not be simulated, so balance changes are based on the decoded request only.${why}`);
   } else if (outcome?.result) {
     // A null result means this simulator does not cover the call: show the decoded request only.
     let sim = outcome.result;
     // A revert under the request's own gas limit: run it again without the limit to see whether the limit is why.
-    if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length && !replay) {
+    // (Not one refused for a limit that is too high: without the limit it runs, and too little gas isn't why.)
+    if (sim.status === 'reverted' && tx.gas !== undefined && deps.simulator && !context.pendingTransactions?.length && !replay && !/^gas limit too high/.test(sim.revertReason ?? '')) {
       try {
         const unlimited = await deps.simulator.simulate({ ...simulationRequest(tx, d), gas: undefined, ...(at && { at }), ...(context.stateOverrides && { stateOverrides: context.stateOverrides }) });
         // (What it needs is its peak, before its refund, where the simulator says: a call clearing slots used 36,824

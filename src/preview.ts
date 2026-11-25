@@ -134,6 +134,52 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   };
 }
 
+/** A node's words for a call the network wouldn't take as it stands, which it refuses a whole batch for. */
+const REFUSAL = /insufficient funds|intrinsic gas too low/i;
+
+/**
+ * The results of a batch the node refuses as a whole for calls the network wouldn't take: each such call marked
+ * refused with the reason, the others as they run in order without it (a transaction that isn't taken changes
+ * nothing for those after it). The first refused call is the last of the shortest run from the start that the node
+ * refuses, found by halving; then the rest are run, and where the node refuses them again, the next is found the
+ * same way (three at most). Null where the node fails otherwise, or more calls than that are refused.
+ */
+async function withoutRefused(all: SimulationRequest[], simulator: NonNullable<Dependencies['simulator']>, first: string): Promise<SimulationResult[] | null> {
+  /** The calls' results; a reason, where the node refuses them; undefined, where it fails otherwise. */
+  const attempt = async (reqs: SimulationRequest[]): Promise<SimulationResult[] | string | undefined> => {
+    try {
+      const rs = reqs.length === 1 ? [await simulator.simulate(reqs[0])] : await simulator.simulateBatch!(reqs);
+      if (!rs || rs.length !== reqs.length || rs.some(r => !r)) return undefined;
+      const refused = (rs as SimulationResult[]).find(r => r.refused);
+      return refused ? refused.revertReason ?? 'the network refuses it' : rs as SimulationResult[];
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return REFUSAL.test(message) ? rejection(message) ?? undefined : undefined;
+    }
+  };
+  const refused = new Map<number, string>();
+  let live = all.map((_, i) => i), reason = first, source: string | undefined;
+  for (let round = 0; round < 3 && live.length; round++) {
+    let lo = 1, hi = live.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1, r = await attempt(live.slice(0, mid).map(i => all[i]));
+      if (r === undefined) return null;
+      if (typeof r === 'string') { hi = mid; reason = r; } else { lo = mid + 1; source ??= r[0].source; }
+    }
+    const index = live[lo - 1];
+    // (Alone, a call says more of why: the gas limit it names against what its calldata costs.)
+    if (lo === 1 && live.length > 1) { const alone = await attempt([all[index]]); if (typeof alone === 'string') reason = alone; }
+    refused.set(index, reason);
+    live = live.filter(i => i !== index);
+    const rest = live.length ? await attempt(live.map(i => all[i])) : [];
+    if (rest === undefined) return null;
+    if (typeof rest === 'string') { reason = rest; continue; }
+    source ??= rest[0]?.source;
+    return all.map((_, i) => (refused.has(i) ? { status: 'reverted' as const, source: source ?? "the chain's node", revertReason: refused.get(i)!, transfers: [], limited: true, refused: true } : rest[live.indexOf(i)]));
+  }
+  return null;
+}
+
 const SKIPPED_IN_BATCH = "This call was not simulated: it may depend on the calls before it, and the simulator (or this chain's RPC) can only check one call at a time.";
 
 /**
@@ -187,8 +233,6 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   // An all-or-nothing batch of a plain account's, whose calls go through a transaction each and fail as the one
   // transaction a wallet makes of them (the account given code, EIP-7702): which call, and why.
   let asOneFails: { call?: number; reason?: string } | undefined;
-  // A call the account can't pay for, which the node refuses a batch for as a whole: which call, and why.
-  let unpaid: { call: number; reason: string; source: string } | undefined;
   let requests: SimulationRequest[] | undefined;
   let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
@@ -264,29 +308,14 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         presets = (error as Error)?.name === 'BatchSimulationUnsupported'
           ? txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH })) // e.g. HyperEVM: eth_call can check call 1 alone
           : txs.map(() => ({ error: message }));
-        // A node refuses the whole request where one of its calls can't be paid for (the account hasn't the coin
-        // it sends), without saying which: a batch from an account with no coin, one call sending 1 wei, was "could
-        // not be simulated", as information, where a transaction alone is "expected to fail: insufficient funds".
-        // Which call is found by running the calls up to each in turn (for a batch of up to eight): those before
-        // it as they ran, it as refused, the ones after it not run.
-        const why = (error as Error)?.name !== 'BatchSimulationUnsupported' ? rejection(message) : null;
-        if (why && requests && txs.length <= 8) {
-          const all = requests;
-          let before: SimulationResult[] = [], at_: number | undefined, refused: SimulationResult | undefined;
-          for (let n = 1; n <= all.length && at_ === undefined; n++) {
-            const part = await (n === 1 ? deps.simulator.simulate(all[0]).then(r => (r ? [r] : null)) : deps.simulator.simulateBatch(all.slice(0, n))).catch(() => null);
-            if (part?.length === n && !part[n - 1].refused && part.every(r => !r.limited)) { before = part; continue; }
-            if (n === 1 && !part?.[0]?.refused) break;   // (the first call alone tells nothing: left as it was)
-            at_ = n - 1;
-            refused = part?.[n - 1]?.refused ? part[n - 1] : { status: 'reverted', source: before[0]?.source ?? 'the chain\'s node', revertReason: why, transfers: [], limited: true, refused: true };
-          }
-          if (at_ === undefined && before.length === all.length) { results = before; presets = txs.map((_, i) => ({ result: before[i] })); }
-          else if (at_ !== undefined && refused) {
-            const k = at_;
-            unpaid = { call: k + 1, reason: refused.revertReason ?? why, source: refused.source };
-            presets = txs.map((_, i) => (i < k ? { result: before[i] } : i === k ? { result: refused! } : { skipped: `This call was not simulated: call ${k + 1} can't be paid for, and nothing after it was run.` }));
-          }
-        }
+        // A node refuses the whole request where one of its calls is one the network wouldn't take (the account
+        // hasn't the coin it sends; a gas limit under what the calldata alone costs), without saying which: a batch
+        // from an account with no coin, one call sending 1 wei, was "could not be simulated", as information, where
+        // a transaction alone is refused with the reason. The calls it refuses are found, and the others run
+        // without them (withoutRefused), as the local EVM runs such a batch.
+        const why = (error as Error)?.name !== 'BatchSimulationUnsupported' && REFUSAL.test(message) ? rejection(message) : null;
+        const recovered = why && requests ? await withoutRefused(requests, deps.simulator, why).catch(() => null) : null;
+        if (recovered) { results = recovered; presets = txs.map((_, i) => ({ result: recovered[i] })); ran = undefined; }
       }
     } else {
       presets = txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH }));
@@ -365,16 +394,16 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         // The state read after the last call covers every permission touched by the batch.
         approvals = await approvalChanges(results.flatMap((r, i) => (r.approvals ?? []).map(approval => ({ approval, callTo: txs[i].to }))), txs[0], deps, results[results.length - 1].approvalState);
       }
+    } else if (results[failed].refused) {
+      // (A call the network wouldn't take as it stands isn't one that fails once mined: no fee is paid for it.)
+      const reason = results[failed].revertReason ? ` (${results[failed].revertReason})` : '';
+      if (batch.atomicRequired) b.warn('danger', 'batch_will_fail', `This batch is all-or-nothing, and the network would refuse call ${failed + 1} as it stands${reason}, so none of the calls would take effect.`);
+      else b.warn('caution', 'batch_partial_failure', `The network would refuse call ${failed + 1} as it stands${reason}. The batch is not marked all-or-nothing, so the wallet may still carry out the other calls, leaving them in effect without it.`);
     } else if (batch.atomicRequired) {
       b.warn('danger', 'batch_will_fail', `This batch is all-or-nothing, and call ${failed + 1} is expected to fail, so none of the calls would take effect. You would still pay the network fee.`);
     } else {
       b.warn('caution', 'batch_partial_failure', `Call ${failed + 1} is expected to fail. The batch is not marked all-or-nothing, so the wallet may still carry out the other calls, leaving them in effect without it.`);
     }
-  }
-  if (unpaid && !results) {
-    simulation = { status: 'reverted', source: `${unpaid.source}, ${txs.length} calls in order`, revertReason: `call ${unpaid.call}: ${unpaid.reason}` };
-    if (batch.atomicRequired) b.warn('danger', 'batch_will_fail', `This batch is all-or-nothing, and call ${unpaid.call} can't be paid for (${unpaid.reason}), so none of the calls would take effect.`);
-    else b.warn('caution', 'batch_partial_failure', `Call ${unpaid.call} can't be paid for (${unpaid.reason}). The batch is not marked all-or-nothing, so the wallet may still carry out the calls before it, leaving them in effect without it.`);
   }
   // A call that has another account act (src/evm/smart-account.ts, accountCallAdapter): the batch's run read the
   // sender's balances. It is read again for that account (for the first three such accounts), as a single
@@ -411,7 +440,8 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     summary: `Runs ${calls.length} call${calls.length === 1 ? '' : 's'} in order${batch.atomicRequired ? ', all or nothing' : ''}. ${calls.map((c, i) => `(${i + 1}) ${c.summary}`).join(' ')}`,
     details: b.details, assetChanges, ...(approvals.length ? { approvals } : {}), warnings, attention: attentionOf(warnings),
     decoding: { status: statuses.every(s => s === 'full') ? 'full' : statuses.every(s => s === 'opaque') ? 'opaque' : 'partial', decoder: 'batch', notes: b.notes },
-    ...(simulation && { simulation }),
+    // (A batch of one call is that call: its simulation is the batch's.)
+    ...(simulation ? { simulation } : calls.length === 1 && calls[0].simulation ? { simulation: calls[0].simulation } : {}),
     ...(wholeTrace && { trace: wholeTrace }),
     calls,
   };

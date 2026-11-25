@@ -491,6 +491,10 @@ export class RpcSimulator implements Simulator {
     const stateOverrides = await simulateV1Overrides(reqs, this.stateOf(reqs));
     const blockOverrides = this.blockOverrides(reqs);
     const before = await this.before(chainId, reqs, fitted);
+    // A node that caps the calls of one simulation (Arbitrum One's public node: 30) answers more with HTTP 429,
+    // every time: a batch of 32 calls there was "could not be simulated", after eight seconds of asking again.
+    // Such a batch is run by the local EVM, where one is set up for the chain.
+    if (PACKED_READS.has(chainId) && !before.length && calls.length > CALL_CAP && this.fork?.covers(chainId)) return this.withoutSimulateV1(url, chainId, reqs);
     const body = await this.post(url, 'eth_simulateV1', [{ blockStateCalls: [{ calls: [...before, ...calls], ...(blockOverrides && { blockOverrides }), ...(stateOverrides && { stateOverrides }) }], traceTransfers: true, validation: false }, this.at(chainId, reqs).tag]) as { result?: { calls: RawCallResult[]; number?: string }[]; error?: { code?: number; message: string } };
     if (body.error?.code === -32601 || /method not found|does not exist|not supported/i.test(body.error?.message ?? '')) {
       this.noSimulate.add(chainId);
@@ -1003,6 +1007,8 @@ const READ_GAS = 10_000_000n;
  * naming twelve tokens more than its own took 51 and lost its reads to ten refusals ("RPC HTTP 429", 19.6 s).
  */
 const PACKED_READS = new Set([42161]);
+/** How many calls such a node takes in one simulation. */
+const CALL_CAP = 30;
 /** A call in an eth_simulateV1's block, as readState and leanReads build them. */
 type SimCall = { from?: string; to?: string; data?: string; [field: string]: unknown };
 /** The address readState's and leanReads' reads come from: it has no nonce to move. */
@@ -1094,10 +1100,14 @@ export function faultReason(message: string | undefined): string | undefined {
 }
 
 /** A node's refusal that says why the transaction can't run at all, worded for the preview; null for other errors. */
-export function rejection(message: string, request?: { value: bigint; gasPrice?: bigint }): string | null {
+export function rejection(message: string, request?: { value: bigint; gasPrice?: bigint; gas?: bigint }): string | null {
   // (At a price, what the account can't cover is the fee too, or the fee alone.)
   if (/insufficient funds/i.test(message)) return request?.gasPrice ? `insufficient funds: the account can't cover ${request.value > 0n ? 'the value it sends and the network fee' : 'the network fee'} at the price it was run at` : "insufficient funds: the account can't cover the value it sends";
   if (/intrinsic gas too low/i.test(message)) return 'out of gas: the gas limit is below the minimum any transaction with this calldata needs';
+  // (Of a transaction alone that names its gas limit: geth and reth say "Block gas limit exceeded by the block's
+  // transactions", bor "block gas limit reached: remaining: 160000000, required: 1000000000". It was "could not be
+  // simulated", with nothing said on a chain that has no cap on a transaction's gas to warn of.)
+  if (request?.gas !== undefined && /block gas limit (exceeded|reached)|exceeds block gas limit/i.test(message)) return `gas limit too high: the gas limit (${request.gas.toLocaleString('en-US')}) is more than a block holds here, so no block can include the transaction`;
   return null;
 }
 
