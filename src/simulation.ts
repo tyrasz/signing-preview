@@ -705,7 +705,12 @@ export class RpcSimulator implements Simulator {
     const hints = this.fork.discovered?.(reqs) ?? [];
     const probed = this.probeOrCall(url, chainId, hints.length ? reqs.map(r => ({ ...r, watch: [...new Set([...(r.watch ?? []), ...hints])] })) : reqs);
     probed.catch(() => { /* the fork's answer may still come */ });
-    return Promise.race([probed, forked.then(r => r ?? probed, () => probed)]);
+    // A batch the probe can't run (an RPC with no state overrides: HyperEVM's) has only the local EVM to run it:
+    // its answer is waited for, to its own time limit. Past the budget above, a batch there came back with only its
+    // first call simulated, the local EVM's run of all of them a moment from done.
+    const answer = probed.catch(e => (e instanceof BatchSimulationUnsupported ? forked.then(r => r ?? Promise.reject(e), () => Promise.reject(e)) : Promise.reject(e)));
+    answer.catch(() => { /* the fork's answer may still come */ });
+    return Promise.race([answer, forked.then(r => r ?? answer, () => answer)]);
   }
 
   /** The probe's answer, or eth_call's where the probe can't run. */
@@ -1169,6 +1174,54 @@ export function decodeRevert(data: Hex | undefined): string | undefined {
   } catch {
     return knownError(data) ?? `custom error ${data.slice(0, 10)}`;
   }
+}
+
+/** A node's words for a call the network wouldn't take as it stands, which it refuses a whole batch for. */
+export const REFUSAL = /insufficient funds|intrinsic gas too low/i;
+
+/**
+ * The results of a batch the node refuses as a whole for calls the network wouldn't take: each such call marked
+ * refused with the reason, the others as they run in order without it (a transaction that isn't taken changes
+ * nothing for those after it). The first refused call is the last of the shortest run from the start that the node
+ * refuses, found by halving; then the rest are run, and where the node refuses them again, the next is found the
+ * same way (three at most). With the results, which calls ran (`live`, their places in the batch). Null where the
+ * node fails otherwise, or more calls than that are refused.
+ */
+export async function withoutRefused(all: SimulationRequest[], simulator: Simulator, first: string): Promise<{ results: SimulationResult[]; live: number[] } | null> {
+  /** The calls' results; a reason, where the node refuses them; undefined, where it fails otherwise. */
+  const attempt = async (reqs: SimulationRequest[]): Promise<SimulationResult[] | string | undefined> => {
+    try {
+      const rs = reqs.length === 1 ? [await simulator.simulate(reqs[0])] : await simulator.simulateBatch!(reqs);
+      if (!rs || rs.length !== reqs.length || rs.some(r => !r)) return undefined;
+      const refused = (rs as SimulationResult[]).find(r => r.refused);
+      return refused ? refused.revertReason ?? 'the network refuses it' : rs as SimulationResult[];
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return REFUSAL.test(message) ? rejection(message) ?? undefined : undefined;
+    }
+  };
+  const refused = new Map<number, string>();
+  let live = all.map((_, i) => i), reason = first, source: string | undefined;
+  for (let round = 0; round < 3 && live.length; round++) {
+    let lo = 1, hi = live.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1, r = await attempt(live.slice(0, mid).map(i => all[i]));
+      if (r === undefined) return null;
+      if (typeof r === 'string') { hi = mid; reason = r; } else { lo = mid + 1; source ??= r[0].source; }
+    }
+    const index = live[lo - 1];
+    // (Alone, a call says more of why: the gas limit it names against what its calldata costs.)
+    if (lo === 1 && live.length > 1) { const alone = await attempt([all[index]]); if (typeof alone === 'string') reason = alone; }
+    refused.set(index, reason);
+    live = live.filter(i => i !== index);
+    const rest = live.length ? await attempt(live.map(i => all[i])) : [];
+    if (rest === undefined) return null;
+    if (typeof rest === 'string') { reason = rest; continue; }
+    source ??= rest[0]?.source;
+    const ran = live;
+    return { live: ran, results: all.map((_, i) => (refused.has(i) ? { status: 'reverted' as const, source: source ?? "the chain's node", revertReason: refused.get(i)!, transfers: [], limited: true, refused: true } : rest[ran.indexOf(i)])) };
+  }
+  return null;
 }
 
 /** Returns canned results keyed by `${chainId}:${to}:${data}`; for tests and demos. */

@@ -2,6 +2,7 @@ import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } f
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, PreviewTrace, ReplayInfo, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { blockText, namedBlock, pinLatest, type BlockAt, type Pinned } from '../block.ts';
+import { REFUSAL, rejection, withoutRefused } from '../simulation.ts';
 import { compareWithReceipt, noTrace, sameRun, tracePreviews, type TraceEnv } from './trace.ts';
 import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
@@ -260,7 +261,18 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       const pricing = replay ? Promise.resolve(undefined) : expectedGasPrice(tx, deps, named?.at.header.baseFeePerGas).catch(() => undefined);
       if (pending.length && deps.simulator.simulateBatch) {
         // On top of the wallet's pending transactions, in order: this one is the last call of the batch.
-        const results = await deps.simulator.simulateBatch([...pending, request]);
+        // (A node refuses the lot where one of them is a transaction the network wouldn't take, without saying
+        // which: after a pending transfer of everything the account holds, a transaction sending 1 wei was "could
+        // not be simulated", with no warning. Found as in a batch (withoutRefused): a pending one is said to fail,
+        // and this one is run without it; this one is refused, with why.)
+        const all = [...pending, request];
+        const results = await deps.simulator.simulateBatch(all).catch(async (e: unknown) => {
+          const message = e instanceof Error ? e.message : String(e), why = REFUSAL.test(message) ? rejection(message) : null;
+          const recovered = why ? await withoutRefused(all, deps.simulator!, why).catch(() => null) : null;
+          if (!recovered) throw e;
+          ran = recovered.live.map(i => all[i]);
+          return recovered.results;
+        });
         const failed = results ? results.slice(0, -1).findIndex(r => r.status === 'reverted') : -1;
         if (failed !== -1) b.warn('caution', 'pending_transaction_fails', `Your pending transaction #${failed + 1} is expected to fail${results![failed].revertReason ? ` (${results![failed].revertReason})` : ''}, so this one was simulated after a failed transaction.`);
         b.note(`Simulated after your ${pending.length} pending transaction${pending.length === 1 ? '' : 's'}, in order, as they will run before it.`);

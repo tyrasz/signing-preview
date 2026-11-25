@@ -4,7 +4,7 @@ import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext
 import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, standInsNote, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
-import { decodeRevert, rejection } from './simulation.ts';
+import { decodeRevert, REFUSAL, rejection, withoutRefused } from './simulation.ts';
 import { addUsdValues } from './prices.ts';
 import { noTrace, tracePreviews, type TraceEnv } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
@@ -134,52 +134,6 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   };
 }
 
-/** A node's words for a call the network wouldn't take as it stands, which it refuses a whole batch for. */
-const REFUSAL = /insufficient funds|intrinsic gas too low/i;
-
-/**
- * The results of a batch the node refuses as a whole for calls the network wouldn't take: each such call marked
- * refused with the reason, the others as they run in order without it (a transaction that isn't taken changes
- * nothing for those after it). The first refused call is the last of the shortest run from the start that the node
- * refuses, found by halving; then the rest are run, and where the node refuses them again, the next is found the
- * same way (three at most). Null where the node fails otherwise, or more calls than that are refused.
- */
-async function withoutRefused(all: SimulationRequest[], simulator: NonNullable<Dependencies['simulator']>, first: string): Promise<SimulationResult[] | null> {
-  /** The calls' results; a reason, where the node refuses them; undefined, where it fails otherwise. */
-  const attempt = async (reqs: SimulationRequest[]): Promise<SimulationResult[] | string | undefined> => {
-    try {
-      const rs = reqs.length === 1 ? [await simulator.simulate(reqs[0])] : await simulator.simulateBatch!(reqs);
-      if (!rs || rs.length !== reqs.length || rs.some(r => !r)) return undefined;
-      const refused = (rs as SimulationResult[]).find(r => r.refused);
-      return refused ? refused.revertReason ?? 'the network refuses it' : rs as SimulationResult[];
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      return REFUSAL.test(message) ? rejection(message) ?? undefined : undefined;
-    }
-  };
-  const refused = new Map<number, string>();
-  let live = all.map((_, i) => i), reason = first, source: string | undefined;
-  for (let round = 0; round < 3 && live.length; round++) {
-    let lo = 1, hi = live.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1, r = await attempt(live.slice(0, mid).map(i => all[i]));
-      if (r === undefined) return null;
-      if (typeof r === 'string') { hi = mid; reason = r; } else { lo = mid + 1; source ??= r[0].source; }
-    }
-    const index = live[lo - 1];
-    // (Alone, a call says more of why: the gas limit it names against what its calldata costs.)
-    if (lo === 1 && live.length > 1) { const alone = await attempt([all[index]]); if (typeof alone === 'string') reason = alone; }
-    refused.set(index, reason);
-    live = live.filter(i => i !== index);
-    const rest = live.length ? await attempt(live.map(i => all[i])) : [];
-    if (rest === undefined) return null;
-    if (typeof rest === 'string') { reason = rest; continue; }
-    source ??= rest[0]?.source;
-    return all.map((_, i) => (refused.has(i) ? { status: 'reverted' as const, source: source ?? "the chain's node", revertReason: refused.get(i)!, transfers: [], limited: true, refused: true } : rest[live.indexOf(i)]));
-  }
-  return null;
-}
-
 const SKIPPED_IN_BATCH = "This call was not simulated: it may depend on the calls before it, and the simulator (or this chain's RPC) can only check one call at a time.";
 
 /**
@@ -234,6 +188,8 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   // transaction a wallet makes of them (the account given code, EIP-7702): which call, and why.
   let asOneFails: { call?: number; reason?: string } | undefined;
   let requests: SimulationRequest[] | undefined;
+  // Which calls `ran` holds, where it isn't all of them (the ones the network would refuse left out).
+  let ranOf: number[] | undefined;
   let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
@@ -315,7 +271,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         // without them (withoutRefused), as the local EVM runs such a batch.
         const why = (error as Error)?.name !== 'BatchSimulationUnsupported' && REFUSAL.test(message) ? rejection(message) : null;
         const recovered = why && requests ? await withoutRefused(requests, deps.simulator, why).catch(() => null) : null;
-        if (recovered) { results = recovered; presets = txs.map((_, i) => ({ result: recovered[i] })); ran = undefined; }
+        if (recovered) { results = recovered.results; presets = txs.map((_, i) => ({ result: recovered.results[i] })); ran = recovered.live.map(i => requests![i]); ranOf = recovered.live; }
       }
     } else {
       presets = txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH }));
@@ -328,10 +284,10 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   let wholeTrace: Preview['trace'];
   if (context.trace && results && ran) {
     const env: TraceEnv = { chainId: txs[0].chainId, account: txs[0].from, deps };
-    const traces = await tracePreviews(ran, whole ? [whole.result] : results, env);
+    const traces = await tracePreviews(ran, whole ? [whole.result] : ranOf ? ranOf.map(i => results![i]) : results, env);
     // (Run as one transaction, the trace is the batch's: the account calling itself, and each call under that.)
     if (whole) wholeTrace = traces?.[0];
-    else for (const [i, t] of (traces ?? []).entries()) if (t) calls[i].trace = t;
+    else for (const [i, t] of (traces ?? []).entries()) if (t) calls[ranOf ? ranOf[i] : i].trace = t;
     if (!traces) untraced = noTrace(env);
   }
 

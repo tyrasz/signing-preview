@@ -291,3 +291,59 @@ test('A batch of more calls than a node takes in one simulation is run by the lo
   const results = await sim.simulateBatch(pay(31));
   assert.deepEqual([results?.length, results?.every(r => r.status === 'success'), ran, asked.includes('eth_simulateV1')], [31, true, [31], false]);
 });
+
+test('A transaction the network would refuse after the wallet’s pending transactions is said to be, and a pending one that is', async () => {
+  // The node refuses the pending transactions and this one as a lot, and doesn't say which of them it wouldn't
+  // take: after a pending transfer of all the account holds, a transfer of 1 wei was "could not be simulated".
+  const BOB_ = '0x00000000000000000000000000000000000b0b0b', refusal = 'eth_simulateV1 failed: insufficient funds for gas * price + value: have 0 want 1';
+  const ok = (): SimulationResult => ({ status: 'success', source: 'mock', gasUsed: 21_000n, balancesRead: true, transfers: [] });
+  const refused = (): SimulationResult => ({ status: 'reverted', source: 'mock', revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true, refused: true });
+  // An account holding 10 wei: what a run of transactions leaves of it decides which the node takes.
+  const payable = (rs: SimulationRequest[]) => { let held = 10n; for (const r of rs) { if (r.value > held) return false; held -= r.value; } return true; };
+  const simulator: Simulator = { simulate: async r => (payable([r]) ? ok() : refused()), simulateBatch: async rs => { if (!payable(rs)) throw new Error(refusal); return rs.map(ok); } };
+  const send = (value: string, pending: { to: string; value: string }[]) => previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: BOB_, value, chainId: '0xa4b1' }] }, { now: NOW, pendingTransactions: pending }, { tokens: new StaticTokenRegistry(), simulator });
+  // The pending transfer takes all ten: this one can't send its 1 wei.
+  const after = await send('0x1', [{ to: BOB_, value: '0xa' }]);
+  assert.equal(after.simulation?.status, 'reverted');
+  assert.match(after.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^The network would refuse this transaction as it stands: insufficient funds: the account can't cover the value it sends\. It would not be mined\.$/);
+  assert.match(after.decoding.notes.join(' '), /Simulated after your 1 pending transaction, in order, as they will run before it\./);
+  assert.ok(!codes(after).includes('simulation_unavailable'));
+  // A pending transaction that is the one the network wouldn't take: said, and this one run without it.
+  const before = await send('0x1', [{ to: BOB_, value: '0x64' }]);
+  assert.equal(before.simulation?.status, 'success');
+  assert.match(before.warnings.find(w => w.code === 'pending_transaction_fails')?.message ?? '', /^Your pending transaction #1 is expected to fail \(insufficient funds: the account can't cover the value it sends\)/);
+});
+
+test('A traced batch with a call the network would refuse traces the calls that ran', async () => {
+  const BOB_ = '0x00000000000000000000000000000000000b0b0b';
+  const ok = (): SimulationResult => ({ status: 'success', source: 'mock', gasUsed: 21_000n, balancesRead: true, transfers: [] });
+  const traced: number[] = [];
+  const simulator: Simulator = {
+    simulate: async r => (r.value > 5n ? { status: 'reverted', source: 'mock', revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true, refused: true } : ok()),
+    simulateBatch: async rs => { if (rs.some(r => r.value > 5n)) throw new Error('eth_simulateV1 failed: insufficient funds for gas * price + value'); return rs.map(ok); },
+    // (What the trace holds isn't the matter here: which calls it is asked for is.)
+    trace: async rs => { traced.push(rs.length); return rs.map(() => ok()); },
+  };
+  const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [{ to: BOB_, value: '0x1' }, { to: BOB_, value: '0x64' }, { to: BOB_, value: '0x2' }] }] }, { now: NOW, trace: true }, { tokens: new StaticTokenRegistry(), simulator, rpc: { has: () => true, call: async (_c: number, m: string) => (m === 'eth_getBlockByNumber' ? { number: '0x10', timestamp: '0x65000000', baseFeePerGas: '0x1', gasLimit: '0x1c9c380', miner: `0x${'00'.repeat(20)}`, hash: `0x${'11'.repeat(32)}`, parentHash: `0x${'22'.repeat(32)}` } : '0x') } });
+  assert.deepEqual(p.calls?.map(c => c.simulation?.status), ['success', 'reverted', 'success']);
+  // The two calls that ran were the ones traced: it was none, with nothing said.
+  assert.deepEqual(traced, [2]);
+});
+
+test('A batch the probe can’t run waits for the local EVM, which is all that can run it', async () => {
+  // An RPC with no eth_simulateV1 and no state overrides (HyperEVM's): past the budget the local EVM has before the
+  // probe answers in its place, a batch came back with only its first call simulated, the probe having no way to
+  // run calls in order, though the local EVM's run of them all was a moment from done.
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { method: string };
+    return new Response(JSON.stringify(body.method === 'eth_simulateV1' ? { error: { code: -32601, message: 'the method eth_simulateV1 does not exist/is not available' } }
+      : body.method === 'eth_call' ? { error: { code: -32602, message: 'state override is not supported' } } : { result: '0x' }));
+  }) as typeof fetch;
+  const slow = { covers: () => true, simulate: async () => null, simulateBatch: (reqs: SimulationRequest[]) => new Promise<SimulationResult[]>(resolve => setTimeout(() => resolve(reqs.map(() => ({ status: 'success', source: 'the local EVM', gasUsed: 21_000n, transfers: [], basis: 'fork' }))), 150)) };
+  const reqs: SimulationRequest[] = [1n, 2n].map(value => ({ chainId: 999, from: ALICE, to: USDC, data: '0x' as const, value }));
+  const results = await new RpcSimulator({ 999: 'http://rpc.invalid' }, { fetchImpl, fork: slow as never, forkBudgetMs: 20 }).simulateBatch(reqs);
+  assert.deepEqual(results?.map(r => [r.status, r.source]), [['success', 'the local EVM'], ['success', 'the local EVM']]);
+  // (A local EVM that fails leaves the probe's answer: that such a batch can't be run in order here.)
+  const failing = { ...slow, simulateBatch: () => new Promise<SimulationResult[]>((_, reject) => setTimeout(() => reject(new Error('ran out of time')), 60)) };
+  await assert.rejects(new RpcSimulator({ 999: 'http://rpc.invalid' }, { fetchImpl, fork: failing as never, forkBudgetMs: 20 }).simulateBatch(reqs), { name: 'BatchSimulationUnsupported' });
+});
