@@ -346,6 +346,8 @@ const FAILED_OP = '0x220266b6', FAILED_OP_WITH_REVERT = '0x65c8fd4d';
 /** The simulated bundler when no other is known (simulateHandleOp doesn't check its caller; paymasters can check tx.origin, see recentBundlers). */
 const BUNDLER = '0x0000000000000000000000000000000000004337';
 const BUNDLER_BALANCE = `0x${(10n ** 24n).toString(16)}`;
+/** How long a lookup of a paymaster's bundlers that the first run didn't wait for is waited for once that run is made. */
+const LATE_LOOKUP_MS = 2500;
 
 /**
  * Bundlers that recently submitted operations this paymaster paid for (at most five), which its operations are
@@ -3440,6 +3442,8 @@ async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Pr
   const soon = await Promise.race([bundlers, new Promise<string[]>(r => { timer = setTimeout(() => r([]), 1500); (timer as { unref?: () => void }).unref?.(); })]);
   clearTimeout(timer);
   const first = soon[0] ?? BUNDLER;
+  /** The first run was made before the lookup answered; and the bundler it then found, which later runs are made as. */
+  let lateLookup = !!paymaster && !soon.length, known: string | undefined;
   // The price the bundle's transaction pays (tx.gasprice), taken as what the operation pays its bundler: the base fee
   // plus its priority fee, up to its fee cap (on Arbitrum too, which now charges tips: tx-checks). Contracts read it:
   // a Base DEX's pools add a "MEV tax" to a swap's fee by the transaction's priority fee, and an operation simulated
@@ -3565,7 +3569,25 @@ async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Pr
     new NodeFailure(`${who} refused the simulation's own bundler (${first.rejected?.slice(0, 4) ?? 'postOp reverting'}), and the run as a bundler it took lately failed: ${e.message}`, e.passing);
   const standIn = stub.wallet ? 'wallet' as const : stub.enable ? 'enable' as const : stub.p256 || stub.madeUp ? 'passkey' as const : 'ecdsa' as const;
   const attempt = async (recover: Hex) => {
-    let ran = await run(origin?.bundler ?? first, recover);
+    let ran = await run(origin?.bundler ?? known ?? first, recover);
+    // The lookup lost the race, and the paymaster took the simulation's own bundler: it may still work otherwise
+    // for a bundler it knows (the one above charged 4% more gas), and nothing then said so. The likely cause of a
+    // preview on Arbitrum One (2026-11-25): an operation through a paymaster that takes a fixed token fee in postOp
+    // showed no fee paid and 39.8% less gas than it used, the paymaster's first of the run, where the account's
+    // next, the lookup remembered by then, matched (its state was gone before it could be run again: inferred).
+    // Once the lookup answers (the run has given it time, and it gets LATE_LOOKUP_MS more), the operation runs again
+    // as a bundler the paymaster's operations came through, and that run is the one kept, for this stand-in and
+    // those after it.
+    if (paymaster && lateLookup && ran && !paymasterRefused(ran) && !origin?.bundler && !known) {
+      lateLookup = false;
+      let late: ReturnType<typeof setTimeout> | undefined;
+      const found = await Promise.race([bundlers.catch(() => [] as string[]), new Promise<string[]>(r => { late = setTimeout(() => r([]), LATE_LOOKUP_MS); (late as { unref?: () => void }).unref?.(); })]);
+      clearTimeout(late);
+      if (found.length && found[0] !== first) {
+        const again = await another(found[0], recover).catch(() => null);
+        if (again && !paymasterRefused(again)) { ran = again; known = found[0]; }
+      }
+    }
     // The paymaster refused: once more as each other bundler it accepted lately, in case it only refused this one, in
     // its validation (AA33) or in its charge after the calls (postOp: on EntryPoint v0.6 a failing postOp is run again
     // and, failing again, rejects the operation, AA50; from v0.7 the calls are undone and the paymaster still pays).

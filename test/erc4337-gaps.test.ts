@@ -41,7 +41,7 @@ await chain.putCode(EP, ENTRY_POINT_SIMULATIONS_V07 as Hex);
 await chain.putCode(EP6, ENTRY_POINT_SIMULATIONS_V06 as Hex);
 await chain.setBalance(FUNDER, 100n * E);
 const put = (a: string, slot: Hex, value: Hex) => chain.evm.stateManager.putStorage(createAddressFromString(a), hexToBytes(pad(slot, { size: 32 })), unpadBytes(hexToBytes(pad(value, { size: 32 }))));
-const A = parseAbi(['function mint(address,uint256)', 'function transfer(address,uint256)', 'function depositTo(address)', 'function execute(address,uint256,bytes)', 'function installModule(uint256,address,bytes)']);
+const A = parseAbi(['function mint(address,uint256)', 'function transfer(address,uint256)', 'function approve(address,uint256)', 'function depositTo(address)', 'function execute(address,uint256,bytes)', 'function installModule(uint256,address,bytes)']);
 const call = (fn: string, args: unknown[]) => encodeFunctionData({ abi: A, functionName: fn, args } as never);
 const sendUsdc = call('execute', [usdc, 0n, call('transfer', [BOB, 50_000_000n])]);
 const deps: Dependencies = {
@@ -178,6 +178,31 @@ test('A paymaster refusing other bundlers in postOp on EntryPoint v0.7 (the call
   assert.ok(!codes(p).includes('userop_postop_reverts'), p.warnings.map(w => w.message).join(' | '));
   assert.ok(whole(p), p.decoding.notes.join(' | '));
   assert.deepEqual(usdcChange(p), ['out 50']);
+});
+
+test('A paymaster that works otherwise for a bundler it doesn’t know, without refusing it: run again as its bundler once the lookup answers', async () => {
+  // It pays for anyone, and takes its fee (0.03654 USDC, after the calls) only from a bundle its own bundler sends.
+  // On Arbitrum One (2026-11-25) such a paymaster's operation, previewed with the lookup of its bundlers still
+  // unanswered when the run started, showed no fee and 39.8% less gas than it used: nothing was refused, so the run
+  // as the simulation's own address stood.
+  const OWN = '0xb0d1e70000000000000000000000000000074337';
+  const quiet = await chain.deploy('OwnBundlerFeePaymaster', 'address,address,address', [EP, usdc, OWN]);
+  await chain.exec(EP, call('depositTo', [quiet]), FUNDER, E);
+  const a = await account();
+  await chain.exec(usdc, call('approve', [quiet, (1n << 256n) - 1n]), a);
+  const sent: string[] = [];
+  const real = deps.simulator!;
+  const simulator = { ...real, simulate: (r: SimulationRequest) => { if (r.to?.toLowerCase() === EP) sent.push(r.from); return real.simulate(r); } } as unknown as Dependencies['simulator'];
+  const op = v07(a, { paymaster: quiet, paymasterVerificationGasLimit: '0x186a0', paymasterPostOpGasLimit: '0x186a0', paymasterData: '0x' });
+  // Its bundler found 1.6 s on, after the first run has started as the simulation's own address: run again as it.
+  const p = await preview(op, OWNER, { ...deps, rpc: lookupNode(OWN, 1600), simulator });
+  assert.ok(whole(p), p.decoding.notes.join(' | '));
+  assert.deepEqual(sent, ['0x0000000000000000000000000000000000004337', OWN]);
+  assert.deepEqual(usdcChange(p), ['out 50.03654'], 'the fee its own bundler\'s bundle pays is in what leaves');
+  // (Remembered: the next preview runs as its bundler from the start.)
+  sent.length = 0;
+  const again = await preview(op, OWNER, { ...deps, rpc: lookupNode(OWN, 0), simulator });
+  assert.deepEqual([sent, usdcChange(again)], [[OWN], ['out 50.03654']]);
 });
 
 /** The test chain's simulator, with the whole operation's runs (to an EntryPoint) failing as `fail` says, counted. */

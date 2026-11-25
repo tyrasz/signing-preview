@@ -296,6 +296,22 @@ contract PostOpBundlerPaymaster {
         if (tx.origin != bundler) revert BundlerNotAllowed(tx.origin);
     }
 }
+/// A paymaster that pays for any bundler, and takes its token fee (a fixed one, after the calls) only where its own
+/// bundler sends the bundle: it works otherwise for a sender it doesn't know, without refusing it.
+contract OwnBundlerFeePaymaster {
+    address public entryPoint;
+    Token public token;
+    address public bundler;
+    constructor(address ep, Token t, address b) { entryPoint = ep; token = t; bundler = b; }
+    function validatePaymasterUserOp(PackedUserOperation calldata op, bytes32, uint256) external view returns (bytes memory, uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        return (tx.origin == bundler ? abi.encode(op.sender) : bytes(""), 0);
+    }
+    function postOp(uint8, bytes calldata context, uint256, uint256) external {
+        require(msg.sender == entryPoint, "entrypoint");
+        token.transferFrom(abi.decode(context, (address)), address(this), 36540);
+    }
+}
 /// An Account4337 that installs ERC-7579 modules (logging ModuleInstalled), as modular accounts do.
 contract ModularAccount4337 is Account4337 {
     event ModuleInstalled(uint256 moduleTypeId, address module);
