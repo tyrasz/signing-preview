@@ -1,14 +1,15 @@
-import { attentionOf, PreviewBuilder, shortAddress } from './format.ts';
+import { attentionOf, PreviewBuilder, sameAddress, shortAddress } from './format.ts';
 import { chainName } from './chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
-import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
+import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, standInsNote, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
 import { decodeRevert } from './simulation.ts';
 import { addUsdValues } from './prices.ts';
 import { noTrace, tracePreviews, type TraceEnv } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
-import { approvalChanges, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './evm/effects.ts';
+import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './evm/effects.ts';
+import { simulatedCoreActions } from './evm/hyperliquid.ts';
 import { parseTypedData, typedDataDigest, type TypedAdapter } from './typed-data/common.ts';
 import { hyperliquidL1Adapter, hyperliquidUserSignedAdapter } from './typed-data/hyperliquid.ts';
 import { genericTypedDataAdapter, permitAdapter } from './typed-data/permit.ts';
@@ -172,6 +173,8 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     decoded.push(d.status === 'opaque' && tx !== given[i] ? await decodeTransaction(given[i], deps, context).then(g => g.status === 'opaque' ? d : g) : d);
   }
 
+  // The accounts the calls have act in the sender's place or hand calls on to (Decoded.account, Decoded.actors).
+  const acting = [...new Set(decoded.flatMap(d => [...(d.account ? [d.account] : []), ...(d.actors ?? [])]).map(a => a.toLowerCase()))].filter(a => !txs.some(t => t.from.toLowerCase() === a));
   // Simulate the whole batch in order when the simulator can; otherwise only the first call is independent.
   let presets: (PresetSimulation | undefined)[] = txs.map(() => undefined);
   let results: SimulationResult[] | null = null;
@@ -207,7 +210,9 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
             // that. Nor one with a call refused before it ran, as a single transaction's isn't: a batch from an
             // account with no coin for the fee, which a relayer or a paymaster pays, was shown failing.)
             const unread = again?.some((r, i) => (r.stateReadError && !results![i].stateReadError) || r.refused || r.limited);
-            if (price && again && again.length === txs.length && !unread && again.some((r, i) => effectOf(r, txs[i].from) !== effectOf(results![i], txs[i].from))) { results = again; priced = price; ran = pricedRequests; }
+            // (What it does for the accounts the calls have act counts as what it does for the sender: by the runs' events.)
+            const parties = (i: number) => [txs[i].from, ...acting];
+            if (price && again && again.length === txs.length && !unread && again.some((r, i) => parties(i).some(account => effectOf(r, account) !== effectOf(results![i], account)))) { results = again; priced = price; ran = pricedRequests; }
           } catch { /* the node refused the priced run: the first stands */ }
         }
         // A batch an account with code runs is one transaction, and what a call leaves for the transaction's length
@@ -220,7 +225,9 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         // each and fails as one (a contract that takes no caller with code), that is said.
         if (results && (failing !== -1 || batch.atomicRequired) && txs.every(t => t.to && t.from === txs[0].from) && deps.rpc?.has(txs[0].chainId)) {
           try {
-            const code = await deps.rpc.call(txs[0].chainId, 'eth_getCode', [txs[0].from, 'latest']);
+            // (As the run has it: on the block it is of, and what the caller's state overrides put there.)
+            const given = Object.entries(context.stateOverrides ?? {}).find(([address]) => address.toLowerCase() === txs[0].from.toLowerCase())?.[1]?.code;
+            const code = given ?? await deps.rpc.call(txs[0].chainId, 'eth_getCode', [txs[0].from, named ? `0x${named.number.toString(16)}` : 'latest']);
             const plain = code === '0x';
             const one = typeof code !== 'string' ? null : !plain ? (failing !== -1 ? asOneTransaction(txs[0].from, code, txs) : null) : batch.atomicRequired ? asOneTransactionOfPlain(txs[0].from, txs) : null;
             if (one) {
@@ -229,7 +236,16 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
                 stateOverrides: { ...context.stateOverrides, ...one.overrides, [txs[0].from.toLowerCase()]: { ...context.stateOverrides?.[txs[0].from.toLowerCase()], ...one.overrides[txs[0].from.toLowerCase()] } } };
               const result = await deps.simulator.simulate(request);
               if (failing !== -1) {
-                if (result?.status === 'success' && !result.limited && !result.refused) { whole = { result, failed: failing, reason: results[failing].revertReason, ...(plain && { plain }) }; ran = [request]; }
+                if (result?.status === 'success' && !result.limited && !result.refused) {
+                  whole = { result, failed: failing, reason: results[failing].revertReason, ...(plain && { plain }) }; ran = [request];
+                  // Once more at the price it would pay now, as the calls in order are: shown where that changes what it does.
+                  if (result.gasUsed !== undefined) try {
+                    const price = await expectedGasPrice(txs[0], deps, named?.at.header.baseFeePerGas);
+                    const at_ = price && { ...request, gas: gas ?? roomFor(result.gasUsed), gasPrice: price.gasPrice, baseFee: price.baseFee };
+                    const again = at_ && await deps.simulator.simulate(at_);
+                    if (price && at_ && again?.status === 'success' && !again.limited && !again.refused && !(again.stateReadError && !result.stateReadError) && [txs[0].from, ...acting].some(account => effectOf(again, account) !== effectOf(result, account))) { whole = { ...whole, result: again }; priced = price; ran = [at_]; }
+                  } catch { /* the node refused the priced run: the first stands */ }
+                }
               } else if (result?.status === 'reverted' && !result.limited && !result.refused) {
                 const failed = failedCall(result.returnData);
                 asOneFails = { ...(failed && failed.index < txs.length && { call: failed.index + 1 }), reason: failed ? decodeRevert(failed.data) : result.revertReason };
@@ -290,6 +306,15 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     assetChanges = [...await netChanges(r.transfers, account, deps, b, basis), ...await nftChanges(r.nftTransfers ?? [], account, deps, b, basis)];
     // (An approval a call makes on its own target is one the call names: the others were set along the way.)
     approvals = await approvalChanges((r.approvals ?? []).map(approval => ({ approval, callTo: txs.find(t => t.to?.toLowerCase() === approval.emitter.toLowerCase())?.to ?? null })), account, deps, r.approvalState);
+    // Warned of as a call's own run warns: the calls have no runs of their own here, and a batch made to run as one
+    // (a call that leans on what another leaves) showed no warning of an operator approval set along the way.
+    const declared = decoded.flatMap(d => d.declaredApprovals ?? []);
+    for (const a of approvals) if (declared.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender))) a.direct = true;
+    approvalWarnings(b, approvals, context.now);
+    if (r.coreActions?.length) await simulatedCoreActions(r.coreActions, account.from, b, { deps, context });
+    if (r.rulesNote) b.note(r.rulesNote);
+    if (r.standIns?.length) b.note(standInsNote(r.standIns));
+    if (priced) b.note(pricedNote('calls', priced));
   } else if (results) {
     const failed = results.findIndex(r => r.status === 'reverted');
     const gasUsed = results.reduce((sum, r) => sum + (r.gasUsed ?? 0n), 0n);
@@ -323,9 +348,8 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   // sender's balances. It is read again for that account (for the first three such accounts), as a single
   // transaction's run is (src/evm/transaction.ts): its changes and the approvals it leaves, beside the sender's.
   // Where it can't be, what the call has the account move is kept as the call asks it, and that is said.
-  if (results && (whole || results.every(r => r.status === 'success'))) {
+  if (results && (whole || results.every(r => r.status === 'success')) && txs.every(t => t.from === txs[0].from)) {
     const sender = txs[0].from.toLowerCase();
-    const acting = [...new Set(decoded.flatMap(d => (d.account && d.account.toLowerCase() !== sender ? [d.account.toLowerCase()] : [])))];
     const read = new Set<string>();
     for (const account of acting.slice(0, 3)) {
       const theirs = ran && deps.simulator ? await forAccount(ran, { chainId: txs[0].chainId, from: account }, deps, b, true).catch(() => null) : null;
@@ -336,7 +360,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
       approvals = [...approvals, ...theirs.approvals];
     }
     if (read.size) b.note(`The batch's run was read again for ${[...read].map(a => shortAddress(a)).join(', ')}, the account${read.size === 1 ? '' : 's'} its calls have act: ${read.size === 1 ? 'its' : 'their'} balances and approvals are what those calls change.`);
-    const asked = calls.flatMap((c, i) => (decoded[i].account && !read.has(decoded[i].account!.toLowerCase()) ? c.assetChanges.filter(x => x.basis === 'requested' && x.account.toLowerCase() !== sender).map(x => ({ i, x })) : []));
+    const asked = calls.flatMap((c, i) => c.assetChanges.filter(x => x.basis === 'requested' && acting.includes(x.account.toLowerCase()) && !read.has(x.account.toLowerCase())).map(x => ({ i, x })));
     if (asked.length) {
       const which = [...new Set(asked.map(t => t.i + 1))], one = which.length === 1;
       assetChanges = [...assetChanges, ...asked.map(t => t.x)];

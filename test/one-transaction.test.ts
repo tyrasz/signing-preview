@@ -151,3 +151,25 @@ test('The stand-in for the code a wallet gives a plain account: coin is taken, a
   assert.deepEqual(failedCall(`0x${'00'.repeat(32)}`), { index: 0, data: '0x' });
   assert.deepEqual([failedCall('0x08c379a0'), failedCall(undefined), failedCall(`0x${'ff'.repeat(32)}`)], [null, null, null]);
 });
+
+test('A payment made to the account on a transfer’s 2,300 gas still reaches it in the one transaction', async () => {
+  // A contract that pays its caller 1 wei the way a wrapped coin's withdraw does (a call with no gas but the 2,300
+  // a transfer of value carries), and an account whose code takes coin (delegated to code that stops). The account's
+  // own code takes the payment; handed on cold from the batching code it didn't (2,600 for the first touch of the
+  // real code), and a batch of open, withdraw, close stayed "expected to fail".
+  const PAYER = '0x0000000000000000000000000000000000ba1e12', TAKES = '0x00000000000000000000000000000000007a4e50', HOLDER = '0x00000000000000000000000000000000000a11cf';
+  await chain.putCode(PAYER, '0x60006000600060006001336000f160165760006000fd5b00');
+  await chain.putCode(TAKES, '0x00');
+  const code = `0xef0100${TAKES.slice(2)}` as Hex;
+  await chain.putCode(HOLDER, code);
+  await chain.setBalance(PAYER, 10n ** 18n);
+  await chain.setBalance(HOLDER, 10n ** 18n);
+  const withdraw = { to: PAYER, value: 0n, data: '0x' };
+  // Alone, from the account as it is: paid.
+  assert.equal((await sim.simulate({ chainId: 1, from: HOLDER, to: PAYER, data: '0x', value: 0n }))!.status, 'success');
+  // As one transaction, between the calls that need it to be one: paid too, 1 wei in.
+  const whole = (await one([calls[0], withdraw, calls[2]], code, HOLDER))!;
+  assert.deepEqual([whole.status, whole.transfers.filter(t => t.asset === 'native').map(t => [t.to, t.raw])], ['success', [[HOLDER, 1n]]]);
+  // And first in the batch, before anything else was handed on.
+  assert.equal((await one([withdraw, calls[0], calls[2]], code, HOLDER))!.status, 'success');
+});

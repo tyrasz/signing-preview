@@ -207,6 +207,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
   // The account the transaction has act, where it isn't the sender (Decoded.account): what is decoded is that
   // account's, and so is what matters of the simulation.
   const subject = d.account && !sameAddress(d.account, tx.from) ? { chainId: tx.chainId, from: d.account.toLowerCase() } : undefined;
+  // And the accounts its calls hand calls on to (Decoded.actors), the first three: read for too.
+  const actors = [...new Set((d.actors ?? []).map(a => a.toLowerCase()))].filter(a => !sameAddress(a, tx.from) && a !== subject?.from).slice(0, 3);
+  // Whether the run shown is the local EVM's, not the node's: another account's reading of it is then the local EVM's too.
+  let localEvm = false;
   // What was simulated for the result shown (the wallet's pending transactions, then this one), for tracing it.
   let ran: SimulationRequest[] | undefined;
   // A replay shown as the local EVM ran it, where the node's run wasn't what the receipt says: why (see below).
@@ -288,7 +292,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
           } else if (!nodes.matches) {
             const exact: SimulationRequest = replay.ownTimestamp !== undefined ? { ...request, at: { ...request.at!, header: { ...request.at!.header, ownTimestamp: replay.ownTimestamp } } } : request;
             const own = (await deps.simulator.trace([exact], { budgetMs: REPLAY_TRACE_MS }).catch(() => null))?.[0];
-            if (own && compareWithReceipt(own, replay.receipt).matches) { outcome = { result: { ...own, source: LOCAL_RUN } }; ran = [exact]; localRun = replay.ownTimestamp !== undefined ? OWN_TIME : `The chain's node ran this transaction differently from its receipt (${nodes.differences!.join('; ')}). The run shown is the local EVM's, which is what the receipt says.`; }
+            if (own && compareWithReceipt(own, replay.receipt).matches) { outcome = { result: { ...own, source: LOCAL_RUN } }; ran = [exact]; localEvm = true; localRun = replay.ownTimestamp !== undefined ? OWN_TIME : `The chain's node ran this transaction differently from its receipt (${nodes.differences!.join('; ')}). The run shown is the local EVM's, which is what the receipt says.`; }
           }
         }
       }
@@ -300,6 +304,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         const own = (await deps.simulator.trace([...pending, request]).catch(() => null))?.at(-1);
         if (own && (!sameRun(own, outcome.result) || own.gasUsed !== outcome.result.gasUsed)) {
           outcome = { result: { ...own, source: LOCAL_RUN } };
+          localEvm = true;
           b.note(`The gas limit (${tx.gas!.toLocaleString('en-US')}) is over what a transaction has to run on here (${ORDINARY_GAS_CAP.toLocaleString('en-US')}): the rest only pays for new state. The chain's node doesn't simulate that and its run came out differently, so the run shown is the local EVM's.`);
         }
       }
@@ -318,7 +323,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
           // `limited` too): an account with no coin for the fee, as a gasless wallet's has none, was shown failing a
           // transfer it could make, "can't cover the value it sends", where it sent none. Whether the sender can
           // pay the fee is the fee check's.)
-          if (again && !again.limited && !again.refused && effectOf(again, tx.from) !== effectOf(first, tx.from) && !(again.stateReadError && !first.stateReadError)) {
+          // (What it does for the account that acts in the sender's place, and for those handed calls, counts as
+          // what it does for the sender: by the runs' events, the balances read being the sender's.)
+          const changed = [tx.from, ...(subject ? [subject.from] : []), ...actors].some(account => effectOf(again!, account) !== effectOf(first, account));
+          if (again && !again.limited && !again.refused && changed && !(again.stateReadError && !first.stateReadError)) {
             outcome = { result: again };
             ran = [...pending, priced];
             b.note(pricedNote('transaction', price));
@@ -360,40 +368,53 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       const basis = sim.basis === 'state' || sim.basis === 'fork' || sim.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
       const simulated = [...await netChanges(sim.transfers, tx, deps, b, basis), ...await nftChanges(sim.nftTransfers ?? [], tx, deps, b, basis)];
       const declared = (a: ApprovalChange) => !!d.declaredApprovals?.some(x => x.kind === a.kind && sameAddress(x.token, a.token) && sameAddress(x.spender, a.spender));
+      // A simulation reads the balances of one account, the sender's: the same run again, read for the account that
+      // acts in the sender's place (Decoded.account), and for the accounts the calls hand calls on to
+      // (Decoded.actors). The acting account's changes come first; the sender's own (the coin sent with the call,
+      // anything a call takes from or pays to the sender) after them; then the others', each under its account.
+      const reads: { account: string; assetChanges: AssetChange[]; approvals: ApprovalChange[] }[] = [];
+      const unread: string[] = [];
+      for (const account of [...(subject ? [subject.from] : []), ...actors]) {
+        const theirs = ran && deps.simulator ? await forAccount(ran, { chainId: tx.chainId, from: account }, deps, b, false, localEvm).catch(() => null) : null;
+        if (theirs) reads.push({ account, ...theirs }); else unread.push(account);
+      }
+      // (What the request asks of an account whose run couldn't be read is kept, as it asks it.)
+      const asked = (account: string) => assetChanges.filter(c => c.basis === 'requested' && sameAddress(c.account, account));
+      const of = (account: string) => reads.find(r => r.account === account)?.assetChanges ?? asked(account);
       if (subject) {
-        // A simulation reads the balances of one account, the sender's: the same run again, read for the account
-        // that acts. Its changes come first; the sender's own (the coin sent with the call, anything a call takes
-        // from or pays to the sender) after them, each under its account.
-        const short = shortAddress(subject.from);
-        const theirs = ran && deps.simulator ? await forAccount(ran, subject, deps, b).catch(() => null) : null;
+        const short = shortAddress(subject.from), theirs = reads.find(r => r.account === subject.from);
         if (theirs) {
-          assetChanges = [...theirs.assetChanges, ...simulated];
           for (const a of theirs.approvals) if (declared(a)) a.direct = true;
-          // (What it grants along the way is said of it, not of the sender.)
-          accountApprovalWarnings(b, theirs.approvals, subject.from, context.now);
-          approvals = theirs.approvals;
           b.note(`The run was read twice: for your own account, and for ${short}, whose balances and approvals are what the calls change.`);
-        } else {
-          assetChanges = [...assetChanges, ...simulated];
-          if (!preset) b.note(`What the calls move for ${short} is shown as they ask: the simulation read your own account's balances, not that account's.`);
-        }
+        } else if (!preset) b.note(`What the calls move for ${short} is shown as they ask: the simulation read your own account's balances, not that account's.`);
+        assetChanges = [...(theirs ? theirs.assetChanges : assetChanges.filter(c => !actors.some(a => sameAddress(a, c.account)))), ...simulated, ...actors.flatMap(of)];
         // What leaves the sender's own account beyond the coin it sends with the call isn't the account's doing
         // for itself: something the calls reach can spend the sender's tokens, or charges whoever submits it.
         const own = simulated.filter(c => c.direction === 'out' && !(c.asset === 'native' && c.raw !== undefined && BigInt(c.raw) <= tx.value));
         if (own.length) b.warn('caution', 'account_call_takes_yours', `The transaction also takes ${own.map(c => `${c.amount} ${c.symbol}`).join(', ')} out of your own account (${shortAddress(tx.from)}), not ${short}'s: something the calls reach can spend your tokens (an allowance you gave), or charges whoever submits it.`);
+      } else if (actors.length) {
+        // (The sender's own batch: what it moves itself as the run says, or as it asks where the run shows nothing.)
+        const mine = assetChanges.filter(c => !actors.some(a => sameAddress(a, c.account)));
+        assetChanges = [...(simulated.length || !mine.length ? simulated : mine), ...actors.flatMap(of)];
       } else if (simulated.length || !assetChanges.length) assetChanges = simulated;
+      const handed = actors.filter(a => reads.some(r => r.account === a)), left = actors.filter(a => unread.includes(a));
+      if (handed.length) b.note(`The run was read again for ${handed.map(a => shortAddress(a)).join(', ')}, the account${handed.length === 1 ? '' : 's'} the calls hand calls on to: ${handed.length === 1 ? 'its' : 'their'} balances and approvals are what those calls change.`);
+      if (left.length && !preset && left.some(a => asked(a).length)) b.note(`What the calls move for ${left.map(a => shortAddress(a)).join(', ')} is shown as they ask: the simulation read your own account's balances, not ${left.length === 1 ? "that account's" : "those accounts'"}.`);
       const own = await approvalChanges((sim.approvals ?? []).map(approval => ({ approval, callTo: tx.to })), tx, deps, sim.approvalState);
       // Approvals the decoded request already shows (e.g. a router's Permit2 permit step) are not hidden.
       for (const a of own) if (!subject && declared(a)) a.direct = true;
+      // The sender's own first, then what each other account grants along the way, said of it: told together where
+      // they are of one kind (a preview carries each code once, and the account's alone would hide the sender's).
       approvalWarnings(b, own, context.now);
-      approvals = [...approvals, ...own];
+      for (const r of reads) accountApprovalWarnings(b, r.approvals, r.account, context.now);
+      approvals = [...reads.filter(r => r.account === subject?.from).flatMap(r => r.approvals), ...own, ...reads.filter(r => r.account !== subject?.from).flatMap(r => r.approvals)];
       if (sim.coreActions?.length && !sameAddress(tx.to ?? '', HYPERLIQUID.coreWriter)) await simulatedCoreActions(sim.coreActions, tx.from, b, { deps, context });
       // A batch's call leaves the block to the batch's own note.
       b.note(replay || named ? pastNote(sim, preset ? undefined : named) : simulationNote(sim));
       // A simulation the local EVM ran itself, under rules that may not be the chain's: it says so.
       if (sim.rulesNote) b.note(sim.rulesNote);
       // And one that ran contracts the node runs itself (Base's B20 tokens) from their Solidity references.
-      if (sim.standIns?.length) b.note(`The simulation ran ${sim.standIns.length === 1 ? `${sim.standIns[0]}, which this chain's node runs itself,` : `${sim.standIns.length} contracts this chain's node runs itself (${sim.standIns.join(', ')})`} from the Base Standard Library's Solidity reference, which keeps its state where the node does, charged the gas the node charges.`);
+      if (sim.standIns?.length) b.note(standInsNote(sim.standIns));
     }
     // A replay against its receipt: the same outcome, events and gas say the run shown is what happened.
     if (replay) {
@@ -448,10 +469,12 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
  * (`batch`), each of them reporting for it, their changes netted. Null where the run doesn't come out the same way
  * or can't say.
  */
-export async function forAccount(ran: SimulationRequest[], account: { chainId: number; from: string }, deps: Dependencies, b: PreviewBuilder, batch = false): Promise<{ assetChanges: AssetChange[]; approvals: ApprovalChange[] } | null> {
+export async function forAccount(ran: SimulationRequest[], account: { chainId: number; from: string }, deps: Dependencies, b: PreviewBuilder, batch = false, local = false): Promise<{ assetChanges: AssetChange[]; approvals: ApprovalChange[] } | null> {
   if (!deps.simulator || !ran.length) return null;
   const requests = ran.map((q, i) => (batch || i === ran.length - 1 ? { ...q, account: account.from } : q));
-  const all = requests.length > 1 ? (deps.simulator.simulateBatch ? await deps.simulator.simulateBatch(requests) : null) : [await deps.simulator.simulate(requests[0])];
+  // (Where the run shown is the local EVM's, the node's having come out otherwise, so is this reading of it.)
+  const all = local ? (deps.simulator.trace ? await deps.simulator.trace(requests, { budgetMs: REPLAY_TRACE_MS }) : null)
+    : requests.length > 1 ? (deps.simulator.simulateBatch ? await deps.simulator.simulateBatch(requests) : null) : [await deps.simulator.simulate(requests[0])];
   const rs = (batch ? all : all?.slice(-1))?.filter((r): r is SimulationResult => !!r);
   if (!rs?.length || (batch && rs.length !== requests.length) || rs.some(r => r.status !== 'success' || r.limited)) return null;
   // (A simulator that reads the sender's balances whatever account is named says nothing of this one: the probe.)
@@ -462,6 +485,9 @@ export async function forAccount(ran: SimulationRequest[], account: { chainId: n
     approvals: await approvalChanges(rs.flatMap(r => (r.approvals ?? []).map(approval => ({ approval, callTo: null }))), account, deps, rs[rs.length - 1].approvalState),
   };
 }
+
+/** The note of a run that ran contracts the node runs itself (Base's B20 tokens) from their Solidity references. */
+export const standInsNote = (standIns: string[]): string => `The simulation ran ${standIns.length === 1 ? `${standIns[0]}, which this chain's node runs itself,` : `${standIns.length} contracts this chain's node runs itself (${standIns.join(', ')})`} from the Base Standard Library's Solidity reference, which keeps its state where the node does, charged the gas the node charges.`;
 
 /** What an account that isn't the sender grants along the way (forAccount), said of it and not of the sender. */
 export function accountApprovalWarnings(b: PreviewBuilder, approvals: ApprovalChange[], account: string, now?: number): void {

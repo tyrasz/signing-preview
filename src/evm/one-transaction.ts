@@ -32,7 +32,7 @@ export const BATCHER = '0x000000000000000000000000000000005b5c7a01', MOVED = '0x
 export const SELECTOR = '5b5c7a01';
 
 type Op = number | { push: string } | { label: string } | { jump: string } | { jumpi: string };
-const O = { STOP: 0x00, ADD: 0x01, GT: 0x11, EQ: 0x14, ISZERO: 0x15, SHL: 0x1b, SHR: 0x1c, ADDRESS: 0x30, CALLER: 0x33, CALLDATALOAD: 0x35, CALLDATASIZE: 0x36, CALLDATACOPY: 0x37,
+const O = { STOP: 0x00, ADD: 0x01, GT: 0x11, EQ: 0x14, ISZERO: 0x15, SHL: 0x1b, SHR: 0x1c, ADDRESS: 0x30, CALLER: 0x33, CALLDATALOAD: 0x35, CALLDATASIZE: 0x36, CALLDATACOPY: 0x37, EXTCODESIZE: 0x3b, POP: 0x50,
   RETURNDATASIZE: 0x3d, RETURNDATACOPY: 0x3e, MLOAD: 0x51, MSTORE: 0x52, GAS: 0x5a, JUMPDEST: 0x5b, DUP1: 0x80, DUP3: 0x82, DUP6: 0x85, DUP7: 0x86, CALL: 0xf1, RETURN: 0xf3,
   DELEGATECALL: 0xf4, REVERT: 0xfd } as const;
 const p = (hex: string): Op => ({ push: hex });
@@ -62,6 +62,11 @@ export function batcherCode(real: string): Hex {
     O.CALLDATASIZE, p('04'), O.GT, { jumpi: 'forward' },
     O.CALLER, O.ADDRESS, O.EQ, O.ISZERO, { jumpi: 'forward' },
     p('00'), O.CALLDATALOAD, p('e0'), O.SHR, p(SELECTOR), O.EQ, O.ISZERO, { jumpi: 'forward' },
+    // The real code is touched once before the calls, so that it is warm for the rest of the transaction: handing a
+    // call on to it then costs what the account's own code would have cost the caller, and a payment made to the
+    // account on the 2,300 gas of a transfer (a wrapped coin's withdraw) still fits. Cold, the hand-on alone took
+    // 2,600, and a batch of open, withdraw, close stayed "expected to fail".
+    p(real.slice(2).toLowerCase().padStart(40, '0')), O.EXTCODESIZE, O.POP,
     p('04'), p('20'), O.MSTORE,
     { label: 'loop' },
     p('20'), O.MLOAD,                                             // [place]

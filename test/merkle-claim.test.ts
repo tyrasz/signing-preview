@@ -89,3 +89,30 @@ test('A contract that answers as neither distributor, or a chain that doesn’t 
   assert.equal(readsAt({ deps: {}, context: {} } as never), 'latest');
   assert.equal(readsAt({ deps: {}, context: { replay: { at: { block: '0x1940a2f' } } } } as never), '0x1940a2f');
 });
+
+test('The token a distributor says it pays is checked like any token, and a list it doesn’t have pays nothing', async () => {
+  // A contract that answers as a distributor paying a token of its own that calls itself USDC (the fake-airdrop
+  // shape): the claim read "Claim 5,000 USDC from a Merkle distributor", with no warning.
+  const FAKE = '0xfa4e00000000000000000000000000000000fa4e', curated = new StaticTokenRegistry();
+  // (The registry as a live one answers: curated tokens, else what the contract says of itself.)
+  const told = (answers: Record<string, string>): Dependencies => ({ ...chain(answers).d, tokens: { get: async (c: number, a: string) => (a.toLowerCase() === FAKE ? { address: FAKE, symbol: 'USDC', decimals: 6, source: 'onchain' as const } : curated.get(c, a)) } });
+  const single = await send(claim(1n, ALICE, 5_000_000_000n), told({ [S.token]: `0x${w(FAKE)}`, [S.isClaimed]: `0x${w(0n)}` }));
+  assert.deepEqual([single.title, single.attention, codes(single).includes('token_impersonation')], ['Claim 5,000 USDC from a Merkle distributor', 'danger', true]);
+  const tree = (token: string, root = 1n) => `0x${w(token)}${w(0n)}${w(root)}`;
+  const listed = await send(claim(1n, ALICE, 5_000_000_000n), told({ [S.trees]: tree(FAKE), [S.claimed]: `0x${w(0n)}`, [S.native]: `0x${w(NATIVE)}` }));
+  assert.deepEqual([listed.attention, codes(listed).includes('token_impersonation')], ['danger', true]);
+  // (The real one, at its own address, raises nothing.)
+  assert.equal((await send(claim(1n, ALICE, 5_000_000_000n), chain({ [S.token]: `0x${w(USDC)}`, [S.isClaimed]: `0x${w(0n)}` }).d)).attention, 'none');
+
+  // A tree the distributor doesn't have: no token, no root. It was titled "Claim 250000000 base units of token
+  // 0x0000…0000", with that listed as coming in, beside the caution that the claim reverts.
+  const unset = `0x${w(0n)}${w(0n)}${w(0n)}`;
+  const missing = await send(claim(9n, ALICE, 250_000_000n), chain({ [S.trees]: unset, [S.claimed]: `0x${w(0n)}`, [S.native]: `0x${w(NATIVE)}` }).d);
+  assert.deepEqual([missing.title, codes(missing), missing.assetChanges.length], ['Claim from a distributor: it has no such list', ['claim_no_such_list'], 0]);
+  // Also where the distributor names the zero address for the coin: an unset tree is not a claim of coin.
+  const zeroNative = await send(claim(9n, ALICE, 5n * 10n ** 17n), chain({ [S.trees]: unset, [S.claimed]: `0x${w(0n)}`, [S.native]: `0x${w(0n)}` }).d);
+  assert.deepEqual([zeroNative.title, codes(zeroNative), zeroNative.assetChanges.length], ['Claim from a distributor: it has no such list', ['claim_no_such_list'], 0]);
+  // (A tree that is set, of such a distributor, does pay the coin.)
+  const coin = await send(claim(9n, ALICE, 5n * 10n ** 17n), chain({ [S.trees]: tree(`0x${'00'.repeat(20)}`), [S.claimed]: `0x${w(0n)}`, [S.native]: `0x${w(0n)}` }).d);
+  assert.deepEqual([coin.title, coin.assetChanges.map(c => [c.direction, c.amount, c.symbol])], ['Claim 0.5 ETH from a distributor', [['in', '0.5', 'ETH']]]);
+});

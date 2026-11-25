@@ -18,7 +18,7 @@
 import { decodeAbiParameters, encodeAbiParameters, toFunctionSelector, type Hex } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
-import { decoded, readsAt, tokenAmount, tokenInfo, type Adapter } from './common.ts';
+import { decoded, readsAt, tokenAmount, tokenInfo, tokenSourceWarnings, type Adapter } from './common.ts';
 import type { AssetChange } from '../types.ts';
 
 const CLAIM = '0x2e7ba6ef';
@@ -60,26 +60,33 @@ export const merkleClaimAdapter: Adapter = async (tx, env) => {
   // A distributor of several trees, its amounts running totals.
   if (tree && /^0x[0-9a-f]{192}$/i.test(tree) && ADDRESS_WORD.test(tree.slice(0, 66)) && /^0{63}[01]$/.test(tree.slice(66, 130)) && before && /^0x[0-9a-f]{64}$/i.test(before)) {
     const token = `0x${tree.slice(26, 66)}`.toLowerCase(), paused = tree.slice(129, 130) === '1', had = BigInt(before), pays = amount - had;
-    const native = !!nativeToken && ADDRESS_WORD.test(nativeToken) && `0x${nativeToken.slice(26)}`.toLowerCase() === token;
-    const info = native ? undefined : await tokenInfo(env, tx.chainId, token);
+    // A tree the distributor doesn't have answers with nothing: no token, no root. (Not one whose token is the
+    // address the distributor names for the coin, should that be the zero address: it has a root.)
+    const unset = /^0x0{40}$/.test(token) && /^0{64}$/.test(tree.slice(130, 194));
+    const native = !unset && !!nativeToken && ADDRESS_WORD.test(nativeToken) && `0x${nativeToken.slice(26)}`.toLowerCase() === token;
+    const missing = /^0x0{40}$/.test(token) && !native;
+    const info = native || missing ? undefined : await tokenInfo(env, tx.chainId, token);
+    // (The token is whatever the contract called says it pays: one that names itself as a known token isn't it.)
+    tokenSourceWarnings(b, tx.chainId, info);
     const show = (raw: bigint) => (native ? `${formatUnits(raw, chain?.nativeDecimals ?? 18)} ${coin}` : tokenAmount(raw, info, token));
     b.detail('List', `tree ${first}`).detail('Token', native ? coin : info ? `${info.symbol} (${token})` : token, native ? 'native' : token);
     b.detail('Total claimable', show(amount), amount.toString()).detail('Claimed before', show(had), had.toString()).detail('Pays now', pays > 0n ? show(pays) : 'nothing', (pays > 0n ? pays : 0n).toString());
-    if (/^0x0{40}$/.test(token)) b.warn('caution', 'claim_no_such_list', `The distributor has no tree ${first}: the claim reverts.`);
+    if (missing) b.warn('caution', 'claim_no_such_list', `The distributor has no tree ${first}: the claim reverts.`);
     else if (pays <= 0n) b.warn('caution', 'claim_already_made', `${mine ? 'You have' : `${shortAddress(to)} has`} already claimed ${show(had)} of tree ${first}, and this claim's total is ${show(amount)}: nothing is left to pay, and it reverts.`);
     if (paused) b.warn('caution', 'claim_paused', `Tree ${first} is paused on the distributor: the claim reverts until it is resumed.`);
     shared();
     const changes = out(pays, native ? null : token).map(c => (native || !info ? c : { ...c, amount: formatUnits(pays, info.decimals), symbol: info.symbol }));
     return decoded({
-      title: pays > 0n ? `Claim ${show(pays)}${forWhom} from a distributor` : `Claim from a distributor${forWhom}: nothing left to pay`,
-      summary: `Claims from tree ${first} of the distributor ${shortAddress(distributor)}: its total for ${mine ? 'you' : to} is ${show(amount)}, of which ${show(had)} is claimed already.`,
-      decoder: 'merkle_claim', status: 'full', b, assetChanges: paused ? [] : changes, ...(!native && { watch: [token] }),
+      title: missing ? `Claim from a distributor${forWhom}: it has no such list` : pays > 0n ? `Claim ${show(pays)}${forWhom} from a distributor` : `Claim from a distributor${forWhom}: nothing left to pay`,
+      summary: missing ? `Claims from tree ${first} of the distributor ${shortAddress(distributor)}, which it doesn't have.` : `Claims from tree ${first} of the distributor ${shortAddress(distributor)}: its total for ${mine ? 'you' : to} is ${show(amount)}, of which ${show(had)} is claimed already.`,
+      decoder: 'merkle_claim', status: 'full', b, assetChanges: paused || missing ? [] : changes, ...(!native && !missing && { watch: [token] }),
     });
   }
 
   // Uniswap's: one token, each claim made once.
   if (single && ADDRESS_WORD.test(single) && !/^0x0{64}$/.test(single) && isClaimed && /^0x0{63}[01]$/.test(isClaimed)) {
     const token = `0x${single.slice(26)}`.toLowerCase(), claimed = isClaimed.endsWith('1'), info = await tokenInfo(env, tx.chainId, token), what = tokenAmount(amount, info, token);
+    tokenSourceWarnings(b, tx.chainId, info);
     b.detail('Claim index', first.toString()).detail('Token', info ? `${info.symbol} (${token})` : token, token).detail('Amount', what, amount.toString());
     if (claimed) b.warn('caution', 'claim_already_made', `The distributor says claim ${first} is already made: it pays a claim once, and this one reverts.`);
     shared();

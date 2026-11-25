@@ -134,3 +134,34 @@ test('Calls handed on from one account to others are told once, and accounts the
   assert.deepEqual(unread.assetChanges.map(c => [c.account, c.direction, c.raw, c.basis]), [[alice, 'out', '1000000000', 'simulated_state'], [WALLET, 'out', '1000000000', 'requested']]);
   assert.match(unread.decoding.notes.join(' '), /Call 1 has another account make calls: what it moves for that account is shown as the call asks\. The batch's simulation read your own account's balances, not that account's\./);
 });
+
+test('A call the acting account makes back into the sender’s own account is the sender’s, and said to be', async () => {
+  // The sender has another account call its own account's execute: its account's code runs the inner call, and what
+  // that approves is the sender's. Read as the acting account's, the sender's account "has no code, so this call to
+  // it runs nothing" (it was delegated in the same transaction), and the unlimited approval of its USDC wasn't shown.
+  const alice = ALICE.toLowerCase(), DELEGATE = '0x63c0c19a282a1b52b07dd5a65b58948a07dae32b';
+  const inner = encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [USDC, 0n, approve] });
+  const back = encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [ALICE as Hex, 0n, inner] });
+  const codeOf = (own: string): Dependencies => ({ ...offline, rpc: { has: () => true, call: async (_c: number, m: string, p: unknown[]) => (m === 'eth_getCode' ? (String(p[0]).toLowerCase() === alice ? own : '0x6000') : m === 'eth_getTransactionCount' ? '0x0' : '0x') } });
+  const all = (p: Awaited<ReturnType<typeof send>>) => [p.title, p.summary, ...p.details.map(d => d.value), ...p.warnings.map(w => w.message), ...p.decoding.notes].join('\n');
+  // Delegating its own account in the same transaction (an authorization the wallet has yet to sign).
+  const fresh = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: WALLET, data: back, chainId: '0x1', authorizationList: [{ address: DELEGATE, chainId: '0x1', nonce: '0x1' }] }] }, { now: NOW }, codeOf('0x'));
+  assert.ok(!codes(fresh).includes('smart_account_no_code'), codes(fresh).join());
+  assert.match(fresh.warnings.find(w => w.code === 'account_call_back_to_yours')?.message ?? '', /^Call 1: This comes back in your own account \(0xa11c…0001\), called by the account the transaction has act: your account's code makes the call as its own, and what it moves or approves is yours\.$/);
+  assert.match(fresh.warnings.find(w => w.code === 'unlimited_approval')?.message ?? '', /^Call 1: Back in your own account \(0xa11c…0001\): Call 1: 0xb0b0…0002 will be able to move all of your USDC/);
+  assert.match(detail(fresh, 'Call 1') ?? '', /^Back in your own account \(0xa11c…0001\): /);
+  // What is the sender's keeps saying "your"; the rest is the acting account's, and the note tells them apart.
+  assert.match(fresh.decoding.notes.join(' '), /where a line says "you" or "your", that account is meant, not the one sending this \(but for what is marked as back in your own account, which is yours\)\./);
+  assert.ok(!all(fresh).includes('⁣'));
+  assert.equal(fresh.attention, 'danger');   // its own account's delegation, as before
+  // An account that has code already: the same.
+  const delegated = await send(back, codeOf(`0xef0100${DELEGATE.slice(2)}`));
+  assert.ok(codes(delegated).includes('account_call_back_to_yours') && codes(delegated).includes('unlimited_approval'), codes(delegated).join());
+  assert.ok(!delegated.warnings.some(w => /hands? calls on to another account/.test(w.message)));
+  assert.ok(!all(delegated).includes('⁣'));
+  // (A call handed on to a third account is still that account's.)
+  const OTHER = '0x0000000000000000000000000000000000b0b0b0';
+  const on = await send(encodeFunctionData({ abi: ACCOUNT, functionName: 'execute', args: [OTHER as Hex, 0n, inner] }), codeOf('0x'));
+  assert.ok(!codes(on).includes('account_call_back_to_yours'));
+  assert.match(on.warnings.filter(w => w.code === 'account_call').map(w => w.message).join(' '), /hands calls on to another account \(0x0000000000000000000000000000000000b0b0b0\)/);
+});

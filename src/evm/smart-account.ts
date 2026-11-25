@@ -345,7 +345,7 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     if (self) return { d: decoded({ title: `Call your own account (${c.data.slice(0, 10)})`, summary: '', decoder: 'smart_account', status: back?.calls.length ? 'opaque' : 'partial' }), sub };
     // (With the transaction's authorizations: a call into another account this same transaction delegates runs that
     // account's new code. Without them, six accounts a sponsor delegated and then called were each "no code".)
-    return { d: await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value, ...(tx.authorizations && { authorizations: tx.authorizations }) }, env.deps, env.context), sub };
+    return { d: await decodeTransaction({ chainId: tx.chainId, from: tx.from, to: c.target.toLowerCase(), data: c.data.toLowerCase() as Hex, value: c.value, ...(tx.authorizations && { authorizations: tx.authorizations }), ...(tx.origin && { origin: tx.origin, ...(tx.originAuthorizations && { originAuthorizations: tx.originAuthorizations }) }) }, env.deps, env.context), sub };
   };
   const described: { d: Decoded; sub: PreviewBuilder }[] = [];
   for (let i = 0; i < listed.length; i += 8) described.push(...await Promise.all(listed.slice(i, i + 8).map((c, j) => describe(c, i + j))));
@@ -397,6 +397,8 @@ export const smartAccountAdapter: Adapter = async (tx, env) => {
     assetChanges: inner.flatMap(d => d.assetChanges),
     declaredApprovals: inner.flatMap(d => d.declaredApprovals ?? []),
     watch: inner.flatMap(d => d.watch ?? []),
+    // (The accounts its calls hand calls on to, and those they hand on to in turn: a simulation is read for them.)
+    ...(inner.some(d => d.account || d.actors?.length) && { actors: [...new Set(inner.flatMap(d => [...(d.account ? [d.account] : []), ...(d.actors ?? [])]))] }),
   });
 };
 
@@ -418,18 +420,42 @@ export const accountCallAdapter: Adapter = async (tx, env) => {
   if (!tx.to || sameAddress(tx.to, tx.from) || tx.data.length < 10) return null;
   const read = batchCalls(tx.data);
   if (!read || (!read.calls.length && !read.unread)) return null;
-  const account = tx.to.toLowerCase(), short = shortAddress(account);
+  const account = tx.to.toLowerCase(), short = shortAddress(account), origin = (tx.origin ?? tx.from).toLowerCase();
+  // A call that comes back into the transaction's own sender's account, from an account it had act: the sender's
+  // account's code makes the calls, and what they move or approve is the sender's. Read as the sender's own (with
+  // the authorizations it sends for itself, signed or not), and marked: the lines about it say "you" and mean it,
+  // where the lines around them mean the account that acts (KEPT). A sender delegating its account in the same
+  // transaction and reaching it through another account's execute was read as "has no code, so this call to it
+  // runs nothing", the unlimited approval it made of the sender's tokens not shown.
+  if (tx.origin && account === origin) {
+    const own = await smartAccountAdapter({ ...tx, from: origin, origin: undefined, originAuthorizations: undefined, ...((tx.authorizations || tx.originAuthorizations) && { authorizations: [...(tx.authorizations ?? []), ...(tx.originAuthorizations ?? [])] }) }, env);
+    if (!own) return null;
+    const mark = (text: string) => `${text}${KEPT}`, where = `back in your own account (${short})`;
+    const b = new PreviewBuilder();
+    for (const x of own.b.details) b.detail(`In your own account: ${x.label}`, mark(x.value), x.raw);
+    b.warnings.push({ severity: 'caution', code: 'account_call_back_to_yours', message: mark(`This comes ${where}, called by the account the transaction has act: your account's code makes the call${read.calls.length === 1 ? '' : 's'} as its own, and what ${read.calls.length === 1 ? 'it moves or approves' : 'they move or approve'} is yours.`) });
+    for (const w of own.b.warnings) b.warnings.push({ ...w, message: mark(`${where[0].toUpperCase()}${where.slice(1)}: ${w.message}`) });
+    for (const note of own.b.notes) b.note(mark(note));
+    return { ...own, b, title: mark(`${where[0].toUpperCase()}${where.slice(1)}: ${own.title}`), summary: mark(own.summary) };
+  }
   // (An authorization the sender hasn't signed yet is the sender's own, not this account's.)
-  const d = await smartAccountAdapter({ ...tx, from: account, ...(tx.authorizations && { authorizations: tx.authorizations.filter(a => a.signature) }) }, env);
+  const unsigned = tx.origin ? tx.originAuthorizations : tx.authorizations?.filter(a => !a.signature);
+  const d = await smartAccountAdapter({ ...tx, from: account, origin, ...(unsigned?.length && { originAuthorizations: unsigned }), ...(tx.authorizations && { authorizations: tx.authorizations.filter(a => a.signature) }) }, env);
   if (!d) return null;
-  const theirs = (text: string) => text.replace(/\b([Yy])our (?:own )?account\b/g, (_m, y: string) => `${y === 'Y' ? 'The' : 'the'} account ${short}`);
+  // (What is marked as the sender's own is left as it says; the marks come off where the transaction's sender reads it.)
+  const said = (text: string) => (tx.origin ? text : text.replaceAll(KEPT, ''));
+  const theirs = (text: string) => (text.includes(KEPT) ? said(text) : text.replace(/\b([Yy])our (?:own )?account\b/g, (_m, y: string) => `${y === 'Y' ? 'The' : 'the'} account ${short}`));
+  const back = [d.title, ...d.b.warnings.map(w => w.message), ...d.b.details.map(x => x.value)].some(t => t.includes(KEPT));
   const b = new PreviewBuilder();
   for (const x of d.b.details) b.detail(x.label, theirs(x.value), x.raw);
   const n = read.calls.length;
   b.warn('info', 'account_call', `This has the account ${account} make ${n === 1 ? 'the call' : `the ${n} calls`} below, not the account sending it: its code runs ${n === 1 ? 'it' : 'them'} as that account, and what ${n === 1 ? 'it moves or approves' : 'they move or approve'} is that account's. Whether it takes ${n === 1 ? 'the call' : 'them'} from you (as its owner, a key or a module it accepts) is for its code to say.`);
   for (const w of d.b.warnings) b.warnings.push({ ...w, message: theirs(w.message) });
   for (const note of d.b.notes) b.note(theirs(note));
-  b.note(`Each call is read as ${short}'s own: where a line says "you" or "your", that account is meant, not the one sending this.`);
+  b.note(`Each call is read as ${short}'s own: where a line says "you" or "your", that account is meant, not the one sending this${back ? ' (but for what is marked as back in your own account, which is yours)' : ''}.`);
   const title = theirs(d.title);
   return { ...d, b, title: title.includes(short) ? title : `As the account ${short}: ${title}`, summary: theirs(d.summary), decoder: 'account_call', account };
 };
+
+/** Ends a text that speaks of the transaction's own sender inside a call read as another account's: left as it says. */
+const KEPT = '\u2063';

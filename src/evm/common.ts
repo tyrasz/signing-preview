@@ -24,6 +24,13 @@ export interface Tx {
   nonce?: bigint;
   /** The request's EIP-2930 access list: it costs gas up front and warms what it names, and adds to an OP Stack L1 fee. */
   accessList?: { address: string; storageKeys: string[] }[];
+  /**
+   * The transaction's own sender, where `from` stands for an account acting inside it: a call read as another
+   * account's (src/evm/smart-account.ts, accountCallAdapter), which can come back into the sender's own account.
+   */
+  origin?: string;
+  /** With `origin`: the authorizations the sender sends for its own account and has yet to sign, which aren't `from`'s. */
+  originAuthorizations?: AuthorizationRequest[];
 }
 
 /** One EIP-7702 authorization, as requested: unsigned (the wallet signs it for the sender) or already signed. */
@@ -56,6 +63,11 @@ export interface Decoded {
    * simulation's are told of it as well as of the sender (src/evm/transaction.ts).
    */
   account?: string;
+  /**
+   * Other accounts the transaction's calls have act: those a batch of the sender's own account hands calls on to
+   * (src/evm/smart-account.ts). What they move isn't the sender's, and a simulation's changes are read for them too.
+   */
+  actors?: string[];
 }
 
 export interface AdapterEnv {

@@ -78,7 +78,9 @@ const blockReceipts = (block: string) => { let r = RECEIPTS.get(block); if (!r) 
 async function othersDelegated(list: readonly { chainId: string; address: string; nonce: string; yParity?: string; v?: string; r: string; s: string }[] | undefined, account: string): Promise<number> {
   let n = 0;
   for (const a of list ?? []) {
-    const yParity = a.yParity !== undefined ? Number(a.yParity) : a.v !== undefined ? Number(BigInt(a.v) % 2n === 0n ? 1 : 0) : 0;
+    // (v as a node gives it: the parity itself, 0 or 1, or 27 and 28.)
+    const v = a.v !== undefined ? BigInt(a.v) : 0n;
+    const yParity = a.yParity !== undefined ? Number(a.yParity) : Number(v <= 1n ? v : (v - 27n) % 2n);
     const signer = await recoverAuthorizationAddress({ authorization: { address: a.address as Hex, chainId: Number(a.chainId), nonce: Number(a.nonce) }, signature: { r: a.r as Hex, s: a.s as Hex, yParity } }).catch(() => null);
     if (signer && signer.toLowerCase() !== account) n++;
   }
