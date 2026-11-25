@@ -35,6 +35,18 @@ const TRANSACTION_GAS_CAP = 16_777_216n, GAS_CAPPED = new Set([1, 56, 8453, 10])
  * (evmUserModify; the node answers eth_usingBigBlocks), and big blocks have their own base fee (eth_bigBlockGasPrice).
  */
 const HYPEREVM = 999, HYPEREVM_SMALL_BLOCK = 3_000_000n, HYPEREVM_BIG_BLOCK = 30_000_000n;
+/**
+ * Chains whose nodes refuse a transaction that offers under a least of their own, whatever the base fee (2026-11-25).
+ * BNB Chain has no base fee (zero), so what a transaction names is all it pays: its node refuses a price under 0.05
+ * gwei ("require GasPrice=50000000, Provide=10000000", for a legacy price and for a priority fee alike, and takes
+ * 0.05 on to the funds check), suggests exactly that (eth_gasPrice, eth_maxPriorityFeePerGas), and none of 1,627
+ * priced transactions in 15 blocks paid less. Polygon's refuses a priority fee under 25 gwei ("transaction gas price
+ * below minimum: gas tip cap 1500000000, minimum needed 25000000000"; 24.9 refused, 25 taken), and of 6,361 priced
+ * transactions in 80 blocks three paid validators less over the base fee, 24.78 at the lowest; its node suggests
+ * about 30. A chain can lower its least (BNB Chain has, several times), and its node's suggestion follows: the least
+ * held to is the lower of the figure here and what the node suggests now.
+ */
+export const LEAST_TIP: Record<number, bigint> = { 56: 50_000_000n, 137: 25_000_000_000n };
 const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
 const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
 const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
@@ -112,7 +124,7 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     call<string>('eth_getTransactionCount', [tx.from, 'pending']),
     call<string>('eth_getBalance', [tx.from, 'latest']),
     call<{ baseFeePerGas?: string; blockAccessListHash?: string; gasLimit?: string }>('eth_getBlockByNumber', ['latest', false]),
-    tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
+    (tx.maxPriorityFeePerGas === undefined && tx.gasPrice === undefined) || LEAST_TIP[tx.chainId] !== undefined ? call<string>('eth_maxPriorityFeePerGas', []) : Promise.resolve(undefined),
     arbitrum ? call<string>('eth_call', [{ to: NODE_INTERFACE, data: encodeFunctionData({ abi: L1_COMPONENT, functionName: 'gasEstimateL1Component', args: [(tx.to ?? '0x0000000000000000000000000000000000000000') as Hex, tx.to === null, tx.data] }) }, 'latest']) : Promise.resolve(undefined),
     // HyperEVM: which kind of block the account's transactions go into, and big blocks' base fee (HYPEREVM).
     tx.chainId === HYPEREVM ? call<boolean>('eth_usingBigBlocks', [tx.from]) : Promise.resolve(undefined),
@@ -150,6 +162,23 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
   const baseFee = bigBase !== undefined ? BigInt(bigBase) : block?.baseFeePerGas !== undefined ? BigInt(block.baseFeePerGas) : undefined;
   const cap = tx.maxFeePerGas ?? tx.gasPrice;
   if (cap !== undefined && baseFee !== undefined && cap < baseFee) b.warn('caution', 'fee_below_base_fee', `The fee cap (${gwei(cap)}) is below the current base fee (${gwei(baseFee)}): the transaction waits until the base fee falls that low.`);
+
+  // A fee under the least the chain's nodes take (LEAST_TIP), where the request names one: what it offers validators
+  // (its priority fee; a legacy price whole; with a fee cap alone, the tip a wallet adds, which the cap bounds).
+  const known = LEAST_TIP[tx.chainId];
+  if (known !== undefined && tip !== undefined && cap !== undefined) {
+    const suggested = BigInt(tip), least = suggested < known ? suggested : known;
+    const offered = tx.maxPriorityFeePerGas ?? tx.gasPrice ?? (cap < suggested ? cap : suggested);
+    const what = tx.maxPriorityFeePerGas !== undefined ? 'priority fee' : tx.gasPrice !== undefined ? 'gas price' : 'fee cap';
+    const over = baseFee !== undefined && cap >= baseFee ? cap - baseFee : undefined;
+    if (offered < least) {
+      b.warn('danger', 'fee_below_minimum', `The ${what} (${gwei(offered)}) is below the least ${chainName(tx.chainId)} takes (${gwei(least)}): its nodes refuse a transaction that offers less, so the network will reject this transaction as it is.`);
+    } else if (over !== undefined && over < least && !(tx.maxPriorityFeePerGas !== undefined && tx.maxPriorityFeePerGas > cap)) {
+      // (Taken by a node, and left by validators until the base fee leaves them their least: of 6,361 transactions
+      // on Polygon three were included with a little less, 24.78 gwei at the lowest.)
+      b.warn('caution', 'fee_cap_leaves_low_tip', `The fee cap (${gwei(cap)}) leaves ${gwei(over)} over the current base fee (${gwei(baseFee!)}) for validators, who take ${gwei(least)} at least on ${chainName(tx.chainId)}: the transaction may wait until the base fee falls.`);
+    }
+  }
 
   // A gas limit above what the chain lets one transaction have: refused as it is, whatever it would have used.
   if (tx.gas !== undefined && tx.gas > TRANSACTION_GAS_CAP && GAS_CAPPED.has(tx.chainId) && block && block.blockAccessListHash === undefined) {

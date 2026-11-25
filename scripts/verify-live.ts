@@ -27,6 +27,7 @@ import { createPublicClient, http, formatUnits, toFunctionSelector, encodeFuncti
 import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { previewRequest } from '../src/preview.ts';
 import { builtinTokens, CHAINS, EVM_RPCS, HYPERCORE_CCTP_WITHDRAWAL, StaticTokenRegistry } from '../src/chains.ts';
+import { LEAST_TIP } from '../src/evm/tx-checks.ts';
 import { ChainedTokenRegistry, OnchainTokenRegistry } from '../src/tokens.ts';
 import { ChainedSignatures, ContractAbiResolver, detectProxy, EtherscanAbiSource, FourByteSignatures, OpenChainSignatures, SourcifyAbiSource } from '../src/abi.ts';
 import type { RpcClient } from '../src/rpc.ts';
@@ -698,6 +699,25 @@ console.log('\n# Contracts read from their layout or signed types: still the cod
   }
   const modules = await rpcCall(42161, 'eth_call', [{ to: '0x0000000000bbf5c5fd284e657f01bd000933c96d', data: '0xb2494df3' }, 'latest']);
   check(!!modules && modules.length > 130, 'Velora Delta adapter modules'.padEnd(34), modules ? `${(modules.length - 2) / 2} bytes` : 'no answer');
+}
+
+// The least fee a chain's nodes take (LEAST_TIP in src/evm/tx-checks.ts): a request naming less is told the network
+// will reject it. A chain that lowers its least mines transactions under it within blocks, and those warnings would
+// then be wrong: what the transactions of its latest blocks paid validators over the base fee is read here.
+console.log("\n# The least fee a chain's nodes take: what the transactions of its latest blocks paid");
+for (const [id, least] of Object.entries(LEAST_TIP)) {
+  const url = process.env[EVM_RPCS[Number(id)].env] ?? EVM_RPCS[Number(id)].public;
+  const head = BigInt((await jsonRpc(url, { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] })).result);
+  let lowest: bigint | undefined, priced = 0;
+  for (let i = 0n; i < 6n; i++) {
+    const block = (await jsonRpc(url, { jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber', params: [toHex(head - i * 25n), true] }))?.result as { baseFeePerGas?: string; transactions?: { gasPrice?: string }[] } | null;
+    const base = BigInt(block?.baseFeePerGas ?? 0);
+    // (A price of zero is the chain's own: a validator's system transaction, a state sync.)
+    for (const t of block?.transactions ?? []) { const price = BigInt(t.gasPrice ?? 0); if (price === 0n) continue; priced++; if (lowest === undefined || price - base < lowest) lowest = price - base; }
+  }
+  // (Polygon's validators include a few with a little less than its nodes take: 24.43 gwei the lowest of 10,856.
+  // A tenth under is allowed for that; a least that was lowered shows well under it.)
+  check(lowest !== undefined && lowest * 10n >= least * 9n, `Least fee, ${CHAINS[Number(id)].name}`.padEnd(34), `the lowest of ${priced} priced transactions paid ${lowest === undefined ? 'nothing read' : formatUnits(lowest, 9)} gwei over the base fee; held to ${formatUnits(least, 9)}`);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

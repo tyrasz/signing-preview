@@ -157,6 +157,54 @@ test('A fee cap under the base fee, and a balance short of the value plus the mo
   assert.ok(!codes(await send({ gas: toHex(100_000n), maxFeePerGas: toHex(20n * GWEI) })).includes('insufficient_funds_for_gas'));
 });
 
+test('A fee under the least a chain’s nodes take: refused on BNB Chain and Polygon, and a cap that leaves validators too little waits', async () => {
+  // BNB Chain's node refuses a price under 0.05 gwei and Polygon's a priority fee under 25 gwei (2026-11-25, asked
+  // with unfunded transactions); the preview priced such a transaction and said nothing.
+  const node = (base: bigint, suggested: bigint): Dependencies => ({ ...deps(), rpc: { has: () => true, call: async (_c: number, method: string, params: unknown[]) =>
+    method === 'eth_getBlockByNumber' ? { baseFeePerGas: toHex(base) } : method === 'eth_maxPriorityFeePerGas' ? toHex(suggested) : rpc(10n ** 18n).call(1, method, params) } });
+  const fee = (p: Awaited<ReturnType<typeof send>>) => p.warnings.find(w => w.code === 'fee_below_minimum' || w.code === 'fee_cap_leaves_low_tip');
+  const g = (n: number) => toHex(BigInt(Math.round(n * 1e9)));
+
+  const bnb = (tx: Record<string, unknown>, suggested = GWEI / 20n) => send({ chainId: '0x38', ...tx }, node(0n, suggested));
+  const low = fee(await bnb({ gasPrice: g(0.01) }));
+  assert.equal(low?.severity, 'danger');
+  assert.match(low!.message, /^The gas price \(0\.01 gwei\) is below the least BNB Chain takes \(0\.05 gwei\): its nodes refuse .* the network will reject this transaction as it is\.$/);
+  assert.equal(fee(await bnb({ gasPrice: g(0.05) })), undefined);
+  assert.match(fee(await bnb({ maxFeePerGas: g(1), maxPriorityFeePerGas: g(0.01) }))!.message, /^The priority fee \(0\.01 gwei\) is below the least/);
+  // A fee cap alone: the tip a wallet adds can't pass it.
+  assert.match(fee(await bnb({ maxFeePerGas: g(0.02) }))!.message, /^The fee cap \(0\.02 gwei\) is below the least/);
+  assert.equal(fee(await bnb({ maxFeePerGas: g(1) })), undefined);
+  assert.equal(fee(await bnb({})), undefined, 'a request that names no fee is priced by the wallet');
+  // A chain that lowers its least: the node's suggestion follows it, and the lower of the two is held to.
+  assert.equal(fee(await bnb({ gasPrice: g(0.02) }, GWEI / 100n)), undefined);
+  assert.match(fee(await bnb({ gasPrice: g(0.005) }, GWEI / 100n))!.message, /below the least BNB Chain takes \(0\.01 gwei\)/);
+
+  const polygon = (tx: Record<string, unknown>, suggested = 30n * GWEI) => send({ chainId: '0x89', ...tx }, node(250n * GWEI, suggested));
+  const tip = fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(1.5) }));
+  assert.equal(tip?.severity, 'danger');
+  assert.match(tip!.message, /^The priority fee \(1\.5 gwei\) is below the least Polygon takes \(25 gwei\)/);
+  // Under what the node suggests and over the least: taken (20 of 1,063 transactions paid between the two).
+  assert.equal(fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(26) })), undefined);
+  assert.equal(fee(await polygon({ gasPrice: g(600) })), undefined);
+  // A cap that leaves validators under their least over the base fee: a node takes it, and it waits.
+  const waits = fee(await polygon({ maxFeePerGas: g(260), maxPriorityFeePerGas: g(30) }));
+  assert.equal(waits?.severity, 'caution');
+  assert.equal(waits!.message, 'The fee cap (260 gwei) leaves 10 gwei over the current base fee (250 gwei) for validators, who take 25 gwei at least on Polygon: the transaction may wait until the base fee falls.');
+  assert.equal(fee(await polygon({ gasPrice: g(270) }))?.code, 'fee_cap_leaves_low_tip');
+  assert.equal(fee(await polygon({ maxFeePerGas: g(260) }))?.code, 'fee_cap_leaves_low_tip');
+  // A cap under the base fee is said once, as waiting on the base fee.
+  const under = await polygon({ maxFeePerGas: g(200), maxPriorityFeePerGas: g(30) });
+  assert.ok(codes(under).includes('fee_below_base_fee'));
+  assert.equal(fee(under), undefined);
+  // A tip above the cap is refused for that, not also said to wait.
+  assert.equal(fee(await polygon({ maxFeePerGas: g(260), maxPriorityFeePerGas: g(300) })), undefined);
+  assert.equal(fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(12) }, 10n * GWEI)), undefined);
+  assert.match(fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(5) }, 10n * GWEI))!.message, /below the least Polygon takes \(10 gwei\)/);
+
+  // No such least elsewhere: Ethereum mines transactions that tip nothing.
+  assert.equal(fee(await send({ maxFeePerGas: g(2), maxPriorityFeePerGas: '0x0' })), undefined);
+});
+
 test('A gas limit too low says how much the call needs; nodes’ refusals are answers', async () => {
   const p = await send({ gas: toHex(30_000n), data: '0x12345678' });
   assert.equal(p.simulation?.revertReason, 'out of gas: the gas limit (30,000) is below the 50,000 gas this call needs');
