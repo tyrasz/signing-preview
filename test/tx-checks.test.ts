@@ -175,6 +175,13 @@ test('A fee under the least a chain’s nodes take: refused on BNB Chain and Pol
   assert.match(fee(await bnb({ maxFeePerGas: g(0.02) }))!.message, /^The fee cap \(0\.02 gwei\) is below the least/);
   assert.equal(fee(await bnb({ maxFeePerGas: g(1) })), undefined);
   assert.equal(fee(await bnb({})), undefined, 'a request that names no fee is priced by the wallet');
+  // A price of zero is a sponsored transaction on BNB Chain, which mines a tenth of its transactions so: said as
+  // what it is, not as one the network will reject (as it was).
+  for (const zero of [{ gasPrice: '0x0' }, { maxFeePerGas: '0x0', maxPriorityFeePerGas: '0x0' }]) {
+    const sponsored = await bnb(zero);
+    assert.equal(fee(sponsored), undefined);
+    assert.equal(sponsored.warnings.find(w => w.code === 'fee_zero_sponsored')?.severity, 'info');
+  }
   // A chain that lowers its least: the node's suggestion follows it, and the lower of the two is held to.
   assert.equal(fee(await bnb({ gasPrice: g(0.02) }, GWEI / 100n)), undefined);
   assert.match(fee(await bnb({ gasPrice: g(0.005) }, GWEI / 100n))!.message, /below the least BNB Chain takes \(0\.01 gwei\)/);
@@ -186,6 +193,8 @@ test('A fee under the least a chain’s nodes take: refused on BNB Chain and Pol
   // A priority fee named alone (the wallet fills in the cap): checked as well.
   assert.match(fee(await polygon({ maxPriorityFeePerGas: g(1.5) }))!.message, /^The priority fee \(1\.5 gwei\) is below the least Polygon takes \(25 gwei\)/);
   assert.equal(fee(await polygon({ maxPriorityFeePerGas: g(30) })), undefined);
+  // (Polygon mines none that tip nothing: zero is under the least there as any other.)
+  assert.equal(fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: '0x0' }))?.severity, 'danger');
   // Under what the node suggests and over the least: taken (20 of 1,063 transactions paid between the two).
   assert.equal(fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(26) })), undefined);
   assert.equal(fee(await polygon({ gasPrice: g(600) })), undefined);

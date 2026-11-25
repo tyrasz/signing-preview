@@ -1206,10 +1206,11 @@ export function batchRefusal(message: string, reqs: SimulationRequest[]): { firs
  * information.) An unknown call's place in `results` holds no result of its own. Null where the node fails
  * otherwise.
  *
- * `overBlock`: the node refused the batch for gas limits a block doesn't hold (batchRefusal). A call that names one
- * no block holds is refused whatever comes before it, and a limit a block holds means any lower does: the calls that
- * name a limit are asked alone, from the highest down, until one is taken. (A batch of three transfers, the second
- * naming a limit of a thousand million, was "could not be simulated" on Ethereum, BNB Chain and Base.)
+ * A call that names a gas limit no block holds is refused whatever comes before it, and a limit a block holds means
+ * any lower does: the calls that name a limit are asked alone first, from the highest down, until one is taken. (A
+ * batch of three transfers, the second naming a limit of a thousand million, was "could not be simulated" on
+ * Ethereum, BNB Chain and Base.) `overBlock`: gas limits are what the node refused the batch for (batchRefusal);
+ * where no call's own is too high then, the limits only pass a block's together, and nothing is found.
  */
 export async function withoutRefused(all: SimulationRequest[], simulator: Simulator, first: string, overBlock = false): Promise<{ results: SimulationResult[]; live: number[]; unknown: number[] } | null> {
   let tries = 0;
@@ -1233,30 +1234,37 @@ export async function withoutRefused(all: SimulationRequest[], simulator: Simula
   const answer = (ran: number[], rs: SimulationResult[], unknown: number[]) => ({ live: ran, unknown, results: all.map((_, i): SimulationResult => (
     refused.has(i) ? { status: 'reverted', source: source ?? "the chain's node", revertReason: refused.get(i)!, transfers: [], limited: true, refused: true }
       : unknown.includes(i) ? { status: 'success', source: source ?? "the chain's node", transfers: [], limited: true } : rs[ran.indexOf(i)])) });
-  if (overBlock) {
-    const named = live.filter(i => all[i].gas !== undefined).sort((x, y) => (all[y].gas! > all[x].gas! ? 1 : all[y].gas! < all[x].gas! ? -1 : x - y));
-    let last: { gas: bigint; reason: string } | undefined;
-    for (const i of named) {
-      if (last && last.gas === all[i].gas) { refused.set(i, last.reason); continue; }
-      const alone = tries < REFUSED_TRIES ? await attempt([all[i]]) : undefined;
-      if (typeof alone !== 'string' || !/^gas limit too high/.test(alone)) break;
-      refused.set(i, alone); last = { gas: all[i].gas!, reason: alone };
-    }
-    if (!refused.size) return null;
+  /** What was found when the tries are spent or the node stops answering: kept, the rest left unsaid. */
+  const partial = () => (refused.size ? answer(live.slice(0, good.length), good, live.slice(good.length)) : null);
+  // Calls naming a gas limit no block holds, whichever the node complained of first: geth says a call can't be paid
+  // for before it adds up the limits, reth the other way round, and a batch with one of each was left unsimulated
+  // on the first. (One request more where a call names a limit, which a wallet's batch seldom does.)
+  const named = live.filter(i => all[i].gas !== undefined).sort((x, y) => (all[y].gas! > all[x].gas! ? 1 : all[y].gas! < all[x].gas! ? -1 : x - y));
+  let last: { gas: bigint; reason: string } | undefined;
+  for (const i of named) {
+    if (last && last.gas === all[i].gas) { refused.set(i, last.reason); continue; }
+    const alone = tries < REFUSED_TRIES ? await attempt([all[i]]) : undefined;
+    if (typeof alone !== 'string' || !/^gas limit too high/.test(alone)) break;
+    refused.set(i, alone); last = { gas: all[i].gas!, reason: alone };
+  }
+  if (overBlock && !refused.size) return null;
+  if (refused.size) {
     live = live.filter(i => !refused.has(i));
     if (!live.length) return answer([], [], []);
     const rest = await attempt(live.map(i => all[i]));
-    if (rest === undefined) return null;
+    if (rest === undefined) return partial();
     if (typeof rest !== 'string') return answer(live, rest, []);
     reason = rest;
   }
-  while (live.length && tries < REFUSED_TRIES) {
+  while (live.length) {
     // The shortest run from the start of `live` that the node refuses: longer than what is known to run, and `live`
     // itself at most.
     let lo = good.length + 1, hi = live.length, mid = lo;
     while (lo < hi) {
+      if (tries >= REFUSED_TRIES) return partial();
       const r = await attempt(live.slice(0, mid).map(i => all[i]));
-      if (r === undefined) return null;
+      // (A node that stops answering midway, a rate limit, leaves what was found standing: it was all dropped.)
+      if (r === undefined) return partial();
       if (typeof r === 'string') { hi = mid; reason = r; } else { lo = mid + 1; good = r; source ??= r[0].source; }
       mid = (lo + hi) >> 1;
     }
@@ -1266,13 +1274,14 @@ export async function withoutRefused(all: SimulationRequest[], simulator: Simula
     refused.set(index, reason);
     live = live.filter(i => i !== index);
     if (live.length === good.length) return answer(live, good, []);
+    if (tries >= REFUSED_TRIES) return partial();
     const rest = await attempt(live.map(i => all[i]));
-    if (rest === undefined) return null;
+    if (rest === undefined) return partial();
     if (typeof rest === 'string') { reason = rest; continue; }
     source ??= rest[0]?.source;
     return answer(live, rest, []);
   }
-  return refused.size ? answer(live.slice(0, good.length), good, live.slice(good.length)) : null;
+  return partial();
 }
 /** How many times withoutRefused asks the node (the three calls it looked for before took up to twenty-one). */
 const REFUSED_TRIES = 24;

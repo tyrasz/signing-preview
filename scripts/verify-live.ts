@@ -722,7 +722,8 @@ for (const [id, least] of Object.entries(LEAST_TIP)) {
   for (let i = 0n; i < 6n; i++) {
     const block = (await jsonRpc(url, { jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber', params: [toHex(head - i * 25n), true] }))?.result as { baseFeePerGas?: string; transactions?: { gasPrice?: string }[] } | null;
     const base = BigInt(block?.baseFeePerGas ?? 0);
-    // (A price of zero is the chain's own: a validator's system transaction, a state sync.)
+    // (A price of zero is a validator's system transaction, a state sync, or on BNB Chain one a sponsor pays for:
+    // those aren't under the least, they are outside it, and the preview says so of one, as information.)
     for (const t of block?.transactions ?? []) { const price = BigInt(t.gasPrice ?? 0); if (price === 0n) continue; priced++; if (lowest === undefined || price - base < lowest) lowest = price - base; }
   }
   // (Polygon's validators include a few with a little less than its nodes take: 24.43 gwei the lowest of 10,856.

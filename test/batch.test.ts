@@ -229,9 +229,12 @@ test('A batch with a call the account can’t pay for says which call, where the
   assert.match(p.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^Call 2: The network would refuse this transaction as it stands: insufficient funds: the account can't cover the value it sends\. It would not be mined\.$/);
   assert.match(p.warnings.find(w => w.code === 'batch_partial_failure')?.message ?? '', /^The network would refuse call 2 as it stands \(insufficient funds: the account can't cover the value it sends\)\. The batch is not marked all-or-nothing/);
   assert.ok(!codes(p).includes('simulation_unavailable') && !codes(p).includes('simulation_skipped'), codes(p).join());
-  // All or nothing: none of it happens.
+  // All or nothing: none of it happens. Such a batch is one transaction, which is mined, fails at the call that
+  // sends coin the account hasn't, and pays its fee: the call isn't a transaction the network refuses there (it
+  // read "the network would refuse call 2", with "It would not be mined" of the call).
   const atomic = await batch([send, pay], true);
-  assert.match(atomic.warnings.find(w => w.code === 'batch_will_fail')?.message ?? '', /^This batch is all-or-nothing, and the network would refuse call 2 as it stands \(insufficient funds: the account can't cover the value it sends\), so none of the calls would take effect\.$/);
+  assert.equal(atomic.warnings.find(w => w.code === 'batch_will_fail')?.message, 'This batch is all-or-nothing, and call 2 is expected to fail, so none of the calls would take effect. You would still pay the network fee.');
+  assert.match(atomic.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^Call 2: The transaction is expected to fail: insufficient funds: the account can't cover the value it sends\. You would still pay the network fee\.$/);
   assert.equal(atomic.attention, 'danger');
   // The first call: found from the call alone.
   const first = await batch([pay, send]);
@@ -260,9 +263,26 @@ test('A batch with a call the account can’t pay for says which call, where the
   assert.equal(flood.calls?.map(c => c.simulation?.status[0]).join(''), 'rrrrrrrrrrrruuuu');
   assert.equal(flood.simulation?.status, 'reverted');
   assert.match(flood.simulation?.source ?? '', /, 12 calls in order$/);
-  assert.match(flood.warnings.find(w => w.code === 'simulation_skipped' && /^Call 13:/.test(w.message))?.message ?? '', /^Call 13: This call was not simulated: the network would refuse so many of this batch's calls as they stand/);
-  assert.ok(flood.decoding.notes.some(n => n === 'The network would refuse 12 of the first 12 calls as they stand, and the preview stopped looking there: calls 13 to 16 were not simulated.'), flood.decoding.notes.join(' | '));
+  assert.match(flood.warnings.find(w => w.code === 'simulation_skipped' && /^Call 13:/.test(w.message))?.message ?? '', /^Call 13: This call was not simulated: the network would refuse others of this batch's calls as they stand, and the preview didn't get to this one/);
+  assert.ok(flood.decoding.notes.some(n => n === "The network would refuse 12 of this batch's calls as they stand, and the preview stopped looking for more: calls 13 to 16 were not simulated."), flood.decoding.notes.join(' | '));
   assert.ok(!codes(flood).includes('simulation_unavailable'));
+  // The node is asked 24 times at most to find them, whatever the batch (it was checked between calls found only:
+  // 32 calls, every other one unpaid, took 32).
+  for (const calls of [[...Array.from({ length: 14 }, () => pay), send, send], Array.from({ length: 32 }, (_, i) => (i % 2 ? pay : send))]) {
+    asked = 0;
+    const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: counting });
+    assert.ok(asked <= 25, `the node was asked ${asked} times (the batch, and 24 to find the calls)`);
+    assert.ok(p.calls?.some(c => c.simulation?.status === 'reverted') && p.calls?.some(c => c.simulation?.status === 'unavailable'));
+    // What ran before the last call found is kept as it ran; nothing found is said of a call that wasn't asked about.
+    const statuses = p.calls!.map(c => c.simulation?.status[0]).join('');
+    assert.match(statuses, /^[sr]+u+$/, statuses);
+    for (const [i, c] of p.calls!.entries()) if (c.simulation?.status !== 'unavailable') assert.equal(c.simulation?.status, calls[i] === pay ? 'reverted' : 'success', `call ${i + 1}`);
+  }
+  // A node that stops answering midway (a rate limit) leaves what was found standing: it was all dropped.
+  let left = 5;
+  const tiring: Simulator = { simulate: r => { if (left-- <= 0) throw new Error('RPC HTTP 429: Too Many Requests'); return simulator.simulate(r); }, simulateBatch: rs => { if (left-- <= 0) throw new Error('RPC HTTP 429: Too Many Requests'); return simulator.simulateBatch!(rs); } };
+  const tired = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [pay, pay, pay, pay, send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: tiring });
+  assert.equal(tired.calls?.map(c => c.simulation?.status[0]).join(''), 'rruuu');
   // A node error that says nothing of the kind is as it was.
   const other = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [send, send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ok(), simulateBatch: async () => { throw new Error('RPC HTTP 503'); } } });
   assert.ok(codes(other).includes('simulation_unavailable'));
@@ -335,6 +355,31 @@ test('A batch with a call naming a gas limit no block holds says which call; lim
   const several = await batch([call(10n ** 9n), call(50_000n), call(10n ** 9n), call(2n * 10n ** 9n), call(100_000n)]);
   assert.equal(several.calls?.map(c => c.simulation?.status[0]).join(''), 'rsrrs');
   assert.deepEqual(asked, [5, 1, 1, 1, 2]);
+  // With a call that can't be paid for as well, whichever the node complains of first: geth says the unpaid call
+  // before it adds up the limits (the batch was left unsimulated), reth the limits first.
+  const unpaid = { to: '0x00000000000000000000000000000000000b0b0b', value: '0x1' };
+  const fundsRefusal = 'eth_simulateV1 failed: insufficient funds for gas * price + value: have 0 want 1';
+  const refusedForFunds = (): SimulationResult => ({ status: 'reverted', source: 'mock', revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true, refused: true });
+  for (const gasFirst of [false, true]) {
+    const both: Simulator = {
+      simulate: async r => (r.gas !== undefined && r.gas > BLOCK ? tooHigh(r.gas) : r.value > 0n ? refusedForFunds() : ok()),
+      simulateBatch: async rs => {
+        const overLimit = rs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n) > BLOCK, short = rs.some(r => r.value > 0n);
+        if (overLimit && (gasFirst || !short)) throw new Error(over);
+        if (short) throw new Error(fundsRefusal);
+        return rs.map(ok);
+      },
+    };
+    const mixed = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [unpaid, call(), call(10n ** 9n)] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: both });
+    assert.equal(mixed.calls?.map(c => c.simulation?.status[0]).join(''), 'rsr', gasFirst ? 'limits first' : 'funds first');
+    // More unpaid calls than are looked for, and a call found for its gas limit after them: the note counts what was
+    // found and names the calls not got to (it said "12 of the first 11 calls", the last call among those "not simulated").
+    const long = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [...Array.from({ length: 14 }, () => unpaid), call(), call(10n ** 9n)] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: both });
+    const statuses = long.calls!.map(c => c.simulation?.status[0]).join('');
+    assert.match(statuses, /^r{11,12}u+r$/, statuses);
+    const found = statuses.split('r').length - 1, first = statuses.indexOf('u') + 1;
+    assert.ok(long.decoding.notes.includes(`The network would refuse ${found} of this batch's calls as they stand, and the preview stopped looking for more: calls ${first} to 15 were not simulated.`), long.decoding.notes.join(' | '));
+  }
   // Limits that together pass a block's and each fit one: transactions that go into blocks of their own. No call
   // is blamed.
   const together = await batch([call(30_000_000n), call(30_000_000n), call(30_000_000n)]);

@@ -18,9 +18,17 @@
 //
 // Half the "swaps" mined ask nothing back: a minimum of zero, and no call that buys the token the request names (the
 // call hands the tokens to a cross-chain service, which is how Trust Wallet's routes to Tron, Bitcoin and Solana
-// go). On this chain those are a transfer into that service, and are shown as that.
+// go). Those aren't swaps on this chain, and aren't shown as swaps.
+//
+// Where the tokens go on this chain, for a bridge or such a hand-over, is in the route's own call, and the router
+// checks only that its contract and function are on its owner's list: the call's data is the request's. A request
+// naming the sender as the recipient can carry a call that sends the tokens anywhere that contract will. So nothing
+// is said of where they go but what is read: one contract's call is (RangoRouter.route, below), any other is said
+// not to be, as a caution, as an unread call anywhere is. (A first version said "the tokens go into" the call's
+// target and showed the request's recipient: of 148 mined, 43 sent them to an address in the call's data.)
 // Checked against the receipts of mined transactions on Ethereum, BNB Chain, Polygon, Arbitrum One and Base
-// (2026-11-25): what the sender paid, and what the receiver got against the minimum (figures in the README).
+// (2026-11-25): what the sender paid, what the receiver got against the minimum, and where RangoRouter's calls sent
+// the tokens (figures in the README).
 import { decodeFunctionData, parseAbi } from 'viem';
 import { formatUnits, PreviewBuilder, sameAddress, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
@@ -45,16 +53,26 @@ export const RANGO_ABI = parseAbi([
   'function genericSwapAndBridge(Swap request, Call[] calls, Bridge bridgeRequest) payable',
   'function genericBridge(Bridge bridgeRequest, BridgeRequest request) payable',
 ]);
-type Call = { target: string; swapFromToken: string; swapToToken: string; needsTransferFromUser: boolean; amount: bigint };
+type Call = { target: string; swapFromToken: string; swapToToken: string; needsTransferFromUser: boolean; amount: bigint; callData: string };
 type Swap = { fromToken: string; toToken: string; amountIn: bigint; minimumAmountExpected: bigint; feeFromInputToken: boolean; dAppName: string;
   platformFee?: bigint; destinationExecutorFee?: bigint; affiliateFee?: bigint; totalAffiliateFee?: bigint };
-type Bridge = { bridgeId: number; calls: readonly { target: string }[]; recipient: string; dstChainId: bigint; hasInterchainMessage: boolean; hasDestinationSwap: boolean };
+type Bridge = { bridgeId: number; calls: readonly { target: string; data: string }[]; recipient: string; dstChainId: bigint; hasInterchainMessage: boolean; hasDestinationSwap: boolean; extraFee: bigint };
+/**
+ * Rango's own RangoRouter (verified on Sourcify; one address on Ethereum, BNB Chain, Polygon, Arbitrum One and Base):
+ * route(token, destination, amount) moves the tokens from its caller straight to `destination`, any address. 29 of
+ * 87 bridges and 14 of 35 hand-overs mined go through it, to 43 different addresses (a cross-chain service's
+ * deposit addresses), none of them the contract itself.
+ */
+const ROUTER = '0xb8cf3cdbc390180257295bf08cfdeca80dca9e8a', ROUTE = '0x58b4e548';
 
 /**
  * A destination that isn't an EVM chain is named by letters of its name, as a number: "TRON", "BTC", the last four of
  * "SOLANA" (24, 10 and 13 of 87 bridges mined on Ethereum and BNB Chain, 2026-11-25).
  */
 const TAGS: Record<string, string> = { '4346947': 'Bitcoin', '1414680398': 'Tron', '1279348289': 'Solana' };
+/** EVM chains whose chain id happens to spell letters (Aurora's is "NEAR"). */
+const SPELLED: Record<string, string> = { '1313161554': 'Aurora' };
+const ZERO = '0x0000000000000000000000000000000000000000';
 const isZero = (a: string) => /^0x0{40}$/.test(a);
 const printable = (s: string) => s.length > 0 && s.length < 64 && /^[\x20-\x7e]+$/.test(s);
 /** The letters a number spells, where it spells capitals and digits only (a destination's tag). */
@@ -63,11 +81,16 @@ function letters(n: bigint): string | undefined {
   for (let v = n; v > 0n; v >>= 8n) s = String.fromCharCode(Number(v & 0xffn)) + s;
   return /^[A-Z0-9]{3,8}$/.test(s) ? s : undefined;
 }
-function destinationOf(id: bigint): { name: string; evm: boolean } {
+/**
+ * A destination's name, and whether it is off the EVM. One named by letters that aren't a known tag counts as off the
+ * EVM only where the recipient is text too (`text`): a chain id can spell letters, and its recipient is an address
+ * to check against the sender.
+ */
+function destinationOf(id: bigint, text: boolean): { name: string; evm: boolean } {
   const known = TAGS[id.toString()];
   if (known) return { name: known, evm: false };
-  const label = chainLabel(id), tag = letters(id);
-  return /^chain \d+$/.test(label) && tag ? { name: `"${tag}" (as Rango names it; not an EVM chain)`, evm: false } : { name: label, evm: true };
+  const label = SPELLED[id.toString()] ?? chainLabel(id), tag = letters(id);
+  return /^chain \d+$/.test(label) && tag && text ? { name: `"${tag}" (as Rango names it; not an EVM chain)`, evm: false } : { name: label, evm: true };
 }
 /** A recipient off the EVM is given as the first twenty characters of its address there, in an address's place. */
 function recipientText(recipient: string): string | undefined {
@@ -88,31 +111,54 @@ async function asset(env: AdapterEnv, chainId: number, token: string, raw: bigin
 
 /** The fee's share of `of`, warned of from 1% (Trust Wallet's is 0.8%, the others seen 0.35% to 0.95%). */
 function feeWarning(b: PreviewBuilder, fee: bigint, of: bigint, what: string): void {
-  if (fee === 0n || of === 0n) return;
+  // (Out of what is bought with no minimum asked, there is nothing to take the share of: it read "100%".)
+  if (fee === 0n || of <= fee) return;
   const bps = fee * 10_000n / of;
   if (bps >= 1000n) b.warn('danger', 'large_fee_portion', `${formatUnits(bps, 2)}% of ${what} goes in fees. Wallet and router fees are normally under 1%.`);
   else if (bps >= 100n) b.warn('caution', 'large_fee_portion', `${formatUnits(bps, 2)}% of ${what} goes in fees.`);
 }
 
-/** The bridge's part: where the request says the tokens go. Its own calls decide, and aren't read. */
+/**
+ * Where a route's calls send the tokens on this chain: read for RangoRouter.route, said not to be read for any
+ * other call. Returns the address the tokens are forwarded to, where one call says.
+ */
+function routeCalls(b: PreviewBuilder, calls: readonly { target: string; data: string }[], from: string): { to?: string; unread: string[] } {
+  const unread: string[] = [];
+  let to: string | undefined;
+  for (const c of calls) {
+    const target = c.target.toLowerCase(), selector = c.data.slice(0, 10).toLowerCase();
+    if (target === ROUTER && selector === ROUTE && c.data.length >= 10 + 64 * 3) to = `0x${c.data.slice(10 + 64 + 24, 10 + 128)}`.toLowerCase();
+    else unread.push(`${target} (function ${selector})`);
+  }
+  if (to !== undefined) {
+    b.detail('Sent on this chain to', sameAddress(to, from) ? `you (${to})` : to, to);
+    if (!sameAddress(to, from)) b.warn('caution', 'route_forwards_tokens', `On this chain the route sends the tokens straight to ${to}, an address its call names: a cross-chain service's deposit address, if the route is what it says. Whose address it is can't be told from here.`);
+  }
+  if (unread.length) {
+    b.detail("Route's call", unread.join(', '), unread[0].slice(0, 42));
+    b.warn('caution', 'route_call_not_read', `Where the tokens go on this chain is decided by the route's call to ${unread.map(u => shortAddress(u.slice(0, 42))).join(' and ')}, which isn't read here. Rango's owner has allow-listed the contract and the function; what the call says, the recipient with it, is the request's.`);
+  }
+  return { to, unread };
+}
+
+/** The bridge's part: where the request says the tokens are bound, and what its calls do with them here. */
 function bridgeTerms(b: PreviewBuilder, bridge: Bridge, from: string): { dest: string } {
-  const { name: dest, evm } = destinationOf(bridge.dstChainId), recipient = bridge.recipient.toLowerCase();
+  const recipient = bridge.recipient.toLowerCase(), text = recipientText(recipient);
+  const { name: dest, evm } = destinationOf(bridge.dstChainId, text !== undefined);
   b.detail('Destination', dest, bridge.dstChainId.toString());
-  const targets = [...new Set(bridge.calls.map(c => c.target.toLowerCase()))];
-  if (targets.length) b.detail('Bridge contract', targets.join(', '), targets[0]);
   if (!evm) {
-    const text = recipientText(recipient);
-    if (text) b.detail('Recipient', `an address on ${dest.replace(/ \(.*$/, '')} starting "${text}"`);
+    if (text) b.detail('Named recipient', `an address on ${dest.replace(/ \(.*$/, '')} starting "${text}"`);
     b.warn('info', 'bridge_non_evm', `The destination is ${dest}: the recipient there is in the bridge's own data, which isn't decoded here${text ? `. The request names one starting "${text}"` : ''}.`);
   } else if (!sameAddress(recipient, from)) {
-    b.detail('Recipient', recipient);
+    b.detail('Named recipient', recipient);
     b.warn('caution', 'recipient_not_sender', `The request names ${recipient} as the recipient on ${dest}, not your address.`);
   } else {
-    b.detail('Recipient', `you (${recipient})`, recipient);
+    b.detail('Named recipient', `you (${recipient})`, recipient);
     b.warn('info', 'bridge_same_address', `The request names your address as the recipient on ${dest}. If your account is a smart-contract wallet, check you control the same address there.`);
   }
   if (bridge.hasInterchainMessage || bridge.hasDestinationSwap) b.warn('info', 'bridge_message', `The bridge also runs ${bridge.hasDestinationSwap ? 'a swap' : 'a call'} on ${dest} when the funds arrive.`);
-  b.note("The destination and recipient are what the request names, which Rango's router records in its event. What the bridge does with the tokens is in its own call, to a contract Rango's owner has allow-listed, and isn't decoded here.");
+  routeCalls(b, bridge.calls, from);
+  b.note("The destination and recipient are what the request names, which Rango's router only records in its event: they don't bind the route's call.");
   return { dest };
 }
 
@@ -131,13 +177,17 @@ export const rangoAdapter: Adapter = async (tx, env) => {
     const sent = await asset(env, tx.chainId, request.token, request.amount + request.totalAffiliateFee);
     b.detail('You send', sent.text, isZero(request.token) ? undefined : request.token.toLowerCase());
     if (request.totalAffiliateFee > 0n) b.detail('Fee', `${(await asset(env, tx.chainId, request.token, request.totalAffiliateFee)).text}, out of what you send`);
-    // Coin sent with the call beyond what is bridged: what the bridge charges, which the router passes on.
+    // Coin sent with the call beyond what is bridged: what the bridge charges, which the router passes on and
+    // gives none of back. It leaves the sender with the rest.
     const over = tx.value - (isZero(request.token) ? request.amount + request.totalAffiliateFee : 0n);
-    if (over > 0n) b.detail("Bridge's own fee", `${(await asset(env, tx.chainId, '0x0000000000000000000000000000000000000000', over)).text}, sent with the call`);
+    const carried = over > 0n ? await asset(env, tx.chainId, ZERO, over) : undefined;
+    if (carried) b.detail("Bridge's own fee", `${carried.text}, sent with the call`);
     integrator(request.dAppName);
     const { dest } = bridgeTerms(b, bridge, tx.from);
     feeWarning(b, request.totalAffiliateFee, request.amount + request.totalAffiliateFee, 'what you send');
-    if (sent.change) changes.push({ ...sent.change, direction: 'out', account: tx.from });
+    const out = isZero(request.token) && carried ? await asset(env, tx.chainId, ZERO, request.amount + request.totalAffiliateFee + over) : sent;
+    if (out.change) changes.push({ ...out.change, direction: 'out', account: tx.from });
+    if (!isZero(request.token) && carried?.change) changes.push({ ...carried.change, direction: 'out', account: tx.from });
     return decoded({ title: `Bridge ${sent.text} to ${dest} (Rango)`, summary: `Sends ${sent.text} through Rango's router to a bridge, for ${dest}.`, decoder: 'rango', status: 'partial', b, assetChanges: changes });
   }
 
@@ -146,7 +196,15 @@ export const rangoAdapter: Adapter = async (tx, env) => {
   const taken = request.amountIn + (request.feeFromInputToken ? fees : 0n);
   const sent = await asset(env, tx.chainId, request.fromToken, taken);
   b.detail('You send', sent.text, isZero(request.fromToken) ? undefined : request.fromToken.toLowerCase());
-  if (sent.change) changes.push({ ...sent.change, direction: 'out', account: tx.from });
+  // Before a bridge, coin the router keeps for the bridge's own fee (extraFee) comes on top: of coin sent, the
+  // amount, the fees and it are kept and the rest returned; with a token sent, the call's coin is the bridge's.
+  // (Bought as coin with none sent, the fee comes out of what was bought.)
+  const kept = typeof last === 'string' ? 0n : isZero(request.fromToken) ? last.extraFee : tx.value;
+  const carried = kept > 0n ? await asset(env, tx.chainId, ZERO, kept) : undefined;
+  if (carried) b.detail("Bridge's own fee", `${carried.text}, sent with the call`);
+  const out = isZero(request.fromToken) && carried ? await asset(env, tx.chainId, ZERO, taken + kept) : sent;
+  if (out.change) changes.push({ ...out.change, direction: 'out', account: tx.from });
+  if (!isZero(request.fromToken) && carried?.change) changes.push({ ...carried.change, direction: 'out', account: tx.from });
   // A call that takes tokens of its own from the sender, besides the request's.
   for (const c of calls) {
     if (!c.needsTransferFromUser || isZero(c.swapFromToken) || c.amount === 0n) continue;
@@ -157,8 +215,6 @@ export const rangoAdapter: Adapter = async (tx, env) => {
   }
   if (fees > 0n) b.detail('Fee', `${(await asset(env, tx.chainId, request.feeFromInputToken ? request.fromToken : request.toToken, fees)).text}, ${request.feeFromInputToken ? 'out of what you send' : 'out of what is bought'}`);
   integrator(request.dAppName);
-  const targets = [...new Set(calls.map(c => c.target.toLowerCase()))];
-  if (targets.length) b.detail('Route', targets.map(shortAddress).join(', '), targets[0]);
   feeWarning(b, fees, request.feeFromInputToken ? taken : request.minimumAmountExpected + fees, request.feeFromInputToken ? 'what you send' : 'what is bought');
   const bought = await asset(env, tx.chainId, request.toToken, request.minimumAmountExpected);
   /** Whether a call buys the token the request names: where none does and no minimum is asked, nothing comes back here. */
@@ -171,9 +227,19 @@ export const rangoAdapter: Adapter = async (tx, env) => {
   }
   const receiver = last.toLowerCase();
   if (request.minimumAmountExpected === 0n && !buys) {
-    const into = targets.length ? shortAddress(targets[targets.length - 1]) : 'a contract of the route';
-    b.warn('info', 'bridge_terms_not_decoded', `This asks for nothing back on this chain: the tokens go into ${into}, a contract Rango's owner has allow-listed (a cross-chain service, as such routes are), and where they go from there is in its own call, which isn't decoded here. The simulation shows what comes back, if anything.`);
-    return decoded({ title: `Send ${sent.text} into ${into} through Rango`, summary: `Sends ${sent.text} through Rango's router into ${into}, with nothing required back on this chain.`, decoder: 'rango', status: 'partial', b, assetChanges: changes });
+    const { to } = routeCalls(b, calls.map(c => ({ target: c.target, data: c.callData })), tx.from);
+    b.warn('info', 'bridge_terms_not_decoded', "This asks for nothing back on this chain, and none of its calls buys the token it names: the tokens are handed to the route's call (a cross-chain service, as such routes are), and what comes of them elsewhere isn't decoded here. The simulation shows what comes back, if anything.");
+    return decoded({ title: to ? `Send ${sent.text} to ${shortAddress(to)} through Rango` : `Send ${sent.text} through Rango's router`,
+      summary: `Sends ${sent.text} through Rango's router ${to ? `to ${shortAddress(to)}` : "into its route's call"}, with nothing required back on this chain.`, decoder: 'rango', status: 'partial', b, assetChanges: changes });
+  }
+  const targets = [...new Set(calls.map(c => c.target.toLowerCase()))];
+  if (targets.length) b.detail('Route', targets.map(shortAddress).join(', '), targets[0]);
+  // Coin sent beside a swap from a token: the router takes its input as the token, and its calls spend coin only
+  // where one swaps from coin. It leaves the sender all the same.
+  if (!isZero(request.fromToken) && tx.value > 0n && !calls.some(c => isZero(c.swapFromToken))) {
+    const beside = await asset(env, tx.chainId, ZERO, tx.value);
+    b.warn('caution', 'value_not_used', `The call carries ${beside.text} that a swap from a token has no use for: the router takes its input as the token, and nothing in the swap as the request describes it returns the coin.`);
+    if (beside.change) changes.push({ ...beside.change, direction: 'out', account: tx.from });
   }
   b.detail('You receive at least', `${bought.text}${!request.feeFromInputToken && fees > 0n ? ', after the fee' : ''}`, isZero(request.toToken) ? undefined : request.toToken.toLowerCase());
   if (!sameAddress(receiver, tx.from)) { b.detail('Recipient', receiver); b.warn('caution', 'recipient_not_sender', `The tokens you buy go to ${shortAddress(receiver)}, not to you.`); }

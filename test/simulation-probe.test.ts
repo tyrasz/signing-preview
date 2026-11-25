@@ -178,6 +178,8 @@ test('Failures: revert reasons, insufficient funds, and a contract that refuses 
   assert.equal(broke.simulation?.status, 'reverted');
   assert.equal(broke.simulation?.revertReason, 'insufficient funds: the account holds 10 HYPE and the call sends 100 HYPE');
   assert.equal(broke.warnings.find(w => w.code === 'simulation_reverted')?.message, 'The network would refuse this transaction as it stands: insufficient funds: the account holds 10 HYPE and the call sends 100 HYPE. It would not be mined.');
+  // (Not mined, it uses no gas: none is given, and no network fee is worked out for it.)
+  assert.equal(broke.simulation?.gasUsed, undefined);
   // Under the probe the sender has code, so EoaOnly refuses it; a plain eth_call shows the claim works.
   const claim = await send(eoaOnly, call('claim'));
   assert.equal(claim.simulation?.status, 'success');

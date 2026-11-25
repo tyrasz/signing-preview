@@ -47,6 +47,13 @@ const HYPEREVM = 999, HYPEREVM_SMALL_BLOCK = 3_000_000n, HYPEREVM_BIG_BLOCK = 30
  * held to is the lower of the figure here and what the node suggests now.
  */
 export const LEAST_TIP: Record<number, bigint> = { 56: 50_000_000n, 137: 25_000_000_000n };
+/**
+ * Chains that mine transactions priced at zero, which a sponsor pays for beside them (BNB Chain's gas sponsorship):
+ * 86 of 868 transactions in ten blocks of BNB Chain on 2026-11-25, validators' own aside, a plain account's USDC
+ * transfer among them. A zero price there was first told "the network will reject this transaction as it is". None
+ * of 2,576 priced ones paid between zero and the least, and none of Polygon's 6,361 tipped nothing.
+ */
+const SPONSORED = new Set([56]);
 const gwei = (v: bigint) => `${formatUnits(v, 9)} gwei`;
 const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000f';
 const L1_FEE = parseAbi(['function getL1Fee(bytes _data) view returns (uint256)']);
@@ -172,7 +179,9 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
     const suggested = BigInt(tip), least = suggested < known ? suggested : known;
     const what = tx.maxPriorityFeePerGas !== undefined ? 'priority fee' : tx.gasPrice !== undefined ? 'gas price' : 'fee cap';
     const over = cap !== undefined && baseFee !== undefined && cap >= baseFee ? cap - baseFee : undefined;
-    if (offered < least) {
+    if (offered === 0n && SPONSORED.has(tx.chainId)) {
+      b.warn('info', 'fee_zero_sponsored', `This transaction offers no fee. ${chainName(tx.chainId)} mines such a transaction only where someone else pays for it (a wallet's or an app's gas sponsorship, which sends it on with a paying transaction); sent the ordinary way, its nodes refuse it.`);
+    } else if (offered < least) {
       b.warn('danger', 'fee_below_minimum', `The ${what} (${gwei(offered)}) is below the least ${chainName(tx.chainId)} takes (${gwei(least)}): its nodes refuse a transaction that offers less, so the network will reject this transaction as it is.`);
     } else if (cap !== undefined && over !== undefined && over < least && !(tx.maxPriorityFeePerGas !== undefined && tx.maxPriorityFeePerGas > cap)) {
       // (Taken by a node, and left by validators until the base fee leaves them their least: of 6,361 transactions

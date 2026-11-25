@@ -162,9 +162,10 @@ export async function probeSimulate(post: RpcPost, reqs: SimulationRequest[], de
     if (!o.ok) {
       const chain = CHAINS[chainId], units = (v: bigint) => `${formatUnits(v, chain?.nativeDecimals ?? 18)} ${chain?.nativeSymbol ?? ''}`.trim();
       const short = req.value > native[i];
-      return { status: 'reverted', source, gasUsed, revertReason: short ? `insufficient funds: the account holds ${units(native[i])} and the call sends ${units(req.value)}` : decodeRevert(o.ret), transfers: [], basis: 'state', tokensRead: 0,
-        // (A transaction the account can't pay for is one the network refuses, not one that fails once mined.)
-        ...(short && { refused: true }) };
+      // (A transaction the account can't pay for is one the network refuses, not one that fails once mined: it
+      // uses no gas, and none is given, or a network fee was worked out for a transaction said not to be mined.)
+      if (short) return { status: 'reverted', source, revertReason: `insufficient funds: the account holds ${units(native[i])} and the call sends ${units(req.value)}`, transfers: [], basis: 'state', tokensRead: 0, refused: true };
+      return { status: 'reverted', source, gasUsed, revertReason: decodeRevert(o.ret), transfers: [], basis: 'state', tokensRead: 0 };
     }
     const transfers: SimulatedTransfer[] = [], nftTransfers: SimulatedNftTransfer[] = [], approvals: SimulatedApproval[] = [];
     const fungible = (asset: string, delta: bigint) => {
