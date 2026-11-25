@@ -860,7 +860,10 @@ async function replay(item: string): Promise<void> {
   // bundle, its paymaster's and token's state cold in the replay: USDC fee 17.1% high, its gas about 15%). Only for
   // the paymaster's fee (charged): the smallest transfer out, taken as the fee where no paymaster's is seen, moves by
   // the gas's percentage at most, else an amount that is wrong passes as a fee.
-  const feeSlack = (token: string) => BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed) && gasPercent !== undefined ? (charged.has(token) ? 1.3 : 1) * Math.abs(gasPercent) : 0)));
+  // (And for an operation whose gas isn't judged for what its preview said it didn't know, set below: its fee is
+  // priced on that gas.)
+  let gasNotJudged = false;
+  const feeSlack = (token: string) => BigInt(Math.ceil(1 + ((ops.length > 1 || timeBumped || relayed || gasNotJudged) && gasPercent !== undefined ? (charged.has(token) ? 1.3 : 1) * Math.abs(gasPercent) : 0)));
   const feeLike = (t: Compared) => !t.account && fees.has(t.token) && abs(BigInt(t.simulated) - BigInt(t.actual)) * 100n <= fees.get(t.token)! * feeSlack(t.token);
   // Run a second after its block (BNB Chain): a swap's output or a reward can differ by that second, within a
   // ten-thousandth (as scripts/accuracy.ts allows).
@@ -1039,6 +1042,15 @@ async function replay(item: string): Promise<void> {
     const short = gasCompared.gasless ? gasCompared.actual - BigInt(gasCompared.simulated) : (gasCompared.actual - BigInt(gasCompared.simulated)) * actualGasUsed / gasCompared.actual;
     const gap = tookPrecompile ? short : -short;
     if (gap >= 250_000n && gap <= 420_000n) row.passkeyVerifierAssumed = true;
+  }
+  // A fee priced on gas that isn't judged moves with it. On Arbitrum One (2026-11-24, 0xe4f79ee6…c313) such a ZeroDev
+  // account paid its paymaster 0.032305 USDC where the preview, 38.7% short in gas for the verifier it didn't know
+  // of, showed 0.019875: 38.5% short, and the operation was a difference in its tokens. Held to the gas's
+  // percentage, as a bundle of several's fee is; an amount off by more than its fee can be still differs.
+  if ((row.passkeyVerifierAssumed || row.passkeyExtraKey) && row.tokens === 'other') {
+    gasNotJudged = true;
+    const again = matchOf();
+    if (again !== 'other') row.tokens = again;
   }
   const differs = row.notSimulated ? [] : [
     !row.outcome && !warned && 'outcome',
