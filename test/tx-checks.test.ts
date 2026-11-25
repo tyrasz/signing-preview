@@ -183,6 +183,9 @@ test('A fee under the least a chain’s nodes take: refused on BNB Chain and Pol
   const tip = fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(1.5) }));
   assert.equal(tip?.severity, 'danger');
   assert.match(tip!.message, /^The priority fee \(1\.5 gwei\) is below the least Polygon takes \(25 gwei\)/);
+  // A priority fee named alone (the wallet fills in the cap): checked as well.
+  assert.match(fee(await polygon({ maxPriorityFeePerGas: g(1.5) }))!.message, /^The priority fee \(1\.5 gwei\) is below the least Polygon takes \(25 gwei\)/);
+  assert.equal(fee(await polygon({ maxPriorityFeePerGas: g(30) })), undefined);
   // Under what the node suggests and over the least: taken (20 of 1,063 transactions paid between the two).
   assert.equal(fee(await polygon({ maxFeePerGas: g(600), maxPriorityFeePerGas: g(26) })), undefined);
   assert.equal(fee(await polygon({ gasPrice: g(600) })), undefined);

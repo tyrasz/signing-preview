@@ -166,14 +166,15 @@ export async function transactionChecks(tx: Tx, gasUsed: bigint | undefined, dep
   // A fee under the least the chain's nodes take (LEAST_TIP), where the request names one: what it offers validators
   // (its priority fee; a legacy price whole; with a fee cap alone, the tip a wallet adds, which the cap bounds).
   const known = LEAST_TIP[tx.chainId];
-  if (known !== undefined && tip !== undefined && cap !== undefined) {
+  // (A priority fee named with no cap is checked too: the wallet fills in the cap, and can't make the tip more.)
+  const offered = tx.maxPriorityFeePerGas ?? tx.gasPrice ?? (cap !== undefined && tip !== undefined ? (cap < BigInt(tip) ? cap : BigInt(tip)) : undefined);
+  if (known !== undefined && tip !== undefined && offered !== undefined) {
     const suggested = BigInt(tip), least = suggested < known ? suggested : known;
-    const offered = tx.maxPriorityFeePerGas ?? tx.gasPrice ?? (cap < suggested ? cap : suggested);
     const what = tx.maxPriorityFeePerGas !== undefined ? 'priority fee' : tx.gasPrice !== undefined ? 'gas price' : 'fee cap';
-    const over = baseFee !== undefined && cap >= baseFee ? cap - baseFee : undefined;
+    const over = cap !== undefined && baseFee !== undefined && cap >= baseFee ? cap - baseFee : undefined;
     if (offered < least) {
       b.warn('danger', 'fee_below_minimum', `The ${what} (${gwei(offered)}) is below the least ${chainName(tx.chainId)} takes (${gwei(least)}): its nodes refuse a transaction that offers less, so the network will reject this transaction as it is.`);
-    } else if (over !== undefined && over < least && !(tx.maxPriorityFeePerGas !== undefined && tx.maxPriorityFeePerGas > cap)) {
+    } else if (cap !== undefined && over !== undefined && over < least && !(tx.maxPriorityFeePerGas !== undefined && tx.maxPriorityFeePerGas > cap)) {
       // (Taken by a node, and left by validators until the base fee leaves them their least: of 6,361 transactions
       // on Polygon three were included with a little less, 24.78 gwei at the lowest.)
       b.warn('caution', 'fee_cap_leaves_low_tip', `The fee cap (${gwei(cap)}) leaves ${gwei(over)} over the current base fee (${gwei(baseFee!)}) for validators, who take ${gwei(least)} at least on ${chainName(tx.chainId)}: the transaction may wait until the base fee falls.`);
