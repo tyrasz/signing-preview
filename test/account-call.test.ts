@@ -112,14 +112,25 @@ test('Calls handed on from one account to others are told once, and accounts the
   // In a wallet_sendCalls batch, a call into another account is read the same way.
   const batch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: WALLET, data: one }, { to: USDC, data: transfer }] }] }, { now: NOW }, offline);
   assert.deepEqual(batch.calls?.map(c => c.decoding.decoder), ['account_call', 'erc20_transfer']);
-  // The batch's simulation nets the sender's own balances: what the first call has the other account move is kept
-  // beside them, as the call asks it, and said to be that.
+  // The batch's simulation nets the sender's own balances: it is read again for the account the first call has act,
+  // whose changes are listed beside the sender's.
   const alice = ALICE.toLowerCase();
+  const asked: (string | undefined)[][] = [];
   const result = (r: SimulationRequest): SimulationResult => ({ status: 'success', source: 'mock', gasUsed: 50_000n, balancesRead: true,
-    transfers: r.to?.toLowerCase() === USDC ? [{ asset: USDC, from: alice, to: BOB.toLowerCase(), raw: 1_000_000_000n }] : [] });
-  const run: Dependencies = { ...offline, simulator: { simulate: async r => result(r), simulateBatch: async rs => rs.map(result) } };
-  const ranBatch = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: WALLET, data: one }, { to: USDC, data: transfer }] }] }, { now: NOW }, run);
+    transfers: r.account === WALLET ? (r.to === WALLET ? [{ asset: USDC, from: WALLET, to: BOB.toLowerCase(), raw: 1_000_000_000n }] : [])
+      : r.to?.toLowerCase() === USDC ? [{ asset: USDC, from: alice, to: BOB.toLowerCase(), raw: 1_000_000_000n }] : [],
+    ...(r.account === WALLET && r.to === WALLET && { approvals: [{ kind: 'erc20' as const, emitter: WETH, token: WETH, owner: WALLET, spender: EVIL, amount: (1n << 256n) - 1n }] }) });
+  const sendCalls = (d: Dependencies) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls: [{ to: WALLET, data: one }, { to: USDC, data: transfer }] }] }, { now: NOW }, d);
+  const ranBatch = await sendCalls({ ...offline, simulator: { simulate: async r => result(r), simulateBatch: async rs => { asked.push(rs.map(r => r.account)); return rs.map(result); } } });
   assert.equal(ranBatch.simulation?.status, 'success');
-  assert.deepEqual(ranBatch.assetChanges.map(c => [c.account, c.direction, c.raw, c.basis]), [[alice, 'out', '1000000000', 'simulated_state'], [WALLET, 'out', '1000000000', 'requested']]);
-  assert.match(ranBatch.decoding.notes.join(' '), /Call 1 has another account make calls: what it moves for that account is shown as the call asks\. The batch's simulation read your own account's balances, not that account's\./);
+  assert.deepEqual(asked.at(-1), [WALLET, WALLET]);
+  assert.deepEqual(ranBatch.assetChanges.map(c => [c.account, c.direction, c.raw, c.basis]), [[alice, 'out', '1000000000', 'simulated_state'], [WALLET, 'out', '1000000000', 'simulated_state']]);
+  assert.match(ranBatch.decoding.notes.join(' '), /The batch's run was read again for 0x5ca1…ffee, the account its calls have act: its balances and approvals are what those calls change\./);
+  // An approval that account leaves along the way is said of it.
+  assert.match(ranBatch.warnings.find(w => w.code === 'hidden_unlimited_approval')?.message ?? '', /^For the account 0x5ca1…ffee: Set by this transaction along the way: after it, 0x9622…7242 can spend an unlimited amount of its WETH\.$/);
+  assert.deepEqual(ranBatch.approvals?.map(a => [a.owner, a.spender]), [[WALLET, EVIL]]);
+  // Where the run can't be read for that account, what the call has it move is kept as the call asks, and said to be.
+  const unread = await sendCalls({ ...offline, simulator: { simulate: async r => result(r), simulateBatch: async rs => (rs.some(r => r.account) ? null : rs.map(result)) } });
+  assert.deepEqual(unread.assetChanges.map(c => [c.account, c.direction, c.raw, c.basis]), [[alice, 'out', '1000000000', 'simulated_state'], [WALLET, 'out', '1000000000', 'requested']]);
+  assert.match(unread.decoding.notes.join(' '), /Call 1 has another account make calls: what it moves for that account is shown as the call asks\. The batch's simulation read your own account's balances, not that account's\./);
 });

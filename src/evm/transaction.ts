@@ -370,9 +370,7 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
           assetChanges = [...theirs.assetChanges, ...simulated];
           for (const a of theirs.approvals) if (declared(a)) a.direct = true;
           // (What it grants along the way is said of it, not of the sender.)
-          const said = new PreviewBuilder();
-          approvalWarnings(said, theirs.approvals, context.now);
-          for (const w of said.warnings) b.also(w.severity, w.code, `For the account ${short}: ${w.message.replace(/NFT you hold/g, 'NFT it holds').replace(/from your account/g, 'from that account').replace(/\byour\b/g, 'its')}`);
+          accountApprovalWarnings(b, theirs.approvals, subject.from, context.now);
           approvals = theirs.approvals;
           b.note(`The run was read twice: for your own account, and for ${short}, whose balances and approvals are what the calls change.`);
         } else {
@@ -445,21 +443,31 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
 
 /**
  * The run a preview shows, read for another account than its sender (Decoded.account): that account's balance
- * changes and the approvals it leaves. The requests are the ones that ran (the wallet's pending transactions first,
- * a replay's place and price), the last of them reporting for the account. Null where the run doesn't come out the
- * same way or can't say.
+ * changes and the approvals it leaves. The requests are the ones that ran: for a transaction, the wallet's pending
+ * transactions first (a replay's place and price), the last of them reporting for the account; for a batch's calls
+ * (`batch`), each of them reporting for it, their changes netted. Null where the run doesn't come out the same way
+ * or can't say.
  */
-async function forAccount(ran: SimulationRequest[], account: { chainId: number; from: string }, deps: Dependencies, b: PreviewBuilder): Promise<{ assetChanges: AssetChange[]; approvals: ApprovalChange[] } | null> {
-  const requests = ran.map((q, i) => (i === ran.length - 1 ? { ...q, account: account.from } : q));
-  const r = requests.length > 1 && deps.simulator!.simulateBatch ? (await deps.simulator!.simulateBatch(requests))?.at(-1) : requests.length === 1 ? await deps.simulator!.simulate(requests[0]) : null;
-  if (!r || r.status !== 'success' || r.limited) return null;
+export async function forAccount(ran: SimulationRequest[], account: { chainId: number; from: string }, deps: Dependencies, b: PreviewBuilder, batch = false): Promise<{ assetChanges: AssetChange[]; approvals: ApprovalChange[] } | null> {
+  if (!deps.simulator || !ran.length) return null;
+  const requests = ran.map((q, i) => (batch || i === ran.length - 1 ? { ...q, account: account.from } : q));
+  const all = requests.length > 1 ? (deps.simulator.simulateBatch ? await deps.simulator.simulateBatch(requests) : null) : [await deps.simulator.simulate(requests[0])];
+  const rs = (batch ? all : all?.slice(-1))?.filter((r): r is SimulationResult => !!r);
+  if (!rs?.length || (batch && rs.length !== requests.length) || rs.some(r => r.status !== 'success' || r.limited)) return null;
   // (A simulator that reads the sender's balances whatever account is named says nothing of this one: the probe.)
-  if (r.basis === 'state') return null;
-  const basis = r.basis === 'fork' || r.balancesRead ? 'simulated_state' as const : 'simulated_events' as const;
+  if (rs.some(r => r.basis === 'state')) return null;
+  const basis = rs[0].basis === 'fork' || rs.every(r => r.balancesRead) ? 'simulated_state' as const : 'simulated_events' as const;
   return {
-    assetChanges: [...await netChanges(r.transfers, account, deps, b, basis), ...await nftChanges(r.nftTransfers ?? [], account, deps, b, basis)],
-    approvals: await approvalChanges((r.approvals ?? []).map(approval => ({ approval, callTo: null })), account, deps, r.approvalState),
+    assetChanges: [...await netChanges(rs.flatMap(r => r.transfers), account, deps, b, basis), ...await nftChanges(rs.flatMap(r => r.nftTransfers ?? []), account, deps, b, basis)],
+    approvals: await approvalChanges(rs.flatMap(r => (r.approvals ?? []).map(approval => ({ approval, callTo: null }))), account, deps, rs[rs.length - 1].approvalState),
   };
+}
+
+/** What an account that isn't the sender grants along the way (forAccount), said of it and not of the sender. */
+export function accountApprovalWarnings(b: PreviewBuilder, approvals: ApprovalChange[], account: string, now?: number): void {
+  const said = new PreviewBuilder();
+  approvalWarnings(said, approvals, now);
+  for (const w of said.warnings) b.also(w.severity, w.code, `For the account ${shortAddress(account)}: ${w.message.replace(/NFT you hold/g, 'NFT it holds').replace(/from your account/g, 'from that account').replace(/\byour\b/g, 'its')}`);
 }
 
 /** A simulated block given a later second than the real one had (src/block.ts, afterParent). */

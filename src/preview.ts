@@ -1,7 +1,7 @@
-import { attentionOf, PreviewBuilder } from './format.ts';
+import { attentionOf, PreviewBuilder, shortAddress } from './format.ts';
 import { chainName } from './chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, SigningRequest, SimulationRequest, SimulationResult, SimulationSummary, Warning } from './types.ts';
-import { decodeTransaction, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
+import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
 import { addUsdValues } from './prices.ts';
@@ -303,12 +303,26 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     }
   }
   // A call that has another account act (src/evm/smart-account.ts, accountCallAdapter): the batch's run read the
-  // sender's balances, and what such a call has that account move is kept beside them, as the call asks it.
-  if (results && assetChanges.every(c => c.basis !== 'requested')) {
-    const theirs = calls.flatMap((c, i) => (c.decoding.decoder === 'account_call' ? c.assetChanges.filter(x => x.basis === 'requested' && x.account.toLowerCase() !== txs[0].from.toLowerCase()).map(x => ({ i, x })) : []));
-    if (theirs.length) {
-      const which = [...new Set(theirs.map(t => t.i + 1))], one = which.length === 1;
-      assetChanges = [...assetChanges, ...theirs.map(t => t.x)];
+  // sender's balances. It is read again for that account (for the first three such accounts), as a single
+  // transaction's run is (src/evm/transaction.ts): its changes and the approvals it leaves, beside the sender's.
+  // Where it can't be, what the call has the account move is kept as the call asks it, and that is said.
+  if (results && (whole || results.every(r => r.status === 'success'))) {
+    const sender = txs[0].from.toLowerCase();
+    const acting = [...new Set(decoded.flatMap(d => (d.account && d.account.toLowerCase() !== sender ? [d.account.toLowerCase()] : [])))];
+    const read = new Set<string>();
+    for (const account of acting.slice(0, 3)) {
+      const theirs = ran && deps.simulator ? await forAccount(ran, { chainId: txs[0].chainId, from: account }, deps, b, true).catch(() => null) : null;
+      if (!theirs) continue;
+      read.add(account);
+      assetChanges = [...assetChanges, ...theirs.assetChanges];
+      accountApprovalWarnings(b, theirs.approvals, account, context.now);
+      approvals = [...approvals, ...theirs.approvals];
+    }
+    if (read.size) b.note(`The batch's run was read again for ${[...read].map(a => shortAddress(a)).join(', ')}, the account${read.size === 1 ? '' : 's'} its calls have act: ${read.size === 1 ? 'its' : 'their'} balances and approvals are what those calls change.`);
+    const asked = calls.flatMap((c, i) => (decoded[i].account && !read.has(decoded[i].account!.toLowerCase()) ? c.assetChanges.filter(x => x.basis === 'requested' && x.account.toLowerCase() !== sender).map(x => ({ i, x })) : []));
+    if (asked.length) {
+      const which = [...new Set(asked.map(t => t.i + 1))], one = which.length === 1;
+      assetChanges = [...assetChanges, ...asked.map(t => t.x)];
       b.note(`Call${one ? '' : 's'} ${which.join(', ')} ${one ? 'has' : 'have'} another account make calls: what ${one ? 'it moves' : 'they move'} for that account is shown as the call${one ? ' asks' : 's ask'}. The batch's simulation read your own account's balances, not that account's.`);
     }
   }
