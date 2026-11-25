@@ -543,10 +543,16 @@ console.log('\n9. Kinetiq and HyperLend on HyperEVM');
     }
   }
   if (borrower && collateralAsset) {
-    const p = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: borrower, to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function withdraw(address,uint256,address)']), functionName: 'withdraw', args: [collateralAsset as Address, 2n ** 256n - 1n, borrower as Address] }), chainId: '0x3e7' }] }, {}, deps);
+    const withdrawAll = () => previewRequest({ method: 'eth_sendTransaction', params: [{ from: borrower, to: m.pool, data: encodeFunctionData({ abi: parseAbi(['function withdraw(address,uint256,address)']), functionName: 'withdraw', args: [collateralAsset as Address, 2n ** 256n - 1n, borrower as Address] }), chainId: '0x3e7' }] }, {}, deps);
+    // (HyperEVM's public RPC allows an address about 100 requests a minute, and the search for a borrower above can
+    // use them up: the simulation then has no answer, which says nothing of the prediction (the scheduled run of
+    // 2026-11-25 failed so, "chain: unavailable" after 58 seconds). One the node didn't answer is tried again once
+    // the limit's minute has passed, twice at most, and says what the node said if it still has none.)
+    let p = await withdrawAll();
+    for (let i = 0; i < 2 && (p.simulation?.status ?? 'unavailable') === 'unavailable'; i++) { await new Promise(r => setTimeout(r, 65_000)); p = await withdrawAll(); }
     const predicted = p.warnings.some(w => w.code === 'lending_will_fail'), reverted = p.simulation?.status === 'reverted';
     // Only meaningful when the borrower's debt depends on WHYPE collateral: then both must say it fails.
-    check(predicted === reverted || (!predicted && !p.details.some(d => d.label === 'Health factor (estimated)')), 'HyperLend withdraw-all prediction'.padEnd(34), `decoder: ${predicted ? 'will fail' : 'ok'} (${p.details.find(d => d.label === 'Health factor (estimated)')?.value ?? 'no HF'}); chain: ${p.simulation?.revertReason ?? p.simulation?.status}`);
+    check(predicted === reverted || (!predicted && !p.details.some(d => d.label === 'Health factor (estimated)')), 'HyperLend withdraw-all prediction'.padEnd(34), `decoder: ${predicted ? 'will fail' : 'ok'} (${p.details.find(d => d.label === 'Health factor (estimated)')?.value ?? 'no HF'}); chain: ${p.simulation?.revertReason ?? p.simulation?.status ?? 'not simulated'}${p.simulation?.status === 'unavailable' && p.simulation.error ? ` (${p.simulation.error})` : ''}`);
   } else console.log('skip HyperLend withdraw check: no recent borrower with supplied collateral found');
 }
 
