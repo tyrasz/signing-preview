@@ -361,7 +361,11 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
     const stateBlock = replay ? BigInt(replay.at.block) : named?.number;
     simulation = { status: sim.status, source: sim.source, ...(sim.gasUsed !== undefined && { gasUsed: sim.gasUsed.toString() }), ...(sim.revertReason && { revertReason: sim.revertReason }), ...(stateBlock !== undefined && { block: stateBlock.toString() }), ...(sim.stateReadError && { stateReadError: sim.stateReadError }) };
     if (sim.status === 'reverted') {
-      b.warn('danger', 'simulation_reverted', replay ? `The transaction failed${sim.revertReason ? `: ${sim.revertReason}` : ''}. Its sender still paid the network fee.` : `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
+      // (One the network refuses before any of it runs, for what its sender can't pay or a gas limit under what its
+      // calldata costs, isn't mined at all: no fee is paid for it.)
+      b.warn('danger', 'simulation_reverted', replay ? `The transaction failed${sim.revertReason ? `: ${sim.revertReason}` : ''}. Its sender still paid the network fee.`
+        : sim.refused ? `The network would refuse this transaction as it stands${sim.revertReason ? `: ${sim.revertReason}` : ''}. It would not be mined.`
+        : `The transaction is expected to fail${sim.revertReason ? `: ${sim.revertReason}` : ''}. You would still pay the network fee.`);
     } else if (sim.limited) {
       b.note(sim.note ?? "Checked with eth_call: the call succeeds at the latest block. This chain's RPC can't simulate transfers, so balance changes are based on the decoded request.");
     } else {

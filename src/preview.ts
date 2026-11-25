@@ -4,7 +4,7 @@ import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext
 import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, standInsNote, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
-import { decodeRevert } from './simulation.ts';
+import { decodeRevert, rejection } from './simulation.ts';
 import { addUsdValues } from './prices.ts';
 import { noTrace, tracePreviews, type TraceEnv } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
@@ -187,6 +187,9 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   // An all-or-nothing batch of a plain account's, whose calls go through a transaction each and fail as the one
   // transaction a wallet makes of them (the account given code, EIP-7702): which call, and why.
   let asOneFails: { call?: number; reason?: string } | undefined;
+  // A call the account can't pay for, which the node refuses a batch for as a whole: which call, and why.
+  let unpaid: { call: number; reason: string; source: string } | undefined;
+  let requests: SimulationRequest[] | undefined;
   let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
@@ -195,7 +198,7 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
         named = await namedBlock(context, deps.rpc, txs[0].chainId);
         const at = named?.at ?? (context.trace ? await pinLatest(deps.rpc, txs[0].chainId) : undefined);
-        const requests = txs.map((tx, i) => ({ ...simulationRequest(tx, decoded[i]), ...(at && { at }), ...(context.stateOverrides && { stateOverrides: context.stateOverrides }) }));
+        requests = txs.map((tx, i) => ({ ...simulationRequest(tx, decoded[i]), ...(at && { at }), ...(context.stateOverrides && { stateOverrides: context.stateOverrides }) }));
         ran = requests;
         results = await deps.simulator.simulateBatch(requests);
         if (results && results.length !== txs.length) throw new Error(`the simulator returned ${results.length} results for ${txs.length} calls`);
@@ -257,9 +260,33 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         presets = txs.map((_, i) => ({ result: whole ? null : results?.[i] ?? null }));
       } catch (error) {
         results = null;
+        const message = error instanceof Error ? error.message : String(error);
         presets = (error as Error)?.name === 'BatchSimulationUnsupported'
           ? txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH })) // e.g. HyperEVM: eth_call can check call 1 alone
-          : txs.map(() => ({ error: error instanceof Error ? error.message : String(error) }));
+          : txs.map(() => ({ error: message }));
+        // A node refuses the whole request where one of its calls can't be paid for (the account hasn't the coin
+        // it sends), without saying which: a batch from an account with no coin, one call sending 1 wei, was "could
+        // not be simulated", as information, where a transaction alone is "expected to fail: insufficient funds".
+        // Which call is found by running the calls up to each in turn (for a batch of up to eight): those before
+        // it as they ran, it as refused, the ones after it not run.
+        const why = (error as Error)?.name !== 'BatchSimulationUnsupported' ? rejection(message) : null;
+        if (why && requests && txs.length <= 8) {
+          const all = requests;
+          let before: SimulationResult[] = [], at_: number | undefined, refused: SimulationResult | undefined;
+          for (let n = 1; n <= all.length && at_ === undefined; n++) {
+            const part = await (n === 1 ? deps.simulator.simulate(all[0]).then(r => (r ? [r] : null)) : deps.simulator.simulateBatch(all.slice(0, n))).catch(() => null);
+            if (part?.length === n && !part[n - 1].refused && part.every(r => !r.limited)) { before = part; continue; }
+            if (n === 1 && !part?.[0]?.refused) break;   // (the first call alone tells nothing: left as it was)
+            at_ = n - 1;
+            refused = part?.[n - 1]?.refused ? part[n - 1] : { status: 'reverted', source: before[0]?.source ?? 'the chain\'s node', revertReason: why, transfers: [], limited: true, refused: true };
+          }
+          if (at_ === undefined && before.length === all.length) { results = before; presets = txs.map((_, i) => ({ result: before[i] })); }
+          else if (at_ !== undefined && refused) {
+            const k = at_;
+            unpaid = { call: k + 1, reason: refused.revertReason ?? why, source: refused.source };
+            presets = txs.map((_, i) => (i < k ? { result: before[i] } : i === k ? { result: refused! } : { skipped: `This call was not simulated: call ${k + 1} can't be paid for, and nothing after it was run.` }));
+          }
+        }
       }
     } else {
       presets = txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH }));
@@ -343,6 +370,11 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
     } else {
       b.warn('caution', 'batch_partial_failure', `Call ${failed + 1} is expected to fail. The batch is not marked all-or-nothing, so the wallet may still carry out the other calls, leaving them in effect without it.`);
     }
+  }
+  if (unpaid && !results) {
+    simulation = { status: 'reverted', source: `${unpaid.source}, ${txs.length} calls in order`, revertReason: `call ${unpaid.call}: ${unpaid.reason}` };
+    if (batch.atomicRequired) b.warn('danger', 'batch_will_fail', `This batch is all-or-nothing, and call ${unpaid.call} can't be paid for (${unpaid.reason}), so none of the calls would take effect.`);
+    else b.warn('caution', 'batch_partial_failure', `Call ${unpaid.call} can't be paid for (${unpaid.reason}). The batch is not marked all-or-nothing, so the wallet may still carry out the calls before it, leaving them in effect without it.`);
   }
   // A call that has another account act (src/evm/smart-account.ts, accountCallAdapter): the batch's run read the
   // sender's balances. It is read again for that account (for the first three such accounts), as a single

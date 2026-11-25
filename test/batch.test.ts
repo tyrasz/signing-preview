@@ -208,3 +208,34 @@ test('Shared gas: a call that uses up a share smaller than a transaction may hav
   assert.deepEqual((await plain.run())?.map(r => r.status), ['success', 'success', 'success']);
   assert.ok(plain.asked.every(a => a.every(g => g === null)), JSON.stringify(plain.asked));
 });
+
+test('A batch with a call the account can’t pay for says which call, where the node refuses the lot', async () => {
+  // The node refuses the whole request for one call that sends coin the account hasn't, and doesn't say which: the
+  // batch was two or three calls that "could not be simulated", as information, each listed as the request asks.
+  const pay = { to: '0x00000000000000000000000000000000000b0b0b', value: '0x1' }, send = { to: USDC, data: approve(ROUTER, 1n).data };
+  const refusal = 'eth_simulateV1 failed: err: insufficient funds for gas * price + value: address 0xA11cE00000000000000000000000000000000001 have 0 want 1 (supplied gas 50000000)';
+  const ok = (): SimulationResult => ({ status: 'success', source: 'mock', gasUsed: 46_000n, balancesRead: true, transfers: [] });
+  const simulator: Simulator = {
+    // (As the node simulator answers: a transaction alone that can't be paid is refused with the reason; a batch throws.)
+    simulate: async r => (r.value > 0n ? { status: 'reverted', source: 'mock', revertReason: "insufficient funds: the account can't cover the value it sends", transfers: [], limited: true, refused: true } : ok()),
+    simulateBatch: async rs => { if (rs.some(r => r.value > 0n)) throw new Error(refusal); return rs.map(ok); },
+  };
+  const batch = (calls: unknown[], atomicRequired = false) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, atomicRequired, calls }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
+  const p = await batch([send, pay, send]);
+  assert.deepEqual([p.simulation?.status, p.simulation?.revertReason], ['reverted', "call 2: insufficient funds: the account can't cover the value it sends"]);
+  assert.deepEqual(p.calls?.map(c => c.simulation?.status), ['success', 'reverted', 'unavailable']);
+  assert.match(p.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^Call 2: The network would refuse this transaction as it stands: insufficient funds: the account can't cover the value it sends\. It would not be mined\.$/);
+  assert.match(p.warnings.find(w => w.code === 'batch_partial_failure')?.message ?? '', /^Call 2 can't be paid for \(insufficient funds: the account can't cover the value it sends\)\. The batch is not marked all-or-nothing/);
+  assert.ok(!codes(p).includes('simulation_unavailable'), codes(p).join());
+  assert.match(p.warnings.find(w => w.code === 'simulation_skipped')?.message ?? '', /^Call 3: This call was not simulated: call 2 can't be paid for, and nothing after it was run\.$/);
+  // All or nothing: none of it happens.
+  const atomic = await batch([send, pay], true);
+  assert.match(atomic.warnings.find(w => w.code === 'batch_will_fail')?.message ?? '', /^This batch is all-or-nothing, and call 2 can't be paid for \(insufficient funds: the account can't cover the value it sends\), so none of the calls would take effect\.$/);
+  assert.equal(atomic.attention, 'danger');
+  // The first call: found from the call alone.
+  const first = await batch([pay, send]);
+  assert.deepEqual([first.simulation?.revertReason, first.calls?.map(c => c.simulation?.status)], ["call 1: insufficient funds: the account can't cover the value it sends", ['reverted', 'unavailable']]);
+  // A node error that says nothing of the kind is as it was.
+  const other = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [send, send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ok(), simulateBatch: async () => { throw new Error('RPC HTTP 503'); } } });
+  assert.ok(codes(other).includes('simulation_unavailable'));
+});
