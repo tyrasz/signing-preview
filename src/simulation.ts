@@ -433,8 +433,18 @@ export class RpcSimulator implements Simulator {
    * again. Undefined where the node's allowance isn't known, or the calls don't run so either.
    */
   private async withSharedGas(reqs: SimulationRequest[], url: string, chainId: number): Promise<SimulationResult[] | undefined> {
-    const allowance = await this.allowance(url, chainId);
-    if (allowance === undefined) return undefined;
+    const measured = await this.allowance(url, chainId);
+    if (measured === undefined) return undefined;
+    // (A public RPC can be several nodes that allow different amounts: Sepolia's answered the measure with 100
+    // million from one and ran the calls on another that allows 50, refusing them again. So on less, in turn.)
+    for (const allowance of [measured, 50_000_000n, 25_000_000n].filter((a, i) => i === 0 || a < measured)) {
+      const ran = await this.sharing(reqs, chainId, allowance);
+      if (ran) return ran;
+    }
+    return undefined;
+  }
+
+  private async sharing(reqs: SimulationRequest[], chainId: number, allowance: bigint): Promise<SimulationResult[] | undefined> {
     const most = CAPPED.has(chainId) && TRANSACTION_GAS_CAP < allowance ? TRANSACTION_GAS_CAP : allowance, MARGIN = 100_000n;
     const free = reqs.filter(r => r.gas === undefined).length, named = reqs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n);
     const room = allowance - named - MARGIN;
