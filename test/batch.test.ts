@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi } from 'viem';
+import { encodeAbiParameters, encodeFunctionData, maxUint256, parseAbi, toHex } from 'viem';
 import { previewRequest } from '../src/preview.ts';
 import { StaticTokenRegistry } from '../src/chains.ts';
 import { faultReason, rejection, RpcSimulator } from '../src/simulation.ts';
@@ -241,9 +241,28 @@ test('A batch with a call the account can’t pay for says which call, where the
   assert.deepEqual([long.simulation?.revertReason, long.calls?.map(c => c.simulation?.status[0]).join('')], ["call 10: insufficient funds: the account can't cover the value it sends", 'sssssssssrss']);
   const two = await batch(Array.from({ length: 8 }, (_, i) => (i === 2 || i === 6 ? pay : send)));
   assert.equal(two.calls?.map(c => c.simulation?.status[0]).join(''), 'ssrsssrs');
-  // (More than three of them: left as the node's refusal of the lot.)
+  // More than three of them (it was three at most, and seven calls with four refused "could not be simulated", all
+  // seven, as information): each is found, next to the last where they come together.
   const many = await batch([pay, pay, pay, pay, send]);
-  assert.ok(codes(many).includes('simulation_unavailable'));
+  assert.equal(many.calls?.map(c => c.simulation?.status[0]).join(''), 'rrrrs');
+  assert.ok(!codes(many).includes('simulation_unavailable') && !codes(many).includes('simulation_skipped'), codes(many).join());
+  const spread = await batch([send, pay, pay, pay, pay, send, pay]);
+  assert.equal(spread.calls?.map(c => c.simulation?.status[0]).join(''), 'srrrrsr');
+  assert.match(spread.warnings.find(w => w.code === 'batch_partial_failure')?.message ?? '', /^The network would refuse call 2 as it stands/);
+  let asked = 0;
+  const counting: Simulator = { simulate: r => { asked++; return simulator.simulate(r); }, simulateBatch: rs => { asked++; return simulator.simulateBatch!(rs); } };
+  const all = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: Array.from({ length: 10 }, () => pay) }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: counting });
+  assert.equal(all.calls?.map(c => c.simulation?.status[0]).join(''), 'rrrrrrrrrr');
+  assert.ok(asked <= 20, `the node was asked ${asked} times`);
+  // More than the node is asked about: what was found is kept, and the calls after it are said not to have been
+  // simulated (they were all "could not be simulated").
+  const flood = await batch([...Array.from({ length: 14 }, () => pay), send, send]);
+  assert.equal(flood.calls?.map(c => c.simulation?.status[0]).join(''), 'rrrrrrrrrrrruuuu');
+  assert.equal(flood.simulation?.status, 'reverted');
+  assert.match(flood.simulation?.source ?? '', /, 12 calls in order$/);
+  assert.match(flood.warnings.find(w => w.code === 'simulation_skipped' && /^Call 13:/.test(w.message))?.message ?? '', /^Call 13: This call was not simulated: the network would refuse so many of this batch's calls as they stand/);
+  assert.ok(flood.decoding.notes.some(n => n === 'The network would refuse 12 of the first 12 calls as they stand, and the preview stopped looking there: calls 13 to 16 were not simulated.'), flood.decoding.notes.join(' | '));
+  assert.ok(!codes(flood).includes('simulation_unavailable'));
   // A node error that says nothing of the kind is as it was.
   const other = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0xa4b1', from: ALICE, calls: [send, send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator: { simulate: async () => ok(), simulateBatch: async () => { throw new Error('RPC HTTP 503'); } } });
   assert.ok(codes(other).includes('simulation_unavailable'));
@@ -292,6 +311,37 @@ test('A batch of more calls than a node takes in one simulation is run by the lo
   assert.deepEqual([results?.length, results?.every(r => r.status === 'success'), ran, asked.includes('eth_simulateV1')], [31, true, [31], false]);
 });
 
+test('A batch with a call naming a gas limit no block holds says which call; limits that only together pass a block’s are no call’s fault', async () => {
+  // The node refuses the lot ("Block gas limit exceeded by the block's transactions"), as it does a transaction
+  // alone: three transfers, the second naming a thousand million, were "could not be simulated" on Ethereum, BNB
+  // Chain and Base.
+  const BLOCK = 60_000_000n, over = "eth_simulateV1 failed: Block gas limit exceeded by the block's transactions";
+  const ok = (): SimulationResult => ({ status: 'success', source: 'mock', gasUsed: 21_000n, balancesRead: true, transfers: [] });
+  const tooHigh = (gas: bigint): SimulationResult => ({ status: 'reverted', source: 'mock', revertReason: `gas limit too high: the gas limit (${gas.toLocaleString('en-US')}) is more than a block holds here, so no block can include the transaction`, transfers: [], limited: true, refused: true });
+  const asked: number[] = [];
+  const simulator: Simulator = {
+    simulate: async r => { asked.push(1); return r.gas !== undefined && r.gas > BLOCK ? tooHigh(r.gas) : ok(); },
+    simulateBatch: async rs => { asked.push(rs.length); if (rs.reduce((sum, r) => sum + (r.gas ?? 0n), 0n) > BLOCK) throw new Error(over); return rs.map(ok); },
+  };
+  const call = (gas?: bigint) => ({ to: '0x00000000000000000000000000000000000b0b0b', value: '0x0', ...(gas !== undefined && { gas: toHex(gas) }) });
+  const batch = (calls: unknown[]) => previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, calls }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
+  const p = await batch([call(), call(10n ** 9n), call()]);
+  assert.deepEqual(p.calls?.map(c => c.simulation?.status), ['success', 'reverted', 'success']);
+  assert.match(p.warnings.find(w => w.code === 'batch_partial_failure')?.message ?? '', /^The network would refuse call 2 as it stands \(gas limit too high: the gas limit \(1,000,000,000\) is more than a block holds here, so no block can include the transaction\)\./);
+  assert.ok(!codes(p).includes('simulation_unavailable'), codes(p).join());
+  // Found from the highest limit down, asked alone: the same limit again isn't asked about, and a limit a block
+  // holds ends it (the batch, the two over, one a block holds, then the rest together).
+  asked.length = 0;
+  const several = await batch([call(10n ** 9n), call(50_000n), call(10n ** 9n), call(2n * 10n ** 9n), call(100_000n)]);
+  assert.equal(several.calls?.map(c => c.simulation?.status[0]).join(''), 'rsrrs');
+  assert.deepEqual(asked, [5, 1, 1, 1, 2]);
+  // Limits that together pass a block's and each fit one: transactions that go into blocks of their own. No call
+  // is blamed.
+  const together = await batch([call(30_000_000n), call(30_000_000n), call(30_000_000n)]);
+  assert.deepEqual(together.calls?.map(c => c.simulation?.status), ['unavailable', 'unavailable', 'unavailable']);
+  assert.ok(!codes(together).includes('batch_partial_failure') && !codes(together).includes('simulation_reverted'));
+});
+
 test('A transaction the network would refuse after the wallet’s pending transactions is said to be, and a pending one that is', async () => {
   // The node refuses the pending transactions and this one as a lot, and doesn't say which of them it wouldn't
   // take: after a pending transfer of all the account holds, a transfer of 1 wei was "could not be simulated".
@@ -312,6 +362,13 @@ test('A transaction the network would refuse after the wallet’s pending transa
   const before = await send('0x1', [{ to: BOB_, value: '0x64' }]);
   assert.equal(before.simulation?.status, 'success');
   assert.match(before.warnings.find(w => w.code === 'pending_transaction_fails')?.message ?? '', /^Your pending transaction #1 is expected to fail \(insufficient funds: the account can't cover the value it sends\)/);
+  // This one naming a gas limit no block holds: the node refuses the lot for that too, and it is said of this one.
+  const tooHigh = "gas limit too high: the gas limit (1,000,000,000) is more than a block holds here, so no block can include the transaction";
+  const gassy: Simulator = { simulate: async r => (r.gas !== undefined && r.gas > 60_000_000n ? { ...refused(), revertReason: tooHigh } : ok()),
+    simulateBatch: async rs => { if (rs.some(r => r.gas !== undefined && r.gas > 60_000_000n)) throw new Error("eth_simulateV1 failed: Block gas limit exceeded by the block's transactions"); return rs.map(ok); } };
+  const high = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: BOB_, value: '0x1', gas: '0x3b9aca00', chainId: '0xa4b1' }] }, { now: NOW, pendingTransactions: [{ to: BOB_, value: '0x1' }] }, { tokens: new StaticTokenRegistry(), simulator: gassy });
+  assert.match(high.warnings.find(w => w.code === 'simulation_reverted')?.message ?? '', /^The network would refuse this transaction as it stands: gas limit too high: the gas limit \(1,000,000,000\) is more than a block holds here/);
+  assert.ok(!codes(high).includes('simulation_unavailable') && !codes(high).includes('pending_transaction_fails'), codes(high).join());
 });
 
 test('A traced batch with a call the network would refuse traces the calls that ran', async () => {

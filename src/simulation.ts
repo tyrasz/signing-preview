@@ -1112,7 +1112,7 @@ export function rejection(message: string, request?: { value: bigint; gasPrice?:
   // (Of a transaction alone that names its gas limit: geth and reth say "Block gas limit exceeded by the block's
   // transactions", bor "block gas limit reached: remaining: 160000000, required: 1000000000". It was "could not be
   // simulated", with nothing said on a chain that has no cap on a transaction's gas to warn of.)
-  if (request?.gas !== undefined && /block gas limit (exceeded|reached)|exceeds block gas limit/i.test(message)) return `gas limit too high: the gas limit (${request.gas.toLocaleString('en-US')}) is more than a block holds here, so no block can include the transaction`;
+  if (request?.gas !== undefined && OVER_BLOCK.test(message)) return `gas limit too high: the gas limit (${request.gas.toLocaleString('en-US')}) is more than a block holds here, so no block can include the transaction`;
   return null;
 }
 
@@ -1178,18 +1178,44 @@ export function decodeRevert(data: Hex | undefined): string | undefined {
 
 /** A node's words for a call the network wouldn't take as it stands, which it refuses a whole batch for. */
 export const REFUSAL = /insufficient funds|intrinsic gas too low/i;
+/** A node's words for gas limits a block doesn't hold: one transaction's, or those of a batch's calls together. */
+export const OVER_BLOCK = /block gas limit (exceeded|reached)|exceeds block gas limit/i;
+/**
+ * Whether a node's failure of a batch is its refusal of calls the network wouldn't take, which withoutRefused finds:
+ * the reason it starts from, and whether it is a gas limit (a call may name one no block holds; the node says the
+ * same where the calls' limits together pass a block's, which is no call's fault and isn't found).
+ */
+export function batchRefusal(message: string, reqs: SimulationRequest[]): { first: string; overBlock: boolean } | null {
+  if (REFUSAL.test(message)) { const first = rejection(message); return first ? { first, overBlock: false } : null; }
+  return OVER_BLOCK.test(message) && reqs.some(r => r.gas !== undefined) ? { first: message, overBlock: true } : null;
+}
 
 /**
  * The results of a batch the node refuses as a whole for calls the network wouldn't take: each such call marked
  * refused with the reason, the others as they run in order without it (a transaction that isn't taken changes
  * nothing for those after it). The first refused call is the last of the shortest run from the start that the node
- * refuses, found by halving; then the rest are run, and where the node refuses them again, the next is found the
- * same way (three at most). With the results, which calls ran (`live`, their places in the batch). Null where the
- * node fails otherwise, or more calls than that are refused.
+ * refuses: looked for right after the calls known to run (calls refused for one reason come together: an account
+ * with no coin sending some in each), then by halving. Then the rest are run, and where the node refuses them again,
+ * the next is found the same way, from where the last was.
+ *
+ * With the results, which calls ran (`live`, their places in the batch), and which weren't looked at (`unknown`):
+ * the node is asked REFUSED_TRIES times at most, and a batch with more refused calls than that finds (twelve refused
+ * one after another; fewer spread through a long batch) keeps what was found, the calls before the last one found
+ * as they ran, and leaves the rest unsaid. (It was three calls at most, and nothing kept past them: a batch of
+ * seven calls, four of them sending coin the account hadn't, was "could not be simulated" for all seven, as
+ * information.) An unknown call's place in `results` holds no result of its own. Null where the node fails
+ * otherwise.
+ *
+ * `overBlock`: the node refused the batch for gas limits a block doesn't hold (batchRefusal). A call that names one
+ * no block holds is refused whatever comes before it, and a limit a block holds means any lower does: the calls that
+ * name a limit are asked alone, from the highest down, until one is taken. (A batch of three transfers, the second
+ * naming a limit of a thousand million, was "could not be simulated" on Ethereum, BNB Chain and Base.)
  */
-export async function withoutRefused(all: SimulationRequest[], simulator: Simulator, first: string): Promise<{ results: SimulationResult[]; live: number[] } | null> {
+export async function withoutRefused(all: SimulationRequest[], simulator: Simulator, first: string, overBlock = false): Promise<{ results: SimulationResult[]; live: number[]; unknown: number[] } | null> {
+  let tries = 0;
   /** The calls' results; a reason, where the node refuses them; undefined, where it fails otherwise. */
   const attempt = async (reqs: SimulationRequest[]): Promise<SimulationResult[] | string | undefined> => {
+    tries++;
     try {
       const rs = reqs.length === 1 ? [await simulator.simulate(reqs[0])] : await simulator.simulateBatch!(reqs);
       if (!rs || rs.length !== reqs.length || rs.some(r => !r)) return undefined;
@@ -1202,27 +1228,54 @@ export async function withoutRefused(all: SimulationRequest[], simulator: Simula
   };
   const refused = new Map<number, string>();
   let live = all.map((_, i) => i), reason = first, source: string | undefined;
-  for (let round = 0; round < 3 && live.length; round++) {
-    let lo = 1, hi = live.length;
+  /** The results of the calls at the start of `live` that are known to run, in order. */
+  let good: SimulationResult[] = [];
+  const answer = (ran: number[], rs: SimulationResult[], unknown: number[]) => ({ live: ran, unknown, results: all.map((_, i): SimulationResult => (
+    refused.has(i) ? { status: 'reverted', source: source ?? "the chain's node", revertReason: refused.get(i)!, transfers: [], limited: true, refused: true }
+      : unknown.includes(i) ? { status: 'success', source: source ?? "the chain's node", transfers: [], limited: true } : rs[ran.indexOf(i)])) });
+  if (overBlock) {
+    const named = live.filter(i => all[i].gas !== undefined).sort((x, y) => (all[y].gas! > all[x].gas! ? 1 : all[y].gas! < all[x].gas! ? -1 : x - y));
+    let last: { gas: bigint; reason: string } | undefined;
+    for (const i of named) {
+      if (last && last.gas === all[i].gas) { refused.set(i, last.reason); continue; }
+      const alone = tries < REFUSED_TRIES ? await attempt([all[i]]) : undefined;
+      if (typeof alone !== 'string' || !/^gas limit too high/.test(alone)) break;
+      refused.set(i, alone); last = { gas: all[i].gas!, reason: alone };
+    }
+    if (!refused.size) return null;
+    live = live.filter(i => !refused.has(i));
+    if (!live.length) return answer([], [], []);
+    const rest = await attempt(live.map(i => all[i]));
+    if (rest === undefined) return null;
+    if (typeof rest !== 'string') return answer(live, rest, []);
+    reason = rest;
+  }
+  while (live.length && tries < REFUSED_TRIES) {
+    // The shortest run from the start of `live` that the node refuses: longer than what is known to run, and `live`
+    // itself at most.
+    let lo = good.length + 1, hi = live.length, mid = lo;
     while (lo < hi) {
-      const mid = (lo + hi) >> 1, r = await attempt(live.slice(0, mid).map(i => all[i]));
+      const r = await attempt(live.slice(0, mid).map(i => all[i]));
       if (r === undefined) return null;
-      if (typeof r === 'string') { hi = mid; reason = r; } else { lo = mid + 1; source ??= r[0].source; }
+      if (typeof r === 'string') { hi = mid; reason = r; } else { lo = mid + 1; good = r; source ??= r[0].source; }
+      mid = (lo + hi) >> 1;
     }
     const index = live[lo - 1];
-    // (Alone, a call says more of why: the gas limit it names against what its calldata costs.)
-    if (lo === 1 && live.length > 1) { const alone = await attempt([all[index]]); if (typeof alone === 'string') reason = alone; }
+    // (A call found first in line was asked alone on the way, which says more of why: the gas limit it names
+    // against what its calldata costs.)
     refused.set(index, reason);
     live = live.filter(i => i !== index);
-    const rest = live.length ? await attempt(live.map(i => all[i])) : [];
+    if (live.length === good.length) return answer(live, good, []);
+    const rest = await attempt(live.map(i => all[i]));
     if (rest === undefined) return null;
     if (typeof rest === 'string') { reason = rest; continue; }
     source ??= rest[0]?.source;
-    const ran = live;
-    return { live: ran, results: all.map((_, i) => (refused.has(i) ? { status: 'reverted' as const, source: source ?? "the chain's node", revertReason: refused.get(i)!, transfers: [], limited: true, refused: true } : rest[ran.indexOf(i)])) };
+    return answer(live, rest, []);
   }
-  return null;
+  return refused.size ? answer(live.slice(0, good.length), good, live.slice(good.length)) : null;
 }
+/** How many times withoutRefused asks the node (the three calls it looked for before took up to twenty-one). */
+const REFUSED_TRIES = 24;
 
 /** Returns canned results keyed by `${chainId}:${to}:${data}`; for tests and demos. */
 export class MockSimulator implements Simulator {

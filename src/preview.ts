@@ -4,7 +4,7 @@ import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext
 import { accountApprovalWarnings, decodeTransaction, forAccount, normalizeTransaction, standInsNote, previewTransaction, RequestError, simulationNote, simulationRequest, type PresetSimulation, normalizeOverrides, overriddenWarning } from './evm/transaction.ts';
 import { expectedGasPrice } from './evm/tx-checks.ts';
 import { blockText, namedBlock, parseBlock, pinLatest, type Pinned } from './block.ts';
-import { decodeRevert, REFUSAL, rejection, withoutRefused } from './simulation.ts';
+import { batchRefusal, decodeRevert, withoutRefused } from './simulation.ts';
 import { addUsdValues } from './prices.ts';
 import { noTrace, tracePreviews, type TraceEnv } from './evm/trace.ts';
 import type { Decoded } from './evm/common.ts';
@@ -134,6 +134,8 @@ async function previewTypedData(method: string, params: unknown[], context: Prev
   };
 }
 
+/** A call after the last refused one found, where the batch has more refused calls than are looked for (withoutRefused). */
+const NOT_LOOKED_AT = "This call was not simulated: the network would refuse so many of this batch's calls as they stand that the preview stopped finding them, and this one comes after the last it found.";
 const SKIPPED_IN_BATCH = "This call was not simulated: it may depend on the calls before it, and the simulator (or this chain's RPC) can only check one call at a time.";
 
 /**
@@ -190,6 +192,8 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   let requests: SimulationRequest[] | undefined;
   // Which calls `ran` holds, where it isn't all of them (the ones the network would refuse left out).
   let ranOf: number[] | undefined;
+  /** Calls with no result of their own in `results`: the ones withoutRefused didn't get to. */
+  let unlooked: number[] = [];
   let named: Pinned | undefined;
   const sameChain = txs.every(t => t.chainId === txs[0].chainId);
   if (deps.simulator && txs.length > 1) {
@@ -269,9 +273,10 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
         // from an account with no coin, one call sending 1 wei, was "could not be simulated", as information, where
         // a transaction alone is refused with the reason. The calls it refuses are found, and the others run
         // without them (withoutRefused), as the local EVM runs such a batch.
-        const why = (error as Error)?.name !== 'BatchSimulationUnsupported' && REFUSAL.test(message) ? rejection(message) : null;
-        const recovered = why && requests ? await withoutRefused(requests, deps.simulator, why).catch(() => null) : null;
-        if (recovered) { results = recovered.results; presets = txs.map((_, i) => ({ result: recovered.results[i] })); ran = recovered.live.map(i => requests![i]); ranOf = recovered.live; }
+        // (And a call that names a gas limit no block holds, which the node refuses the lot for too.)
+        const why = (error as Error)?.name !== 'BatchSimulationUnsupported' && requests ? batchRefusal(message, requests) : null;
+        const recovered = why && requests ? await withoutRefused(requests, deps.simulator, why.first, why.overBlock).catch(() => null) : null;
+        if (recovered) { results = recovered.results; unlooked = recovered.unknown; presets = txs.map((_, i) => (recovered.unknown.includes(i) ? { skipped: NOT_LOOKED_AT } : { result: recovered.results[i] })); ran = recovered.live.map(i => requests![i]); ranOf = recovered.live; }
       }
     } else {
       presets = txs.map((_, i) => (i === 0 ? undefined : { skipped: SKIPPED_IN_BATCH }));
@@ -330,10 +335,11 @@ export async function previewBatch(raw: unknown, context: PreviewContext, deps: 
   } else if (results) {
     const failed = results.findIndex(r => r.status === 'reverted');
     const gasUsed = results.reduce((sum, r) => sum + (r.gasUsed ?? 0n), 0n);
-    simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length} calls in order`, gasUsed: gasUsed.toString(),
+    simulation = { status: failed === -1 ? 'success' : 'reverted', source: `${results[0].source}, ${results.length - unlooked.length} calls in order`, gasUsed: gasUsed.toString(),
       ...(failed !== -1 && results[failed].revertReason && { revertReason: `call ${failed + 1}: ${results[failed].revertReason}` }), ...(named && { block: named.number.toString() }),
       ...(results[0].stateReadError && { stateReadError: results[0].stateReadError }) };
     b.note('The calls were simulated in order in one block, each seeing the effects of the calls before it.');
+    if (unlooked.length) b.note(`The network would refuse ${results.filter(r => r.refused).length} of the first ${unlooked[0]} calls as they stand, and the preview stopped looking there: call${unlooked.length === 1 ? ` ${unlooked[0] + 1} was` : `s ${unlooked[0] + 1} to ${txs.length} were`} not simulated.`);
     if (asOneFails) b.warn('caution', 'atomic_batch_fails_as_one', `This batch is all-or-nothing, which a wallet makes of a plain account's calls by giving the account smart-account code (EIP-7702) and running them as one transaction. Run so here, on a stand-in for that code (which code is the wallet's choice), ${asOneFails.call ? `call ${asOneFails.call}` : 'a call'} fails${asOneFails.reason ? ` (${asOneFails.reason})` : ''}, and with it the whole batch: a contract can refuse or treat differently a caller that has code. What is shown is the calls run a transaction each, which go through.`);
     if (named) b.note(`Simulated on the state after ${blockText(named.number, named.time)}, in the block that followed: what the calls would have done then, not now.`);
     if (context.stateOverrides) b.warn('caution', 'state_overridden', overriddenWarning(context.stateOverrides));

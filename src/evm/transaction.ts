@@ -2,7 +2,7 @@ import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } f
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, PreviewTrace, ReplayInfo, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { blockText, namedBlock, pinLatest, type BlockAt, type Pinned } from '../block.ts';
-import { REFUSAL, rejection, withoutRefused } from '../simulation.ts';
+import { batchRefusal, withoutRefused } from '../simulation.ts';
 import { compareWithReceipt, noTrace, sameRun, tracePreviews, type TraceEnv } from './trace.ts';
 import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
@@ -267,9 +267,10 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
         // and this one is run without it; this one is refused, with why.)
         const all = [...pending, request];
         const results = await deps.simulator.simulateBatch(all).catch(async (e: unknown) => {
-          const message = e instanceof Error ? e.message : String(e), why = REFUSAL.test(message) ? rejection(message) : null;
-          const recovered = why ? await withoutRefused(all, deps.simulator!, why).catch(() => null) : null;
-          if (!recovered) throw e;
+          const message = e instanceof Error ? e.message : String(e), why = batchRefusal(message, all);
+          const recovered = why ? await withoutRefused(all, deps.simulator!, why.first, why.overBlock).catch(() => null) : null;
+          // (With more refused than are looked for, this one, the last, wasn't got to: nothing to say of it.)
+          if (!recovered || recovered.unknown.includes(all.length - 1)) throw e;
           ran = recovered.live.map(i => all[i]);
           return recovered.results;
         });
