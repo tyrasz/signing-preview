@@ -2877,7 +2877,10 @@ export class ForkSimulator implements Simulator {
       state.at.read = undefined;
       const nativeBefore = await native(from);
       if (req.value > await native(caller)) {
-        results.push({ status: 'reverted', source: source_, revertReason: `insufficient funds: the account holds ${units(chainId, nativeBefore)} and the call sends ${units(chainId, req.value)}`, transfers: [], basis: 'fork' });
+        // (Refused, as the node refuses it: not mined, so no fee. It was "expected to fail. You would still pay
+        // the network fee", where the same transaction on a chain whose node simulates is one "the network would
+        // refuse".)
+        results.push({ status: 'reverted', source: source_, revertReason: `insufficient funds: the account holds ${units(chainId, nativeBefore)} and the call sends ${units(chainId, req.value)}`, transfers: [], basis: 'fork', refused: true });
         continue;
       }
       // A transaction the network refuses before it runs, as every chain's node refuses it (with its validation off

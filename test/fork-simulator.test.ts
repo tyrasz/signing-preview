@@ -117,7 +117,11 @@ test('What a simulation sets in storage is not read over by the slots the node s
 test('Failures: revert reasons, insufficient funds; a chain precompile is answered by the chain', async () => {
   const fail = await send(reverter, call('fail'));
   assert.deepEqual([fail.simulation?.status, fail.simulation?.revertReason], ['reverted', 'nope']);
-  assert.equal((await send(BOB, '0x', 100n * E)).simulation?.revertReason, 'insufficient funds: the account holds 10 HYPE and the call sends 100 HYPE');
+  const broke = await send(BOB, '0x', 100n * E);
+  assert.equal(broke.simulation?.revertReason, 'insufficient funds: the account holds 10 HYPE and the call sends 100 HYPE');
+  // A transaction the account can't pay for is refused, not mined: it was "expected to fail. You would still pay
+  // the network fee".
+  assert.equal(broke.warnings.find(w => w.code === 'simulation_reverted')?.message, 'The network would refuse this transaction as it stands: insufficient funds: the account holds 10 HYPE and the call sends 100 HYPE. It would not be mined.');
   const [r] = (await fork().simulateBatch([{ chainId: 999, from: USER, to: reader, data: call('read', [5]), value: 0n }]))!;
   assert.equal(r.status, 'success');
   assert.equal(BigInt(r.returnData!), 17n);
