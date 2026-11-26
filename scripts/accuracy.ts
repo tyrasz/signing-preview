@@ -396,14 +396,19 @@ for (const row of rows) for (const name of SIMULATORS) {
   // price that moves with the time) by more than the allowance above. Where the same transaction run at its block's
   // own time has the receipt's (the local EVM's run, when both simulators ran), the second is what moved it:
   // reported, not failed. On BNB Chain (2026-11-20) one transaction of 199 failed the scheduled run on its native
-  // change alone, on the node a second late; the local EVM had it exactly.
+  // change alone, on the node a second late; the local EVM had it exactly. Its approvals the same way: a run that
+  // fails a second late (a deadline of the block's own timestamp, its outcome reported above) sets none, where the
+  // receipt has them and so has the run at its own time (BNB Chain, 2026-11-26: one transaction's node run reverted
+  // a second late and was failed on its approvals alone, its outcome and token movements already put down to the
+  // second).
   const own = row.timeBumped && name !== 'fork' ? row.fork as Record<string, any> | undefined : undefined;
   const ownHas = (right: (cell: Record<string, any>) => boolean) => !!own && !own.error && own.outcome === true && right(own);
   const lateNative = !r.native && !unreadNative && ownHas(c => c.native === true);
   const lateTokens = !r.unread && tokensDiffer && ownHas(c => !c.unread && !c.tokenDiffs.some((d: { actual: string; simulated: string }) => !near(1_000_000n)(d)));
-  if (lateNative || lateTokens) r.warned = [r.warned, `${[lateNative && 'native change', lateTokens && 'token movements'].filter(Boolean).join(' and ')} (run a second after its block; at its own time, in the local EVM, as the receipt)`].filter(Boolean).join('; ');
+  const lateApprovals = r.approvals < r.approvalTotal && ownHas(c => c.approvals === c.approvalTotal);
+  if (lateNative || lateTokens || lateApprovals) r.warned = [r.warned, `${[lateNative && 'native change', lateTokens && 'token movements', lateApprovals && 'approvals'].filter(Boolean).join(' and ')} (run a second after its block; at its own time, in the local EVM, as the receipt)`].filter(Boolean).join('; ');
   const differs = [!r.outcome && !row.timeBumped && 'outcome', !r.unread && tokensDiffer && !lateTokens && 'tokens',
-    !r.native && !unreadNative && !lateNative && 'native', r.approvals < r.approvalTotal && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
+    !r.native && !unreadNative && !lateNative && 'native', r.approvals < r.approvalTotal && !lateApprovals && 'approvals', !r.gas && !row.timeBumped && r.gasPercent !== undefined && Math.abs(r.gasPercent) >= GAS_FAIL_PERCENT && 'gas'].filter(Boolean);
   if (unreadTokens || unreadNative) r.warned = [r.warned, `amounts from events (the node's reads got no answer: ${r.unread})`].filter(Boolean).join('; ');
   if (differs.length) r.differs = differs;
 }

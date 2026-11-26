@@ -3571,10 +3571,9 @@ async function simulateOperationOnce(op: OperationInput, deps: Dependencies): Pr
   const attempt = async (recover: Hex) => {
     let ran = await run(origin?.bundler ?? known ?? first, recover);
     // The lookup lost the race, and the paymaster took the simulation's own bundler: it may still work otherwise
-    // for a bundler it knows (the one above charged 4% more gas), and nothing then said so. The likely cause of a
-    // preview on Arbitrum One (2026-11-25): an operation through a paymaster that takes a fixed token fee in postOp
-    // showed no fee paid and 39.8% less gas than it used, the paymaster's first of the run, where the account's
-    // next, the lookup remembered by then, matched (its state was gone before it could be run again: inferred).
+    // for a bundler it knows (the one above charged 4% more gas), and nothing then said so. (A preview on Arbitrum
+    // One, 2026-11-25, was first put down to this and wasn't it: its paymaster signed another form of the
+    // EIP-7702 marker than the one run, src/typed-data/user-operation.ts.)
     // Once the lookup answers (the run has given it time, and it gets LATE_LOOKUP_MS more), the operation runs again
     // as a bundler the paymaster's operations came through, and that run is the one kept, for this stand-in and
     // those after it.

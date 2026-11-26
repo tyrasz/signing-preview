@@ -671,9 +671,10 @@ console.log('\n# Contracts read from their layout or signed types: still the cod
   const urlOf = (id: number) => process.env[EVM_RPCS[id].env] ?? EVM_RPCS[id].public;
   const rpcCall = async (id: number, method: string, params: unknown[]) => (await jsonRpc(urlOf(id), { jsonrpc: '2.0', id: 1, method, params }))?.result as string | undefined;
   const word = (r: string | undefined) => (r && r.length >= 66 ? `0x${r.slice(26, 66)}` : String(r));
-  // The BNB Chain fee router (src/evm/bsc-fee-router.ts): its EIP-1967 implementation.
+  // The BNB Chain fee router (src/evm/bsc-fee-router.ts): its EIP-1967 implementation (changed 2026-11-26, and the
+  // layout checked again against the receipts of calls made since).
   const impl = word(await rpcCall(56, 'eth_getStorageAt', ['0xd36b6d646ac6e23672e9eedec558164c7f2d6deb', '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc', 'latest']));
-  check(impl === '0x3f3e9aa26467e4f99bf00f8564b620b8647b92fe', 'BNB Chain fee router implementation'.padEnd(34), impl);
+  check(impl === '0x321f95ccd668fda6dfab69fa90f477157c725d42', 'BNB Chain fee router implementation'.padEnd(34), impl);
   // Binance Web3 Wallet's router (src/evm/binance-wallet.ts): the facet behind its entry point, on each chain read.
   const FACETS: Record<number, string> = { 1: '0xf4351fe8260d9a4dd58f687379e9ae1ebc68f277', 56: '0xb415f8f4ee87219fa26c6795e31217ea05b7fc8d', 42161: '0xefb6c460dc0f27ca8cd3fcea0774de177b539552', 8453: '0xeee23de5d28d40502ab1dbbe9e33ffed73a003e6', 137: '0xfdb1e637f5173d5f87b984d4b3b0268bff0c8db6', 10: '0xc120386ff338a960080b7458a67b269f8f3ef032' };
   for (const [id, facet] of Object.entries(FACETS)) {

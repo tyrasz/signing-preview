@@ -1412,3 +1412,51 @@ test('From Amsterdam on, calls that fail only for want of gas for new state: sho
     before: [{ chainId: SEPOLIA, from: OWNER, to: WRITER, data: '0x', value: 0n, gas: 2n * 16_777_216n }] }, on(true));
   assert.equal(after?.afterReservoir, true);
 });
+
+test('An EIP-7702 account’s operation whose paymaster signed its initCode as the two bytes 0x7702: run in that form, not with the marker padded to 20 bytes', async () => {
+  const { keccak256 } = await import('viem');
+  // An account delegating to code that takes any signature, and a paymaster whose approval covers the initCode's bytes.
+  const user = privateKeyToAccount('0x8888888888888888888888888888888888888888888888888888888888888888').address.toLowerCase();
+  const delegate = await chain.deploy('AnySignatureAccount');
+  await chain.putCode(user, `0xef0100${delegate.slice(2)}` as Hex);
+  await chain.setBalance(user, E);
+  await chain.exec(usdc, call('mint', [user, 10_000_000n]));
+  const pm = await chain.deploy('InitCodePaymaster', 'address', [EP9]);
+  await chain.exec(EP9, call('depositTo', [pm]), '0xde9100000000000000000000000000000000d001', E);
+  const inits: string[] = [];
+  const sim = deps.simulator!;
+  const SIM = parseAbi(['function simulateHandleOp((address sender, uint256 nonce, bytes initCode, bytes callData, bytes32 accountGasLimits, uint256 preVerificationGas, bytes32 gasFees, bytes paymasterAndData, bytes signature) op, address target, bytes targetCallData)']);
+  const { decodeFunctionData } = await import('viem');
+  const seen = (rs: SimulationRequest[]) => { for (const r of rs) if (r.to?.toLowerCase() === EP9 && r.data?.startsWith('0x97b2dcb9')) inits.push((decodeFunctionData({ abi: SIM, data: r.data as Hex }).args[0] as { initCode: string }).initCode); };
+  const watched: Dependencies = { ...deps, simulator: { simulate: async r => { seen([r]); return sim.simulate(r); }, simulateBatch: async rs => { seen(rs); return sim.simulateBatch!(rs); } } };
+  // The typed data a wallet signs has the delegate where the EntryPoint is sent the marker, so it doesn't say which
+  // form of the marker the bundler sends.
+  const typed = (initCode: string, approved: Hex) => JSON.stringify({ domain: { name: 'ERC4337', version: '1', chainId: 999, verifyingContract: EP9 }, primaryType: 'PackedUserOperation',
+    types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+      PackedUserOperation: [{ name: 'sender', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'initCode', type: 'bytes' }, { name: 'callData', type: 'bytes' }, { name: 'accountGasLimits', type: 'bytes32' }, { name: 'preVerificationGas', type: 'uint256' }, { name: 'gasFees', type: 'bytes32' }, { name: 'paymasterAndData', type: 'bytes' }] },
+    message: { sender: user, nonce: '0', initCode, callData: call('execute', [usdc, 0n, call('transfer', [BOB, 5_000_000n])]), accountGasLimits: concatHex([word(200_000n), word(200_000n)]), preVerificationGas: '50000', gasFees: concatHex([word(1_000_000_000n), word(2_000_000_000n)]),
+      paymasterAndData: concatHex([pm as Hex, word(100_000n), word(100_000n), approved]) } });
+  const run = async (initCode: string, approved: Hex) => { inits.length = 0; return previewRequest({ method: 'eth_signTypedData_v4', params: [user, typed(initCode, approved)] }, { now: NOW }, watched); };
+  const bareNote = (p: Preview) => p.decoding.notes.some(n => /paymaster signed it with the EIP-7702 marker in its initCode as the two bytes 0x7702/.test(n));
+  const PADDED = `0x7702${'00'.repeat(18)}`;
+
+  // Signed for the two bytes: the padded form fails the paymaster's signature, the bare one runs, and is what is shown.
+  const bare = await run(delegate, keccak256('0x7702'));
+  assert.deepEqual([...new Set(inits)], [PADDED, '0x7702']);
+  assert.deepEqual([usdcChange(bare), codes(bare).includes('userop_paymaster_signature'), codes(bare).includes('userop_rejected'), bareNote(bare)], [['out 5'], false, false, true], codes(bare).join());
+  assert.equal(detail(bare, 'Account setup'), `EIP-7702 account, delegating to ${delegate}`);
+  assert.ok(bare.decoding.notes.some(n => /whole operation was simulated as EntryPoint v0\.9 runs it/.test(n)));
+  // Signed for the padded marker: one form is run, with nothing said of the other.
+  const padded = await run(delegate, keccak256(PADDED as Hex));
+  assert.deepEqual([...new Set(inits)], [PADDED]);
+  assert.deepEqual([usdcChange(padded), codes(padded).includes('userop_paymaster_signature'), bareNote(padded)], [['out 5'], false, false]);
+  // Signed for neither (other gas values, say): both are tried, and the signature is said not to check out.
+  const neither = await run(delegate, keccak256('0x77'));
+  assert.deepEqual([...new Set(inits)], [PADDED, '0x7702']);
+  assert.deepEqual([codes(neither).includes('userop_paymaster_signature'), bareNote(neither)], [true, false]);
+  // With an initialization call the marker is its first 20 bytes whoever sends it: only that form is run.
+  const withCall = `${delegate}deadbeef`;
+  const init = await run(withCall, keccak256(`${PADDED}deadbeef` as Hex));
+  assert.deepEqual([...new Set(inits)], [`${PADDED}deadbeef`]);
+  assert.deepEqual([codes(init).includes('userop_paymaster_signature'), bareNote(init)], [false, false]);
+});

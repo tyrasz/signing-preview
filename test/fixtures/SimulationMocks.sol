@@ -312,6 +312,17 @@ contract OwnBundlerFeePaymaster {
         token.transferFrom(abi.decode(context, (address)), address(this), 36540);
     }
 }
+/// A paymaster whose approval covers the operation's initCode as its bytes are sent, as paymasters that hash the
+/// operation's fields themselves do: its data names the hash of the initCode it approved, and the same operation
+/// with its initCode in another form (an EIP-7702 account's marker, padded or not) fails its signature.
+contract InitCodePaymaster {
+    address public entryPoint;
+    constructor(address ep) { entryPoint = ep; }
+    function validatePaymasterUserOp(PackedUserOperation calldata op, bytes32, uint256) external view returns (bytes memory, uint256) {
+        require(msg.sender == entryPoint, "entrypoint");
+        return ("", keccak256(op.initCode) == bytes32(op.paymasterAndData[52:84]) ? 0 : 1);
+    }
+}
 /// An Account4337 that installs ERC-7579 modules (logging ModuleInstalled), as modular accounts do.
 contract ModularAccount4337 is Account4337 {
     event ModuleInstalled(uint256 moduleTypeId, address module);

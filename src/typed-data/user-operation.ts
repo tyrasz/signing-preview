@@ -22,6 +22,16 @@ export const ENTRY_POINTS: Record<string, string> = {
 const FIELDS = ['sender', 'nonce', 'initCode', 'callData', 'accountGasLimits', 'preVerificationGas', 'gasFees', 'paymasterAndData'];
 /** initCode of an EIP-7702 account: the marker 0x7702 padded to 20 bytes, then an optional initialization call. */
 const EIP7702_MARKER = `0x7702${'00'.repeat(18)}`;
+/**
+ * The marker with no initialization call, as bundlers also send it: its two bytes alone. The EntryPoint reads the
+ * initCode's first 20 bytes from calldata, which pads a shorter one with zeros, so it takes 0x7702 with any padding
+ * up to 20 bytes as the marker, and hashes each with the account's delegate in its place: the operation's hash, and
+ * so the account's signature, is the same for all of them.
+ */
+const EIP7702_BARE = '0x7702';
+const isMarker = (initCode: string): boolean => initCode.startsWith(EIP7702_MARKER) || /^0x7702(00){0,17}$/.test(initCode);
+/** The paymaster turned the run down in its own validation: its signature failed, or its validation reverted. */
+const paymasterValidationFailed = (run: OperationRun | null | undefined): boolean => !!run && (!!run.paymaster?.signatureFailed || /^AA3[34]/.test(run.rejected ?? ''));
 
 const hex = (v: unknown): Hex | null => typeof v === 'string' && /^0x([0-9a-fA-F]{2})*$/.test(v) ? v.toLowerCase() as Hex : null;
 /**
@@ -345,7 +355,7 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
   const lead = initCode.length >= 42 ? `0x${initCode.slice(2, 42)}` : null;
   const init = initCode.length > 42 ? ', with an initialization call' : '';
   if (initCode === '0x') b.detail('Account setup', 'none (the account already exists)');
-  else if (initCode.startsWith(EIP7702_MARKER)) b.detail('Account setup', `EIP-7702 account (its current delegation)${init}`);
+  else if (initCode.startsWith(EIP7702_MARKER) || (isMarker(initCode) && !/v0\.[67]$/.test(u.entryPointName ?? ''))) b.detail('Account setup', `EIP-7702 account (its current delegation)${init}`);
   // EntryPoint v0.6 and v0.7 know nothing of EIP-7702: their initCode is always a factory and its data.
   else if (lead && mine && !/v0\.[67]$/.test(u.entryPointName ?? '')) {
     b.detail('Account setup', `EIP-7702 account, delegating to ${lead}${init}`, lead);
@@ -411,11 +421,28 @@ export async function describeOperation(u: Operation, env: TypedEnv, b = new Pre
     // The EntryPoint receives an EIP-7702 account's initCode with the 0x7702 marker where the typed data has its delegate.
     const onChainInit = lead && mine && !deploys && !initCode.startsWith(EIP7702_MARKER) && u.entryPointName && !u.entryPointName.endsWith('v0.6') && !u.entryPointName.endsWith('v0.7')
       ? `${EIP7702_MARKER}${initCode.slice(42)}` as Hex : initCode;
+    // With no initialization call, the typed data doesn't say which form of the marker the bundler will send.
+    const eitherForm = onChainInit !== initCode && onChainInit === EIP7702_MARKER;
     try {
       // For a trace, the block is named, so that the tracing run is of the same one (src/block.ts).
       const at = env.context.trace ? await pinLatest(env.deps.rpc, chainId) : undefined;
-      const run = await simulateOperation({ ...(env.context.bundleGas !== undefined && { bundleGas: env.context.bundleGas }), chainId, entryPoint, sender, nonce, initCode: onChainInit, callData: calls ?? '0x', callGasLimit: u.gas.call, verificationGasLimit: u.gas.verification, preVerificationGas: u.gas.preVerification,
-        maxFeePerGas: u.gas.maxFee, maxPriorityFeePerGas: u.gas.maxPriority, paymasterAndData: u.paymasterAndData, ...(before && { before }), ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(u.supertransaction && { supertransaction: u.supertransaction }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+      const gas = u.gas, paymasterAndData = u.paymasterAndData;
+      const runWith = (init: Hex) => simulateOperation({ ...(env.context.bundleGas !== undefined && { bundleGas: env.context.bundleGas }), chainId, entryPoint, sender, nonce, initCode: init, callData: calls ?? '0x', callGasLimit: gas.call, verificationGasLimit: gas.verification, preVerificationGas: gas.preVerification,
+        maxFeePerGas: gas.maxFee, maxPriorityFeePerGas: gas.maxPriority, paymasterAndData, ...(before && { before }), ...(u.signature && { signature: u.signature }), ...(u.digest && { digest: u.digest }), ...(u.supertransaction && { supertransaction: u.supertransaction }), ...(env.signer && { signer: env.signer }), ...(delegate && { delegate }), ...(inner.watch?.length && { watch: inner.watch }), ...(at && { at }), ...(overrides && { stateOverrides: overrides }) }, env.deps);
+      let run = await runWith(onChainInit);
+      // A paymaster that signs the operation's fields itself signs the initCode's own bytes, so its signature is for
+      // one form of the marker only (the account's is for both: EIP7702_BARE). Where it turns down the padded form,
+      // the operation is run with the two bytes alone, and that run is the one shown where the paymaster takes it.
+      // (On Arbitrum One, two operations of EIP-7702 accounts through one paymaster on EntryPoint v0.9 were mined
+      // with the two bytes; run padded, its signature failed and with it the calls its sponsorship pays for.) A second
+      // run the node fails leaves the first as it is.
+      if (eitherForm && paymasterValidationFailed(run)) {
+        const bare = await runWith(EIP7702_BARE).catch(() => null);
+        if (bare && !paymasterValidationFailed(bare)) {
+          run = bare;
+          b.note("This operation's paymaster signed it with the EIP-7702 marker in its initCode as the two bytes 0x7702 (bundlers also send the marker padded to 20 bytes, which this paymaster's signature doesn't cover): it is simulated in the form the paymaster signed.");
+        }
+      }
       if (run) warnOverridden(b, overrides);
       if (run?.origin?.by === 'factory') deployer = run.origin.bundler;
       whole = await reportRun(run, u, chainId, env, b, { deploys, ...(delegate && { delegate }) });

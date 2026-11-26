@@ -13,6 +13,12 @@
 // (eth_simulateV1), a real call paid exactly `minReturn` and one asking a wei more reverted
 // (INSUFFICIENT_OUTPUT_AMOUNT). The two words after the fee receiver were zero in all 200: calls where they aren't
 // are left to the other decoders.
+//
+// Its implementation changed on 2026-11-26 (03:26 UTC, 0x3f3e…92fe to 0x321f…5d42, noticed by the daily live check,
+// scripts/verify-live.ts), and the layout was checked again against the latest 200 calls made since: the sender paid
+// exactly `amount` and was the receiver in 200 of 200, received at least `minReturn` in 153 of 153 with a token
+// output and in 47 of 47 with the native coin out (44 by the Swap event less the fee, the 3 whose fee was taken in
+// the source token by the sender's balance either side of the block), and the two words were zero in all 200.
 import { formatUnits, PreviewBuilder, shortAddress } from '../format.ts';
 import { CHAINS } from '../chains.ts';
 import type { AssetChange } from '../types.ts';
