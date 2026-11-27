@@ -529,6 +529,13 @@ test('What chains do their own way: blob transactions, Arbitrum’s header, Poly
   const capped = await over(70_000_000n);
   assert.deepEqual([capped.simulation!.status, capped.simulation!.gasUsed, capped.simulation!.source], ['reverted', '16777216', "the local EVM, over the chain's state"]);
   assert.match(capped.decoding.notes.join(' '), /The gas limit \(70,000,000\) is over what a transaction has to run on here \(16,777,216\): the rest only pays for new state\. The chain's node doesn't simulate that and its run came out differently, so the run shown is the local EVM's\./);
+  // A simulator that hands such a request to the local EVM itself says so in its result's source (RpcSimulator, where
+  // it has a local EVM): the preview says why that run is the one shown, and doesn't run it a second time.
+  let traced = 0;
+  const handed = await previewRequest({ method: 'eth_sendTransaction', params: [{ from: ALICE, to: USDC, data: transfer, gas: hex(70_000_000n), chainId: '0xaa36a7' }] }, { now: NOW },
+    { tokens: new StaticTokenRegistry(), rpc: amsterdam, simulator: { simulate: async () => ran({ ...failing, gasUsed: 16_777_216n, source: "local EVM over chain 11155111 state (a gas limit over 16,777,216, which the chain's node simulates otherwise)" }), trace: async () => { traced++; return null; } } });
+  assert.deepEqual([handed.simulation!.status, handed.simulation!.gasUsed, traced], ['reverted', '16777216', 0]);
+  assert.match(handed.decoding.notes.join(' '), /The gas limit \(70,000,000\) is over what a transaction has to run on here \(16,777,216\): the rest only pays for new state\. The chain's node doesn't simulate that \(it gives the whole limit as ordinary gas\), so the run shown is the local EVM's\./);
   // Under the cap, or on a chain that isn't Ethereum's, the node's run stands.
   assert.deepEqual([(await over(500_000n)).simulation!.gasUsed, (await over(70_000_000n, '0x2105')).simulation!.gasUsed], ['50000000', '50000000']);
   // If the local EVM's run isn't what happened either, the node's stays, with what differs.

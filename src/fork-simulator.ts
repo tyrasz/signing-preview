@@ -372,7 +372,7 @@ export const CHAIN_PROFILES: Record<number, ChainProfile> = {
   11155111: { hardfork: 'osaka', checked: { forkId: '0x6c1d9423', on: '2026-11-11' }, ...NEXT_BLOCK[11155111] },
   42161: { hardfork: 'osaka', checked: { forkId: '0x92f58d00', on: '2026-11-10' }, ...NEXT_BLOCK[42161], forwardedPrecompiles: ARBOS, precompileGas: arbosGas, revertsKeepGas: ARBOS, missingOpcodes: [0x4a] },
   8453: { hardfork: 'osaka', checked: { forkId: '0x169d85a3', on: '2026-11-10' }, ...NEXT_BLOCK[8453], baseFeeTo: BASE_FEE_VAULT },
-  10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10' }, ...NEXT_BLOCK[10], baseFeeTo: BASE_FEE_VAULT },
+  10: { hardfork: 'osaka', checked: { forkId: '0xc29239af', on: '2026-11-10', next: { forkId: '0x51cd8e22', on: '2026-11-27' } }, ...NEXT_BLOCK[10], baseFeeTo: BASE_FEE_VAULT },
   // Polygon prices storage its own way. Measured on its node with code overrides (2026-11-10): a cold SLOAD costs
   // 5,460; a cold SSTORE adds 2,940 (setting an empty slot 22,940, changing a set one 5,000 as on Ethereum, writing
   // back the same value 3,040), and clearing a slot refunds 3,960. Warm reads, accounts, calls, logs, hashing and

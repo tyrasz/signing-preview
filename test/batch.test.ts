@@ -331,6 +331,39 @@ test('A batch of more calls than a node takes in one simulation is run by the lo
   assert.deepEqual([results?.length, results?.every(r => r.status === 'success'), ran, asked.includes('eth_simulateV1')], [31, true, [31], false]);
 });
 
+test('From Amsterdam on, a call on a gas limit over the cap is run by the local EVM: the node’s simulation counts that gas otherwise', async () => {
+  // Sepolia's node gives the whole limit as ordinary gas when it simulates, where the chain keeps what is over
+  // 16,777,216 back for new state: a creation mined on a limit of 36,147,392 (35,861,609 used) reverted there.
+  const asked: string[] = [];
+  const node = (amsterdam: boolean) => (async (_url: string, init: RequestInit) => {
+    const one = (b: { id: number; method: string }) => {
+      asked.push(b.method);
+      const header = { number: '0x10', ...(amsterdam && { blockAccessListHash: `0x${'11'.repeat(32)}` }) };
+      return { jsonrpc: '2.0', id: b.id, result: b.method === 'eth_simulateV1' ? [{ ...header, number: '0x11', calls: [{ status: '0x0', gasUsed: '0x21c493d', returnData: '0x', error: { code: 3, message: 'execution reverted', data: '0x' } }] }] : b.method === 'eth_getBlockByNumber' ? header : '0x' };
+    };
+    const body = JSON.parse(String(init.body)) as { id: number; method: string } | { id: number; method: string }[];
+    return new Response(JSON.stringify(Array.isArray(body) ? body.map(one) : one(body)));
+  }) as typeof fetch;
+  const ran: bigint[] = [];
+  const fork = (covers = true) => ({ covers: () => covers, simulateBatch: async (reqs: SimulationRequest[]): Promise<SimulationResult[]> => { ran.push(...reqs.map(r => r.gas ?? 0n)); return reqs.map(() => ({ status: 'success', source: 'local EVM over chain 11155111 state (the RPC has no eth_simulateV1)', gasUsed: 35_861_609n, transfers: [], basis: 'fork' })); } });
+  const create = (gas?: bigint, chainId = 11155111): SimulationRequest => ({ chainId, from: ALICE, to: '0x4e59b44847b379578588920ca78fbf26c0b4956c', data: '0x00', value: 0n, ...(gas !== undefined && { gas }) });
+  const run = async (req: SimulationRequest, amsterdam = true, covers = true) => { ran.length = 0; asked.length = 0; return (await new RpcSimulator({ [req.chainId]: 'http://rpc.invalid' }, { fetchImpl: node(amsterdam), fork: fork(covers) as never }).simulateBatch([req]))![0]; };
+  // Over the cap, on an Amsterdam chain: the local EVM's run, said to be so and why.
+  const over = await run(create(36_147_392n));
+  assert.deepEqual([over.status, over.gasUsed, ran], ['success', 35_861_609n, [36_147_392n]]);
+  assert.equal(over.source, "local EVM over chain 11155111 state (a gas limit over 16,777,216, which the chain's node simulates otherwise)");
+  // At the cap or under it, or with no limit named, the node's own (there is nothing kept back to count otherwise).
+  for (const gas of [16_777_216n, 5_000_000n, undefined]) {
+    const under = await run(create(gas));
+    assert.deepEqual([under.status, under.source, ran], ['reverted', 'eth_simulateV1 @ chain 11155111', []], String(gas));
+  }
+  // Before Amsterdam (no block access list hash in the headers), and with no local EVM for the chain: the node's.
+  const before = await run(create(36_147_392n), false);
+  assert.deepEqual([before.status, ran, asked.includes('eth_getBlockByNumber')], ['reverted', [], true]);
+  const none = await run(create(36_147_392n), true, false);
+  assert.deepEqual([none.status, ran], ['reverted', []]);
+});
+
 test('A batch with a call naming a gas limit no block holds says which call; limits that only together pass a block’s are no call’s fault', async () => {
   // The node refuses the lot ("Block gas limit exceeded by the block's transactions"), as it does a transaction
   // alone: three transfers, the second naming a thousand million, were "could not be simulated" on Ethereum, BNB

@@ -2412,6 +2412,14 @@ class Chain {
   private unanswered = '';
   /** The time the programs' block is given (--next: the scheduled fork's), in place of the next block's own. */
   time?: bigint;
+  /**
+   * --next on an OP Stack chain: the block a fork takes effect in holds deposits only, and its node won't simulate
+   * a call in the first block at or past the fork's time ("unexpected non-deposit transactions in fork activation
+   * block"). Once it says so, an empty block is put at the fork's time and the programs in the one after it: a block
+   * time later and a number higher, in the local EVM too. (What reads the block before the programs' then reads one
+   * only the node has: AFTER_ACTIVATION.)
+   */
+  afterActivation = false;
   constructor(chainId: number) {
     this.chainId = chainId;
     this.url = rpcUrlFor(chainId, process.env) ?? (() => { throw new Error(`no RPC for chain ${chainId}`); })();
@@ -2434,11 +2442,12 @@ class Chain {
   /** The programs on the node and in the local EVM, on one named block. */
   async both(programs: Program[]): Promise<{ node: Outcome; local: Outcome }[]> {
     for (let attempt = 0; ; attempt++) {
-      const hadSimulate = this.simulateV1;
+      const hadSimulate = this.simulateV1, hadLead = this.afterActivation;
       // --next needs the node to run a block at the fork's time: eth_call runs in the named block, at its own.
       if (this.time !== undefined && !this.simulateV1) throw new Error("--next: the node has no eth_simulateV1, so it can't run a block at the fork's time: not checked ahead");
       const pinned = this.simulateV1 ? await pinLatest(this.client, this.chainId) : await this.inBlock();
-      const at = pinned && this.time !== undefined ? { ...pinned, header: { ...pinned.header, timestamp: this.time } } : pinned;
+      const lead = this.time !== undefined && this.afterActivation ? this.time : undefined;
+      const at = pinned && this.time !== undefined ? { ...pinned, header: { ...pinned.header, timestamp: this.time, ...(lead !== undefined && { timestamp: lead + BigInt(NEXT_BLOCK[this.chainId]?.blockTime ?? 12), number: pinned.header.number + 1n }) } } : pinned;
       // (A creation goes to no address: its `to` is only a key here.)
       const placed = programs.map((p, i) => ({ ...p, to: p.to ?? place(i) }));
       const overrides: Record<string, { code?: string; balance?: string }> = { ...RICH };
@@ -2448,12 +2457,12 @@ class Chain {
       const given = Object.keys(state).length > 0;
       // What a priced program pays for its gas: a gwei over the block's base fee (where the node simulates blocks).
       const price = at && this.simulateV1 ? at.header.baseFeePerGas + 1_000_000_000n : undefined;
-      const node = await this.onNode(placed, given ? { ...overrides, ...state } : overrides, at, price);
+      const node = await this.onNode(placed, given ? { ...overrides, ...state } : overrides, at, price, lead);
       // A public node drops a block's state within seconds or minutes: on such an answer, another block. And a node
       // found to have no eth_simulateV1 is asked again the other way, with the block to match.
       // (Behind a public RPC some backends are a block behind the one that named the latest: asked again a little
       // later each time. Four tries in a row had once reached only those.)
-      if (hadSimulate !== this.simulateV1) continue;
+      if (hadSimulate !== this.simulateV1 || hadLead !== this.afterActivation) continue;
       if (!node && attempt < 6) { await new Promise(r => setTimeout(r, 1000 * (attempt + 1))); continue; }
       // The accounts the programs give reach the local EVM as the pinned block's own state. No block pinned (the node
       // didn't answer for its latest: Arbitrum's public RPC rate-limiting GitHub's runners), they would reach it not at
@@ -2493,7 +2502,7 @@ class Chain {
     return h?.number ? { block: h.number, header: { ...headerOf(this.chainId, h), baseFeePerGas: 0n } } : undefined;
   }
 
-  private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined, price?: bigint): Promise<Outcome[] | null> {
+  private async onNode(programs: (Program & { to: string })[], overrides: Record<string, unknown>, at: BlockAt | undefined, price?: bigint, lead?: bigint): Promise<Outcome[] | null> {
     const base = at?.header.baseFeePerGas ?? 0n, hex = (v: bigint) => `0x${v.toString(16)}`;
     const calls = programs.map(p => ({ from: p.from ?? FROM, ...(!p.create && { to: p.to }), data: p.data ?? '0x', value: hex(p.value ?? 0n), gas: hex(p.gas ?? GAS), ...(p.authorizationList && { authorizationList: authorizationsForNode(p.authorizationList) }), ...(p.priced && price !== undefined && { gasPrice: hex(price) }),
       ...(p.accessList && { accessList: p.accessList }), ...(p.fees && price !== undefined && { maxFeePerGas: hex(base + p.fees.cap), maxPriorityFeePerGas: hex(p.fees.tip ?? base + p.fees.cap) }) }));
@@ -2501,10 +2510,13 @@ class Chain {
     // Without the pseudo-logs traceTransfers would add, and the logs a chain writes outside the EVM (Polygon's own transfer logs).
     const logsOf = (logs: { address: string; topics: string[]; data: string }[] | undefined) => (logs ?? []).filter(l => l.address.toLowerCase() !== '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' && !chainsOwnLog(l)).map(l => `${l.address.toLowerCase()}:${l.topics.join(',')}:${l.data}`).join('|');
     if (this.simulateV1) {
-      const out = await this.post({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: [{ stateOverrides: overrides, calls, ...(at && { blockOverrides: nodeOverrides(at.header) }) }], validation: false }, at?.block ?? 'latest'] });
+      // (An empty block at the fork's time first, where the node takes the programs only after it: afterActivation.)
+      const blocks = [...(lead !== undefined ? [{ blockOverrides: { time: hex(lead) }, calls: [] }] : []), { stateOverrides: overrides, calls, ...(at && { blockOverrides: nodeOverrides(at.header) }) }], last = blocks.length - 1;
+      const out = await this.post({ jsonrpc: '2.0', id: 1, method: 'eth_simulateV1', params: [{ blockStateCalls: blocks, validation: false }, at?.block ?? 'latest'] });
       if (out.error && (out.error.code === -32601 || /method not found|does not exist|not supported|unsupported method/i.test(out.error.message ?? ''))) this.simulateV1 = false;
-      else if (out.error || !out.result?.[0]?.calls) { this.unanswered = String(out.error?.message ?? JSON.stringify(out.error ?? out)).slice(0, 120); if (process.env.RULES_DEBUG) console.log(`  the node: ${JSON.stringify(out.error ?? out).slice(0, 300)}`); return null; }
-      else return (out.result[0].calls as { status: string; returnData: string; gasUsed: string; maxUsedGas?: string; logs?: any[]; error?: { message?: string; data?: string } }[]).map(c => ({ kind: kind(c.status === '0x1', c.error?.message), returns: ((c.status === '0x1' ? c.returnData : c.error?.data ?? c.returnData) ?? '0x').toLowerCase(), gas: BigInt(c.gasUsed), ...(c.maxUsedGas && { peak: BigInt(c.maxUsedGas) }), logs: logsOf(c.logs), why: c.error?.message }));
+      else if (out.error && this.time !== undefined && !this.afterActivation && /non-deposit transactions in fork activation block/i.test(out.error.message ?? '')) { this.afterActivation = true; return null; }
+      else if (out.error || !out.result?.[last]?.calls) { this.unanswered = String(out.error?.message ?? JSON.stringify(out.error ?? out)).slice(0, 120); if (process.env.RULES_DEBUG) console.log(`  the node: ${JSON.stringify(out.error ?? out).slice(0, 300)}`); return null; }
+      else return (out.result[last].calls as { status: string; returnData: string; gasUsed: string; maxUsedGas?: string; logs?: any[]; error?: { message?: string; data?: string } }[]).map(c => ({ kind: kind(c.status === '0x1', c.error?.message), returns: ((c.status === '0x1' ? c.returnData : c.error?.data ?? c.returnData) ?? '0x').toLowerCase(), gas: BigInt(c.gasUsed), ...(c.maxUsedGas && { peak: BigInt(c.maxUsedGas) }), logs: logsOf(c.logs), why: c.error?.message }));
     }
     // No eth_simulateV1: each program in an eth_call of its own (no gas figure, no events).
     const out = await this.post(calls.map((c, i) => ({ jsonrpc: '2.0', id: i, method: 'eth_call', params: [c, at?.block ?? 'latest', overrides] })));
@@ -2565,6 +2577,15 @@ const EXPECTED: Record<number, Record<string, string>> = {
     'HyperEVM L1 block number (0x809)': "HyperCore's block number, which moves several times a second: the chain answers the local EVM's forwarded call a moment after the node's",
   },
 };
+
+/**
+ * --next behind an empty block at the fork's time (Chain.afterActivation): the block before the programs' is that
+ * empty one, which only the node has. Its hash, what EIP-2935's history holds of it and of the block it follows
+ * (each written as a block starts, and the local EVM starts the programs' block alone) and the beacon root written at
+ * its time aren't the local EVM's to know. On OP Mainnet's fork of 2027-01-11 these eight were all that differed of
+ * 1,374 programs.
+ */
+const AFTER_ACTIVATION = /^(BLOCKHASH of the block before|EIP-2935's history contract, asked for the block (two )?before$|EIP-2935 history 2 blocks back|EIP-2935 history and BLOCKHASH agree, 2 blocks back$|EIP-4788 beacon root at the time of the block before$)/;
 
 /**
  * Whether a gas difference is more than `slack` either way. A random program on Arbitrum is allowed the L1 charge
@@ -2640,6 +2661,7 @@ async function compare(chain: Chain, chainId: number, programs: Program[], repor
         const squeezed = !compareGas && batch[j].gas !== undefined && node.kind === 'fails' && /out of gas/i.test(node.why ?? '') && local.kind === 'runs' && local.gas !== undefined
           && local.gas + (l1Charge !== undefined && l1Charge > 0n ? l1Charge * 2n : 20_000n) >= batch[j].gas!;
         const known = EXPECTED[chainId]?.[batch[j].label] ?? (report.amsterdam ? OVER_THE_CAP[batch[j].label] : undefined)
+          ?? (chain.afterActivation && AFTER_ACTIVATION.test(batch[j].label) ? "the block before is the empty one the node puts at the fork's time (it takes calls only in the block after), which the local EVM hasn't" : undefined)
           ?? (squeezed ? `Arbitrum's node takes its charge for L1 data out of the gas the call is given: on ${batch[j].gas} it ran out where the local EVM used ${local.gas}` : undefined);
         if (process.env.RULES_FULL) console.log(`  [full] ${batch[j].label}:\n    node  ${node.kind} gas ${node.gas} ${node.why ?? ''}\n      ${node.returns}\n      logs ${node.logs}\n    local ${local.kind} gas ${local.gas} ${local.why ?? ''}\n      ${local.returns}\n      logs ${local.logs}`);
         (known ? report.expected : report.differences).push(known ? `${batch[j].label}: ${known}` : `${batch[j].label}: the node ${node.kind}${node.kind === 'fails' && node.why ? ` (${node.why.slice(0, 60)})` : ''}${node.gas !== undefined ? `, ${node.gas} gas` : ''}${returns ? said(node, nodeWords) : ''}; the local EVM ${local.kind}${local.kind !== 'runs' && local.why ? ` (${local.why.slice(0, 80)})` : ''}${local.gas !== undefined ? `, ${local.gas} gas` : ''}${returns ? said(local, localWords) : ''}${logs ? '; their events differ' : ''}${batch[j].detail ? ` [${batch[j].detail}]` : ''}${!compareGas && gas ? ` [the L1 charge taken for its batch: ${l1Charge}]` : ''}`);

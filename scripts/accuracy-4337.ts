@@ -518,7 +518,11 @@ async function replay(item: string): Promise<void> {
   // the bundle runs first, and what the bundle had warm.
   const replayAt = (): BlockAt => ({ block: parent, header: headerOf(CHAIN, block as unknown as RpcHeader), required: true, ...(state && { state }), before: prefix });
   const warmed = (q: SimulationRequest): SimulationRequest => warm.length ? { ...q, accessList: [...(q.accessList ?? []), ...warm.map(w => (typeof w === 'string' ? { address: w, storageKeys: [] } : w))] } : q;
-  const simulator = { simulate: (q: SimulationRequest) => node.simulate(atBundlePrice(q)), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(qs.map(atBundlePrice)),
+  // Who the preview ran the operation's bundle as (the sender of its last call to the EntryPoint): a bundler the
+  // paymaster's operations came through lately, or the simulation's own. Not always the one that mined it: ranAs.
+  let ranAs: string | undefined;
+  const asked = (qs: SimulationRequest[]) => { for (const q of qs) if (q.to?.toLowerCase() === EP) ranAs = q.from.toLowerCase(); return qs.map(atBundlePrice); };
+  const simulator = { simulate: (q: SimulationRequest) => node.simulate(asked([q])[0]), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(asked(qs)),
     ...(state && LOCAL && { trace: (qs: SimulationRequest[]) => LOCAL.trace(qs.map(q => warmed({ ...atBundlePrice(q), at: replayAt() }))) }) };
   const deps = { ...liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   // (The bundle's gas limit is part of what the operation met: from Amsterdam on, what it holds over the cap pays for
@@ -1104,9 +1108,20 @@ async function replay(item: string): Promise<void> {
   // in gas and showed no fee paid to its paymaster, and nothing kept said which of these it was).
   let asMined: string | undefined;
   if (differs.includes('gas') || differs.includes('tokens')) {
+    // (What each run moved of the account's tokens, by its events, and the gas its operation used.)
+    const ranFrom = new Map<string, { moved: Map<string, bigint>; gasUsed: bigint; paid: bigint }>();
     const fared = async (from: string) => {
       const run = (await node.simulateBatch([{ ...mined, from, ...(from !== mined.from && { stateOverrides: { ...mined.stateOverrides, [from]: { balance: `0x${(10n ** 24n).toString(16)}` } } }) }]).catch(() => null))?.[0];
       const event = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
+      if (event) {
+        const net = new Map<string, bigint>();
+        for (const l of run!.logs ?? []) if (l.topics[0] === TRANSFER_TOPIC && l.topics.length === 3 && /^0x[0-9a-f]{64}$/i.test(l.data)) {
+          const [a, b] = [`0x${l.topics[1].slice(26)}`, `0x${l.topics[2].slice(26)}`], token = l.address.toLowerCase();
+          if (b === sender) net.set(token, (net.get(token) ?? 0n) + BigInt(l.data));
+          if (a === sender) net.set(token, (net.get(token) ?? 0n) - BigInt(l.data));
+        }
+        ranFrom.set(from, { moved: net, gasUsed: BigInt(`0x${event.data.slice(194, 258)}`), paid: BigInt(`0x${event.data.slice(130, 194)}`) });
+      }
       // (FailedOp, FailedOpWithRevert: the EntryPoint turns the operation away in validation, as a paymaster that
       // takes only its own bundlers makes it. On Ethereum, Pimlico's does, from any other sender.)
       if (!event) return !run ? 'not run' : /0x220266b6|0x65c8fd4d|^AA\d\d/.test(String(run.revertReason ?? '')) ? `the EntryPoint turns it away in validation (${String(run.revertReason).slice(0, 60)})` : `not run (${String(run.revertReason ?? run.status).slice(0, 60)})`;
@@ -1114,7 +1129,27 @@ async function replay(item: string): Promise<void> {
       return `${BigInt(`0x${event.data.slice(66, 130)}`) === 1n ? 'succeeds' : 'fails'}, gas used ${BigInt(`0x${event.data.slice(194, 258)}`)}, paid ${BigInt(`0x${event.data.slice(130, 194)}`)}, ${moved} token transfer${moved === 1 ? '' : 's'} of the account's`;
     };
     const [own, other] = [await fared(mined.from), tx.from.toLowerCase() === OTHER_BUNDLER ? undefined : await fared(OTHER_BUNDLER)];
-    asMined = `as mined on the preview's state: ${own}${other ? `; from another sender than its bundler: ${other}` : ''} (the receipt: gas used ${actualGasUsed}, paid ${actualGasCost})`;
+    // And from the sender the preview ran it as, where that is neither. What runs can read who sends the bundle
+    // (tx.origin) for more than a paymaster's leave: on Base (2026-11-27) two operations swapped through a pool
+    // whose price turns on it. Each was mined by one of its paymaster's bundlers and previewed as another: 0.015%
+    // and 0.54% less of the token bought, and 19,000 less gas. From the preview's sender the mined operation gave
+    // the preview's amount to the unit; from its own bundler, the receipt's (and on the node, a tip ten times as
+    // high moved the amount by 0.0002%, a second later by nothing). Which bundler will carry an operation isn't
+    // known when it is signed, so where the mined operation run as the preview's sender has the preview's amounts
+    // (and its gas, within 1%: the signature isn't the same), and from its own bundler came out as mined, the
+    // difference is the sender's: reported, not failed.
+    const preview = ranAs && ranAs !== mined.from && ranAs !== OTHER_BUNDLER ? ranAs : undefined;
+    const third = preview ? await fared(preview) : undefined, asPreview = preview ? ranFrom.get(preview) : undefined, asOwn = ranFrom.get(mined.from);
+    asMined = `as mined on the preview's state: ${own}${other ? `; from another sender than its bundler: ${other}` : ''}${third ? `; from the sender the preview ran as (${preview}): ${third}` : ''} (the receipt: gas used ${actualGasUsed}, paid ${actualGasCost})`;
+    const near = (a: bigint, b: bigint) => { const d = a > b ? a - b : b - a; return d * 100n <= (a > b ? a : b); };
+    const sendersTokens = !!asPreview && differs.includes('tokens') && (row.tokenDiffs as Compared[] | undefined ?? []).every(t => (asPreview.moved.get(t.token.toLowerCase()) ?? 0n) === BigInt(t.simulated) && (asOwn?.moved.get(t.token.toLowerCase()) ?? 0n) === BigInt(t.actual));
+    const sendersGas = !!asPreview && differs.includes('gas') && asOwn?.gasUsed === actualGasUsed && gasCompared !== undefined && near(gasCompared.gasless ? asPreview.gasUsed : asPreview.paid, BigInt(gasCompared.simulated));
+    if ((sendersTokens || !differs.includes('tokens')) && (sendersGas || !differs.includes('gas')) && (sendersTokens || sendersGas)) {
+      for (const what of ['tokens', 'gas']) if (differs.includes(what)) differs.splice(differs.indexOf(what), 1);
+      row.bundleSender = preview;
+      row.warned = [row.warned, `${[sendersTokens && 'tokens', sendersGas && 'gas'].filter(Boolean).join(' and ')} (who sends the bundle: the mined operation run as the sender the preview ran as, ${preview}, has the preview's; from its own bundler, the receipt's)`].filter(Boolean).join('; ');
+      if (!differs.length) delete row.differs;
+    }
   }
   if (differs.length || !row.outcome || row.tokens === 'other' || (gasPercent !== undefined && Math.abs(gasPercent) >= 5)) {
     const sim = p.simulation, firstOfKey = (BigInt(op.nonce) & ((1n << 64n) - 1n)) === 0n;

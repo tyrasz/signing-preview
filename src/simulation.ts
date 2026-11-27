@@ -585,6 +585,20 @@ export class RpcSimulator implements Simulator {
       const ran = short.length ? await this.afterRelated(reqs, retried) : undefined;
       if (ran && short.some(i => ran[i]?.status === 'success')) return ran;
     }
+    // From Amsterdam on (Glamsterdam: Sepolia), what a gas limit holds over 16,777,216 is kept back for new state:
+    // code has the cap to run on, and new state is paid for from the rest first, which the 63/64 a call hands on
+    // doesn't touch. The chain's node gives the whole limit as ordinary gas when it simulates
+    // (scripts/rules-check.ts, OVER_THE_CAP), so a call on a limit over the cap can come out there as it wouldn't on
+    // the chain, either way. A creation of 23 KB of code through the CREATE2 deployer, mined on a limit of
+    // 36,147,392 (it used 35,861,609, most of it for the code's state), reverted in the node's simulation on that
+    // limit and ran there on 60,000,000, for the receipt's gas; and code that needs more ordinary gas than the cap
+    // runs there where the chain stops it at the cap. Such a call is run in the local EVM, which keeps the chain's
+    // accounts (that creation: the receipt's gas to the unit), where one is set up for the chain.
+    if (this.fork?.covers(chainId) && reqs.some(r => r.gas !== undefined && r.gas > TRANSACTION_GAS_CAP)
+      && await this.amsterdam(url, reqs, this.at(chainId, reqs).tag, body.result?.[0] as { blockAccessListHash?: string } | undefined)) {
+      const local = await this.fork.simulateBatch(reqs).catch(() => null);
+      if (local?.length === reqs.length) return local.map(r => ({ ...r, source: r.source.replace('(the RPC has no eth_simulateV1)', OVER_THE_CAP_LOCALLY) }));
+    }
     const parsed: SimulationResult[] = results.map(result => {
       const gasUsed = BigInt(result.gasUsed), peak = result.maxUsedGas ? BigInt(result.maxUsedGas) : undefined;
       const gasPeak = peak !== undefined && peak > gasUsed ? { gasPeak: peak } : {};
@@ -614,12 +628,19 @@ export class RpcSimulator implements Simulator {
    * and for one already delegated 31,816 where its own took 22,816. Each request's gas is corrected by the difference,
    * from the sender's code before the block (an authorization for another chain doesn't apply, and isn't counted).
    */
+  /**
+   * Whether the requests' block runs Amsterdam's rules: as its header says where they name it, else by the block the
+   * node simulated or the one it ran on (a header carries a block access list hash from that fork on).
+   */
+  private async amsterdam(url: string, reqs: SimulationRequest[], tag: string, simulated?: { blockAccessListHash?: string }): Promise<boolean> {
+    return reqs[0].at?.header.amsterdam ?? (simulated?.blockAccessListHash !== undefined
+      || !!((await this.post(url, 'eth_getBlockByNumber', [tag, false]).catch(() => undefined)) as { result?: { blockAccessListHash?: string } } | undefined)?.result?.blockAccessListHash);
+  }
+
   private async amsterdamStandIns(url: string, reqs: SimulationRequest[], parsed: SimulationResult[], tag: string, simulated?: { blockAccessListHash?: string }) {
     const asked = reqs.map((r, i) => ({ r, i })).filter(({ r, i }) => parsed[i]?.gasUsed !== undefined && r.unsignedAuthorizations?.some(a => a.chainId === 0 || a.chainId === r.chainId));
     if (!asked.length) return;
-    const amsterdam = reqs[0].at?.header.amsterdam ?? (simulated?.blockAccessListHash !== undefined
-      || !!((await this.post(url, 'eth_getBlockByNumber', [tag, false]).catch(() => undefined)) as { result?: { blockAccessListHash?: string } } | undefined)?.result?.blockAccessListHash);
-    if (!amsterdam) return;
+    if (!await this.amsterdam(url, reqs, tag, simulated)) return;
     for (const { r, i } of asked) {
       // (The sender's code before the transaction: as the block's state beneath the request has it, else the chain's.
       // Not the request's own override, which is the authorization's effect standing in: its delegation.)
@@ -1087,6 +1108,8 @@ export function decodeState(a: SimulatedApproval, data: Hex): SimulatedApproval 
  * batch that names no limit runs on no more, where the batch is run with a limit for each (withSharedGas).
  */
 const TRANSACTION_GAS_CAP = 16_777_216n, CAPPED = new Set([1, 56, 8453, 10]);
+/** In a result's source: the local EVM ran it because a call's gas limit is over the cap on an Amsterdam chain (simulate). */
+export const OVER_THE_CAP_LOCALLY = "(a gas limit over 16,777,216, which the chain's node simulates otherwise)";
 
 type Log = { address: string; topics: string[]; data: string };
 const topicAddress = (t: string) => '0x' + t.slice(26).toLowerCase();

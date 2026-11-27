@@ -2,7 +2,7 @@ import { attentionOf, formatUnits, PreviewBuilder, sameAddress, shortAddress } f
 import { CHAINS, chainName, HYPERLIQUID } from '../chains.ts';
 import type { ApprovalChange, AssetChange, Dependencies, Preview, PreviewContext, PreviewTrace, ReplayInfo, SimulationRequest, SimulationResult, SimulationSummary } from '../types.ts';
 import { blockText, namedBlock, pinLatest, type BlockAt, type Pinned } from '../block.ts';
-import { batchRefusal, withoutRefused } from '../simulation.ts';
+import { batchRefusal, OVER_THE_CAP_LOCALLY, withoutRefused } from '../simulation.ts';
 import { compareWithReceipt, noTrace, sameRun, tracePreviews, type TraceEnv } from './trace.ts';
 import { approvalChanges, approvalWarnings, effectOf, netChanges, nftChanges, pricedNote, roomFor } from './effects.ts';
 import { type Adapter, type AuthorizationRequest, type Decoded, type Tx } from './common.ts';
@@ -315,7 +315,12 @@ export async function previewTransaction(tx: Tx, deps: Dependencies, context: Pr
       // to run on, and a transaction that burns all its gas burns that much. Sepolia's node doesn't simulate that
       // (it gives the whole limit as ordinary gas), so for such a request the local EVM runs it too, and where the
       // two come out differently, the local EVM's run is the one shown.
-      if (overCap && at?.header.amsterdam && outcome.result && deps.simulator.trace) {
+      // (RpcSimulator hands such a request to the local EVM itself where it has one, and its result says so: then
+      // there is no run of the node's to set it beside.)
+      if (overCap && at?.header.amsterdam && outcome.result?.source.includes(OVER_THE_CAP_LOCALLY)) {
+        localEvm = true;
+        b.note(`The gas limit (${tx.gas!.toLocaleString('en-US')}) is over what a transaction has to run on here (${ORDINARY_GAS_CAP.toLocaleString('en-US')}): the rest only pays for new state. The chain's node doesn't simulate that (it gives the whole limit as ordinary gas), so the run shown is the local EVM's.`);
+      } else if (overCap && at?.header.amsterdam && outcome.result && deps.simulator.trace) {
         const own = (await deps.simulator.trace([...pending, request]).catch(() => null))?.at(-1);
         if (own && (!sameRun(own, outcome.result) || own.gasUsed !== outcome.result.gasUsed)) {
           outcome = { result: { ...own, source: LOCAL_RUN } };

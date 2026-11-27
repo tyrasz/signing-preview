@@ -150,7 +150,10 @@ async function replay(b: B, seen?: Set<string>) {
   const simulators = ([
     // Not the block's gas limit: public nodes refuse a simulated block above their RPC gas cap (50M on publicnode,
     // below Ethereum's 60M); the parent's, the node's default, is all but the same.
-    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time, feeRecipient: b.miner, ...randomness, baseFeePerGas: b.baseFeePerGas } }) })],
+    // (With the local EVM beside it, as the previewer has it: what RpcSimulator hands over to it is run there. From
+    // Amsterdam on that is a transaction on a gas limit over the cap, which the chain's node simulates otherwise:
+    // two of 73 on Sepolia on 2026-11-27, both mined and both failing in the node's simulation alone.)
+    ['eth_simulateV1', new RpcSimulator({ [CHAIN]: URL_ }, { replay: () => ({ block: parent, blockOverrides: { number: b.number, time, feeRecipient: b.miner, ...randomness, baseFeePerGas: b.baseFeePerGas } }), fork: forkAt() })],
     ['fork', forkAt()],
   ] as [string, Simulator][]).filter(([name]) => SIMULATORS.includes(name));
   let taken = 0;
