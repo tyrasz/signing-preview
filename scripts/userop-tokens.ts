@@ -9,6 +9,29 @@ export const DEPOSIT = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c
 export type Log = { address: string; topics: readonly string[]; data: string };
 /** An asset change as a preview reports it (src/types.ts AssetChange), the fields compared here. */
 export type Shown = { account?: string; asset?: string; raw?: string; direction: string; basis?: string };
+/**
+ * Where a run's events first part from a receipt's, in a line: which event, whose it is, and the words of its data
+ * that differ (three at most). The events of `skip` are left out of both (the EntryPoint's own, whose gas figures
+ * are never the same), as are the chain's own logs of native transfers. Undefined where the two don't part.
+ * A run that moves another amount than its receipt moved it somewhere first: a pool's fee, a price, a share.
+ */
+export function firstDifference(receipt: readonly Log[], run: readonly Log[], skip: string): string | undefined {
+  const keep = (logs: readonly Log[]) => logs.filter(l => l.address.toLowerCase() !== skip.toLowerCase() && l.address.toLowerCase() !== NATIVE_LOG_ADDRESS);
+  const a = keep(receipt), b = keep(run), kind = (l: Log) => `${l.address.toLowerCase()} ${(l.topics[0] ?? 'no topic').slice(0, 10)}`;
+  const show = (word: string | undefined) => { if (word === undefined) return 'nothing'; const v = BigInt(`0x${word}`); return v < 1n << 128n ? v.toString() : `0x${word.replace(/^0+/, '')}`; };
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i], y = b[i];
+    if (!x || !y) return `event ${i + 1}: only the ${x ? 'receipt' : 'run'} has it (${kind(x ?? y)}); the receipt has ${a.length} events, the run ${b.length}`;
+    if (kind(x) !== kind(y)) return `event ${i + 1}: ${kind(x)} in the receipt, ${kind(y)} in the run`;
+    if (x.topics.length !== y.topics.length || x.topics.some((t, k) => t.toLowerCase() !== y.topics[k].toLowerCase())) return `event ${i + 1} (${kind(x)}): its indexed values differ`;
+    if (x.data.toLowerCase() === y.data.toLowerCase()) continue;
+    const words = (data: string) => data.slice(2).toLowerCase().match(/.{1,64}/g) ?? [], wx = words(x.data), wy = words(y.data), parts: string[] = [];
+    for (let k = 0; k < Math.max(wx.length, wy.length) && parts.length < 3; k++) if (wx[k] !== wy[k]) parts.push(`word ${k + 1} is ${show(wx[k])} in the receipt and ${show(wy[k])} in the run`);
+    return `event ${i + 1} of ${a.length} (${kind(x)}): ${parts.join('; ')}`;
+  }
+  return undefined;
+}
+
 /** A compared token: the account's (`account` only for another than the operation's), what moved, what the preview has. */
 export type Compared = { token: string; actual: string; simulated: string; account?: string };
 

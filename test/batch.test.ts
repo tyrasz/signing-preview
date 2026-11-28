@@ -209,6 +209,25 @@ test('Shared gas: a call that uses up a share smaller than a transaction may hav
   assert.ok(plain.asked.every(a => a.every(g => g === null)), JSON.stringify(plain.asked));
 });
 
+test('A failure of the transactions run before a batch isn’t read as the node refusing one of its calls', async () => {
+  // A batch replayed behind its block's earlier transactions, which used up what the node allows one simulation: the
+  // node's words for that ("intrinsic gas too low") are in the failure, and were taken for its refusal of a call.
+  const { batchRefusal } = await import('../src/simulation.ts');
+  const earlier = "the chain's node couldn't run the 670 transactions before this one in its block within its gas allowance for one simulation (intrinsic gas too low); a node with a higher allowance can";
+  const send = { to: USDC, data: approve(ROUTER, 1n).data };
+  const reqs: SimulationRequest[] = [{ chainId: 1, from: ALICE, to: USDC, data: '0x', value: 0n, gas: 108_831n }];
+  assert.equal(batchRefusal(earlier, reqs), null);
+  assert.equal(batchRefusal("the chain's node won't run the 190 transactions before this one in its block: it adds up their gas limits, which pass the block's, where the chain counts the gas they used (Block gas limit exceeded by the block's transactions); a node that counts as the chain does can", reqs), null);
+  // (The node's own refusals are still read.)
+  assert.deepEqual(batchRefusal('eth_simulateV1 failed: intrinsic gas too low', reqs), { first: 'out of gas: the gas limit is below the minimum any transaction with this calldata needs', overBlock: false });
+  let asked = 0;
+  const simulator: Simulator = { simulate: async () => { asked++; throw new Error(earlier); }, simulateBatch: async () => { asked++; throw new Error(earlier); } };
+  const p = await previewRequest({ method: 'wallet_sendCalls', params: [{ version: '2.0.0', chainId: '0x1', from: ALICE, atomicRequired: true, calls: [send, send] }] }, { now: NOW }, { tokens: new StaticTokenRegistry(), simulator });
+  // Not simulated, and said so: no call is shown failing, and the node isn't asked call by call for one that would.
+  assert.deepEqual([p.simulation?.status, p.calls?.map(c => c.simulation?.status), codes(p).includes('simulation_reverted'), codes(p).includes('batch_partial_failure'), asked], [undefined, ['unavailable', 'unavailable'], false, false, 1]);
+  assert.match(p.calls?.[0]?.simulation?.error ?? '', /couldn't run the 670 transactions before this one/);
+});
+
 test('A batch with a call the account can’t pay for says which call, where the node refuses the lot', async () => {
   // The node refuses the whole request for one call that sends coin the account hasn't, and doesn't say which: the
   // batch was two or three calls that "could not be simulated", as information, each listed as the request asks.

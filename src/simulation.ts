@@ -1199,6 +1199,8 @@ export function decodeRevert(data: Hex | undefined): string | undefined {
   }
 }
 
+/** RpcSimulator's own words where the node didn't run the transactions before the requests (a replay's earlier ones). */
+const EARLIER_FAILED = /the chain's node (couldn't|won't) run the \d+ transactions? before/;
 /** A node's words for a call the network wouldn't take as it stands, which it refuses a whole batch for. */
 export const REFUSAL = /insufficient funds|intrinsic gas too low/i;
 /** A node's words for gas limits a block doesn't hold: one transaction's, or those of a batch's calls together. */
@@ -1209,6 +1211,11 @@ export const OVER_BLOCK = /block gas limit (exceeded|reached)|exceeds block gas 
  * same where the calls' limits together pass a block's, which is no call's fault and isn't found).
  */
 export function batchRefusal(message: string, reqs: SimulationRequest[]): { first: string; overBlock: boolean } | null {
+  // Not a failure of the transactions run before the batch (a replay's block): the node's words are in that message
+  // too, and are about its allowance for one simulation, which they used up, not about a call of the batch. A batch
+  // mined 671st in its block, behind 56.9 million gas of transactions on a node that allows 50, was shown with its
+  // first call "out of gas: the gas limit is below the minimum any transaction with this calldata needs".
+  if (EARLIER_FAILED.test(message)) return null;
   if (REFUSAL.test(message)) { const first = rejection(message); return first ? { first, overBlock: false } : null; }
   return OVER_BLOCK.test(message) && reqs.some(r => r.gas !== undefined) ? { first: message, overBlock: true } : null;
 }

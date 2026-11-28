@@ -61,7 +61,7 @@ import { SAFE_4337_MODULES } from '../src/typed-data/safe.ts';
 import { deployedFallbackHandler, safeSetupOf } from '../src/safe-sim.ts';
 import type { Preview, SimulationRequest } from '../src/types.ts';
 import { chainName, EVM_RPCS, OP_STACK, rpcUrlFor } from '../src/chains.ts';
-import { compareTokens, keptEarlier, movedAlike, TRANSFER, type Compared } from './userop-tokens.ts';
+import { compareTokens, firstDifference, keptEarlier, movedAlike, TRANSFER, type Compared, type Log } from './userop-tokens.ts';
 
 const arg = (name: string, fallback: string) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? process.argv[i + 1] : fallback; };
 const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOLLOW = Number(arg('follow', '0')), BLOCKS = Number(arg('blocks', '100')), MAX = Number(arg('max', '30'));
@@ -69,6 +69,8 @@ const CHAIN = Number(arg('chain', '1')), VERSION = arg('entrypoint', '0.7'), FOL
 // dummy no key signed, as a wallet's gas-estimation stub carries one (the preview then stands in in that form:
 // src/erc4337-sim.ts, walletForm).
 const WALLET_STUB = process.argv.includes('--wallet-stub');
+// --digest: every operation's line of what it was and how it fares as mined, not only a differing one's (to look at one: --tx).
+const DIGEST = process.argv.includes('--digest');
 const DUMMY_ECDSA = `${'11'.repeat(32)}${'22'.repeat(32)}1b`;
 /** The signature with DUMMY_ECDSA in place of each ECDSA signature in it (ecdsaOffsets). */
 function dummyForm(sig: Hex): Hex {
@@ -520,9 +522,17 @@ async function replay(item: string): Promise<void> {
   const warmed = (q: SimulationRequest): SimulationRequest => warm.length ? { ...q, accessList: [...(q.accessList ?? []), ...warm.map(w => (typeof w === 'string' ? { address: w, storageKeys: [] } : w))] } : q;
   // Who the preview ran the operation's bundle as (the sender of its last call to the EntryPoint): a bundler the
   // paymaster's operations came through lately, or the simulation's own. Not always the one that mined it: ranAs.
-  let ranAs: string | undefined;
-  const asked = (qs: SimulationRequest[]) => { for (const q of qs) if (q.to?.toLowerCase() === EP) ranAs = q.from.toLowerCase(); return qs.map(atBundlePrice); };
-  const simulator = { simulate: (q: SimulationRequest) => node.simulate(asked([q])[0]), simulateBatch: (qs: SimulationRequest[]) => node.simulateBatch(asked(qs)),
+  // And what that call logged, the last time it ran: set beside the receipt's events where the preview's amounts
+  // aren't the receipt's, to say where the two runs part (firstDifference).
+  // (And the state it set for the run: the stand-ins for the signature and the EntryPoint's simulation code, which
+  // the block's earlier transactions run under too. See the mined operation's runs below.)
+  let ranAs: string | undefined, ranLogs: Log[] | undefined, ranOverrides: SimulationRequest['stateOverrides'];
+  const noted = async <T,>(qs: SimulationRequest[], out: Promise<T>): Promise<T> => {
+    const results = await out, each = ([] as unknown[]).concat(results) as ({ logs?: Log[] } | null | undefined)[];
+    qs.forEach((q, i) => { if (q.to?.toLowerCase() !== EP) return; ranAs = q.from.toLowerCase(); ranOverrides = q.stateOverrides; if (each[i]?.logs?.length) ranLogs = each[i]!.logs; });
+    return results;
+  };
+  const simulator = { simulate: (q: SimulationRequest) => noted([q], node.simulate(atBundlePrice(q))), simulateBatch: (qs: SimulationRequest[]) => noted(qs, node.simulateBatch(qs.map(atBundlePrice))),
     ...(state && LOCAL && { trace: (qs: SimulationRequest[]) => LOCAL.trace(qs.map(q => warmed({ ...atBundlePrice(q), at: replayAt() }))) }) };
   const deps = { ...liveDependencies({ [EVM_RPCS[CHAIN].env]: URL_, SIGNING_PREVIEW_FORK_CACHE: 'off' }, { warmUp: false }), rpc: atParent, simulator };
   // (The bundle's gas limit is part of what the operation met: from Amsterdam on, what it holds over the cap pays for
@@ -842,6 +852,10 @@ async function replay(item: string): Promise<void> {
   own.forEach((l, i) => {
     if (l.topics[0] !== TRANSFER || l.topics.length !== 3 || l.address.toLowerCase() === NATIVE_LOG_ADDRESS || `0x${l.topics[1].slice(26)}` !== sender) return;
     const to = `0x${l.topics[2].slice(26)}`, token = l.address.toLowerCase(), v = BigInt(l.data);
+    // (A transfer of nothing is no fee: an operation on Arbitrum One sent 0 USDT and paid its paymaster 8,025 base
+    // units of it for gas, which the preview had at 8,039 with its gas 0.17% high. The 0 was taken for the fee, a
+    // fee of nothing has no rounding, and the run failed on 14 base units.)
+    if (v === 0n) return;
     if (paymaster && (to === paymaster || own[i + 1]?.address.toLowerCase() === paymaster)) { fees.set(token, charged.has(token) ? fees.get(token)! + v : v); charged.add(token); }
     else if (!charged.has(token) && (!fees.has(token) || v < fees.get(token)!)) fees.set(token, v);
   });
@@ -1107,12 +1121,14 @@ async function replay(item: string): Promise<void> {
   // bundler it doesn't know: on Arbitrum One, 2026-11-25, a preview of an account's first operation was 39.8% short
   // in gas and showed no fee paid to its paymaster, and nothing kept said which of these it was).
   let asMined: string | undefined;
-  if (differs.includes('gas') || differs.includes('tokens')) {
+  if (differs.includes('gas') || differs.includes('tokens') || DIGEST) {
     // (What each run moved of the account's tokens, by its events, and the gas its operation used.)
     const ranFrom = new Map<string, { moved: Map<string, bigint>; gasUsed: bigint; paid: bigint }>();
-    const fared = async (from: string) => {
-      const run = (await node.simulateBatch([{ ...mined, from, ...(from !== mined.from && { stateOverrides: { ...mined.stateOverrides, [from]: { balance: `0x${(10n ** 24n).toString(16)}` } } }) }]).catch(() => null))?.[0];
+    const UNDER = "under the preview's stand-ins";
+    const fared = async (from: string, overrides?: SimulationRequest['stateOverrides']) => {
+      const run = (await node.simulateBatch([{ ...mined, from, ...((from !== mined.from || overrides) && { stateOverrides: { ...mined.stateOverrides, ...overrides, ...(from !== mined.from && { [from]: { ...overrides?.[from], balance: `0x${(10n ** 24n).toString(16)}` } }) } }) }]).catch(() => null))?.[0];
       const event = run?.status === 'success' ? opEvent(run.logs ?? []) : undefined;
+      if (overrides) from = UNDER;
       if (event) {
         const net = new Map<string, bigint>();
         for (const l of run!.logs ?? []) if (l.topics[0] === TRANSFER_TOPIC && l.topics.length === 3 && /^0x[0-9a-f]{64}$/i.test(l.data)) {
@@ -1126,7 +1142,9 @@ async function replay(item: string): Promise<void> {
       // takes only its own bundlers makes it. On Ethereum, Pimlico's does, from any other sender.)
       if (!event) return !run ? 'not run' : /0x220266b6|0x65c8fd4d|^AA\d\d/.test(String(run.revertReason ?? '')) ? `the EntryPoint turns it away in validation (${String(run.revertReason).slice(0, 60)})` : `not run (${String(run.revertReason ?? run.status).slice(0, 60)})`;
       const moved = (run!.logs ?? []).filter(l => l.topics[0] === TRANSFER_TOPIC && l.topics.length === 3 && (`0x${l.topics[1].slice(26)}` === sender || `0x${l.topics[2].slice(26)}` === sender)).length;
-      return `${BigInt(`0x${event.data.slice(66, 130)}`) === 1n ? 'succeeds' : 'fails'}, gas used ${BigInt(`0x${event.data.slice(194, 258)}`)}, paid ${BigInt(`0x${event.data.slice(130, 194)}`)}, ${moved} token transfer${moved === 1 ? '' : 's'} of the account's`;
+      // (With what it moved of each token the preview's amount differs in: the receipt's, the preview's, or another.)
+      const amounts = (row.tokenDiffs as Compared[] | undefined ?? []).filter(t => !t.account).map(t => `${ranFrom.get(from)?.moved.get(t.token.toLowerCase()) ?? 0n} of ${t.token}`);
+      return `${BigInt(`0x${event.data.slice(66, 130)}`) === 1n ? 'succeeds' : 'fails'}, gas used ${BigInt(`0x${event.data.slice(194, 258)}`)}, paid ${BigInt(`0x${event.data.slice(130, 194)}`)}, ${moved} token transfer${moved === 1 ? '' : 's'} of the account's${amounts.length ? ` (${amounts.join(', ')})` : ''}`;
     };
     const [own, other] = [await fared(mined.from), tx.from.toLowerCase() === OTHER_BUNDLER ? undefined : await fared(OTHER_BUNDLER)];
     // And from the sender the preview ran it as, where that is neither. What runs can read who sends the bundle
@@ -1138,9 +1156,20 @@ async function replay(item: string): Promise<void> {
     // known when it is signed, so where the mined operation run as the preview's sender has the preview's amounts
     // (and its gas, within 1%: the signature isn't the same), and from its own bundler came out as mined, the
     // difference is the sender's: reported, not failed.
-    const preview = ranAs && ranAs !== mined.from && ranAs !== OTHER_BUNDLER ? ranAs : undefined;
-    const third = preview ? await fared(preview) : undefined, asPreview = preview ? ranFrom.get(preview) : undefined, asOwn = ranFrom.get(mined.from);
-    asMined = `as mined on the preview's state: ${own}${other ? `; from another sender than its bundler: ${other}` : ''}${third ? `; from the sender the preview ran as (${preview}): ${third}` : ''} (the receipt: gas used ${actualGasUsed}, paid ${actualGasCost})`;
+    // (The simulation's own bundler, where no paymaster's is looked for, is the other sender already run.)
+    const preview = ranAs && ranAs !== mined.from ? ranAs : undefined;
+    const third = preview && preview !== OTHER_BUNDLER ? await fared(preview) : undefined, asPreview = preview ? ranFrom.get(preview) : undefined, asOwn = ranFrom.get(mined.from);
+    // And with the state the preview set for its run in place, where transactions of the block run before the
+    // operation. The stand-ins for the signature and the EntryPoint's simulation code are the whole simulated
+    // block's, so an earlier bundle runs under them too, and may not run as it did (its own validation on a gas
+    // limit with no room for a stand-in, say). Then the operation meets another state than it met. On BNB Chain
+    // (2026-11-28) four accounts traded the same two pools against each other, often one transaction apart in a
+    // block: 29 of their operations previewed 0.01-0.08% over the receipt's amounts, where the mined operation, with
+    // no stand-in in the block, had the receipt's gas to the unit. A wallet's preview, on the latest state, has no
+    // transaction before it to change; where the mined operation run under the preview's stand-ins has the
+    // preview's amounts and without them the receipt's, the difference is the replay's: reported, not failed.
+    const under = ranOverrides && prefix.length ? await fared(mined.from, ranOverrides) : undefined, asUnder = ranFrom.get(UNDER);
+    asMined = `as mined on the preview's state: ${own}${other ? `; from another sender than its bundler: ${other}` : ''}${third ? `; from the sender the preview ran as (${preview}): ${third}` : ''}${under ? `; with the preview's stand-ins in the block: ${under}` : ''} (the receipt: gas used ${actualGasUsed}, paid ${actualGasCost})`;
     const near = (a: bigint, b: bigint) => { const d = a > b ? a - b : b - a; return d * 100n <= (a > b ? a : b); };
     const sendersTokens = !!asPreview && differs.includes('tokens') && (row.tokenDiffs as Compared[] | undefined ?? []).every(t => (asPreview.moved.get(t.token.toLowerCase()) ?? 0n) === BigInt(t.simulated) && (asOwn?.moved.get(t.token.toLowerCase()) ?? 0n) === BigInt(t.actual));
     const sendersGas = !!asPreview && differs.includes('gas') && asOwn?.gasUsed === actualGasUsed && gasCompared !== undefined && near(gasCompared.gasless ? asPreview.gasUsed : asPreview.paid, BigInt(gasCompared.simulated));
@@ -1150,16 +1179,32 @@ async function replay(item: string): Promise<void> {
       row.warned = [row.warned, `${[sendersTokens && 'tokens', sendersGas && 'gas'].filter(Boolean).join(' and ')} (who sends the bundle: the mined operation run as the sender the preview ran as, ${preview}, has the preview's; from its own bundler, the receipt's)`].filter(Boolean).join('; ');
       if (!differs.length) delete row.differs;
     }
+    // (Tokens only: gas under the stand-ins is the stand-ins' own, which is what the preview's gas is judged for.)
+    const earlierTokens = !!asUnder && differs.includes('tokens') && (row.tokenDiffs as Compared[] | undefined ?? []).every(t => (asUnder.moved.get(t.token.toLowerCase()) ?? 0n) === BigInt(t.simulated) && (asOwn?.moved.get(t.token.toLowerCase()) ?? 0n) === BigInt(t.actual));
+    if (earlierTokens) {
+      differs.splice(differs.indexOf('tokens'), 1);
+      row.earlierUnderStandIns = true;
+      row.warned = [row.warned, "tokens (the block's earlier transactions under the preview's stand-ins: the mined operation run with them in the block has the preview's amounts; without them, the receipt's)"].filter(Boolean).join('; ');
+      if (!differs.length) delete row.differs;
+    }
   }
-  if (differs.length || !row.outcome || row.tokens === 'other' || (gasPercent !== undefined && Math.abs(gasPercent) >= 5)) {
+  if (differs.length || !row.outcome || row.tokens === 'other' || (gasPercent !== undefined && Math.abs(gasPercent) >= 5) || DIGEST) {
     const sim = p.simulation, firstOfKey = (BigInt(op.nonce) & ((1n << 64n) - 1n)) === 0n;
+    const failing = p.warnings.find(w => w.code === 'userop_execution_reverts' || w.code === 'userop_rejected');
+    const apart = ops.length === 1 && ranLogs ? firstDifference(own, ranLogs, EP) : undefined;
     const shown = (p.assetChanges ?? []).filter(c => c.asset !== 'native').map(c => `${c.direction === 'out' ? '-' : '+'}${c.raw ?? c.amount} ${c.asset}${(c.account ?? sender).toLowerCase() === sender ? '' : ` (of ${c.account})`}`);
     row.digest = [`sender ${sender}`, paymaster && !/^0x0{40}$/.test(paymaster) && `paymaster ${paymaster}`, `bundler ${tx.from.toLowerCase()}`,
       firstOfKey && 'nonce 0 of its key', op.initCode !== '0x' && `initCode ${op.initCode.slice(0, 42)}`, !!tx.authorizationList?.length && 'its bundle carries EIP-7702 authorizations',
       gasCompared && `gas ${gasCompared.gasless ? 'used' : 'paid'}: simulated ${gasCompared.simulated}, actual ${gasCompared.actual}`,
       `preview "${p.title.slice(0, 90)}"`, sim && `simulation ${sim.status}${sim.revertReason ? ` (${sim.revertReason.slice(0, 160)})` : ''}`,
       p.warnings.some(w => w.severity !== 'info') && `warns ${p.warnings.filter(w => w.severity !== 'info').map(w => w.code).join(', ')}`,
-      shown.length ? `shows ${shown.join(', ').slice(0, 300)}` : 'shows no token moving', asMined].filter(Boolean).join(' | ');
+      // Why the preview has it failing, in its own words; what stood in for the signature, and the mined one's length
+      // (a passkey's assertion is hundreds of bytes, a key's signature 65 and its wrappers); a run a second late.
+      failing && `the preview: ${failing.message.slice(0, 220)}`,
+      row.standIn && `stand-in ${row.standIn}, the mined signature ${(op.signature.length - 2) / 2} bytes`, timeBumped && 'run a second after its block',
+      shown.length ? `shows ${shown.join(', ').slice(0, 300)}` : 'shows no token moving', asMined,
+      // Where the preview's run and the receipt part, by their events (an operation alone in its bundle).
+      apart && `the first event apart: ${apart}`].filter(Boolean).join(' | ');
   }
   // --differing <dir>: each differing operation's row and preview, kept to look at once its state is gone.
   if (differs.length && arg('differing', '')) {

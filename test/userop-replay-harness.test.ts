@@ -2,7 +2,7 @@
 // (scripts/userop-tokens.ts), and what a replay has warm (src/simulation.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { balanceAtTime, compareTokens, couldNotLook, DEPOSIT, differsIn, heldToBalance, keptEarlier, stateGone, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
+import { balanceAtTime, compareTokens, couldNotLook, DEPOSIT, differsIn, firstDifference, heldToBalance, keptEarlier, stateGone, movedAlike, TRANSFER, transfersOf, WITHDRAWAL, type Compared, type Log } from '../scripts/userop-tokens.ts';
 import { RpcSimulator } from '../src/simulation.ts';
 
 const word = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
@@ -221,4 +221,22 @@ test('a balance that moved as the logs say leaves the difference standing, and o
     assert.deepEqual([typeof gone[0].unjudged, differsIn(gone[0])], ['string', false], failure);
   }
   assert.equal(stateGone(new Error('execution reverted: ERC20: no such function')), false);
+});
+
+test("Where a run's events first part from a receipt's: the event, whose it is, and the words that differ", () => {
+  // A swap as mined and as previewed: the pool's event carries another amount out, and the transfers after it follow.
+  const ENTRY_POINT = '0x0000000071727de22e5e9d8baf0edac6f37da032', POOL = '0x28e2ea090877bf75740558f6bfb36a5ffee9e9df', SWAP = `0x40e9cecb${'00'.repeat(28)}`;
+  const swap = (out: bigint, fee: bigint): Log => ({ address: POOL, topics: [SWAP, word(ACCOUNT)], data: `0x${[400n, out, 7n, fee].map(v => v.toString(16).padStart(64, '0')).join('')}` });
+  const own = (gas: bigint): Log => ({ address: ENTRY_POINT, topics: [`0x49628fd1${'00'.repeat(28)}`], data: amount(gas) });
+  const receipt = [own(1n), transfer(USDT, ACCOUNT, POOL, 400n), swap(399_779n, 95n), transfer(WETH, POOL, ACCOUNT, 399_779n), own(541_765n)];
+  const run = [transfer(USDT, ACCOUNT, POOL, 400n), swap(399_912n, 77n), transfer(WETH, POOL, ACCOUNT, 399_912n), own(552_333n)];
+  // The EntryPoint's own events are left out of both (their gas is never the same, and a simulation logs fewer).
+  assert.equal(firstDifference(receipt, run, ENTRY_POINT), `event 2 of 3 (${POOL} 0x40e9cecb): word 2 is 399779 in the receipt and 399912 in the run; word 4 is 95 in the receipt and 77 in the run`);
+  assert.equal(firstDifference(receipt, receipt.slice(1), ENTRY_POINT), undefined);
+  // Another contract's event, one side stopping short, and indexed values that differ.
+  assert.equal(firstDifference(receipt, [transfer(WETH, ACCOUNT, POOL, 400n)], ENTRY_POINT), `event 1: ${USDT} 0xddf252ad in the receipt, ${WETH} 0xddf252ad in the run`);
+  assert.equal(firstDifference(receipt, receipt.slice(0, 3), ENTRY_POINT), `event 3: only the receipt has it (${WETH} 0xddf252ad); the receipt has 3 events, the run 2`);
+  assert.equal(firstDifference(receipt, [transfer(USDT, ACCOUNT, SAFE, 400n)], ENTRY_POINT), `event 1 (${USDT} 0xddf252ad): its indexed values differ`);
+  // A word too large for an amount is shown in hex.
+  assert.match(firstDifference([{ address: POOL, topics: [SWAP], data: `0x${'ff'.repeat(32)}` }], [{ address: POOL, topics: [SWAP], data: amount(1n) }], ENTRY_POINT) ?? '', /word 1 is 0xf{64} in the receipt and 1 in the run$/);
 });
